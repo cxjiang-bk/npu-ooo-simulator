@@ -105,9 +105,9 @@
 
 顺序：
 
-1. Elementwise/Reduce（elementwise/residual-add 已完成第一条 lowering 闭环）；
+1. Elementwise/Reduce（elementwise/residual-add、row-reduce 已完成 lowering 闭环）；
 2. ResNet bottleneck：Conv2D/Norm/Activation/Residual/Pooling；
-3. Softmax/LayerNorm/RMSNorm composite lowering；
+3. Softmax/LayerNorm/RMSNorm composite lowering（softmax 已展开 max/exp/sum/normalize primitive）；
 4. Decoder block：QKV/Attention/MLP/RoPE/KV cache；
 5. BERT/GPT-J/LLaMA2/DeepSeek benchmark templates；
 6. Conv2D halo/layout 和 optional MoE routing 作为后续扩展。

@@ -10,11 +10,20 @@ from npu_ooo.arch import lpu_like_machine_config, minimal_machine_config, wide_m
 from npu_ooo.benchmarks import (
     build_elementwise_case,
     build_elementwise_model,
+    build_reduce_case,
+    build_reduce_model,
+    build_softmax_case,
+    build_softmax_model,
     build_two_matmul_case,
     build_two_matmul_model,
 )
-from npu_ooo.ir import default_elementwise_schedule, default_two_matmul_schedule
-from npu_ooo.lowering import lower_elementwise, lower_two_matmul
+from npu_ooo.ir import (
+    default_elementwise_schedule,
+    default_reduce_schedule,
+    default_softmax_schedule,
+    default_two_matmul_schedule,
+)
+from npu_ooo.lowering import lower_elementwise, lower_reduce, lower_softmax, lower_two_matmul
 from npu_ooo.scheduler import (
     SchedulerPolicy,
     SimulatorConfig,
@@ -90,6 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
     two_mm.add_argument("--dependency-window", type=int)
     two_mm.add_argument("--ready-queue-depth", type=int)
     two_mm.add_argument("--address-scoreboard", action="store_true")
+    two_mm.add_argument("--dynamic-priority", choices=("critical_path", "oldest_first"), default="critical_path")
     two_mm.add_argument(
         "--static-stage-offsets",
         help="comma-separated static stage reservation offsets; enables explicit static pipeline reservations",
@@ -105,8 +115,35 @@ def build_parser() -> argparse.ArgumentParser:
     elementwise.add_argument("--dependency-window", type=int)
     elementwise.add_argument("--ready-queue-depth", type=int)
     elementwise.add_argument("--address-scoreboard", action="store_true")
+    elementwise.add_argument("--dynamic-priority", choices=("critical_path", "oldest_first"), default="critical_path")
     elementwise.add_argument("--static-stage-offsets")
     elementwise.add_argument("--static-stage-ii", type=float, default=1.0)
+    reduce = subparsers.add_parser("reduce", help="compile and schedule a row-reduction benchmark")
+    reduce.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
+    reduce.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
+    reduce.add_argument("--output-dir", type=Path, default=Path("out/reduce"))
+    reduce.add_argument("--instruction-queue-depth", type=int)
+    reduce.add_argument("--rob-entries", type=int)
+    reduce.add_argument("--max-inflight-tiles", type=int)
+    reduce.add_argument("--dependency-window", type=int)
+    reduce.add_argument("--ready-queue-depth", type=int)
+    reduce.add_argument("--address-scoreboard", action="store_true")
+    reduce.add_argument("--dynamic-priority", choices=("critical_path", "oldest_first"), default="critical_path")
+    reduce.add_argument("--static-stage-offsets")
+    reduce.add_argument("--static-stage-ii", type=float, default=1.0)
+    softmax = subparsers.add_parser("softmax", help="compile and schedule a row-softmax benchmark")
+    softmax.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
+    softmax.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
+    softmax.add_argument("--output-dir", type=Path, default=Path("out/softmax"))
+    softmax.add_argument("--instruction-queue-depth", type=int)
+    softmax.add_argument("--rob-entries", type=int)
+    softmax.add_argument("--max-inflight-tiles", type=int)
+    softmax.add_argument("--dependency-window", type=int)
+    softmax.add_argument("--ready-queue-depth", type=int)
+    softmax.add_argument("--address-scoreboard", action="store_true")
+    softmax.add_argument("--dynamic-priority", choices=("critical_path", "oldest_first"), default="critical_path")
+    softmax.add_argument("--static-stage-offsets")
+    softmax.add_argument("--static-stage-ii", type=float, default=1.0)
     sweep = subparsers.add_parser("sweep-two-mm", help="sweep 2mm architecture and scheduler parameters")
     sweep.add_argument("--architectures", default="minimal,wide-mxu")
     sweep.add_argument(
@@ -117,6 +154,7 @@ def build_parser() -> argparse.ArgumentParser:
     sweep.add_argument("--robs", default="4,8")
     sweep.add_argument("--output-dir", type=Path, default=Path("out/sweep-two-mm"))
     sweep.add_argument("--address-scoreboard", action="store_true")
+    sweep.add_argument("--dynamic-priority", choices=("critical_path", "oldest_first"), default="critical_path")
     sweep.add_argument("--static-stage-offsets")
     sweep.add_argument("--static-stage-ii", type=float, default=1.0)
     return parser
@@ -129,11 +167,13 @@ def _simulator_config(
     address_scoreboard: bool,
     static_stage_offsets: tuple[float, ...] = (),
     static_stage_ii: float = 1.0,
+    dynamic_priority: str = "critical_path",
 ) -> SimulatorConfig:
     return SimulatorConfig(
         dependency_window=dependency_window,
         rob_entries=rob_entries,
         address_scoreboard=address_scoreboard,
+        dynamic_priority=dynamic_priority,
         static_pipeline=(
             StaticPipelineConfig(
                 stage_count=len(static_stage_offsets),
@@ -164,6 +204,7 @@ def run_two_mm(args: argparse.Namespace) -> int:
         dependency_window=args.dependency_window,
         ready_queue_depth=args.ready_queue_depth,
         address_scoreboard=args.address_scoreboard,
+        dynamic_priority=args.dynamic_priority,
         static_pipeline=(
             StaticPipelineConfig(
                 stage_count=len(stage_offsets),
@@ -252,6 +293,7 @@ def run_elementwise(args: argparse.Namespace) -> int:
         dependency_window=args.dependency_window,
         ready_queue_depth=args.ready_queue_depth,
         address_scoreboard=args.address_scoreboard,
+        dynamic_priority=args.dynamic_priority,
         static_pipeline=(
             StaticPipelineConfig(
                 stage_count=len(stage_offsets),
@@ -268,6 +310,144 @@ def run_elementwise(args: argparse.Namespace) -> int:
         args.policy,
         simulator_config=simulator_config,
     )
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    write_artifact_json(model, args.output_dir / "model_spec.json")
+    write_artifact_json(case, args.output_dir / "benchmark_case.json")
+    write_artifact_json(instance, args.output_dir / "model_instance.json")
+    write_artifact_json(instance.graph, args.output_dir / "operator_graph.json")
+    write_artifact_json(schedule, args.output_dir / "schedule.json")
+    write_artifact_json(lowered.tile_graph, args.output_dir / "tile_graph.json")
+    write_artifact_json(lowered.execution_graph, args.output_dir / "execution_graph.json")
+    write_artifact_json(result.metrics.get("address_hazards", []), args.output_dir / "address_dependencies.json")
+    write_artifact_json(machine, args.output_dir / "machine.json")
+    write_artifact_json(result.perfetto_trace(), args.output_dir / "perfetto.json")
+    write_artifact_json(
+        {
+            "schema_version": 1,
+            "benchmark": case.case_id,
+            "architecture": args.arch,
+            "machine_hash": machine.stable_hash(),
+            "schedule": schedule.schedule_id,
+            "policy": result.policy,
+            "backend": result.backend,
+            "calibration_status": result.metrics["calibration_status"],
+            "simulator_config": result.metrics["simulator_config"],
+            "address_dependency_count": result.metrics.get("address_dependency_count", 0),
+            "total_cycles": result.total_cycles,
+            "statistics": lowered.statistics,
+        },
+        args.output_dir / "manifest.json",
+    )
+    write_operator_graph_dot(instance.graph, args.output_dir / "operator_graph.dot")
+    write_operator_graph_svg(instance.graph, args.output_dir / "operator_graph.svg")
+    write_tile_graph_dot(lowered.tile_graph, args.output_dir / "tile_graph.dot")
+    write_execution_graph_dot(lowered.execution_graph, args.output_dir / "execution_graph.dot")
+    write_json(result, args.output_dir / "summary.json")
+    write_csv(result, args.output_dir / "tasks.csv")
+    write_svg(result, args.output_dir / "swimlane.svg")
+    print(json.dumps({"architecture": args.arch, "policy": result.policy, "total_cycles": result.total_cycles, "output_dir": str(args.output_dir)}, sort_keys=True))
+    return 0
+
+
+def run_reduce(args: argparse.Namespace) -> int:
+    machine = _machine(args.arch)
+    model = build_reduce_model()
+    case = build_reduce_case(
+        architecture_profile=args.arch,
+        scheduler_profile=args.policy,
+    )
+    instance = model.instantiate(case)
+    schedule = default_reduce_schedule(instance.graph)
+    lowered = lower_reduce(instance, machine, schedule)
+    stage_offsets = _parse_offsets(args.static_stage_offsets)
+    simulator_config = SimulatorConfig(
+        instruction_queue_depth=args.instruction_queue_depth,
+        rob_entries=args.rob_entries,
+        max_inflight_tiles=args.max_inflight_tiles,
+        dependency_window=args.dependency_window,
+        ready_queue_depth=args.ready_queue_depth,
+        address_scoreboard=args.address_scoreboard,
+        dynamic_priority=args.dynamic_priority,
+        static_pipeline=(
+            StaticPipelineConfig(
+                stage_count=len(stage_offsets),
+                stage_offsets=stage_offsets,
+                initiation_interval_cycles=args.static_stage_ii,
+            )
+            if stage_offsets
+            else None
+        ),
+    )
+    result = schedule_execution_graph(lowered.execution_graph, machine, args.policy, simulator_config=simulator_config)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    write_artifact_json(model, args.output_dir / "model_spec.json")
+    write_artifact_json(case, args.output_dir / "benchmark_case.json")
+    write_artifact_json(instance, args.output_dir / "model_instance.json")
+    write_artifact_json(instance.graph, args.output_dir / "operator_graph.json")
+    write_artifact_json(schedule, args.output_dir / "schedule.json")
+    write_artifact_json(lowered.tile_graph, args.output_dir / "tile_graph.json")
+    write_artifact_json(lowered.execution_graph, args.output_dir / "execution_graph.json")
+    write_artifact_json(result.metrics.get("address_hazards", []), args.output_dir / "address_dependencies.json")
+    write_artifact_json(machine, args.output_dir / "machine.json")
+    write_artifact_json(result.perfetto_trace(), args.output_dir / "perfetto.json")
+    write_artifact_json(
+        {
+            "schema_version": 1,
+            "benchmark": case.case_id,
+            "architecture": args.arch,
+            "machine_hash": machine.stable_hash(),
+            "schedule": schedule.schedule_id,
+            "policy": result.policy,
+            "backend": result.backend,
+            "calibration_status": result.metrics["calibration_status"],
+            "simulator_config": result.metrics["simulator_config"],
+            "address_dependency_count": result.metrics.get("address_dependency_count", 0),
+            "total_cycles": result.total_cycles,
+            "statistics": lowered.statistics,
+        },
+        args.output_dir / "manifest.json",
+    )
+    write_operator_graph_dot(instance.graph, args.output_dir / "operator_graph.dot")
+    write_operator_graph_svg(instance.graph, args.output_dir / "operator_graph.svg")
+    write_tile_graph_dot(lowered.tile_graph, args.output_dir / "tile_graph.dot")
+    write_execution_graph_dot(lowered.execution_graph, args.output_dir / "execution_graph.dot")
+    write_json(result, args.output_dir / "summary.json")
+    write_csv(result, args.output_dir / "tasks.csv")
+    write_svg(result, args.output_dir / "swimlane.svg")
+    print(json.dumps({"architecture": args.arch, "policy": result.policy, "total_cycles": result.total_cycles, "output_dir": str(args.output_dir)}, sort_keys=True))
+    return 0
+
+
+def run_softmax(args: argparse.Namespace) -> int:
+    machine = _machine(args.arch)
+    model = build_softmax_model()
+    case = build_softmax_case(
+        architecture_profile=args.arch,
+        scheduler_profile=args.policy,
+    )
+    instance = model.instantiate(case)
+    schedule = default_softmax_schedule(instance.graph)
+    lowered = lower_softmax(instance, machine, schedule)
+    stage_offsets = _parse_offsets(args.static_stage_offsets)
+    simulator_config = SimulatorConfig(
+        instruction_queue_depth=args.instruction_queue_depth,
+        rob_entries=args.rob_entries,
+        max_inflight_tiles=args.max_inflight_tiles,
+        dependency_window=args.dependency_window,
+        ready_queue_depth=args.ready_queue_depth,
+        address_scoreboard=args.address_scoreboard,
+        dynamic_priority=args.dynamic_priority,
+        static_pipeline=(
+            StaticPipelineConfig(
+                stage_count=len(stage_offsets),
+                stage_offsets=stage_offsets,
+                initiation_interval_cycles=args.static_stage_ii,
+            )
+            if stage_offsets
+            else None
+        ),
+    )
+    result = schedule_execution_graph(lowered.execution_graph, machine, args.policy, simulator_config=simulator_config)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     write_artifact_json(model, args.output_dir / "model_spec.json")
     write_artifact_json(case, args.output_dir / "benchmark_case.json")
@@ -349,6 +529,7 @@ def run_sweep_two_mm(args: argparse.Namespace) -> int:
             address_scoreboard=args.address_scoreboard,
             static_stage_offsets=static_config,
             static_stage_ii=args.static_stage_ii,
+            dynamic_priority=args.dynamic_priority,
         )
         result = schedule_execution_graph(
             lowered.execution_graph,
@@ -401,6 +582,7 @@ def run_sweep_two_mm(args: argparse.Namespace) -> int:
                 "total_cycles": result.total_cycles,
                 "speedup_vs_static": (baseline / result.total_cycles if baseline is not None and result.total_cycles else None),
                 "address_scoreboard": args.address_scoreboard,
+                "dynamic_priority": args.dynamic_priority,
                 "address_hazard_count": metrics.get("address_hazard_count", 0),
                 "rob_peak": metrics.get("rob_peak", 0),
                 "ready_set_peak": metrics.get("ready_set_peak", 0),
@@ -427,6 +609,10 @@ def main(argv: list[str] | None = None) -> int:
         return run_two_mm(args)
     if args.command == "elementwise":
         return run_elementwise(args)
+    if args.command == "reduce":
+        return run_reduce(args)
+    if args.command == "softmax":
+        return run_softmax(args)
     if args.command == "sweep-two-mm":
         return run_sweep_two_mm(args)
     raise AssertionError(args.command)

@@ -119,6 +119,29 @@ class CliArtifactTest(unittest.TestCase):
             summary = json.loads((output / "summary.json").read_text())
             self.assertIn("ARU", summary["metrics"]["resource_utilization"])
 
+    def test_reduce_exports_partial_accumulation_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            output = Path(directory)
+            exit_code = main(
+                ["reduce", "--arch", "minimal", "--policy", "dynamic_ready_queue", "--output-dir", str(output)]
+            )
+            self.assertEqual(exit_code, 0)
+            execution_graph = json.loads((output / "execution_graph.json").read_text())
+            reduce_tasks = [task for task in execution_graph["tasks"] if task["primitive"] == "reduce"]
+            self.assertTrue(reduce_tasks)
+            self.assertTrue(any(task["resource"] == "ARU" for task in reduce_tasks))
+
+    def test_softmax_exports_composite_primitive_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            output = Path(directory)
+            exit_code = main(
+                ["softmax", "--arch", "minimal", "--policy", "dynamic_ready_queue", "--output-dir", str(output)]
+            )
+            self.assertEqual(exit_code, 0)
+            execution_graph = json.loads((output / "execution_graph.json").read_text())
+            primitives = {task["primitive"] for task in execution_graph["tasks"]}
+            self.assertTrue({"reduce_max", "exp", "reduce_sum", "normalize"}.issubset(primitives))
+
 
 if __name__ == "__main__":
     unittest.main()

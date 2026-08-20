@@ -67,7 +67,17 @@ def write_svg(result: ScheduleResult, path: str | Path, *, width: int = 1600, ro
     chart_width = max(1, width - label_width - 20)
     scale = chart_width / max(result.total_cycles, 1.0)
     height = 48 + row_height * len(lanes)
-    palette = {"load": "#2f6f9f", "matmul": "#b45f06", "store": "#3b7d3b"}
+    palette = {
+        "load": "#2f6f9f",
+        "matmul": "#b45f06",
+        "elementwise": "#7b4f9d",
+        "reduce": "#a33d4f",
+        "reduce_max": "#a33d4f",
+        "reduce_sum": "#c65a3a",
+        "exp": "#7b4f9d",
+        "normalize": "#4c7f6b",
+        "store": "#3b7d3b",
+    }
     elements: list[str] = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#ffffff"/>',

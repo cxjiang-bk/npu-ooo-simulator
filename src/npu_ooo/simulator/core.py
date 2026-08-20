@@ -139,6 +139,7 @@ class SimulatorConfig:
     ready_queue_depth: int | None = None
     address_scoreboard: bool = False
     static_pipeline: StaticPipelineConfig | None = None
+    dynamic_priority: str = "critical_path"
 
     def resolved(self, machine: MachineConfig) -> "SimulatorConfig":
         scheduler = machine.scheduler
@@ -170,6 +171,7 @@ class SimulatorConfig:
             ),
             address_scoreboard=self.address_scoreboard,
             static_pipeline=self.static_pipeline,
+            dynamic_priority=self.dynamic_priority,
         )
         issues = result.validate()
         if issues:
@@ -189,6 +191,10 @@ class SimulatorConfig:
                 issues.append(f"simulator {name} must be positive when specified")
         if self.static_pipeline is not None:
             issues.extend(self.static_pipeline.validate())
+        if self.dynamic_priority not in {"critical_path", "oldest_first"}:
+            issues.append(
+                "simulator dynamic_priority must be 'critical_path' or 'oldest_first'"
+            )
         return tuple(issues)
 
     def to_dict(self) -> dict[str, Any]:
@@ -202,6 +208,7 @@ class SimulatorConfig:
             "static_pipeline": (
                 self.static_pipeline.to_dict() if self.static_pipeline is not None else None
             ),
+            "dynamic_priority": self.dynamic_priority,
         }
 
 
@@ -684,16 +691,27 @@ def simulate_execution_graph(
                     metrics["tile_window_block_events"] += 1
                 break
             if policy == "dynamic_ready_queue":
-                selected = min(
-                    candidates,
-                    key=lambda item: (
-                        item[2],
-                        -critical_path[item[0].task_id],
-                        item[0].program_order,
-                        item[0].task_id,
-                        item[1].instance,
-                    ),
-                )
+                if config.dynamic_priority == "critical_path":
+                    selected = min(
+                        candidates,
+                        key=lambda item: (
+                            item[2],
+                            -critical_path[item[0].task_id],
+                            item[0].program_order,
+                            item[0].task_id,
+                            item[1].instance,
+                        ),
+                    )
+                else:
+                    selected = min(
+                        candidates,
+                        key=lambda item: (
+                            item[0].program_order,
+                            item[2],
+                            item[0].task_id,
+                            item[1].instance,
+                        ),
+                    )
             else:
                 selected = min(
                     candidates,

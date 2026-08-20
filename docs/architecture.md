@@ -294,6 +294,8 @@ optional modulo initiation interval
 - resource-locality-first；
 - iteration-first，作为静态顺序近似对照。
 
+当前 simulator 将可执行的动态启发式显式化为 `SimulatorConfig.dynamic_priority`：`critical_path`（默认）或 `oldest_first`。这使得 softmax 等多阶段 DAG 可以把“动态 ready queue 机制”和“具体优先级函数”作为两个独立实验维度报告。
+
 TISA-like policy 现在支持可选 runtime range scoreboard、窗口大小和 completion wake-up；scoreboard 不改写编译期图，而是只追踪 active task 的地址范围，因此能在 trace 中区分编译期依赖与运行时 address stall。
 
 ## 7. Discrete-event Simulator

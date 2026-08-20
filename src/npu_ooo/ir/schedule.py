@@ -186,3 +186,47 @@ def default_elementwise_schedule(graph: OperatorGraph) -> ScheduleSpec:
     if issues:
         raise ValueError("; ".join(issues))
     return result
+
+
+def default_reduce_schedule(graph: OperatorGraph) -> ScheduleSpec:
+    """Return a 32x32 iteration/reduction tile schedule for row reductions."""
+
+    schedules: list[OperatorSchedule] = []
+    for operator in graph.operators:
+        if operator.normalized_type != "reduce":
+            raise ValueError(f"default reduce schedule does not support '{operator.normalized_type}'")
+        dimensions = tuple((*operator.iteration_dims, *operator.reduction_dims))
+        schedules.append(
+            OperatorSchedule(
+                operator_id=operator.op_id,
+                tile_sizes=tuple((name, min(32, int(extent))) for name, extent in dimensions),
+                loop_order=tuple(name for name, _ in dimensions),
+            )
+        )
+    result = ScheduleSpec("reduce_default", tuple(schedules), attributes={"source": "hand-written"})
+    issues = result.validate(graph)
+    if issues:
+        raise ValueError("; ".join(issues))
+    return result
+
+
+def default_softmax_schedule(graph: OperatorGraph) -> ScheduleSpec:
+    """Return a 32x32 iteration/reduction tile schedule for row softmax."""
+
+    schedules: list[OperatorSchedule] = []
+    for operator in graph.operators:
+        if operator.normalized_type != "softmax":
+            raise ValueError(f"default softmax schedule does not support '{operator.normalized_type}'")
+        dimensions = tuple((*operator.iteration_dims, *operator.reduction_dims))
+        schedules.append(
+            OperatorSchedule(
+                operator_id=operator.op_id,
+                tile_sizes=tuple((name, min(32, int(extent))) for name, extent in dimensions),
+                loop_order=tuple(name for name, _ in dimensions),
+            )
+        )
+    result = ScheduleSpec("softmax_default", tuple(schedules), attributes={"source": "hand-written"})
+    issues = result.validate(graph)
+    if issues:
+        raise ValueError("; ".join(issues))
+    return result

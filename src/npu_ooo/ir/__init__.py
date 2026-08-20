@@ -22,6 +22,8 @@ from .schedule import (
     ScheduleSpec,
     TensorResidency,
     default_elementwise_schedule,
+    default_reduce_schedule,
+    default_softmax_schedule,
     default_two_matmul_schedule,
 )
 from .tile import TileDependency, TileGraph, TileInstance, build_tile_graph, enumerate_operator_tiles
@@ -55,5 +57,7 @@ __all__ = [
     "build_tile_graph",
     "default_two_matmul_schedule",
     "default_elementwise_schedule",
+    "default_reduce_schedule",
+    "default_softmax_schedule",
     "enumerate_operator_tiles",
 ]
