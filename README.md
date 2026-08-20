@@ -16,13 +16,13 @@
   -> 总周期、利用率、stall 分解和泳道图
 ```
 
-当前已经具备第一条可执行闭环：2mm 模型实例化、显式 tiling、primitive execution graph，以及基于 MachineConfig 的 sequential/static-pipeline/dynamic-ready-queue analytical scheduler。输出包含总周期、等待分解和 Perfetto/Chrome Trace 事件；数值仍标记为 analytical，尚未宣称 RTL cycle-accurate。
+当前已经具备两条可执行算子闭环：2mm 和 residual-add elementwise。它们都经过模型实例化、显式 tiling、primitive execution graph，以及基于 MachineConfig 的 sequential/static-pipeline/dynamic-ready-queue analytical scheduler。输出包含总周期、等待分解和 Perfetto/Chrome Trace 事件；数值仍标记为 analytical，尚未宣称 RTL cycle-accurate。
 
 模型层是必要的：论文 benchmark 同时覆盖 ResNet50、BERT、GPT-J、LLaMA2 和 DeepSeek-R1，并区分 CNN、Transformer、prefill、decode、batch、sequence length 和 dtype。Operator IR 负责描述“一个算子做什么”，Model IR 负责描述“哪些算子以什么拓扑、重复次数和运行阶段组成一个 workload”。
 
 ## 研究目标
 
-- 支持 GEMM、2mm、elementwise、reduction/softmax 和 Attention benchmark；
+- 支持 GEMM、2mm、elementwise/residual-add、reduction/softmax 和 Attention benchmark；
 - 支持 CNN、encoder Transformer、decoder Transformer、长上下文和可选 MoE workload；
 - 在同一 tile graph 和同一硬件配置上公平比较 Static 与 Dynamic 调度；
 - 支持 sequential、static dual/triple pipeline 和 TISA-like dynamic dual/triple pipeline；
@@ -85,6 +85,19 @@ npu-ooo-simulator/
 
 在该闭环稳定后，再加入 ARU/reduction、Attention 和更复杂的硬件资源。
 
+### Elementwise benchmark
+
+`elementwise` 命令使用一个两输入 residual-add 图，lowering 为 `load -> ARU elementwise -> store`，与 2mm 共用 scheduler 和 simulator：
+
+```bash
+PYTHONPATH=src python3 -m npu_ooo.cli elementwise \
+  --arch minimal \
+  --policy dynamic_ready_queue \
+  --dependency-window 4 \
+  --rob-entries 4 \
+  --output-dir out/elementwise-dynamic
+```
+
 当前已实现到 `Execution Graph -> analytical event simulator -> SchedulerResult`，输出 CSV/SVG、Perfetto/Chrome Trace 和 runtime queue/ROB 指标。后端仍是 analytical timing，不是 RTL cycle-accurate；真实 ISA/RTL timing 后续通过 `TimingModel` 接入。
 
 ### 快速运行
@@ -111,7 +124,7 @@ operator_graph.svg      可直接查看的顶层计算图
 schedule.json           tile factor、loop order、stage
 tile_graph.json         具体 tile 实例和依赖
 execution_graph.json    load/matmul/store task 及依赖
-address_dependencies.json  RAW/WAR/WAW 增补依赖
+address_dependencies.json  运行时观测到的 RAW/WAR/WAW 冲突
 machine.json            本次 MachineConfig
 manifest.json           配置 hash、policy、周期和统计
 tasks.csv               task start/finish 时间
@@ -121,7 +134,20 @@ perfetto.json           Perfetto/Chrome Trace
 
 同时提供 `operator_graph.dot`、`tile_graph.dot`、`execution_graph.dot`，用于 Graphviz 或其他图分析工具。`--arch` 可选 `minimal`、`wide-mxu`、`lpu-like`；`--policy` 可选 `sequential`、`static_pipeline`、`dynamic_ready_queue`。
 
-运行时容量可以通过 `--instruction-queue-depth`、`--rob-entries`、`--max-inflight-tiles`、`--dependency-window` 和 `--ready-queue-depth` 覆盖 MachineConfig 默认值；实际生效值会写入 `manifest.json` 和 `summary.json`。加上 `--address-scoreboard` 后，会根据 `BufferRegion` 自动加入同一 tensor/memory range 的 RAW/WAR/WAW 依赖。
+运行时容量可以通过 `--instruction-queue-depth`、`--rob-entries`、`--max-inflight-tiles`、`--dependency-window` 和 `--ready-queue-depth` 覆盖 MachineConfig 默认值；实际生效值会写入 `manifest.json` 和 `summary.json`。`--address-scoreboard` 启用运行时 range scoreboard：活跃 task 的重叠 `BufferRegion` 会产生 RAW/WAR/WAW issue stall，完成后释放并唤醒等待者。静态流水线可用 `--static-stage-offsets 0,200 --static-stage-ii 250` 显式指定 stage reservation；不提供该参数时保留默认 program-order static baseline。
+
+批量比较使用 `sweep-two-mm`。它对每个 architecture/policy/window/ROB 组合重新执行相同的 2mm lowering 和 simulator，并为每个组合写入独立目录：
+
+```bash
+PYTHONPATH=src python3 -m npu_ooo.cli sweep-two-mm \
+  --architectures minimal,wide-mxu \
+  --policies static_pipeline,dynamic_ready_queue \
+  --windows 4,8 \
+  --robs 4,8 \
+  --output-dir out/sweep-two-mm
+```
+
+顶层的 `sweep.csv` / `sweep.json` 汇总 total cycles、相对 static 的 speedup、ROB/ready peak、stall 分解和 pipeline drain；各 case 子目录保留 `manifest.json`、`summary.json`、`tasks.csv`、`address_dependencies.json`、`perfetto.json` 和 `swimlane.svg`。
 
 ## 参考项目
 

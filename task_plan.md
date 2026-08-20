@@ -17,8 +17,8 @@
 | 2 | 2mm tile instance 和 primitive lowering | completed |
 | 3 | Static discrete-event simulator 与 trace | completed |
 | 4 | Dynamic/TISA-like scheduler | in_progress |
-| 5 | Elementwise/Reduce/Softmax/Attention | pending |
-| 6 | Architecture x Schedule x Policy 实验框架 | pending |
+| 5 | Elementwise/Reduce/Softmax/Attention | in_progress |
+| 6 | Architecture x Schedule x Policy 实验框架 | in_progress |
 | 7 | TileFlow/SCALE-Sim/RTL 校准 | pending |
 
 ## 阶段 0 检查表
@@ -34,9 +34,9 @@
 - [ ] 冻结 ExecutionTask dependency/address schema；
 - [ ] 冻结 simulator event/tie-break 语义；
 - [ ] 冻结 trace/summary/manifest schema；
-- [ ] 为 dual/triple pipeline 编写手算 golden case。
+- [x] 为 dual/triple pipeline 编写手算 golden case（dual reservation + drain 已由测试固定；stage_count 支持 triple）。
 
-阶段 0 目前已落地 Model/Operator/MachineConfig、Schedule/Tile/Execution 基础 schema；trace/experiment manifest 和手算 dual/triple golden case 仍待独立冻结。
+阶段 0 目前已落地 Model/Operator/MachineConfig、Schedule/Tile/Execution、trace/summary/manifest 基础 schema；triple stage 仍需在实验矩阵中补充更复杂的 golden case。
 
 ## 第一里程碑
 
@@ -51,7 +51,7 @@
 
 验收必须覆盖两个 architecture profile，并证明 Static/Dynamic 只改变 scheduler policy。
 
-当前已有两个 architecture profile 的 analytical cycle 对比、CSV/SVG/Perfetto 输出、ROB/window/queue 指标和可选 address scoreboard；PNG swimlane 与真实 MXU/memory timing 校准仍待后续提交。
+当前已有两个 architecture profile 的 analytical cycle 对比、CSV/SVG/Perfetto 输出、ROB/window/queue 指标、显式 static stage reservation、runtime address scoreboard 和 occupancy timeline；`sweep-two-mm` 已能批量生成 architecture × policy × window × ROB 结果。PNG swimlane 与真实 MXU/memory timing 校准仍待后续提交。
 
 ## 关键问题
 
@@ -77,7 +77,7 @@
 | 第一版不宣称 cycle-accurate | timing model 需要经过外部模型和 RTL observation 分层校准 |
 | scheduler policy 与 event backend 分离 | policy 只选择 ready task；queue、ROB、II、资源占用和 completion wake-up 由 simulator 统一处理 |
 | `SimulatorConfig` 覆盖 MachineConfig runtime capacity | 便于直接 sweep instruction queue、ROB、dependency window、in-flight tile，而不修改编译图 |
-| address scoreboard 默认可选 | `BufferRegion` hazard augmentation 可验证 RAW/WAR/WAW；在确认范围语义前不强行改变 baseline 图 |
+| address scoreboard 作为可选 runtime layer | 基于 active `BufferRegion` 生成 RAW/WAR/WAW issue stall，COMPLETE 后释放范围；不改写默认 graph，方便和 compile-time dependency 做公平对照 |
 
 ## 暂不做
 

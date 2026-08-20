@@ -252,7 +252,7 @@ def lower_matmul_graph(
                         initiation_interval_cycles=load_a_ii,
                         stage_id=tile.stage_id,
                         program_order=task_order,
-                        attributes={"operand": "lhs"},
+                        attributes={"operand": "lhs", "iteration": tile.ordinal},
                     ),
                     ExecutionTask(
                         task_id=load_b_id,
@@ -267,7 +267,7 @@ def lower_matmul_graph(
                         initiation_interval_cycles=load_b_ii,
                         stage_id=tile.stage_id,
                         program_order=task_order + 1,
-                        attributes={"operand": "rhs"},
+                        attributes={"operand": "rhs", "iteration": tile.ordinal},
                     ),
                 )
             )
@@ -296,6 +296,7 @@ def lower_matmul_graph(
                         "n_tile": output.shape[1],
                         "k_tile": reduction_shape,
                         "macs": output.shape[0] * output.shape[1] * reduction_shape,
+                        "iteration": tile.ordinal,
                     },
                 )
             )
@@ -318,7 +319,7 @@ def lower_matmul_graph(
                         initiation_interval_cycles=store_ii,
                         stage_id=tile.stage_id,
                         program_order=task_order,
-                        attributes={"final_reduction_tile": True},
+                        attributes={"final_reduction_tile": True, "iteration": tile.ordinal},
                     )
                 )
                 task_order += 1

@@ -6,6 +6,7 @@ from .core import (
     TaskTiming,
     TraceEvent,
     SimulatorConfig,
+    StaticPipelineConfig,
     schedule_execution_graph,
 )
 
@@ -15,5 +16,6 @@ __all__ = [
     "TaskTiming",
     "TraceEvent",
     "SimulatorConfig",
+    "StaticPipelineConfig",
     "schedule_execution_graph",
 ]

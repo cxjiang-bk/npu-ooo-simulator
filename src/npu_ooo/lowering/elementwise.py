@@ -1,0 +1,205 @@
+from __future__ import annotations
+
+import math
+from typing import Any
+
+from npu_ooo.arch import MachineConfig
+from npu_ooo.ir import (
+    AccessType,
+    BufferRegion,
+    ExecutionGraph,
+    ExecutionTask,
+    OperatorGraph,
+    ScheduleSpec,
+    TileGraph,
+    TileInstance,
+    build_tile_graph,
+)
+from npu_ooo.ir.model import ModelInstance
+
+from .matmul import (
+    LoweringResult,
+    _local_memory,
+    _path,
+    _region,
+    _root_memory,
+    _transfer_timing,
+    _unit_for,
+    _regions_overlap,
+    dtype_bytes,
+)
+
+
+def _elementwise_timing(machine: MachineConfig, elements: int) -> tuple[float, float, str]:
+    unit = _unit_for(machine, "elementwise")
+    configured_rate = unit.attributes.get("elements_per_cycle", unit.attributes.get("lanes", 1))
+    rate = float(configured_rate) if isinstance(configured_rate, (int, float)) and configured_rate > 0 else 1.0
+    duration = unit.latency_cycles + math.ceil(elements / rate)
+    return float(duration), float(unit.initiation_interval_cycles), unit.name
+
+
+def _output_region(operator, tensors: dict[str, Any], tile: TileInstance, memory: str, access: AccessType) -> BufferRegion:
+    output = tensors[operator.outputs[0]]
+    dimensions = tuple(name for name, _ in operator.iteration_dims)
+    bounds = tile.bound_map
+    starts = tuple(bounds[name][0] for name in dimensions)
+    shape = tuple(bounds[name][1] - bounds[name][0] for name in dimensions)
+    return _region(output, memory, starts, shape, access)
+
+
+def lower_elementwise_graph(
+    graph: OperatorGraph,
+    schedule: ScheduleSpec,
+    machine: MachineConfig,
+) -> LoweringResult:
+    """Lower elementwise/residual-add operators into load -> ARU -> store tasks."""
+
+    graph_issues = graph.validate()
+    schedule_issues = schedule.validate(graph)
+    machine_issues = machine.validate()
+    if graph_issues or schedule_issues or machine_issues:
+        raise ValueError("; ".join((*graph_issues, *schedule_issues, *machine_issues)))
+    tensors = {tensor.name: tensor for tensor in graph.tensors}
+    root = _root_memory(machine)
+    local = _local_memory(machine, root)
+    tasks: list[ExecutionTask] = []
+    producer_stores: dict[str, list[tuple[BufferRegion, str]]] = {}
+    task_order = 0
+    transfer_bytes = 0
+    elements = 0
+
+    for operator_id in graph.topological_order():
+        operator = next(operator for operator in graph.operators if operator.op_id == operator_id)
+        if operator.normalized_type not in {"elementwise", "residual_add"}:
+            raise NotImplementedError(
+                f"elementwise lowering does not support operator type '{operator.normalized_type}'"
+            )
+        if len(operator.outputs) != 1 or not operator.inputs:
+            raise ValueError(f"elementwise operator '{operator.op_id}' requires inputs and one output")
+        dimensions = tuple(name for name, _ in operator.iteration_dims)
+        if not dimensions or operator.reduction_dims:
+            raise ValueError(f"elementwise operator '{operator.op_id}' requires iteration dimensions only")
+        output_shape = tuple(tensors[operator.outputs[0]].shape)
+        for input_name in operator.inputs:
+            if tuple(tensors[input_name].shape) != output_shape:
+                raise ValueError(
+                    f"elementwise operator '{operator.op_id}' requires matching input/output shapes"
+                )
+        from npu_ooo.ir.tile import enumerate_operator_tiles
+
+        tiles = enumerate_operator_tiles(operator, schedule.for_operator(operator_id))
+        output_tensor = tensors[operator.outputs[0]]
+        for tile in tiles:
+            output_global = _output_region(operator, tensors, tile, root, AccessType.WRITE)
+            output_local = _output_region(operator, tensors, tile, local, AccessType.WRITE)
+            output_local_read = _output_region(operator, tensors, tile, local, AccessType.READ)
+            load_ids: list[str] = []
+            load_regions: list[BufferRegion] = []
+            for input_index, input_name in enumerate(operator.inputs):
+                input_tensor = tensors[input_name]
+                bounds = tile.bound_map
+                starts = tuple(bounds[name][0] for name in dimensions)
+                shape = tuple(bounds[name][1] - bounds[name][0] for name in dimensions)
+                input_global = _region(input_tensor, root, starts, shape, AccessType.READ)
+                input_local = _region(input_tensor, local, starts, shape, AccessType.READ)
+                load_id = f"{tile.tile_id}.load_{input_index}"
+                predecessors = {
+                    store_id
+                    for region, store_id in producer_stores.get(input_name, [])
+                    if _regions_overlap(region, input_global)
+                }
+                duration, ii, unit = _transfer_timing(machine, root, local, input_global.size_bytes)
+                tasks.append(
+                    ExecutionTask(
+                        task_id=load_id,
+                        tile_id=tile.tile_id,
+                        operator_id=operator_id,
+                        primitive="load",
+                        resource=unit,
+                        reads=(input_global,),
+                        writes=(BufferRegion(**{**input_local.__dict__, "access": AccessType.WRITE}),),
+                        predecessors=tuple(sorted(predecessors)),
+                        duration_cycles=duration,
+                        initiation_interval_cycles=ii,
+                        stage_id=tile.stage_id,
+                        program_order=task_order,
+                        attributes={"operand": input_index, "iteration": tile.ordinal},
+                    )
+                )
+                task_order += 1
+                load_ids.append(load_id)
+                load_regions.append(input_local)
+                transfer_bytes += input_global.size_bytes
+
+            tile_elements = math.prod(output_local.shape)
+            compute_duration, compute_ii, compute_unit = _elementwise_timing(machine, tile_elements)
+            compute_id = f"{tile.tile_id}.elementwise"
+            tasks.append(
+                ExecutionTask(
+                    task_id=compute_id,
+                    tile_id=tile.tile_id,
+                    operator_id=operator_id,
+                    primitive="elementwise",
+                    resource=compute_unit,
+                    reads=tuple(load_regions),
+                    writes=(output_local,),
+                    predecessors=tuple(load_ids),
+                    duration_cycles=compute_duration,
+                    initiation_interval_cycles=compute_ii,
+                    stage_id=tile.stage_id,
+                    program_order=task_order,
+                    attributes={
+                        "elements": tile_elements,
+                        "input_count": len(operator.inputs),
+                        "iteration": tile.ordinal,
+                    },
+                )
+            )
+            task_order += 1
+            store_id = f"{tile.tile_id}.store"
+            store_duration, store_ii, store_unit = _transfer_timing(machine, local, root, output_local.size_bytes)
+            tasks.append(
+                ExecutionTask(
+                    task_id=store_id,
+                    tile_id=tile.tile_id,
+                    operator_id=operator_id,
+                    primitive="store",
+                    resource=store_unit,
+                    reads=(output_local_read,),
+                    writes=(output_global,),
+                    predecessors=(compute_id,),
+                    duration_cycles=store_duration,
+                    initiation_interval_cycles=store_ii,
+                    stage_id=tile.stage_id,
+                    program_order=task_order,
+                    attributes={"iteration": tile.ordinal},
+                )
+            )
+            task_order += 1
+            producer_stores.setdefault(output_tensor.name, []).append((output_global, store_id))
+            transfer_bytes += output_local.size_bytes
+            elements += tile_elements
+
+    execution = ExecutionGraph(
+        graph_id=f"{graph.graph_id}.execution",
+        tasks=tuple(tasks),
+        attributes={"source": "elementwise-lowering", "root_memory": root, "local_memory": local},
+    )
+    issues = execution.validate()
+    if issues:
+        raise ValueError("; ".join(issues))
+    tile_graph = build_tile_graph(graph, schedule)
+    return LoweringResult(
+        tile_graph=tile_graph,
+        execution_graph=execution,
+        statistics={
+            "tile_count": len(tile_graph.tiles),
+            "task_count": len(execution.tasks),
+            "elements": elements,
+            "transfer_bytes": transfer_bytes,
+        },
+    )
+
+
+def lower_elementwise(model: ModelInstance, machine: MachineConfig, schedule: ScheduleSpec) -> LoweringResult:
+    return lower_elementwise_graph(model.graph, schedule, machine)

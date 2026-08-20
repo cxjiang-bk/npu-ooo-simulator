@@ -4,20 +4,24 @@ from .core import (
     AnalyticalTimingModel,
     SimulationResult,
     SimulatorConfig,
+    StaticPipelineConfig,
     TaskTimingSpec,
     TimingModel,
     TraceEvent,
     TaskTiming,
     simulate_execution_graph,
 )
-from .address import AddressDependency, AddressHazardKind, add_address_dependencies
+from .address import AddressConflict, AddressDependency, AddressHazardKind, AddressScoreboard, add_address_dependencies
 
 __all__ = [
     "AnalyticalTimingModel",
     "AddressDependency",
+    "AddressConflict",
     "AddressHazardKind",
+    "AddressScoreboard",
     "SimulationResult",
     "SimulatorConfig",
+    "StaticPipelineConfig",
     "TaskTiming",
     "TaskTimingSpec",
     "TimingModel",

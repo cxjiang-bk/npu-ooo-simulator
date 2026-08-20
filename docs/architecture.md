@@ -283,7 +283,7 @@ stage offset
 optional modulo initiation interval
 ```
 
-支持 dual-stage 和 triple-stage，但 stage 名称来自 graph，不写死 `M0/S/M1`。
+支持 dual-stage 和 triple-stage，但 stage 名称来自 graph，不写死 `M0/S/M1`。`StaticPipelineConfig` 可用 `stage_offsets + initiation_interval_cycles + task.attributes[iteration]` 生成 reservation，也可用 `task_issue_cycles` 精确指定每条指令的 issue cycle。没有 reservation 配置时，`static_pipeline` 保持 deterministic program-order list scheduling，便于和旧基线对照。
 
 ### 6.3 DynamicReadyQueue
 
@@ -294,7 +294,7 @@ optional modulo initiation interval
 - resource-locality-first；
 - iteration-first，作为静态顺序近似对照。
 
-后续 TISA-like policy 加入 range scoreboard、窗口大小和 completion wake-up。
+TISA-like policy 现在支持可选 runtime range scoreboard、窗口大小和 completion wake-up；scoreboard 不改写编译期图，而是只追踪 active task 的地址范围，因此能在 trace 中区分编译期依赖与运行时 address stall。
 
 ## 7. Discrete-event Simulator
 
@@ -334,7 +334,7 @@ TimingModel / EventBackend
 
 `AnalyticalTimingModel` 只消费 `ExecutionTask.duration_cycles` 和 `MachineConfig` 的 unit 默认值；它是可替换的 timing provider，不代表真实硬件。`SimulatorConfig` 可以覆盖 instruction queue、ROB、ready queue、dependency window 和 max in-flight tiles。
 
-`--address-scoreboard` 启用第一版范围 hazard augmentation：根据相同 `tensor/memory` 上的 `BufferRegion` 重叠关系增加 RAW/WAR/WAW predecessor。它用于验证地址依赖契约，尚不是从真实 TISA 指令动态解析出的硬件 scoreboard。
+`--address-scoreboard` 启用 runtime range scoreboard：根据相同 `tensor/memory` 上的 `BufferRegion` 重叠关系，在 issue 前检查 active task 并产生 RAW/WAR/WAW stall；COMPLETE 后释放范围并继续调度。当前地址来自 canonical `ExecutionTask` metadata，尚不是从真实 TISA binary 动态解析出的硬件 scoreboard。
 
 ## 8. Trace 与结果
 
@@ -370,6 +370,7 @@ speedup_vs_baseline
 resource_utilization
 stall_cycles_by_reason
 pipeline_drain_cycles
+queue_occupancy_timeline
 queue_peak_occupancy
 buffer_peak_usage
 completed_tile_count

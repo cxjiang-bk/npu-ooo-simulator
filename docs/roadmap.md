@@ -105,7 +105,7 @@
 
 顺序：
 
-1. Elementwise/Reduce；
+1. Elementwise/Reduce（elementwise/residual-add 已完成第一条 lowering 闭环）；
 2. ResNet bottleneck：Conv2D/Norm/Activation/Residual/Pooling；
 3. Softmax/LayerNorm/RMSNorm composite lowering；
 4. Decoder block：QKV/Attention/MLP/RoPE/KV cache；
@@ -131,6 +131,7 @@ architecture profile
 交付物：
 
 - 一条命令运行对比实验；
+- `sweep-two-mm` 批量扫描 architecture × policy × window × ROB；
 - 每个 case 独立 manifest；
 - 汇总 CSV/JSON；
 - total cycle、speedup、utilization、stall、drain、buffer/queue peak；

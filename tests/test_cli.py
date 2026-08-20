@@ -62,6 +62,62 @@ class CliArtifactTest(unittest.TestCase):
             self.assertTrue(manifest["simulator_config"]["address_scoreboard"])
             self.assertEqual(manifest["address_dependency_count"], len(json.loads((output / "address_dependencies.json").read_text())))
             self.assertIn("gemm0", (output / "operator_graph.svg").read_text())
+            tasks_header = (output / "tasks.csv").read_text().splitlines()[0]
+            self.assertIn("tile_id", tasks_header)
+            self.assertIn("operator_id", tasks_header)
+            summary = json.loads((output / "summary.json").read_text())
+            self.assertIn("resource_utilization", summary["metrics"])
+            self.assertIn("queue_peak_occupancy", summary["metrics"])
+
+    def test_two_mm_sweep_exports_case_manifests_and_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            output = Path(directory)
+            exit_code = main(
+                [
+                    "sweep-two-mm",
+                    "--architectures",
+                    "minimal",
+                    "--policies",
+                    "static_pipeline,dynamic_ready_queue",
+                    "--windows",
+                    "1",
+                    "--robs",
+                    "1",
+                    "--output-dir",
+                    str(output),
+                ]
+            )
+            self.assertEqual(exit_code, 0)
+            sweep = json.loads((output / "sweep.json").read_text())
+            self.assertEqual(len(sweep), 2)
+            self.assertEqual({row["policy"] for row in sweep}, {"static_pipeline", "dynamic_ready_queue"})
+            for row in sweep:
+                case_dir = output / row["case_id"]
+                self.assertTrue((case_dir / "manifest.json").exists())
+                self.assertTrue((case_dir / "summary.json").exists())
+                self.assertTrue((case_dir / "swimlane.svg").exists())
+            self.assertTrue((output / "sweep.csv").exists())
+
+    def test_elementwise_exports_aru_execution_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            output = Path(directory)
+            exit_code = main(
+                [
+                    "elementwise",
+                    "--arch",
+                    "minimal",
+                    "--policy",
+                    "dynamic_ready_queue",
+                    "--output-dir",
+                    str(output),
+                ]
+            )
+            self.assertEqual(exit_code, 0)
+            execution_graph = json.loads((output / "execution_graph.json").read_text())
+            self.assertTrue(any(task["primitive"] == "elementwise" for task in execution_graph["tasks"]))
+            self.assertTrue(any(task["resource"] == "ARU" for task in execution_graph["tasks"]))
+            summary = json.loads((output / "summary.json").read_text())
+            self.assertIn("ARU", summary["metrics"]["resource_utilization"])
 
 
 if __name__ == "__main__":

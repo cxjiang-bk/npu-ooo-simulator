@@ -49,7 +49,8 @@
 | Policy 只改变 ready-task 选择；task graph 与 MachineConfig 作为共享输入 | 保证 Static/Dynamic 周期差异归因于调度策略，而不是重新切 tile 或更换 timing model |
 | scheduler policy 与 event backend 分离 | policy 只选择 ready task；event backend 统一处理 issue/start/complete、queue、ROB、II、in-flight tile 和 completion wake-up |
 | `SimulatorConfig` 覆盖 MachineConfig runtime capacity | 可以对 dependency window、ROB、instruction queue、ready queue 和 tile window 做实验 sweep |
-| address scoreboard 先作为可选 hazard augmentation | 基于 BufferRegion 生成 RAW/WAR/WAW predecessor，能够验证地址依赖而不改变默认 baseline；真正 runtime range scoreboard 仍待补充 |
+| address scoreboard 作为可选 runtime layer | 基于 active `BufferRegion` 生成 RAW/WAR/WAW issue stall，COMPLETE 后释放范围；不改写默认 graph，方便和 compile-time dependency 做公平对照 |
+| Elementwise/residual-add 先于 reduce/softmax 接入 | 它能验证多输入同形 tile、ARU primitive 和 producer-consumer store/load 依赖，同时不引入 reduction barrier 与指数近似等额外语义 |
 
 ## 视觉发现
 

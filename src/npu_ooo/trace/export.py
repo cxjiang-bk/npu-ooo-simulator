@@ -24,6 +24,9 @@ def write_csv(result: ScheduleResult, path: str | Path) -> None:
             handle,
             fieldnames=(
                 "task_id",
+                "tile_id",
+                "operator_id",
+                "primitive",
                 "resource",
                 "instance",
                 "issue",
@@ -37,8 +40,22 @@ def write_csv(result: ScheduleResult, path: str | Path) -> None:
             ),
         )
         writer.writeheader()
+        issue_details = {
+            event.task_id: dict(event.details)
+            for event in result.events
+            if event.event == "ISSUE"
+        }
         for timing in result.timings:
-            writer.writerow(timing.to_dict())
+            task_id = timing.task_id
+            details = issue_details.get(task_id, {})
+            writer.writerow(
+                {
+                    **timing.to_dict(),
+                    "tile_id": details.get("tile_id", ""),
+                    "operator_id": details.get("operator_id", ""),
+                    "primitive": details.get("primitive", ""),
+                }
+            )
 
 
 def write_svg(result: ScheduleResult, path: str | Path, *, width: int = 1600, row_height: int = 28) -> None:

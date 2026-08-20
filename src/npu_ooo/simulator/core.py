@@ -8,7 +8,7 @@ from typing import Any, Mapping, Protocol
 
 from npu_ooo.arch import ExecutionUnitConfig, MachineConfig
 from npu_ooo.ir import ExecutionGraph, ExecutionTask
-from .address import add_address_dependencies
+from .address import AddressConflict, AddressScoreboard
 
 
 class TimingModel(Protocol):
@@ -59,6 +59,76 @@ class AnalyticalTimingModel:
 
 
 @dataclass(frozen=True)
+class StaticPipelineConfig:
+    """Explicit compile-time reservations for a static pipeline.
+
+    A reservation may be supplied directly per task, or derived from a task's
+    numeric ``attributes[iteration_attribute]`` together with ``stage_id``.
+    The latter is useful for hand-written dual/triple-stage golden cases while
+    the former preserves exact compiler-emitted reservations.
+    """
+
+    stage_count: int = 2
+    stage_offsets: tuple[float, ...] = ()
+    initiation_interval_cycles: float = 1.0
+    iteration_attribute: str = "iteration"
+    task_issue_cycles: tuple[tuple[str, float], ...] = ()
+
+    def validate(self) -> tuple[str, ...]:
+        issues: list[str] = []
+        if isinstance(self.stage_count, bool) or not isinstance(self.stage_count, int) or self.stage_count <= 0:
+            issues.append("static pipeline stage_count must be positive")
+        if not self.iteration_attribute:
+            issues.append("static pipeline iteration_attribute must not be empty")
+        if (
+            isinstance(self.initiation_interval_cycles, bool)
+            or not isinstance(self.initiation_interval_cycles, (int, float))
+            or self.initiation_interval_cycles <= 0
+        ):
+            issues.append("static pipeline initiation_interval_cycles must be positive")
+        if self.stage_offsets and len(self.stage_offsets) != self.stage_count:
+            issues.append("static pipeline stage_offsets must match stage_count")
+        if any(
+            isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0
+            for value in self.stage_offsets
+        ):
+            issues.append("static pipeline stage_offsets must be non-negative numbers")
+        task_ids = [task_id for task_id, _cycle in self.task_issue_cycles]
+        if len(set(task_ids)) != len(task_ids):
+            issues.append("static pipeline task_issue_cycles must contain unique task ids")
+        if any(not task_id for task_id in task_ids):
+            issues.append("static pipeline task_issue_cycles task ids must not be empty")
+        if any(
+            isinstance(cycle, bool) or not isinstance(cycle, (int, float)) or cycle < 0
+            for _task_id, cycle in self.task_issue_cycles
+        ):
+            issues.append("static pipeline task issue cycles must be non-negative numbers")
+        return tuple(issues)
+
+    def issue_cycle(self, task: ExecutionTask) -> float | None:
+        explicit = dict(self.task_issue_cycles)
+        if task.task_id in explicit:
+            return float(explicit[task.task_id])
+        if not self.stage_offsets:
+            return None
+        iteration = task.attributes.get(self.iteration_attribute)
+        if isinstance(iteration, bool) or not isinstance(iteration, (int, float)) or iteration < 0:
+            return None
+        if task.stage_id >= self.stage_count:
+            return None
+        return float(self.stage_offsets[task.stage_id]) + float(iteration) * float(self.initiation_interval_cycles)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "stage_count": self.stage_count,
+            "stage_offsets": list(self.stage_offsets),
+            "initiation_interval_cycles": self.initiation_interval_cycles,
+            "iteration_attribute": self.iteration_attribute,
+            "task_issue_cycles": {task_id: cycle for task_id, cycle in self.task_issue_cycles},
+        }
+
+
+@dataclass(frozen=True)
 class SimulatorConfig:
     """Runtime capacities applied equally to every scheduling policy."""
 
@@ -68,6 +138,7 @@ class SimulatorConfig:
     dependency_window: int | None = None
     ready_queue_depth: int | None = None
     address_scoreboard: bool = False
+    static_pipeline: StaticPipelineConfig | None = None
 
     def resolved(self, machine: MachineConfig) -> "SimulatorConfig":
         scheduler = machine.scheduler
@@ -91,9 +162,14 @@ class SimulatorConfig:
             ready_queue_depth=(
                 self.ready_queue_depth
                 if self.ready_queue_depth is not None
-                else scheduler.instruction_queue_depth
+                else (
+                    self.instruction_queue_depth
+                    if self.instruction_queue_depth is not None
+                    else scheduler.instruction_queue_depth
+                )
             ),
             address_scoreboard=self.address_scoreboard,
+            static_pipeline=self.static_pipeline,
         )
         issues = result.validate()
         if issues:
@@ -111,9 +187,11 @@ class SimulatorConfig:
         ):
             if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
                 issues.append(f"simulator {name} must be positive when specified")
+        if self.static_pipeline is not None:
+            issues.extend(self.static_pipeline.validate())
         return tuple(issues)
 
-    def to_dict(self) -> dict[str, int | None]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "instruction_queue_depth": self.instruction_queue_depth,
             "rob_entries": self.rob_entries,
@@ -121,6 +199,9 @@ class SimulatorConfig:
             "dependency_window": self.dependency_window,
             "ready_queue_depth": self.ready_queue_depth,
             "address_scoreboard": self.address_scoreboard,
+            "static_pipeline": (
+                self.static_pipeline.to_dict() if self.static_pipeline is not None else None
+            ),
         }
 
 
@@ -320,9 +401,20 @@ def simulate_execution_graph(
         raise ValueError("; ".join((*graph_issues, *machine_issues)))
     timing_model = timing_model or AnalyticalTimingModel()
     config = (config or SimulatorConfig()).resolved(machine)
-    address_dependencies = ()
-    if config.address_scoreboard:
-        graph, address_dependencies = add_address_dependencies(graph)
+    if config.static_pipeline is not None and policy != "static_pipeline":
+        raise ValueError("static_pipeline configuration is only valid with the static_pipeline policy")
+    static_pipeline = config.static_pipeline if policy == "static_pipeline" else None
+    if static_pipeline is not None and static_pipeline.stage_offsets:
+        invalid_stages = sorted(
+            {task.stage_id for task in graph.tasks if task.stage_id >= static_pipeline.stage_count}
+        )
+        if invalid_stages:
+            raise ValueError(
+                "static pipeline stage_count does not cover task stage ids: "
+                + ", ".join(str(stage) for stage in invalid_stages)
+            )
+    address_scoreboard = AddressScoreboard() if config.address_scoreboard else None
+    observed_address_hazards: dict[tuple[str, str, str, str, str], AddressConflict] = {}
     tasks = {task.task_id: task for task in graph.tasks}
     graph_order = graph.topological_order()
     order_index = {task_id: index for index, task_id in enumerate(graph_order)}
@@ -350,6 +442,8 @@ def simulate_execution_graph(
     now = 0.0
     rob_occupancy = 0
     inflight_tiles: set[str] = set()
+    stall_started: dict[tuple[str, str], float] = {}
+    stall_cycles_by_reason: dict[str, float] = {}
     tile_task_count: dict[str, int] = {}
     tile_completed_count: dict[str, int] = {}
     for task in graph.tasks:
@@ -360,7 +454,9 @@ def simulate_execution_graph(
         "backend": timing_model.name,
         "policy": policy,
         "simulator_config": config.to_dict(),
-        "address_dependency_count": len(address_dependencies),
+        "address_dependency_count": 0,
+        "address_hazard_count": 0,
+        "address_hazards": [],
         "resource_busy_cycles": {},
         "ready_set_peak": len(ready),
         "visible_ready_peak": 0,
@@ -374,7 +470,71 @@ def simulate_execution_graph(
         "window_block_events": 0,
         "resource_block_events": 0,
         "tile_window_block_events": 0,
+        "address_scoreboard_block_events": 0,
+        "static_reservation_count": 0,
+        "static_block_events": 0,
+        "stall_cycles_by_reason": stall_cycles_by_reason,
+        "stall_by_reason": stall_cycles_by_reason,
+        "pipeline_drain_cycles": 0.0,
+        "queue_occupancy_timeline": [],
     }
+
+    def record_occupancy(timestamp: float, event: str) -> None:
+        metrics["queue_occupancy_timeline"].append(
+            {
+                "timestamp": timestamp,
+                "event": event,
+                "rob": rob_occupancy,
+                "ready": len(ready),
+                "inflight_tiles": len(inflight_tiles),
+                "resources": {
+                    name: sum(resource.in_flight for resource in states)
+                    for name, states in resources.items()
+                },
+            }
+        )
+
+    record_occupancy(0.0, "INIT")
+
+    static_reservations = {
+        task.task_id: static_pipeline.issue_cycle(task)
+        for task in graph.tasks
+        if static_pipeline is not None and static_pipeline.issue_cycle(task) is not None
+    }
+    metrics["static_reservation_count"] = len(static_reservations)
+
+    def begin_stall(task: ExecutionTask, reason: str, details: Mapping[str, Any] | None = None) -> None:
+        key = (task.task_id, reason)
+        if key in stall_started:
+            return
+        stall_started[key] = now
+        events.append(
+            TraceEvent(
+                now,
+                "STALL_BEGIN",
+                task.task_id,
+                task.resource,
+                details={"reason": reason, **dict(details or {})},
+            )
+        )
+
+    def end_stalls(task: ExecutionTask, timestamp: float) -> None:
+        for key in tuple(stall_started):
+            task_id, reason = key
+            if task_id != task.task_id:
+                continue
+            started = stall_started.pop(key)
+            elapsed = max(0.0, timestamp - started)
+            stall_cycles_by_reason[reason] = stall_cycles_by_reason.get(reason, 0.0) + elapsed
+            events.append(
+                TraceEvent(
+                    timestamp,
+                    "STALL_END",
+                    task.task_id,
+                    task.resource,
+                    details={"reason": reason, "duration": elapsed},
+                )
+            )
 
     def push_complete(task: ExecutionTask, resource: _ResourceState, finish: float) -> None:
         nonlocal event_serial
@@ -385,10 +545,21 @@ def simulate_execution_graph(
         )
 
     def visible_ready_tasks() -> list[ExecutionTask]:
-        ordered = sorted(
-            (tasks[task_id] for task_id in ready),
-            key=lambda task: (program_order[task.task_id], order_index[task.task_id], task.task_id),
-        )
+        if static_pipeline is not None:
+            ordered = sorted(
+                (tasks[task_id] for task_id in ready),
+                key=lambda task: (
+                    static_reservations.get(task.task_id, math.inf),
+                    program_order[task.task_id],
+                    order_index[task.task_id],
+                    task.task_id,
+                ),
+            )
+        else:
+            ordered = sorted(
+                (tasks[task_id] for task_id in ready),
+                key=lambda task: (program_order[task.task_id], order_index[task.task_id], task.task_id),
+            )
         queue_limit = config.ready_queue_depth or len(ordered)
         window_budget = max(0, (config.dependency_window or len(ordered)) - rob_occupancy)
         return ordered[: min(queue_limit, window_budget)]
@@ -402,6 +573,9 @@ def simulate_execution_graph(
                 candidates.append((resource, start, resource_ready))
         return candidates
 
+    def static_reservation(task: ExecutionTask) -> float | None:
+        return static_reservations.get(task.task_id)
+
     while len(completed) < len(tasks):
         if event_queue and event_queue[0][0] < now - 1e-9:
             raise RuntimeError("event queue moved backwards in time")
@@ -414,9 +588,12 @@ def simulate_execution_graph(
             finish_by_task[task_id] = finish
             rob_occupancy -= 1
             task = tasks[task_id]
+            if address_scoreboard is not None:
+                address_scoreboard.release(task_id)
             tile_completed_count[task.tile_id] += 1
             if tile_completed_count[task.tile_id] == tile_task_count[task.tile_id]:
                 inflight_tiles.discard(task.tile_id)
+            record_occupancy(finish, "COMPLETE")
             details = {"primitive": task.primitive, "operator_id": task.operator_id, "tile_id": task.tile_id}
             events.append(TraceEvent(finish, "COMPLETE", task_id, resource_name, resource_instance, details))
             for successor in successors[task_id]:
@@ -454,14 +631,50 @@ def simulate_execution_graph(
                     metrics["window_block_events"] += 1
                 break
             candidates: list[tuple[ExecutionTask, _ResourceState, float, float]] = []
+            blocked_by_address: dict[str, AddressConflict] = {}
+            blocked_by_static: set[str] = set()
             for task in visible:
                 if task.tile_id not in inflight_tiles and len(inflight_tiles) >= (config.max_inflight_tiles or math.inf):
                     continue
+                reservation = static_reservation(task)
+                if reservation is not None and now + 1e-9 < reservation:
+                    blocked_by_static.add(task.task_id)
+                    begin_stall(task, "static_reservation", {"reservation_cycle": reservation})
+                    continue
+                if address_scoreboard is not None:
+                    conflict = address_scoreboard.conflict(task)
+                    if conflict is not None:
+                        blocked_by_address[task.task_id] = conflict
+                        observed_address_hazards.setdefault(
+                            (
+                                conflict.predecessor,
+                                conflict.successor,
+                                conflict.kind.value,
+                                conflict.tensor,
+                                conflict.memory,
+                            ),
+                            conflict,
+                        )
+                        begin_stall(
+                            task,
+                            f"address_{conflict.kind.value.lower()}",
+                            {
+                                "predecessor": conflict.predecessor,
+                                "tensor": conflict.tensor,
+                                "memory": conflict.memory,
+                            },
+                        )
+                        continue
                 for resource, start, resource_ready in candidate_resources(task):
                     candidates.append((task, resource, start, resource_ready))
             if not candidates:
                 if ready:
-                    metrics["resource_block_events"] += 1
+                    if blocked_by_address:
+                        metrics["address_scoreboard_block_events"] = metrics.get("address_scoreboard_block_events", 0) + 1
+                    elif blocked_by_static:
+                        metrics["static_block_events"] += 1
+                    else:
+                        metrics["resource_block_events"] += 1
                 blocked_by_tiles = all(
                     task.tile_id not in inflight_tiles
                     and len(inflight_tiles) >= (config.max_inflight_tiles or math.inf)
@@ -484,16 +697,27 @@ def simulate_execution_graph(
             else:
                 selected = min(
                     candidates,
-                    key=lambda item: (item[0].program_order, item[0].task_id, item[1].instance),
+                    key=lambda item: (
+                        static_reservation(item[0])
+                        if static_reservation(item[0]) is not None
+                        else math.inf,
+                        item[0].program_order,
+                        item[0].task_id,
+                        item[1].instance,
+                    ),
                 )
             task, resource, _estimated_start, _estimated_resource_ready = selected
             spec = timing_model.timing(task, machine)
             start, resource_ready = resource.reserve(now, spec.duration_cycles)
             finish = start + spec.duration_cycles
+            end_stalls(task, now)
             ready.remove(task.task_id)
             issued.add(task.task_id)
             rob_occupancy += 1
             inflight_tiles.add(task.tile_id)
+            if address_scoreboard is not None:
+                address_scoreboard.reserve(task)
+            record_occupancy(now, "ISSUE")
             metrics["rob_peak"] = max(metrics["rob_peak"], rob_occupancy)
             metrics["inflight_tile_peak"] = max(metrics["inflight_tile_peak"], len(inflight_tiles))
             timings[task.task_id] = TaskTiming(
@@ -522,6 +746,8 @@ def simulate_execution_graph(
             metrics["issued_task_count"] += 1
             metrics["queue_wait_cycles"] += max(0.0, start - now)
             metrics["ready_wait_cycles"] += max(0.0, now - dependency_ready[task.task_id])
+            if start > now:
+                stall_cycles_by_reason["resource_queue"] = stall_cycles_by_reason.get("resource_queue", 0.0) + (start - now)
             metrics["resource_busy_cycles"][task.resource] = metrics["resource_busy_cycles"].get(task.resource, 0.0) + spec.duration_cycles
             issued_at_now += 1
             if issued_at_now > sum(resource.unit.issue_width for resources_for_unit in resources.values() for resource in resources_for_unit):
@@ -534,6 +760,10 @@ def simulate_execution_graph(
             next_times.append(event_queue[0][0])
         if ready:
             for task in visible_ready_tasks():
+                reservation = static_reservation(task)
+                if reservation is not None and reservation > now + 1e-9:
+                    next_times.append(reservation)
+                    continue
                 for resource in resources.get(task.resource, ()):
                     if resource.in_flight < resource.unit.queue_depth and resource.next_issue > now + 1e-9:
                         next_times.append(resource.next_issue)
@@ -546,14 +776,55 @@ def simulate_execution_graph(
             raise RuntimeError("simulator made no time progress")
         now = next_now
 
-    events.sort(key=lambda event: (event.timestamp, {"ISSUE": 0, "START": 1, "COMPLETE": 2, "WAKE_UP": 3}[event.event], event.task_id, event.instance))
+    for (task_id, reason), started in tuple(stall_started.items()):
+        end_stalls(tasks[task_id], max((timing.finish for timing in timings.values()), default=now))
+    metrics["address_dependency_count"] = len(observed_address_hazards)
+    metrics["address_hazard_count"] = len(observed_address_hazards)
+    metrics["address_hazards"] = [
+        conflict.to_dependency().to_dict()
+        for conflict in sorted(
+            observed_address_hazards.values(),
+            key=lambda item: (item.predecessor, item.successor, item.kind.value, item.tensor, item.memory),
+        )
+    ]
+    if static_reservations:
+        last_reserved_issue = max(static_reservations.values())
+        metrics["pipeline_drain_cycles"] = max(
+            0.0,
+            max((timing.finish for timing in timings.values()), default=0.0) - last_reserved_issue,
+        )
+    events.sort(
+        key=lambda event: (
+            event.timestamp,
+            {"STALL_BEGIN": 0, "ISSUE": 1, "START": 2, "COMPLETE": 3, "WAKE_UP": 4, "STALL_END": 5}[event.event],
+            event.task_id,
+            event.instance,
+        )
+    )
+    total_cycles = max((timing.finish for timing in timings.values()), default=0.0)
+    metrics["resource_utilization"] = {
+        unit.name: (
+            metrics["resource_busy_cycles"].get(unit.name, 0.0)
+            / (total_cycles * unit.count)
+            if total_cycles > 0
+            else 0.0
+        )
+        for unit in machine.execution_units
+    }
+    metrics["queue_peak_occupancy"] = {
+        "rob": metrics["rob_peak"],
+        "ready": metrics["ready_set_peak"],
+        "visible_ready": metrics["visible_ready_peak"],
+        "inflight_tiles": metrics["inflight_tile_peak"],
+    }
+    metrics["completed_tile_count"] = len(tile_task_count)
     metrics["calibration_status"] = machine.attributes.get("calibration_status", "unspecified")
     metrics["task_count"] = len(tasks)
     return SimulationResult(
         backend=timing_model.name,
         policy=policy,
         graph_id=graph.graph_id,
-        total_cycles=max((timing.finish for timing in timings.values()), default=0.0),
+        total_cycles=total_cycles,
         timings=tuple(timings[task.task_id] for task in graph.tasks),
         events=tuple(events),
         metrics=metrics,

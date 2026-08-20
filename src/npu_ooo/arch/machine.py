@@ -286,6 +286,14 @@ def minimal_machine_config() -> MachineConfig:
                 latency_cycles=16,
                 initiation_interval_cycles=4,
             ),
+            ExecutionUnitConfig(
+                "ARU",
+                supported_ops=("elementwise", "reduce"),
+                queue_depth=8,
+                latency_cycles=4,
+                initiation_interval_cycles=2,
+                attributes={"elements_per_cycle": 16},
+            ),
         ),
         transfer_paths=(
             TransferPathConfig("DRAM", "SRAM", "DMA", bandwidth_bytes_per_cycle=16, setup_latency_cycles=2),

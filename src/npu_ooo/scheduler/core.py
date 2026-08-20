@@ -6,6 +6,7 @@ from npu_ooo.simulator import (
     AnalyticalTimingModel,
     SimulationResult,
     SimulatorConfig,
+    StaticPipelineConfig,
     TaskTiming,
     TimingModel,
     TraceEvent,

@@ -31,6 +31,69 @@ class AddressDependency:
         }
 
 
+@dataclass(frozen=True)
+class AddressConflict:
+    """A conflict between a ready task and an in-flight task."""
+
+    predecessor: str
+    successor: str
+    kind: AddressHazardKind
+    tensor: str
+    memory: str
+
+    def to_dependency(self) -> AddressDependency:
+        return AddressDependency(
+            predecessor=self.predecessor,
+            successor=self.successor,
+            kind=self.kind,
+            tensor=self.tensor,
+            memory=self.memory,
+        )
+
+
+class AddressScoreboard:
+    """Runtime range scoreboard for in-flight execution tasks.
+
+    The scoreboard intentionally tracks only active tasks. Compile-time graph
+    edges remain the source of true dataflow; this layer models the additional
+    RAW/WAR/WAW protection needed when independent instructions overlap in
+    the same address space.
+    """
+
+    def __init__(self) -> None:
+        self._active: dict[str, ExecutionTask] = {}
+
+    @property
+    def active_task_ids(self) -> tuple[str, ...]:
+        return tuple(sorted(self._active))
+
+    def reserve(self, task: ExecutionTask) -> None:
+        if task.task_id in self._active:
+            raise ValueError(f"address scoreboard task '{task.task_id}' is already active")
+        self._active[task.task_id] = task
+
+    def release(self, task_id: str) -> None:
+        if task_id not in self._active:
+            raise ValueError(f"address scoreboard task '{task_id}' is not active")
+        del self._active[task_id]
+
+    def conflict(self, task: ExecutionTask) -> AddressConflict | None:
+        for active_id in sorted(self._active):
+            active = self._active[active_id]
+            conflict = _conflict(active, task)
+            if conflict is None:
+                continue
+            kind, region = conflict
+            return AddressConflict(
+                predecessor=active.task_id,
+                successor=task.task_id,
+                kind=kind,
+                tensor=region.tensor,
+                memory=region.memory,
+            )
+        return None
+
+
 def _reads(region: BufferRegion) -> bool:
     access = region.normalized_access
     return access in {AccessType.READ.value, AccessType.READ_WRITE.value}

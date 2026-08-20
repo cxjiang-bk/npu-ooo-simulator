@@ -2,10 +2,144 @@ import unittest
 
 from npu_ooo.arch import minimal_machine_config
 from npu_ooo.ir import AccessType, BufferRegion, ExecutionGraph, ExecutionTask
-from npu_ooo.scheduler import SchedulerPolicy, SimulatorConfig, schedule_execution_graph
+from npu_ooo.scheduler import (
+    SchedulerPolicy,
+    SimulatorConfig,
+    StaticPipelineConfig,
+    schedule_execution_graph,
+)
 
 
 class EventSimulatorTest(unittest.TestCase):
+    def test_static_pipeline_reservations_and_drain_match_hand_schedule(self) -> None:
+        graph = ExecutionGraph(
+            graph_id="static_dual_micro",
+            tasks=(
+                ExecutionTask(
+                    "load0",
+                    "tile0",
+                    "micro",
+                    "load",
+                    "DMA",
+                    duration_cycles=5,
+                    stage_id=0,
+                    program_order=0,
+                    attributes={"iteration": 0},
+                ),
+                ExecutionTask(
+                    "compute0",
+                    "tile0",
+                    "micro",
+                    "matmul",
+                    "MXU",
+                    predecessors=("load0",),
+                    duration_cycles=5,
+                    stage_id=1,
+                    program_order=1,
+                    attributes={"iteration": 0},
+                ),
+                ExecutionTask(
+                    "load1",
+                    "tile1",
+                    "micro",
+                    "load",
+                    "DMA",
+                    duration_cycles=5,
+                    stage_id=0,
+                    program_order=2,
+                    attributes={"iteration": 1},
+                ),
+                ExecutionTask(
+                    "compute1",
+                    "tile1",
+                    "micro",
+                    "matmul",
+                    "MXU",
+                    predecessors=("load1",),
+                    duration_cycles=5,
+                    stage_id=1,
+                    program_order=3,
+                    attributes={"iteration": 1},
+                ),
+            ),
+        )
+        static = schedule_execution_graph(
+            graph,
+            minimal_machine_config(),
+            SchedulerPolicy.STATIC_PIPELINE,
+            simulator_config=SimulatorConfig(
+                static_pipeline=StaticPipelineConfig(
+                    stage_count=2,
+                    stage_offsets=(0, 10),
+                    initiation_interval_cycles=20,
+                )
+            ),
+        )
+        self.assertEqual(static.timing("load0").issue, 0)
+        self.assertEqual(static.timing("compute0").issue, 10)
+        self.assertEqual(static.timing("load1").issue, 20)
+        self.assertEqual(static.timing("compute1").issue, 30)
+        self.assertEqual(static.total_cycles, 35)
+        self.assertEqual(static.metrics["static_reservation_count"], 4)
+        self.assertEqual(static.metrics["pipeline_drain_cycles"], 5)
+        self.assertEqual(static.metrics["completed_tile_count"], 2)
+        self.assertIn("resource_utilization", static.metrics)
+        self.assertEqual(static.metrics["queue_peak_occupancy"]["rob"], 1)
+
+    def test_static_triple_stage_reservation_uses_stage_two(self) -> None:
+        graph = ExecutionGraph(
+            graph_id="static_triple_micro",
+            tasks=(
+                ExecutionTask(
+                    "stage0",
+                    "tile0",
+                    "micro",
+                    "load",
+                    "DMA",
+                    duration_cycles=5,
+                    stage_id=0,
+                    attributes={"iteration": 0},
+                ),
+                ExecutionTask(
+                    "stage1",
+                    "tile1",
+                    "micro",
+                    "matmul",
+                    "MXU",
+                    predecessors=("stage0",),
+                    duration_cycles=5,
+                    stage_id=1,
+                    attributes={"iteration": 0},
+                ),
+                ExecutionTask(
+                    "stage2",
+                    "tile2",
+                    "micro",
+                    "store",
+                    "DMA",
+                    predecessors=("stage1",),
+                    duration_cycles=5,
+                    stage_id=2,
+                    attributes={"iteration": 0},
+                ),
+            ),
+        )
+        triple = schedule_execution_graph(
+            graph,
+            minimal_machine_config(),
+            SchedulerPolicy.STATIC_PIPELINE,
+            simulator_config=SimulatorConfig(
+                static_pipeline=StaticPipelineConfig(
+                    stage_count=3,
+                    stage_offsets=(0, 10, 20),
+                    initiation_interval_cycles=30,
+                )
+            ),
+        )
+        self.assertEqual([triple.timing(task_id).issue for task_id in ("stage0", "stage1", "stage2")], [0, 10, 20])
+        self.assertEqual(triple.total_cycles, 25)
+        self.assertEqual(triple.metrics["pipeline_drain_cycles"], 5)
+
     def test_dynamic_critical_path_priority_changes_issue_order(self) -> None:
         graph = ExecutionGraph(
             graph_id="critical_path_micro",
@@ -76,6 +210,31 @@ class EventSimulatorTest(unittest.TestCase):
         self.assertEqual(constrained_result.metrics["rob_peak"], 1)
         self.assertLessEqual(constrained_result.metrics["visible_ready_peak"], 1)
 
+    def test_instruction_queue_override_controls_visible_ready_depth(self) -> None:
+        graph = ExecutionGraph(
+            graph_id="instruction_queue_micro",
+            tasks=tuple(
+                ExecutionTask(
+                    f"load_{index}",
+                    f"tile_{index}",
+                    "micro",
+                    "load",
+                    "DMA",
+                    duration_cycles=1,
+                    program_order=index,
+                )
+                for index in range(3)
+            ),
+        )
+        result = schedule_execution_graph(
+            graph,
+            minimal_machine_config(),
+            SchedulerPolicy.DYNAMIC_READY_QUEUE,
+            simulator_config=SimulatorConfig(instruction_queue_depth=1),
+        )
+        self.assertEqual(result.metrics["simulator_config"]["ready_queue_depth"], 1)
+        self.assertLessEqual(result.metrics["visible_ready_peak"], 1)
+
     def test_address_scoreboard_blocks_cross_resource_raw_hazard(self) -> None:
         produced = BufferRegion(
             tensor="X",
@@ -131,6 +290,55 @@ class EventSimulatorTest(unittest.TestCase):
         self.assertEqual(with_scoreboard.timing("reader").start, 20)
         self.assertEqual(with_scoreboard.metrics["address_dependency_count"], 1)
         self.assertGreater(with_scoreboard.total_cycles, without_scoreboard.total_cycles)
+
+    def test_address_scoreboard_blocks_war_and_waw_hazards(self) -> None:
+        region = BufferRegion(
+            tensor="X",
+            memory="SRAM",
+            shape=(4,),
+            starts=(0,),
+            access=AccessType.READ,
+            size_bytes=8,
+        )
+        write = BufferRegion(
+            tensor="X",
+            memory="SRAM",
+            shape=(4,),
+            starts=(0,),
+            access=AccessType.WRITE,
+            size_bytes=8,
+        )
+        war_graph = ExecutionGraph(
+            graph_id="address_war_micro",
+            tasks=(
+                ExecutionTask("reader", "tile_r", "micro", "load", "MXU", reads=(region,), duration_cycles=10, program_order=0),
+                ExecutionTask("writer", "tile_w", "micro", "store", "DMA", writes=(write,), duration_cycles=1, program_order=1),
+            ),
+        )
+        waw_graph = ExecutionGraph(
+            graph_id="address_waw_micro",
+            tasks=(
+                ExecutionTask("writer0", "tile_0", "micro", "store", "DMA", writes=(write,), duration_cycles=10, program_order=0),
+                ExecutionTask("writer1", "tile_1", "micro", "store", "MXU", writes=(write,), duration_cycles=1, program_order=1),
+            ),
+        )
+        machine = minimal_machine_config()
+        war = schedule_execution_graph(
+            war_graph,
+            machine,
+            SchedulerPolicy.STATIC_PIPELINE,
+            simulator_config=SimulatorConfig(address_scoreboard=True),
+        )
+        waw = schedule_execution_graph(
+            waw_graph,
+            machine,
+            SchedulerPolicy.STATIC_PIPELINE,
+            simulator_config=SimulatorConfig(address_scoreboard=True),
+        )
+        self.assertEqual(war.timing("writer").issue, 10)
+        self.assertEqual(waw.timing("writer1").issue, 10)
+        self.assertEqual(war.metrics["address_hazards"][0]["kind"], "WAR")
+        self.assertEqual(waw.metrics["address_hazards"][0]["kind"], "WAW")
 
 
 if __name__ == "__main__":
