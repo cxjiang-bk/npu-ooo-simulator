@@ -234,6 +234,8 @@ PYTHONPATH=src python3 -m npu_ooo.cli sweep-workloads \
 
 每个 case 目录同时保留 `operator_graph.json`、`execution_graph.json`、`summary.json`、`tasks.csv`、`perfetto.json`、`swimlane.svg` 和 `swimlane.png`，顶层 `sweep.csv/json` 增加 workload、dynamic priority 字段并计算相对 static 的 speedup。Static baseline 会对每个 priority 值重复记录，确保比较键完全一致。
 
+使用外部架构文件时，sweep 的 architecture label 可以是任意字符串；实际硬件参数来自 `--machine-config`，label 和 `machine_hash` 会同时写入 manifest。
+
 ## 参考项目
 
 - TileFlow/Timeloop：tiling、mapping、memory traffic 和 aggregate cost；

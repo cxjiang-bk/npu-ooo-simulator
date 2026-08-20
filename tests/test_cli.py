@@ -314,6 +314,40 @@ class CliArtifactTest(unittest.TestCase):
             manifest = json.loads((output / "manifest.json").read_text())
             self.assertEqual(manifest["machine_hash"], minimal_machine_config().stable_hash())
 
+    def test_workload_sweep_accepts_custom_architecture_label_with_machine_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            root = Path(directory)
+            config_path = root / "machine.json"
+            config_path.write_text(json.dumps(minimal_machine_config().to_dict()), encoding="utf-8")
+            output = root / "sweep"
+            exit_code = main(
+                [
+                    "sweep-workloads",
+                    "--workloads",
+                    "elementwise",
+                    "--architectures",
+                    "custom-profile",
+                    "--machine-config",
+                    str(config_path),
+                    "--policies",
+                    "static_pipeline",
+                    "--windows",
+                    "1",
+                    "--robs",
+                    "1",
+                    "--tile-sizes",
+                    "16",
+                    "--dynamic-priorities",
+                    "critical_path",
+                    "--output-dir",
+                    str(output),
+                ]
+            )
+            self.assertEqual(exit_code, 0)
+            sweep = json.loads((output / "sweep.json").read_text())
+            self.assertEqual(sweep[0]["architecture"], "custom-profile")
+            self.assertEqual(sweep[0]["total_cycles"], 6144.0)
+
 
 if __name__ == "__main__":
     unittest.main()

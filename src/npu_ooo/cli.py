@@ -1027,7 +1027,7 @@ def run_sweep_two_mm(args: argparse.Namespace) -> int:
     policies = _parse_list(args.policies, name="--policies")
     supported_architectures = {"minimal", "wide-mxu", "lpu-like"}
     unknown_architectures = sorted(set(architectures) - supported_architectures)
-    if unknown_architectures:
+    if unknown_architectures and args.machine_config is None:
         raise ValueError(f"unknown architecture profile(s): {', '.join(unknown_architectures)}")
     supported_policies = {policy.value for policy in SchedulerPolicy}
     unknown_policies = sorted(set(policies) - supported_policies)
@@ -1166,7 +1166,7 @@ def run_sweep_workloads(args: argparse.Namespace) -> int:
         raise ValueError(f"unknown workload(s): {', '.join(unknown_workloads)}")
     supported_architectures = {"minimal", "wide-mxu", "lpu-like"}
     unknown_architectures = sorted(set(architectures) - supported_architectures)
-    if unknown_architectures:
+    if unknown_architectures and args.machine_config is None:
         raise ValueError(f"unknown architecture profile(s): {', '.join(unknown_architectures)}")
     supported_policies = {policy.value for policy in SchedulerPolicy}
     unknown_policies = sorted(set(policies) - supported_policies)
