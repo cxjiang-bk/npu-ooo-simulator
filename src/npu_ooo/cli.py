@@ -12,6 +12,8 @@ from npu_ooo.benchmarks import (
     build_decoder_block_model,
     build_attention_case,
     build_attention_model,
+    build_transformer_block_case,
+    build_transformer_block_model,
     build_elementwise_case,
     build_elementwise_model,
     build_layernorm_case,
@@ -218,6 +220,23 @@ def build_parser() -> argparse.ArgumentParser:
     attention.add_argument("--dynamic-priority", choices=("critical_path", "oldest_first"), default="critical_path")
     attention.add_argument("--static-stage-offsets")
     attention.add_argument("--static-stage-ii", type=float, default=1.0)
+    transformer_block = subparsers.add_parser(
+        "transformer-block",
+        help="compile and schedule a LayerNorm + attention + MLP decoder block skeleton",
+    )
+    transformer_block.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
+    transformer_block.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
+    transformer_block.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
+    transformer_block.add_argument("--output-dir", type=Path, default=Path("out/transformer-block"))
+    transformer_block.add_argument("--instruction-queue-depth", type=int)
+    transformer_block.add_argument("--rob-entries", type=int)
+    transformer_block.add_argument("--max-inflight-tiles", type=int)
+    transformer_block.add_argument("--dependency-window", type=int)
+    transformer_block.add_argument("--ready-queue-depth", type=int)
+    transformer_block.add_argument("--address-scoreboard", action="store_true")
+    transformer_block.add_argument("--dynamic-priority", choices=("critical_path", "oldest_first"), default="critical_path")
+    transformer_block.add_argument("--static-stage-offsets")
+    transformer_block.add_argument("--static-stage-ii", type=float, default=1.0)
     layernorm = subparsers.add_parser("layernorm", help="compile and schedule a row-LayerNorm benchmark")
     layernorm.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
     layernorm.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
@@ -253,7 +272,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     workload_sweep.add_argument(
         "--workloads",
-        default="two-mm,elementwise,reduce,softmax,rmsnorm,layernorm,decoder-block,attention",
+        default="two-mm,elementwise,reduce,softmax,rmsnorm,layernorm,decoder-block,attention,transformer-block",
     )
     workload_sweep.add_argument("--architectures", default="minimal,wide-mxu")
     workload_sweep.add_argument("--machine-config", type=Path, help="use one canonical MachineConfig JSON for every case")
@@ -841,6 +860,87 @@ def run_attention(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_transformer_block(args: argparse.Namespace) -> int:
+    machine = _machine(args.arch, args.machine_config)
+    model = build_transformer_block_model()
+    case = build_transformer_block_case(
+        architecture_profile=args.arch,
+        scheduler_profile=args.policy,
+    )
+    instance = model.instantiate(case)
+    schedule = default_mixed_schedule(instance.graph)
+    lowered = lower_mixed_model(instance, machine, schedule)
+    stage_offsets = _parse_offsets(args.static_stage_offsets)
+    simulator_config = SimulatorConfig(
+        instruction_queue_depth=args.instruction_queue_depth,
+        rob_entries=args.rob_entries,
+        max_inflight_tiles=args.max_inflight_tiles,
+        dependency_window=args.dependency_window,
+        ready_queue_depth=args.ready_queue_depth,
+        address_scoreboard=args.address_scoreboard,
+        dynamic_priority=args.dynamic_priority,
+        static_pipeline=(
+            StaticPipelineConfig(
+                stage_count=len(stage_offsets),
+                stage_offsets=stage_offsets,
+                initiation_interval_cycles=args.static_stage_ii,
+            )
+            if stage_offsets
+            else None
+        ),
+    )
+    result = schedule_execution_graph(lowered.execution_graph, machine, args.policy, simulator_config=simulator_config)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    write_artifact_json(model, args.output_dir / "model_spec.json")
+    write_artifact_json(case, args.output_dir / "benchmark_case.json")
+    write_artifact_json(instance, args.output_dir / "model_instance.json")
+    write_artifact_json(instance.graph, args.output_dir / "operator_graph.json")
+    write_artifact_json(schedule, args.output_dir / "schedule.json")
+    write_artifact_json(lowered.tile_graph, args.output_dir / "tile_graph.json")
+    write_artifact_json(lowered.execution_graph, args.output_dir / "execution_graph.json")
+    write_artifact_json(result.metrics.get("address_hazards", []), args.output_dir / "address_dependencies.json")
+    write_artifact_json(machine, args.output_dir / "machine.json")
+    write_artifact_json(result.perfetto_trace(), args.output_dir / "perfetto.json")
+    write_artifact_json(
+        {
+            "schema_version": 1,
+            "benchmark": case.case_id,
+            "architecture": args.arch,
+            "machine_hash": machine.stable_hash(),
+            "schedule": schedule.schedule_id,
+            "policy": result.policy,
+            "backend": result.backend,
+            "calibration_status": result.metrics["calibration_status"],
+            "simulator_config": result.metrics["simulator_config"],
+            "address_dependency_count": result.metrics.get("address_dependency_count", 0),
+            "total_cycles": result.total_cycles,
+            "statistics": lowered.statistics,
+        },
+        args.output_dir / "manifest.json",
+    )
+    write_operator_graph_dot(instance.graph, args.output_dir / "operator_graph.dot")
+    write_operator_graph_svg(instance.graph, args.output_dir / "operator_graph.svg")
+    write_tile_graph_dot(lowered.tile_graph, args.output_dir / "tile_graph.dot")
+    write_execution_graph_dot(lowered.execution_graph, args.output_dir / "execution_graph.dot")
+    write_json(result, args.output_dir / "summary.json")
+    write_csv(result, args.output_dir / "tasks.csv")
+    write_svg(result, args.output_dir / "swimlane.svg")
+    write_png(result, args.output_dir / "swimlane.png")
+    print(
+        json.dumps(
+            {
+                "architecture": args.arch,
+                "policy": result.policy,
+                "total_cycles": result.total_cycles,
+                "statistics": lowered.statistics,
+                "output_dir": str(args.output_dir),
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def run_layernorm(args: argparse.Namespace) -> int:
     machine = _machine(args.arch, args.machine_config)
     model = build_layernorm_model()
@@ -1052,6 +1152,7 @@ def _workload_builders():
         "layernorm": (build_layernorm_model, build_layernorm_case),
         "decoder-block": (build_decoder_block_model, build_decoder_block_case),
         "attention": (build_attention_model, build_attention_case),
+        "transformer-block": (build_transformer_block_model, build_transformer_block_case),
     }
 
 
@@ -1251,6 +1352,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_decoder_block(args)
     if args.command == "attention":
         return run_attention(args)
+    if args.command == "transformer-block":
+        return run_transformer_block(args)
     if args.command == "layernorm":
         return run_layernorm(args)
     if args.command == "sweep-two-mm":

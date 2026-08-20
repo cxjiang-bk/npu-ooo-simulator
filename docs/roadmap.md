@@ -108,7 +108,7 @@
 1. Elementwise/Reduce（elementwise/residual-add、row-reduce 已完成 lowering 闭环）；
 2. ResNet bottleneck：Conv2D/Norm/Activation/Residual/Pooling；
 3. Softmax/LayerNorm/RMSNorm composite lowering（softmax、LayerNorm 和 RMSNorm 已展开 composite primitive）；
-4. Decoder block：已先接入 `RMSNorm -> Matmul -> ResidualAdd` 混合 fragment，并新增单头 `QK^T -> Softmax -> PV` attention fragment；下一步扩展 QKV/Attention/MLP/RoPE/KV cache；
+4. Decoder block：已先接入 `RMSNorm -> Matmul -> ResidualAdd` 混合 fragment，并新增单头 `QK^T -> Softmax -> PV` attention fragment 与 LayerNorm + Attention + MLP skeleton；下一步扩展 QKV/Attention/MLP/RoPE/KV cache；
 5. BERT/GPT-J/LLaMA2/DeepSeek benchmark templates；
 6. Conv2D halo/layout 和 optional MoE routing 作为后续扩展。
 

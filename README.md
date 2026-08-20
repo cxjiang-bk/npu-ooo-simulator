@@ -154,6 +154,17 @@ PYTHONPATH=src python3 -m npu_ooo.cli attention \
 
 这是 attention 数据流和调度实验的最小 fragment，不等同完整 GQA/MQA、RoPE、KV-cache 或 flash attention 实现。
 
+`transformer-block` 在此基础上连接 LayerNorm、attention、MLP 和两次 residual：
+
+```bash
+PYTHONPATH=src python3 -m npu_ooo.cli transformer-block \
+  --arch minimal \
+  --policy dynamic_ready_queue \
+  --output-dir out/transformer-block-dynamic
+```
+
+它是 shape-only 的 decoder block skeleton，默认生成 9 个 semantic operators、30 tiles、126 primitive tasks；目前仍不包含真实 Q/K/V projection、GQA、RoPE、KV-cache、causal mask 或 fused flash attention。
+
 当前已实现到 `Execution Graph -> analytical event simulator -> SchedulerResult`，输出 CSV/SVG、Perfetto/Chrome Trace 和 runtime queue/ROB 指标。后端仍是 analytical timing，不是 RTL cycle-accurate；真实 ISA/RTL timing 后续通过 `TimingModel` 接入。
 
 ### 快速运行

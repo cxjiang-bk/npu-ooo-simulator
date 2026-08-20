@@ -232,6 +232,26 @@ class CliArtifactTest(unittest.TestCase):
             primitives = {task["primitive"] for task in execution_graph["tasks"]}
             self.assertTrue({"matmul", "reduce_max", "normalize"}.issubset(primitives))
 
+    def test_transformer_block_exports_nine_operator_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            output = Path(directory)
+            exit_code = main(
+                [
+                    "transformer-block",
+                    "--arch",
+                    "minimal",
+                    "--policy",
+                    "dynamic_ready_queue",
+                    "--output-dir",
+                    str(output),
+                ]
+            )
+            self.assertEqual(exit_code, 0)
+            operator_graph = json.loads((output / "operator_graph.json").read_text())
+            self.assertEqual(len(operator_graph["operators"]), 9)
+            execution_graph = json.loads((output / "execution_graph.json").read_text())
+            self.assertGreater(execution_graph["attributes"]["cross_operator_dependency_count"], 0)
+
     def test_workload_sweep_keeps_graph_artifacts_per_case(self) -> None:
         with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
             output = Path(directory)

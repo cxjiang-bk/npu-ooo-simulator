@@ -3,6 +3,7 @@
 from .elementwise import build_elementwise_case, build_elementwise_model
 from .decoder_block import build_decoder_block_case, build_decoder_block_model
 from .attention import build_attention_case, build_attention_model
+from .transformer_block import build_transformer_block_case, build_transformer_block_model
 from .reduce import build_reduce_case, build_reduce_model
 from .softmax import build_softmax_case, build_softmax_model
 from .norm import (
@@ -20,6 +21,8 @@ __all__ = [
     "build_decoder_block_model",
     "build_attention_case",
     "build_attention_model",
+    "build_transformer_block_case",
+    "build_transformer_block_model",
     "build_reduce_case",
     "build_reduce_model",
     "build_softmax_case",

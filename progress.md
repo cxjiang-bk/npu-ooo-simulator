@@ -31,6 +31,7 @@
 - 新增 MachineConfig JSON round-trip、`load_machine_config` 和所有 workload CLI 的 `--machine-config`，允许外部版本化架构文件替换内置 profile。
 - `sweep-workloads` 增加 `--dynamic-priorities` 维度；LayerNorm priority demo 捕获 `critical_path` 慢于 `oldest_first` 的可复现实验。
 - 新增单头 attention fragment 和 `attention` CLI：`QK^T -> Softmax -> PV` 复用 registry，保留矩阵乘/softmax 跨算子依赖；static=4520、dynamic critical-path=4532（analytical）。
+- 新增 `transformer-block` skeleton：LayerNorm + 单头 attention + MLP + residual 串接为 9-operator mixed graph；默认 30 tiles/126 tasks/28 handoffs，static/dynamic critical-path 均 10540 cycles（analytical）。
 
 ### 验证
 
@@ -42,6 +43,7 @@ cross-operator dependencies: 24
 layernorm static_pipeline: 3808 cycles; dynamic_ready_queue (critical_path): 4696 cycles
 small workload sweep demo: 6 cases (3 workloads x 2 policies), each with graph JSON and PNG swimlane
 attention fragment: 12 tiles, 54 tasks, 8 cross-operator dependencies
+transformer block skeleton: 9 operators, 30 tiles, 126 tasks, 28 handoffs
 ```
 
 当前结果仍为 `calibration_status=analytical`。Decoder fragment 在 minimal profile 下 Static/Dynamic 恰好同周期；LayerNorm 则出现 dynamic critical-path 慢于 static 的反例。两者都说明动态机制、priority heuristic、window/ROB 和 barrier 结构必须作为独立实验维度。
