@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 import heapq
+import json
 import math
+from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 from npu_ooo.arch import ExecutionUnitConfig, MachineConfig
@@ -56,6 +58,63 @@ class AnalyticalTimingModel:
         if issues:
             raise ValueError(f"task '{task.task_id}' has invalid timing: {'; '.join(issues)}")
         return spec
+
+
+@dataclass(frozen=True)
+class TimingTableModel:
+    """Override analytical task timing from a small canonical JSON table."""
+
+    entries: Mapping[str, TaskTimingSpec]
+    name: str = "timing_table"
+    fallback: TimingModel = field(default_factory=AnalyticalTimingModel)
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "TimingTableModel":
+        if not isinstance(payload, Mapping):
+            raise ValueError("timing table payload must be an object")
+        raw_entries = payload.get("entries", payload)
+        if not isinstance(raw_entries, Mapping):
+            raise ValueError("timing table entries must be an object")
+        entries: dict[str, TaskTimingSpec] = {}
+        for key, value in raw_entries.items():
+            if key in {"name", "fallback", "metadata"}:
+                continue
+            if not isinstance(key, str) or not key:
+                raise ValueError("timing table keys must be non-empty strings")
+            if not isinstance(value, Mapping):
+                raise ValueError(f"timing table entry '{key}' must be an object")
+            spec = TaskTimingSpec(
+                duration_cycles=float(value["duration_cycles"]),
+                initiation_interval_cycles=float(value["initiation_interval_cycles"]),
+            )
+            issues = spec.validate()
+            if issues:
+                raise ValueError(f"timing table entry '{key}': {'; '.join(issues)}")
+            entries[key] = spec
+        return cls(entries=entries, name=str(payload.get("name", "timing_table")))
+
+    @classmethod
+    def from_path(cls, path: str | Path) -> "TimingTableModel":
+        timing_path = Path(path)
+        try:
+            payload = json.loads(timing_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"cannot load timing table '{timing_path}': {exc}") from exc
+        return cls.from_dict(payload)
+
+    def timing(self, task: ExecutionTask, machine: MachineConfig) -> TaskTimingSpec:
+        keys = (
+            str(task.attributes.get("timing_key", "")),
+            task.task_id,
+            f"{task.resource}:{task.primitive}",
+            task.primitive,
+            task.resource,
+            "default",
+        )
+        for key in keys:
+            if key and key in self.entries:
+                return self.entries[key]
+        return self.fallback.timing(task, machine)
 
 
 @dataclass(frozen=True)

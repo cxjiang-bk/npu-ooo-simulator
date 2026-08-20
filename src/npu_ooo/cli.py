@@ -51,6 +51,7 @@ from npu_ooo.scheduler import (
     StaticPipelineConfig,
     schedule_execution_graph,
 )
+from npu_ooo.simulator import TimingTableModel
 from npu_ooo.trace import (
     write_artifact_json,
     write_csv,
@@ -76,6 +77,10 @@ def _machine(name: str, config_path: Path | None = None):
         return factories[name]()
     except KeyError as exc:
         raise ValueError(f"unknown architecture profile '{name}'") from exc
+
+
+def _timing_model(path: Path | None):
+    return TimingTableModel.from_path(path) if path is not None else None
 
 
 def _parse_offsets(value: str | None) -> tuple[float, ...]:
@@ -116,6 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
     two_mm = subparsers.add_parser("two-mm", help="compile and schedule the 2mm benchmark")
     two_mm.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
     two_mm.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
+    two_mm.add_argument("--timing-config", type=Path, help="load primitive timing overrides from JSON")
     two_mm.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
     two_mm.add_argument("--output-dir", type=Path, default=Path("out/two-mm"))
     two_mm.add_argument("--instruction-queue-depth", type=int)
@@ -133,6 +139,7 @@ def build_parser() -> argparse.ArgumentParser:
     elementwise = subparsers.add_parser("elementwise", help="compile and schedule a residual-add benchmark")
     elementwise.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
     elementwise.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
+    elementwise.add_argument("--timing-config", type=Path, help="load primitive timing overrides from JSON")
     elementwise.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
     elementwise.add_argument("--output-dir", type=Path, default=Path("out/elementwise"))
     elementwise.add_argument("--instruction-queue-depth", type=int)
@@ -147,6 +154,7 @@ def build_parser() -> argparse.ArgumentParser:
     reduce = subparsers.add_parser("reduce", help="compile and schedule a row-reduction benchmark")
     reduce.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
     reduce.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
+    reduce.add_argument("--timing-config", type=Path, help="load primitive timing overrides from JSON")
     reduce.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
     reduce.add_argument("--output-dir", type=Path, default=Path("out/reduce"))
     reduce.add_argument("--instruction-queue-depth", type=int)
@@ -161,6 +169,7 @@ def build_parser() -> argparse.ArgumentParser:
     softmax = subparsers.add_parser("softmax", help="compile and schedule a row-softmax benchmark")
     softmax.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
     softmax.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
+    softmax.add_argument("--timing-config", type=Path, help="load primitive timing overrides from JSON")
     softmax.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
     softmax.add_argument("--output-dir", type=Path, default=Path("out/softmax"))
     softmax.add_argument("--instruction-queue-depth", type=int)
@@ -175,6 +184,7 @@ def build_parser() -> argparse.ArgumentParser:
     rmsnorm = subparsers.add_parser("rmsnorm", help="compile and schedule an RMSNorm benchmark")
     rmsnorm.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
     rmsnorm.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
+    rmsnorm.add_argument("--timing-config", type=Path, help="load primitive timing overrides from JSON")
     rmsnorm.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
     rmsnorm.add_argument("--output-dir", type=Path, default=Path("out/rmsnorm"))
     rmsnorm.add_argument("--instruction-queue-depth", type=int)
@@ -192,6 +202,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     decoder_block.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
     decoder_block.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
+    decoder_block.add_argument("--timing-config", type=Path, help="load primitive timing overrides from JSON")
     decoder_block.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
     decoder_block.add_argument("--output-dir", type=Path, default=Path("out/decoder-block"))
     decoder_block.add_argument("--instruction-queue-depth", type=int)
@@ -209,6 +220,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     attention.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
     attention.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
+    attention.add_argument("--timing-config", type=Path, help="load primitive timing overrides from JSON")
     attention.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
     attention.add_argument("--output-dir", type=Path, default=Path("out/attention"))
     attention.add_argument("--instruction-queue-depth", type=int)
@@ -226,6 +238,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     transformer_block.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
     transformer_block.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
+    transformer_block.add_argument("--timing-config", type=Path, help="load primitive timing overrides from JSON")
     transformer_block.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
     transformer_block.add_argument("--output-dir", type=Path, default=Path("out/transformer-block"))
     transformer_block.add_argument("--instruction-queue-depth", type=int)
@@ -240,6 +253,7 @@ def build_parser() -> argparse.ArgumentParser:
     layernorm = subparsers.add_parser("layernorm", help="compile and schedule a row-LayerNorm benchmark")
     layernorm.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
     layernorm.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
+    layernorm.add_argument("--timing-config", type=Path, help="load primitive timing overrides from JSON")
     layernorm.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
     layernorm.add_argument("--output-dir", type=Path, default=Path("out/layernorm"))
     layernorm.add_argument("--instruction-queue-depth", type=int)
@@ -254,6 +268,7 @@ def build_parser() -> argparse.ArgumentParser:
     sweep = subparsers.add_parser("sweep-two-mm", help="sweep 2mm architecture and scheduler parameters")
     sweep.add_argument("--architectures", default="minimal,wide-mxu")
     sweep.add_argument("--machine-config", type=Path, help="use one canonical MachineConfig JSON for every case")
+    sweep.add_argument("--timing-config", type=Path, help="use one timing table JSON for every case")
     sweep.add_argument(
         "--policies",
         default=",".join(policy.value for policy in SchedulerPolicy),
@@ -276,6 +291,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     workload_sweep.add_argument("--architectures", default="minimal,wide-mxu")
     workload_sweep.add_argument("--machine-config", type=Path, help="use one canonical MachineConfig JSON for every case")
+    workload_sweep.add_argument("--timing-config", type=Path, help="use one timing table JSON for every case")
     workload_sweep.add_argument(
         "--policies",
         default=",".join(policy.value for policy in SchedulerPolicy),
@@ -352,6 +368,7 @@ def run_two_mm(args: argparse.Namespace) -> int:
         effective_execution_graph,
         machine,
         args.policy,
+        timing_model=_timing_model(args.timing_config),
         simulator_config=simulator_config,
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -441,6 +458,7 @@ def run_elementwise(args: argparse.Namespace) -> int:
         lowered.execution_graph,
         machine,
         args.policy,
+        timing_model=_timing_model(args.timing_config),
         simulator_config=simulator_config,
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -512,7 +530,7 @@ def run_reduce(args: argparse.Namespace) -> int:
             else None
         ),
     )
-    result = schedule_execution_graph(lowered.execution_graph, machine, args.policy, simulator_config=simulator_config)
+    result = schedule_execution_graph(lowered.execution_graph, machine, args.policy, timing_model=_timing_model(args.timing_config), simulator_config=simulator_config)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     write_artifact_json(model, args.output_dir / "model_spec.json")
     write_artifact_json(case, args.output_dir / "benchmark_case.json")
@@ -582,7 +600,7 @@ def run_softmax(args: argparse.Namespace) -> int:
             else None
         ),
     )
-    result = schedule_execution_graph(lowered.execution_graph, machine, args.policy, simulator_config=simulator_config)
+    result = schedule_execution_graph(lowered.execution_graph, machine, args.policy, timing_model=_timing_model(args.timing_config), simulator_config=simulator_config)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     write_artifact_json(model, args.output_dir / "model_spec.json")
     write_artifact_json(case, args.output_dir / "benchmark_case.json")
@@ -652,7 +670,7 @@ def run_rmsnorm(args: argparse.Namespace) -> int:
             else None
         ),
     )
-    result = schedule_execution_graph(lowered.execution_graph, machine, args.policy, simulator_config=simulator_config)
+    result = schedule_execution_graph(lowered.execution_graph, machine, args.policy, timing_model=_timing_model(args.timing_config), simulator_config=simulator_config)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     write_artifact_json(model, args.output_dir / "model_spec.json")
     write_artifact_json(case, args.output_dir / "benchmark_case.json")
@@ -726,6 +744,7 @@ def run_decoder_block(args: argparse.Namespace) -> int:
         lowered.execution_graph,
         machine,
         args.policy,
+        timing_model=_timing_model(args.timing_config),
         simulator_config=simulator_config,
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -808,7 +827,7 @@ def run_attention(args: argparse.Namespace) -> int:
             else None
         ),
     )
-    result = schedule_execution_graph(lowered.execution_graph, machine, args.policy, simulator_config=simulator_config)
+    result = schedule_execution_graph(lowered.execution_graph, machine, args.policy, timing_model=_timing_model(args.timing_config), simulator_config=simulator_config)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     write_artifact_json(model, args.output_dir / "model_spec.json")
     write_artifact_json(case, args.output_dir / "benchmark_case.json")
@@ -889,7 +908,7 @@ def run_transformer_block(args: argparse.Namespace) -> int:
             else None
         ),
     )
-    result = schedule_execution_graph(lowered.execution_graph, machine, args.policy, simulator_config=simulator_config)
+    result = schedule_execution_graph(lowered.execution_graph, machine, args.policy, timing_model=_timing_model(args.timing_config), simulator_config=simulator_config)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     write_artifact_json(model, args.output_dir / "model_spec.json")
     write_artifact_json(case, args.output_dir / "benchmark_case.json")
@@ -970,7 +989,7 @@ def run_layernorm(args: argparse.Namespace) -> int:
             else None
         ),
     )
-    result = schedule_execution_graph(lowered.execution_graph, machine, args.policy, simulator_config=simulator_config)
+    result = schedule_execution_graph(lowered.execution_graph, machine, args.policy, timing_model=_timing_model(args.timing_config), simulator_config=simulator_config)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     write_artifact_json(model, args.output_dir / "model_spec.json")
     write_artifact_json(case, args.output_dir / "benchmark_case.json")
@@ -1037,6 +1056,7 @@ def run_sweep_two_mm(args: argparse.Namespace) -> int:
     robs = _parse_positive_int_list(args.robs, name="--robs")
     tile_sizes = _parse_positive_int_list(args.tile_sizes, name="--tile-sizes")
     stage_offsets = _parse_offsets(args.static_stage_offsets)
+    timing_model = _timing_model(args.timing_config)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     model = build_two_matmul_model()
@@ -1072,6 +1092,7 @@ def run_sweep_two_mm(args: argparse.Namespace) -> int:
             lowered.execution_graph,
             machine,
             policy,
+            timing_model=timing_model,
             simulator_config=simulator_config,
         )
         key = (architecture, policy, dependency_window, rob_entries, tile_size)
@@ -1181,6 +1202,7 @@ def run_sweep_workloads(args: argparse.Namespace) -> int:
     if unknown_priorities:
         raise ValueError(f"unsupported dynamic priority(s): {', '.join(unknown_priorities)}")
     stage_offsets = _parse_offsets(args.static_stage_offsets)
+    timing_model = _timing_model(args.timing_config)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     lowered_cache: dict[tuple[str, str, int], tuple[object, object, object, object]] = {}
@@ -1220,6 +1242,7 @@ def run_sweep_workloads(args: argparse.Namespace) -> int:
             lowered.execution_graph,
             machine,
             policy,
+            timing_model=timing_model,
             simulator_config=simulator_config,
         )
         key = (workload, architecture, policy, dependency_window, rob_entries, tile_size, dynamic_priority)

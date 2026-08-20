@@ -62,6 +62,7 @@
 | 通用 workload sweep | `sweep-workloads` 对每个 workload/architecture/tile-size 缓存同一份 lowering，再在 policy/window/ROB 维度重放；每个 case 保留 semantic graph、execution graph 和 SVG/PNG/Perfetto，避免只比较汇总数字而看不到图结构 |
 | 外部 MachineConfig | canonical `MachineConfig.to_dict()` 已支持 round-trip 和 CLI `--machine-config`；自定义 memory hierarchy、execution unit、transfer path 可以不改 simulator 代码直接进入实验，但仍需通过 schema validation |
 | Custom profile label | `sweep-two-mm`/`sweep-workloads` 在提供 `--machine-config` 时允许任意 architecture label；label 只用于实验索引，真实配置由 JSON 和 `machine_hash` 唯一确定 |
+| External timing table | `TimingTableModel` 支持 task id、resource:primitive、primitive、resource 和 default 五级匹配，未覆盖 task 回退 analytical；这提供了 SCALE-Sim/RTL 校准的最小可插拔接口，但还没有真正从 SCALE-Sim 自动导入 |
 | Priority sweep 反例 | `sweep-workloads --workloads layernorm --windows 8 --robs 8` 显示 static=3808；dynamic `oldest_first`=3808，而 dynamic `critical_path`=4696（speedup 0.811）。因此 priority 必须成为 manifest/sweep 的显式键 |
 | Attention 首个闭环 | 单头无 mask/cache 的 `Q @ K^T -> Softmax -> P @ V` 由两个 Matmul 和一个 Softmax semantic op 组成，默认 `64x64x32` 生成 12 tiles、54 primitive tasks、8 个跨算子 handoff；minimal analytical profile 下 static=4520、dynamic critical-path=4532 |
 | Transformer block skeleton | `LayerNorm -> QK^T -> Softmax -> PV -> residual -> MLP1 -> activation -> MLP2 -> residual` 默认生成 9 semantic operators、30 tiles、126 tasks、28 个 root-memory handoff；minimal analytical profile 下 static/dynamic critical-path 均为 10540 cycles，但这只是 shape-only skeleton |

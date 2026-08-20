@@ -314,6 +314,42 @@ class CliArtifactTest(unittest.TestCase):
             manifest = json.loads((output / "manifest.json").read_text())
             self.assertEqual(manifest["machine_hash"], minimal_machine_config().stable_hash())
 
+    def test_cli_accepts_timing_table_json(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            root = Path(directory)
+            timing_path = root / "timing.json"
+            timing_path.write_text(
+                json.dumps(
+                    {
+                        "name": "calibrated_probe_v0",
+                        "entries": {
+                            "elementwise": {
+                                "duration_cycles": 1,
+                                "initiation_interval_cycles": 1,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = root / "run"
+            exit_code = main(
+                [
+                    "elementwise",
+                    "--timing-config",
+                    str(timing_path),
+                    "--policy",
+                    "dynamic_ready_queue",
+                    "--output-dir",
+                    str(output),
+                ]
+            )
+            self.assertEqual(exit_code, 0)
+            manifest = json.loads((output / "manifest.json").read_text())
+            summary = json.loads((output / "summary.json").read_text())
+            self.assertEqual(manifest["backend"], "calibrated_probe_v0")
+            self.assertEqual(summary["backend"], "calibrated_probe_v0")
+
     def test_workload_sweep_accepts_custom_architecture_label_with_machine_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
             root = Path(directory)

@@ -204,6 +204,20 @@ perfetto.json           Perfetto/Chrome Trace
 
 运行时容量可以通过 `--instruction-queue-depth`、`--rob-entries`、`--max-inflight-tiles`、`--dependency-window` 和 `--ready-queue-depth` 覆盖 MachineConfig 默认值；实际生效值会写入 `manifest.json` 和 `summary.json`。`--address-scoreboard` 启用运行时 range scoreboard：活跃 task 的重叠 `BufferRegion` 会产生 RAW/WAR/WAW issue stall，完成后释放并唤醒等待者。动态 policy 可用 `--dynamic-priority critical_path|oldest_first` 切换启发式。静态流水线可用 `--static-stage-offsets 0,200 --static-stage-ii 250` 显式指定 stage reservation；不提供该参数时保留默认 program-order static baseline。
 
+Timing 也可以从 JSON 表覆盖，而不修改 lowering 或 simulator：
+
+```json
+{
+  "name": "rtl_probe_v0",
+  "entries": {
+    "matmul": {"duration_cycles": 64, "initiation_interval_cycles": 4},
+    "MXU:matmul": {"duration_cycles": 64, "initiation_interval_cycles": 4}
+  }
+}
+```
+
+运行时传入 `--timing-config path/to/timing.json`。匹配优先级是 `timing_key`、task id、`resource:primitive`、primitive、resource、`default`；未覆盖的 task 回退到 analytical timing。结果的 `backend` 会记录 timing table 名称。
+
 批量比较使用 `sweep-two-mm`。它对每个 architecture/policy/window/ROB 组合重新执行相同的 2mm lowering 和 simulator，并为每个组合写入独立目录：
 
 ```bash

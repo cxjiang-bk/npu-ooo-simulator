@@ -8,9 +8,45 @@ from npu_ooo.scheduler import (
     StaticPipelineConfig,
     schedule_execution_graph,
 )
+from npu_ooo.simulator import TimingTableModel
 
 
 class EventSimulatorTest(unittest.TestCase):
+    def test_timing_table_overrides_primitive_and_keeps_backend_name(self) -> None:
+        graph = ExecutionGraph(
+            graph_id="timing_table_micro",
+            tasks=(
+                ExecutionTask(
+                    "compute",
+                    "tile0",
+                    "micro",
+                    "matmul",
+                    "MXU",
+                    duration_cycles=100,
+                    initiation_interval_cycles=100,
+                ),
+            ),
+        )
+        result = schedule_execution_graph(
+            graph,
+            minimal_machine_config(),
+            SchedulerPolicy.SEQUENTIAL,
+            timing_model=TimingTableModel.from_dict(
+                {
+                    "name": "rtl_probe_v0",
+                    "entries": {
+                        "matmul": {
+                            "duration_cycles": 7,
+                            "initiation_interval_cycles": 2,
+                        }
+                    },
+                }
+            ),
+        )
+        self.assertEqual(result.backend, "rtl_probe_v0")
+        self.assertEqual(result.total_cycles, 7)
+        self.assertEqual(result.timing("compute").duration, 7)
+
     def test_static_pipeline_reservations_and_drain_match_hand_schedule(self) -> None:
         graph = ExecutionGraph(
             graph_id="static_dual_micro",

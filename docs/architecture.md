@@ -348,6 +348,8 @@ TimingModel / EventBackend
 
 `AnalyticalTimingModel` 只消费 `ExecutionTask.duration_cycles` 和 `MachineConfig` 的 unit 默认值；它是可替换的 timing provider，不代表真实硬件。`SimulatorConfig` 可以覆盖 instruction queue、ROB、ready queue、dependency window 和 max in-flight tiles。
 
+`TimingTableModel` 是第一种外部校准入口：它从 JSON 读取 primitive/resource/task 的 duration 和 initiation interval，未命中的 task 回退到 `AnalyticalTimingModel`。因此 SCALE-Sim、RTL waveform 或硬件 counter 的局部结果可以先转换为 table，再通过同一 scheduler 重放；manifest 的 `backend` 会区分 table 名称和 analytical。
+
 `--address-scoreboard` 启用 runtime range scoreboard：根据相同 `tensor/memory` 上的 `BufferRegion` 重叠关系，在 issue 前检查 active task 并产生 RAW/WAR/WAW stall；COMPLETE 后释放范围并继续调度。当前地址来自 canonical `ExecutionTask` metadata，尚不是从真实 TISA binary 动态解析出的硬件 scoreboard。
 
 ## 8. Trace 与结果
