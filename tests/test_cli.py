@@ -145,6 +145,17 @@ class CliArtifactTest(unittest.TestCase):
             primitives = {task["primitive"] for task in execution_graph["tasks"]}
             self.assertTrue({"reduce_max", "exp", "reduce_sum", "normalize"}.issubset(primitives))
 
+    def test_rmsnorm_exports_sum_square_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            output = Path(directory)
+            exit_code = main(
+                ["rmsnorm", "--arch", "minimal", "--policy", "dynamic_ready_queue", "--output-dir", str(output)]
+            )
+            self.assertEqual(exit_code, 0)
+            execution_graph = json.loads((output / "execution_graph.json").read_text())
+            primitives = {task["primitive"] for task in execution_graph["tasks"]}
+            self.assertTrue({"square", "reduce_sum_square", "rmsnorm"}.issubset(primitives))
+
 
 if __name__ == "__main__":
     unittest.main()

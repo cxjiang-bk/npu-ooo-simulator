@@ -4,6 +4,7 @@ from .matmul import LoweringResult, lower_matmul_graph, lower_two_matmul
 from .elementwise import lower_elementwise, lower_elementwise_graph
 from .reduce import lower_reduce, lower_reduce_graph
 from .softmax import lower_softmax, lower_softmax_graph
+from .norm import lower_rmsnorm, lower_rmsnorm_graph
 
 __all__ = [
     "LoweringResult",
@@ -13,6 +14,8 @@ __all__ = [
     "lower_reduce_graph",
     "lower_softmax",
     "lower_softmax_graph",
+    "lower_rmsnorm",
+    "lower_rmsnorm_graph",
     "lower_matmul_graph",
     "lower_two_matmul",
 ]

@@ -233,3 +233,25 @@ def default_softmax_schedule(graph: OperatorGraph) -> ScheduleSpec:
     if issues:
         raise ValueError("; ".join(issues))
     return result
+
+
+def default_rmsnorm_schedule(graph: OperatorGraph) -> ScheduleSpec:
+    """Return a 32x32 iteration/reduction tile schedule for RMSNorm."""
+
+    schedules: list[OperatorSchedule] = []
+    for operator in graph.operators:
+        if operator.normalized_type != "rmsnorm":
+            raise ValueError(f"default RMSNorm schedule does not support '{operator.normalized_type}'")
+        dimensions = tuple((*operator.iteration_dims, *operator.reduction_dims))
+        schedules.append(
+            OperatorSchedule(
+                operator_id=operator.op_id,
+                tile_sizes=tuple((name, min(32, int(extent))) for name, extent in dimensions),
+                loop_order=tuple(name for name, _ in dimensions),
+            )
+        )
+    result = ScheduleSpec("rmsnorm_default", tuple(schedules), attributes={"source": "hand-written"})
+    issues = result.validate(graph)
+    if issues:
+        raise ValueError("; ".join(issues))
+    return result

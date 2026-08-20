@@ -15,7 +15,7 @@
 
 ### 当前状态
 
-阶段 4 进行中、阶段 5/6 已启动：Model/Benchmark、Operator Graph、MachineConfig、Schedule/Tile/Execution IR 和独立 analytical event backend 已实现；2mm 已完成 tile 展开、matmul lowering、queue/ROB/window 约束、completion wake-up、CSV/SVG/Perfetto trace、显式 static stage reservation、runtime RAW/WAR/WAW range scoreboard，以及 stall/ROB/queue occupancy 指标。`sweep-two-mm` 已能批量扫描 architecture × tile size × policy × window × ROB；residual-add、row-reduce 和 softmax 已完成独立 lowering/CLI，下一步是 LayerNorm/RMSNorm 和跨算子 mixed graph。
+阶段 4 进行中、阶段 5/6 已启动：Model/Benchmark、Operator Graph、MachineConfig、Schedule/Tile/Execution IR 和独立 analytical event backend 已实现；2mm 已完成 tile 展开、matmul lowering、queue/ROB/window 约束、completion wake-up、CSV/SVG/Perfetto trace、显式 static stage reservation、runtime RAW/WAR/WAW range scoreboard，以及 stall/ROB/queue occupancy 指标。`sweep-two-mm` 已能批量扫描 architecture × tile size × policy × window × ROB；residual-add、row-reduce、softmax 和 RMSNorm 已完成独立 lowering/CLI，下一步是 LayerNorm 和跨算子 mixed graph。
 
 ### 2026-08-20：阶段 4 后端语义推进
 
@@ -23,10 +23,11 @@
 - 2mm lowering 为每个 task 保留 `iteration` 元数据，因而可直接生成 dual/triple stage reservation。
 - 新增 runtime `AddressScoreboard`：只追踪 active task 的 `BufferRegion`，issue 前阻塞 RAW/WAR/WAW 冲突，COMPLETE 后释放并继续调度；不再通过改写 execution graph 模拟硬件 scoreboard。
 - 统一输出 `stall_cycles_by_reason`、`stall_by_reason`、`pipeline_drain_cycles`、`queue_occupancy_timeline` 和观测到的 `address_hazards`。
-- 新增 dual/triple reservation、RAW/WAR/WAW、sweep artifact、elementwise/reduce/softmax 和 tile-size sweep micro-tests；当前测试总数 30，全部通过。
+- 新增 dual/triple reservation、RAW/WAR/WAW、sweep artifact、elementwise/reduce/softmax/RMSNorm 和 tile-size sweep micro-tests；当前测试总数 33，全部通过。
 - 新增 `sweep-two-mm` CLI：每个 architecture/tile size/policy/window/ROB 组合独立写 manifest、summary、tasks、Perfetto 和 SVG，并在顶层汇总 CSV/JSON。
 - 新增 `elementwise` benchmark 与通用 `lower_elementwise_graph`，验证 semantic operator 不依赖 matmul 专用 lowering。
 - 新增 row-reduce partial chain 和 softmax composite lowering；动态 priority 现在支持 `critical_path` 与 `oldest_first`。
+- 新增 RMSNorm `square -> reduce_sum_square -> rmsnorm` lowering，覆盖 decoder block 常见归一化路径。
 
 ### 创建/修改文件
 

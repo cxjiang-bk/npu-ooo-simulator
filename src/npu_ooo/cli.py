@@ -14,6 +14,8 @@ from npu_ooo.benchmarks import (
     build_reduce_model,
     build_softmax_case,
     build_softmax_model,
+    build_rmsnorm_case,
+    build_rmsnorm_model,
     build_two_matmul_case,
     build_two_matmul_model,
 )
@@ -21,9 +23,10 @@ from npu_ooo.ir import (
     default_elementwise_schedule,
     default_reduce_schedule,
     default_softmax_schedule,
+    default_rmsnorm_schedule,
     default_two_matmul_schedule,
 )
-from npu_ooo.lowering import lower_elementwise, lower_reduce, lower_softmax, lower_two_matmul
+from npu_ooo.lowering import lower_elementwise, lower_reduce, lower_rmsnorm, lower_softmax, lower_two_matmul
 from npu_ooo.scheduler import (
     SchedulerPolicy,
     SimulatorConfig,
@@ -144,6 +147,19 @@ def build_parser() -> argparse.ArgumentParser:
     softmax.add_argument("--dynamic-priority", choices=("critical_path", "oldest_first"), default="critical_path")
     softmax.add_argument("--static-stage-offsets")
     softmax.add_argument("--static-stage-ii", type=float, default=1.0)
+    rmsnorm = subparsers.add_parser("rmsnorm", help="compile and schedule an RMSNorm benchmark")
+    rmsnorm.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
+    rmsnorm.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
+    rmsnorm.add_argument("--output-dir", type=Path, default=Path("out/rmsnorm"))
+    rmsnorm.add_argument("--instruction-queue-depth", type=int)
+    rmsnorm.add_argument("--rob-entries", type=int)
+    rmsnorm.add_argument("--max-inflight-tiles", type=int)
+    rmsnorm.add_argument("--dependency-window", type=int)
+    rmsnorm.add_argument("--ready-queue-depth", type=int)
+    rmsnorm.add_argument("--address-scoreboard", action="store_true")
+    rmsnorm.add_argument("--dynamic-priority", choices=("critical_path", "oldest_first"), default="critical_path")
+    rmsnorm.add_argument("--static-stage-offsets")
+    rmsnorm.add_argument("--static-stage-ii", type=float, default=1.0)
     sweep = subparsers.add_parser("sweep-two-mm", help="sweep 2mm architecture and scheduler parameters")
     sweep.add_argument("--architectures", default="minimal,wide-mxu")
     sweep.add_argument(
@@ -488,6 +504,75 @@ def run_softmax(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_rmsnorm(args: argparse.Namespace) -> int:
+    machine = _machine(args.arch)
+    model = build_rmsnorm_model()
+    case = build_rmsnorm_case(
+        architecture_profile=args.arch,
+        scheduler_profile=args.policy,
+    )
+    instance = model.instantiate(case)
+    schedule = default_rmsnorm_schedule(instance.graph)
+    lowered = lower_rmsnorm(instance, machine, schedule)
+    stage_offsets = _parse_offsets(args.static_stage_offsets)
+    simulator_config = SimulatorConfig(
+        instruction_queue_depth=args.instruction_queue_depth,
+        rob_entries=args.rob_entries,
+        max_inflight_tiles=args.max_inflight_tiles,
+        dependency_window=args.dependency_window,
+        ready_queue_depth=args.ready_queue_depth,
+        address_scoreboard=args.address_scoreboard,
+        dynamic_priority=args.dynamic_priority,
+        static_pipeline=(
+            StaticPipelineConfig(
+                stage_count=len(stage_offsets),
+                stage_offsets=stage_offsets,
+                initiation_interval_cycles=args.static_stage_ii,
+            )
+            if stage_offsets
+            else None
+        ),
+    )
+    result = schedule_execution_graph(lowered.execution_graph, machine, args.policy, simulator_config=simulator_config)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    write_artifact_json(model, args.output_dir / "model_spec.json")
+    write_artifact_json(case, args.output_dir / "benchmark_case.json")
+    write_artifact_json(instance, args.output_dir / "model_instance.json")
+    write_artifact_json(instance.graph, args.output_dir / "operator_graph.json")
+    write_artifact_json(schedule, args.output_dir / "schedule.json")
+    write_artifact_json(lowered.tile_graph, args.output_dir / "tile_graph.json")
+    write_artifact_json(lowered.execution_graph, args.output_dir / "execution_graph.json")
+    write_artifact_json(result.metrics.get("address_hazards", []), args.output_dir / "address_dependencies.json")
+    write_artifact_json(machine, args.output_dir / "machine.json")
+    write_artifact_json(result.perfetto_trace(), args.output_dir / "perfetto.json")
+    write_artifact_json(
+        {
+            "schema_version": 1,
+            "benchmark": case.case_id,
+            "architecture": args.arch,
+            "machine_hash": machine.stable_hash(),
+            "schedule": schedule.schedule_id,
+            "policy": result.policy,
+            "backend": result.backend,
+            "calibration_status": result.metrics["calibration_status"],
+            "simulator_config": result.metrics["simulator_config"],
+            "address_dependency_count": result.metrics.get("address_dependency_count", 0),
+            "total_cycles": result.total_cycles,
+            "statistics": lowered.statistics,
+        },
+        args.output_dir / "manifest.json",
+    )
+    write_operator_graph_dot(instance.graph, args.output_dir / "operator_graph.dot")
+    write_operator_graph_svg(instance.graph, args.output_dir / "operator_graph.svg")
+    write_tile_graph_dot(lowered.tile_graph, args.output_dir / "tile_graph.dot")
+    write_execution_graph_dot(lowered.execution_graph, args.output_dir / "execution_graph.dot")
+    write_json(result, args.output_dir / "summary.json")
+    write_csv(result, args.output_dir / "tasks.csv")
+    write_svg(result, args.output_dir / "swimlane.svg")
+    print(json.dumps({"architecture": args.arch, "policy": result.policy, "total_cycles": result.total_cycles, "output_dir": str(args.output_dir)}, sort_keys=True))
+    return 0
+
+
 def run_sweep_two_mm(args: argparse.Namespace) -> int:
     architectures = _parse_list(args.architectures, name="--architectures")
     policies = _parse_list(args.policies, name="--policies")
@@ -617,6 +702,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_reduce(args)
     if args.command == "softmax":
         return run_softmax(args)
+    if args.command == "rmsnorm":
+        return run_rmsnorm(args)
     if args.command == "sweep-two-mm":
         return run_sweep_two_mm(args)
     raise AssertionError(args.command)

@@ -16,7 +16,7 @@
   -> 总周期、利用率、stall 分解和泳道图
 ```
 
-当前已经具备 2mm、residual-add、row-reduce 和 softmax 四条可执行算子闭环。它们都经过模型实例化、显式 tiling、primitive execution graph，以及基于 MachineConfig 的 sequential/static-pipeline/dynamic-ready-queue analytical scheduler。输出包含总周期、等待分解和 Perfetto/Chrome Trace 事件；数值仍标记为 analytical，尚未宣称 RTL cycle-accurate。
+当前已经具备 2mm、residual-add、row-reduce、softmax 和 RMSNorm 五条可执行算子闭环。它们都经过模型实例化、显式 tiling、primitive execution graph，以及基于 MachineConfig 的 sequential/static-pipeline/dynamic-ready-queue analytical scheduler。输出包含总周期、等待分解和 Perfetto/Chrome Trace 事件；数值仍标记为 analytical，尚未宣称 RTL cycle-accurate。
 
 模型层是必要的：论文 benchmark 同时覆盖 ResNet50、BERT、GPT-J、LLaMA2 和 DeepSeek-R1，并区分 CNN、Transformer、prefill、decode、batch、sequence length 和 dtype。Operator IR 负责描述“一个算子做什么”，Model IR 负责描述“哪些算子以什么拓扑、重复次数和运行阶段组成一个 workload”。
 
@@ -108,6 +108,15 @@ PYTHONPATH=src python3 -m npu_ooo.cli softmax \
   --dependency-window 8 \
   --rob-entries 8 \
   --output-dir out/softmax-dynamic
+```
+
+`rmsnorm` 展开为 `load -> square -> reduce_sum_square -> rmsnorm -> store`，并把最终 sum barrier 传播到同一行的每个 normalize tile：
+
+```bash
+PYTHONPATH=src python3 -m npu_ooo.cli rmsnorm \
+  --arch minimal \
+  --policy dynamic_ready_queue \
+  --output-dir out/rmsnorm-dynamic
 ```
 
 当前已实现到 `Execution Graph -> analytical event simulator -> SchedulerResult`，输出 CSV/SVG、Perfetto/Chrome Trace 和 runtime queue/ROB 指标。后端仍是 analytical timing，不是 RTL cycle-accurate；真实 ISA/RTL timing 后续通过 `TimingModel` 接入。

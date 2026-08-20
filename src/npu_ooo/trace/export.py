@@ -76,6 +76,9 @@ def write_svg(result: ScheduleResult, path: str | Path, *, width: int = 1600, ro
         "reduce_sum": "#c65a3a",
         "exp": "#7b4f9d",
         "normalize": "#4c7f6b",
+        "square": "#7b4f9d",
+        "reduce_sum_square": "#c65a3a",
+        "rmsnorm": "#4c7f6b",
         "store": "#3b7d3b",
     }
     elements: list[str] = [
