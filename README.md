@@ -206,10 +206,11 @@ PYTHONPATH=src python3 -m npu_ooo.cli sweep-workloads \
   --windows 4,8 \
   --robs 4,8 \
   --tile-sizes 16,32 \
+  --dynamic-priorities critical_path,oldest_first \
   --output-dir out/sweep-workloads
 ```
 
-每个 case 目录同时保留 `operator_graph.json`、`execution_graph.json`、`summary.json`、`tasks.csv`、`perfetto.json`、`swimlane.svg` 和 `swimlane.png`，顶层 `sweep.csv/json` 增加 workload 字段并计算相对 static 的 speedup。
+每个 case 目录同时保留 `operator_graph.json`、`execution_graph.json`、`summary.json`、`tasks.csv`、`perfetto.json`、`swimlane.svg` 和 `swimlane.png`，顶层 `sweep.csv/json` 增加 workload、dynamic priority 字段并计算相对 static 的 speedup。Static baseline 会对每个 priority 值重复记录，确保比较键完全一致。
 
 ## 参考项目
 

@@ -226,6 +226,8 @@ class CliArtifactTest(unittest.TestCase):
                     "1",
                     "--tile-sizes",
                     "16",
+                    "--dynamic-priorities",
+                    "critical_path",
                     "--output-dir",
                     str(output),
                 ]
@@ -238,6 +240,7 @@ class CliArtifactTest(unittest.TestCase):
                 case_dir = output / (
                     f"{row['workload']}__{row['architecture']}__{row['policy']}"
                     f"__tile{row['tile_size']}__window{row['dependency_window']}__rob{row['rob_entries']}"
+                    f"__priority{row['dynamic_priority']}"
                 )
                 self.assertTrue((case_dir / "operator_graph.json").exists())
                 self.assertTrue((case_dir / "execution_graph.json").exists())

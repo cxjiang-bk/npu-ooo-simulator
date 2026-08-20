@@ -248,6 +248,7 @@ def build_parser() -> argparse.ArgumentParser:
     workload_sweep.add_argument("--output-dir", type=Path, default=Path("out/sweep-workloads"))
     workload_sweep.add_argument("--address-scoreboard", action="store_true")
     workload_sweep.add_argument("--dynamic-priority", choices=("critical_path", "oldest_first"), default="critical_path")
+    workload_sweep.add_argument("--dynamic-priorities", default="critical_path,oldest_first")
     workload_sweep.add_argument("--static-stage-offsets")
     workload_sweep.add_argument("--static-stage-ii", type=float, default=1.0)
     return parser
@@ -972,14 +973,19 @@ def run_sweep_workloads(args: argparse.Namespace) -> int:
     windows = _parse_positive_int_list(args.windows, name="--windows")
     robs = _parse_positive_int_list(args.robs, name="--robs")
     tile_sizes = _parse_positive_int_list(args.tile_sizes, name="--tile-sizes")
+    dynamic_priorities = _parse_list(args.dynamic_priorities, name="--dynamic-priorities")
+    supported_priorities = {"critical_path", "oldest_first"}
+    unknown_priorities = sorted(set(dynamic_priorities) - supported_priorities)
+    if unknown_priorities:
+        raise ValueError(f"unsupported dynamic priority(s): {', '.join(unknown_priorities)}")
     stage_offsets = _parse_offsets(args.static_stage_offsets)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     lowered_cache: dict[tuple[str, str, int], tuple[object, object, object, object]] = {}
-    results: dict[tuple[str, str, str, int, int, int], object] = {}
+    results: dict[tuple[str, str, str, int, int, int, str], object] = {}
     records: list[dict[str, object]] = []
-    for workload, architecture, policy, dependency_window, rob_entries, tile_size in product(
-        workloads, architectures, policies, windows, robs, tile_sizes
+    for workload, architecture, policy, dependency_window, rob_entries, tile_size, dynamic_priority in product(
+        workloads, architectures, policies, windows, robs, tile_sizes, dynamic_priorities
     ):
         cache_key = (workload, architecture, tile_size)
         machine = _machine(architecture, args.machine_config)
@@ -1006,7 +1012,7 @@ def run_sweep_workloads(args: argparse.Namespace) -> int:
             address_scoreboard=args.address_scoreboard,
             static_stage_offsets=static_config,
             static_stage_ii=args.static_stage_ii,
-            dynamic_priority=args.dynamic_priority,
+            dynamic_priority=dynamic_priority,
         )
         result = schedule_execution_graph(
             lowered.execution_graph,
@@ -1014,11 +1020,11 @@ def run_sweep_workloads(args: argparse.Namespace) -> int:
             policy,
             simulator_config=simulator_config,
         )
-        key = (workload, architecture, policy, dependency_window, rob_entries, tile_size)
+        key = (workload, architecture, policy, dependency_window, rob_entries, tile_size, dynamic_priority)
         results[key] = result
         case_id = (
             f"{workload}__{architecture}__{policy}__tile{tile_size}"
-            f"__window{dependency_window}__rob{rob_entries}"
+            f"__window{dependency_window}__rob{rob_entries}__priority{dynamic_priority}"
         )
         case_dir = args.output_dir / case_id
         case_dir.mkdir(parents=True, exist_ok=True)
@@ -1044,6 +1050,7 @@ def run_sweep_workloads(args: argparse.Namespace) -> int:
                 "workload": workload,
                 "architecture": architecture,
                 "policy": policy,
+                "dynamic_priority": dynamic_priority,
                 "machine_hash": machine.stable_hash(),
                 "backend": result.backend,
                 "calibration_status": result.metrics["calibration_status"],
@@ -1055,11 +1062,19 @@ def run_sweep_workloads(args: argparse.Namespace) -> int:
         )
 
     static_cycles = {
-        (workload, architecture, dependency_window, rob_entries, tile_size): results[
-            (workload, architecture, SchedulerPolicy.STATIC_PIPELINE.value, dependency_window, rob_entries, tile_size)
+        (workload, architecture, dependency_window, rob_entries, tile_size, dynamic_priority): results[
+            (
+                workload,
+                architecture,
+                SchedulerPolicy.STATIC_PIPELINE.value,
+                dependency_window,
+                rob_entries,
+                tile_size,
+                dynamic_priority,
+            )
         ].total_cycles
-        for workload, architecture, dependency_window, rob_entries, tile_size in product(
-            workloads, architectures, windows, robs, tile_sizes
+        for workload, architecture, dependency_window, rob_entries, tile_size, dynamic_priority in product(
+            workloads, architectures, windows, robs, tile_sizes, dynamic_priorities
         )
         if (
             workload,
@@ -1068,10 +1083,11 @@ def run_sweep_workloads(args: argparse.Namespace) -> int:
             dependency_window,
             rob_entries,
             tile_size,
+            dynamic_priority,
         ) in results
     }
-    for (workload, architecture, policy, dependency_window, rob_entries, tile_size), result in results.items():
-        baseline = static_cycles.get((workload, architecture, dependency_window, rob_entries, tile_size))
+    for (workload, architecture, policy, dependency_window, rob_entries, tile_size, dynamic_priority), result in results.items():
+        baseline = static_cycles.get((workload, architecture, dependency_window, rob_entries, tile_size, dynamic_priority))
         metrics = result.metrics
         records.append(
             {
@@ -1088,7 +1104,7 @@ def run_sweep_workloads(args: argparse.Namespace) -> int:
                     else None
                 ),
                 "address_scoreboard": args.address_scoreboard,
-                "dynamic_priority": args.dynamic_priority,
+                "dynamic_priority": dynamic_priority,
                 "address_hazard_count": metrics.get("address_hazard_count", 0),
                 "rob_peak": metrics.get("rob_peak", 0),
                 "ready_set_peak": metrics.get("ready_set_peak", 0),
@@ -1106,6 +1122,7 @@ def run_sweep_workloads(args: argparse.Namespace) -> int:
             str(record["policy"]),
             int(record["dependency_window"]),
             int(record["rob_entries"]),
+            str(record["dynamic_priority"]),
         )
     )
     with (args.output_dir / "sweep.csv").open("w", newline="", encoding="utf-8") as handle:

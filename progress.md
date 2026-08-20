@@ -29,6 +29,7 @@
 - 新增 LayerNorm lowering/benchmark/CLI：显式 `reduce_sum -> layernorm_mean -> center -> reduce_sum_square -> layernorm` 双 barrier primitive DAG。
 - 新增 `sweep-workloads`：统一扫描 elementwise、LayerNorm、decoder fragment 等 workload 与 architecture/policy/window/ROB/tile-size，并为每个 case 导出完整计算图和泳道 artifact。
 - 新增 MachineConfig JSON round-trip、`load_machine_config` 和所有 workload CLI 的 `--machine-config`，允许外部版本化架构文件替换内置 profile。
+- `sweep-workloads` 增加 `--dynamic-priorities` 维度；LayerNorm priority demo 捕获 `critical_path` 慢于 `oldest_first` 的可复现实验。
 
 ### 验证
 

@@ -33,6 +33,7 @@
 - [ ] 冻结 semantic operator 与 lowering primitive taxonomy；
 - [x] 首批 semantic operator 的 lowering registry 与 mixed-graph handoff 契约；
 - [x] LayerNorm mean/variance barrier lowering 与 micro-test；
+- [x] workload sweep 的 dynamic priority 维度与 Static 配对 baseline；
 - [ ] 冻结五层 IR 的 normalized schema；
 - [ ] 冻结 ExecutionTask dependency/address schema；
 - [ ] 冻结 simulator event/tie-break 语义；

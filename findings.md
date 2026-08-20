@@ -61,6 +61,7 @@
 | LayerNorm 动态反例 | 默认 `128x96`、minimal、同一 graph/machine 下，static pipeline 为 3808 cycles，dynamic `critical_path` 为 4696 cycles；动态 priority 不能被解释成总是优于 static，必须同时 sweep priority、window、ROB 并查看 stall/occupancy trace |
 | 通用 workload sweep | `sweep-workloads` 对每个 workload/architecture/tile-size 缓存同一份 lowering，再在 policy/window/ROB 维度重放；每个 case 保留 semantic graph、execution graph 和 SVG/PNG/Perfetto，避免只比较汇总数字而看不到图结构 |
 | 外部 MachineConfig | canonical `MachineConfig.to_dict()` 已支持 round-trip 和 CLI `--machine-config`；自定义 memory hierarchy、execution unit、transfer path 可以不改 simulator 代码直接进入实验，但仍需通过 schema validation |
+| Priority sweep 反例 | `sweep-workloads --workloads layernorm --windows 8 --robs 8` 显示 static=3808；dynamic `oldest_first`=3808，而 dynamic `critical_path`=4696（speedup 0.811）。因此 priority 必须成为 manifest/sweep 的显式键 |
 
 ## 视觉发现
 
