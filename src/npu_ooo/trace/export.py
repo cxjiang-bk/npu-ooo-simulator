@@ -9,6 +9,11 @@ from typing import Any
 from npu_ooo.scheduler import ScheduleResult
 
 
+def write_artifact_json(artifact: Any, path: str | Path) -> None:
+    payload = artifact.to_dict() if hasattr(artifact, "to_dict") else artifact
+    Path(path).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
 def write_json(result: ScheduleResult, path: str | Path) -> None:
     Path(path).write_text(json.dumps(result.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
 

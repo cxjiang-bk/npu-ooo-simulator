@@ -98,7 +98,25 @@ PYTHONPATH=src python3 -m npu_ooo.cli two-mm \
   --output-dir out/two-mm-dynamic
 ```
 
-命令会生成 `summary.json`、`tasks.csv` 和 `swimlane.svg`。`--arch` 可选 `minimal`、`wide-mxu`、`lpu-like`；`--policy` 可选 `sequential`、`static_pipeline`、`dynamic_ready_queue`。
+命令会同时生成编译图和调度结果：
+
+```text
+model_spec.json         模型模板
+benchmark_case.json     本次 benchmark 参数
+model_instance.json     shape 实例化后的模型
+operator_graph.json     semantic operator/tensor 计算图
+operator_graph.svg      可直接查看的顶层计算图
+schedule.json           tile factor、loop order、stage
+tile_graph.json         具体 tile 实例和依赖
+execution_graph.json    load/matmul/store task 及依赖
+machine.json            本次 MachineConfig
+manifest.json           配置 hash、policy、周期和统计
+tasks.csv               task start/finish 时间
+swimlane.svg            资源泳道图
+perfetto.json           Perfetto/Chrome Trace
+```
+
+同时提供 `operator_graph.dot`、`tile_graph.dot`、`execution_graph.dot`，用于 Graphviz 或其他图分析工具。`--arch` 可选 `minimal`、`wide-mxu`、`lpu-like`；`--policy` 可选 `sequential`、`static_pipeline`、`dynamic_ready_queue`。
 
 ## 参考项目
 

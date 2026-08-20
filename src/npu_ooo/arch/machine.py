@@ -293,6 +293,7 @@ def minimal_machine_config() -> MachineConfig:
             TransferPathConfig("RF", "SRAM", "DMA", bandwidth_bytes_per_cycle=64, setup_latency_cycles=1),
             TransferPathConfig("SRAM", "DRAM", "DMA", bandwidth_bytes_per_cycle=16, setup_latency_cycles=2),
         ),
+        attributes={"source": "hand-written", "calibration_status": "analytical"},
     )
     _raise_if_invalid(config)
     return config

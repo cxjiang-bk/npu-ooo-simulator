@@ -34,6 +34,7 @@
 - 新增 `src/npu_ooo/lowering/matmul.py`：2mm `load -> matmul -> store` lowering、K 方向累加依赖、producer-consumer region 依赖和 MAC/traffic 统计。
 - 新增 `src/npu_ooo/scheduler/core.py`：sequential、static pipeline、dynamic ready queue，以及 task timing、stall 分解、Perfetto trace JSON。
 - 新增 `src/npu_ooo/trace/export.py` 和 `src/npu_ooo/cli.py`：命令行运行 2mm，并导出 summary JSON、task CSV 和无依赖 SVG 泳道图。
+- CLI 进一步导出 Model/Operator/Schedule/Tile/Execution Graph JSON、DOT 和 `operator_graph.svg`，把计算图 artifact 与时间线 artifact 明确分开。
 - 新增 `tests/test_pipeline.py`：覆盖边界 tile、2mm 统计、跨算子依赖、policy 差异和 architecture profile 差异。
 - `docs/model-layer.md`
 - `docs/operator-taxonomy.md`
@@ -49,7 +50,7 @@
 | Old `operator-opt` planning files | no remaining changes from this session | pass |
 | Implementation code | intentionally not created | pass |
 | Paper benchmark/model-layer review | Table IX, compiler stack, TISA operand/instruction fields reviewed | pass |
-| Python unit tests | 11 tests passed | pass |
+| Python unit tests | 12 tests passed | pass |
 | Python compileall | `src` and `tests` compile successfully | pass |
 | `git diff --check` | no whitespace errors | pass |
 
