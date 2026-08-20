@@ -132,6 +132,7 @@ architecture profile
 
 - 一条命令运行对比实验；
 - `sweep-two-mm` 批量扫描 architecture × tile size × policy × window × ROB；
+- `sweep-workloads` 已能扫描多个算子/模型 fragment × architecture × tile size × policy × window × ROB；
 - 每个 case 独立 manifest；
 - 汇总 CSV/JSON；
 - 单 workload CLI 已统一输出 SVG 和 PNG 泳道图；

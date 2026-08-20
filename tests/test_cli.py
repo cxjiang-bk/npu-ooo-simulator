@@ -207,6 +207,41 @@ class CliArtifactTest(unittest.TestCase):
             primitives = {task["primitive"] for task in execution_graph["tasks"]}
             self.assertTrue({"reduce_sum", "layernorm_mean", "center", "reduce_sum_square", "layernorm"}.issubset(primitives))
 
+    def test_workload_sweep_keeps_graph_artifacts_per_case(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            output = Path(directory)
+            exit_code = main(
+                [
+                    "sweep-workloads",
+                    "--workloads",
+                    "elementwise,layernorm,decoder-block",
+                    "--architectures",
+                    "minimal",
+                    "--policies",
+                    "static_pipeline,dynamic_ready_queue",
+                    "--windows",
+                    "1",
+                    "--robs",
+                    "1",
+                    "--tile-sizes",
+                    "16",
+                    "--output-dir",
+                    str(output),
+                ]
+            )
+            self.assertEqual(exit_code, 0)
+            sweep = json.loads((output / "sweep.json").read_text())
+            self.assertEqual(len(sweep), 6)
+            self.assertEqual({row["workload"] for row in sweep}, {"elementwise", "layernorm", "decoder-block"})
+            for row in sweep:
+                case_dir = output / (
+                    f"{row['workload']}__{row['architecture']}__{row['policy']}"
+                    f"__tile{row['tile_size']}__window{row['dependency_window']}__rob{row['rob_entries']}"
+                )
+                self.assertTrue((case_dir / "operator_graph.json").exists())
+                self.assertTrue((case_dir / "execution_graph.json").exists())
+                self.assertTrue((case_dir / "swimlane.png").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

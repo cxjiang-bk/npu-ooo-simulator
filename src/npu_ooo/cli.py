@@ -218,6 +218,27 @@ def build_parser() -> argparse.ArgumentParser:
     sweep.add_argument("--dynamic-priority", choices=("critical_path", "oldest_first"), default="critical_path")
     sweep.add_argument("--static-stage-offsets")
     sweep.add_argument("--static-stage-ii", type=float, default=1.0)
+    workload_sweep = subparsers.add_parser(
+        "sweep-workloads",
+        help="sweep multiple workloads, architectures and scheduler capacities",
+    )
+    workload_sweep.add_argument(
+        "--workloads",
+        default="two-mm,elementwise,reduce,softmax,rmsnorm,layernorm,decoder-block",
+    )
+    workload_sweep.add_argument("--architectures", default="minimal,wide-mxu")
+    workload_sweep.add_argument(
+        "--policies",
+        default=",".join(policy.value for policy in SchedulerPolicy),
+    )
+    workload_sweep.add_argument("--windows", default="4,8")
+    workload_sweep.add_argument("--robs", default="4,8")
+    workload_sweep.add_argument("--tile-sizes", default="32")
+    workload_sweep.add_argument("--output-dir", type=Path, default=Path("out/sweep-workloads"))
+    workload_sweep.add_argument("--address-scoreboard", action="store_true")
+    workload_sweep.add_argument("--dynamic-priority", choices=("critical_path", "oldest_first"), default="critical_path")
+    workload_sweep.add_argument("--static-stage-offsets")
+    workload_sweep.add_argument("--static-stage-ii", type=float, default=1.0)
     return parser
 
 
@@ -909,6 +930,182 @@ def run_sweep_two_mm(args: argparse.Namespace) -> int:
     return 0
 
 
+def _workload_builders():
+    return {
+        "two-mm": (build_two_matmul_model, build_two_matmul_case),
+        "elementwise": (build_elementwise_model, build_elementwise_case),
+        "reduce": (build_reduce_model, build_reduce_case),
+        "softmax": (build_softmax_model, build_softmax_case),
+        "rmsnorm": (build_rmsnorm_model, build_rmsnorm_case),
+        "layernorm": (build_layernorm_model, build_layernorm_case),
+        "decoder-block": (build_decoder_block_model, build_decoder_block_case),
+    }
+
+
+def run_sweep_workloads(args: argparse.Namespace) -> int:
+    workloads = _parse_list(args.workloads, name="--workloads")
+    architectures = _parse_list(args.architectures, name="--architectures")
+    policies = _parse_list(args.policies, name="--policies")
+    builders = _workload_builders()
+    unknown_workloads = sorted(set(workloads) - set(builders))
+    if unknown_workloads:
+        raise ValueError(f"unknown workload(s): {', '.join(unknown_workloads)}")
+    supported_architectures = {"minimal", "wide-mxu", "lpu-like"}
+    unknown_architectures = sorted(set(architectures) - supported_architectures)
+    if unknown_architectures:
+        raise ValueError(f"unknown architecture profile(s): {', '.join(unknown_architectures)}")
+    supported_policies = {policy.value for policy in SchedulerPolicy}
+    unknown_policies = sorted(set(policies) - supported_policies)
+    if unknown_policies:
+        raise ValueError(f"unsupported scheduler policy(s): {', '.join(unknown_policies)}")
+    windows = _parse_positive_int_list(args.windows, name="--windows")
+    robs = _parse_positive_int_list(args.robs, name="--robs")
+    tile_sizes = _parse_positive_int_list(args.tile_sizes, name="--tile-sizes")
+    stage_offsets = _parse_offsets(args.static_stage_offsets)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    lowered_cache: dict[tuple[str, str, int], tuple[object, object, object, object]] = {}
+    results: dict[tuple[str, str, str, int, int, int], object] = {}
+    records: list[dict[str, object]] = []
+    for workload, architecture, policy, dependency_window, rob_entries, tile_size in product(
+        workloads, architectures, policies, windows, robs, tile_sizes
+    ):
+        cache_key = (workload, architecture, tile_size)
+        machine = _machine(architecture)
+        if cache_key not in lowered_cache:
+            model_builder, _case_builder = builders[workload]
+            model = model_builder()
+            compile_case = builders[workload][1](
+                architecture_profile=architecture,
+                scheduler_profile=SchedulerPolicy.STATIC_PIPELINE.value,
+            )
+            instance = model.instantiate(compile_case)
+            schedule = default_mixed_schedule(instance.graph, tile_size=tile_size)
+            lowered = lower_mixed_model(instance, machine, schedule)
+            lowered_cache[cache_key] = (model, instance, schedule, lowered)
+        model, instance, schedule, lowered = lowered_cache[cache_key]
+        case = builders[workload][1](
+            architecture_profile=architecture,
+            scheduler_profile=policy,
+        )
+        static_config = stage_offsets if policy == SchedulerPolicy.STATIC_PIPELINE.value else ()
+        simulator_config = _simulator_config(
+            dependency_window=dependency_window,
+            rob_entries=rob_entries,
+            address_scoreboard=args.address_scoreboard,
+            static_stage_offsets=static_config,
+            static_stage_ii=args.static_stage_ii,
+            dynamic_priority=args.dynamic_priority,
+        )
+        result = schedule_execution_graph(
+            lowered.execution_graph,
+            machine,
+            policy,
+            simulator_config=simulator_config,
+        )
+        key = (workload, architecture, policy, dependency_window, rob_entries, tile_size)
+        results[key] = result
+        case_id = (
+            f"{workload}__{architecture}__{policy}__tile{tile_size}"
+            f"__window{dependency_window}__rob{rob_entries}"
+        )
+        case_dir = args.output_dir / case_id
+        case_dir.mkdir(parents=True, exist_ok=True)
+        write_artifact_json(model, case_dir / "model_spec.json")
+        write_artifact_json(case, case_dir / "benchmark_case.json")
+        write_artifact_json(instance, case_dir / "model_instance.json")
+        write_artifact_json(instance.graph, case_dir / "operator_graph.json")
+        write_artifact_json(schedule, case_dir / "schedule.json")
+        write_artifact_json(lowered.tile_graph, case_dir / "tile_graph.json")
+        write_artifact_json(lowered.execution_graph, case_dir / "execution_graph.json")
+        write_artifact_json(machine, case_dir / "machine.json")
+        write_json(result, case_dir / "summary.json")
+        write_csv(result, case_dir / "tasks.csv")
+        write_svg(result, case_dir / "swimlane.svg")
+        write_png(result, case_dir / "swimlane.png")
+        write_artifact_json(result.perfetto_trace(), case_dir / "perfetto.json")
+        write_artifact_json(result.metrics.get("address_hazards", []), case_dir / "address_dependencies.json")
+        write_artifact_json(
+            {
+                "schema_version": 1,
+                "case_id": case_id,
+                "benchmark": case.case_id,
+                "workload": workload,
+                "architecture": architecture,
+                "policy": policy,
+                "machine_hash": machine.stable_hash(),
+                "backend": result.backend,
+                "calibration_status": result.metrics["calibration_status"],
+                "simulator_config": result.metrics["simulator_config"],
+                "total_cycles": result.total_cycles,
+                "statistics": lowered.statistics,
+            },
+            case_dir / "manifest.json",
+        )
+
+    static_cycles = {
+        (workload, architecture, dependency_window, rob_entries, tile_size): results[
+            (workload, architecture, SchedulerPolicy.STATIC_PIPELINE.value, dependency_window, rob_entries, tile_size)
+        ].total_cycles
+        for workload, architecture, dependency_window, rob_entries, tile_size in product(
+            workloads, architectures, windows, robs, tile_sizes
+        )
+        if (
+            workload,
+            architecture,
+            SchedulerPolicy.STATIC_PIPELINE.value,
+            dependency_window,
+            rob_entries,
+            tile_size,
+        ) in results
+    }
+    for (workload, architecture, policy, dependency_window, rob_entries, tile_size), result in results.items():
+        baseline = static_cycles.get((workload, architecture, dependency_window, rob_entries, tile_size))
+        metrics = result.metrics
+        records.append(
+            {
+                "workload": workload,
+                "architecture": architecture,
+                "policy": policy,
+                "tile_size": tile_size,
+                "dependency_window": dependency_window,
+                "rob_entries": rob_entries,
+                "total_cycles": result.total_cycles,
+                "speedup_vs_static": (
+                    baseline / result.total_cycles
+                    if baseline is not None and result.total_cycles
+                    else None
+                ),
+                "address_scoreboard": args.address_scoreboard,
+                "dynamic_priority": args.dynamic_priority,
+                "address_hazard_count": metrics.get("address_hazard_count", 0),
+                "rob_peak": metrics.get("rob_peak", 0),
+                "ready_set_peak": metrics.get("ready_set_peak", 0),
+                "queue_wait_cycles": metrics.get("queue_wait_cycles", 0.0),
+                "stall_by_reason": json.dumps(metrics.get("stall_by_reason", {}), sort_keys=True),
+                "pipeline_drain_cycles": metrics.get("pipeline_drain_cycles", 0.0),
+                "completed_tile_count": metrics.get("completed_tile_count", 0),
+            }
+        )
+    records.sort(
+        key=lambda record: (
+            str(record["workload"]),
+            str(record["architecture"]),
+            int(record["tile_size"]),
+            str(record["policy"]),
+            int(record["dependency_window"]),
+            int(record["rob_entries"]),
+        )
+    )
+    with (args.output_dir / "sweep.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=tuple(records[0]))
+        writer.writeheader()
+        writer.writerows(records)
+    write_artifact_json(records, args.output_dir / "sweep.json")
+    print(json.dumps({"case_count": len(records), "output_dir": str(args.output_dir)}, sort_keys=True))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "two-mm":
@@ -927,6 +1124,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_layernorm(args)
     if args.command == "sweep-two-mm":
         return run_sweep_two_mm(args)
+    if args.command == "sweep-workloads":
+        return run_sweep_workloads(args)
     raise AssertionError(args.command)
 
 

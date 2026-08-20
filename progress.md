@@ -27,6 +27,7 @@
 - 新增 decoder one-block benchmark：`RMSNorm -> Matmul -> ResidualAdd`，支持 `decoder-block` CLI，生成完整 Model/Operator/Tile/Execution graph、summary、CSV、Perfetto、SVG/PNG 泳道。
 - 新增 `write_png` trace exporter，使用本机 ImageMagick/librsvg 进行 SVG 栅格化；PNG 后端缺失时会给出明确错误。
 - 新增 LayerNorm lowering/benchmark/CLI：显式 `reduce_sum -> layernorm_mean -> center -> reduce_sum_square -> layernorm` 双 barrier primitive DAG。
+- 新增 `sweep-workloads`：统一扫描 elementwise、LayerNorm、decoder fragment 等 workload 与 architecture/policy/window/ROB/tile-size，并为每个 case 导出完整计算图和泳道 artifact。
 
 ### 验证
 
@@ -36,6 +37,7 @@ decoder-block static_pipeline: 9504 cycles, 30 tiles, 114 tasks
 decoder-block dynamic_ready_queue: 9504 cycles, same graph and machine
 cross-operator dependencies: 24
 layernorm static_pipeline: 3808 cycles; dynamic_ready_queue (critical_path): 4696 cycles
+small workload sweep demo: 6 cases (3 workloads x 2 policies), each with graph JSON and PNG swimlane
 ```
 
 当前结果仍为 `calibration_status=analytical`。Decoder fragment 在 minimal profile 下 Static/Dynamic 恰好同周期；LayerNorm 则出现 dynamic critical-path 慢于 static 的反例。两者都说明动态机制、priority heuristic、window/ROB 和 barrier 结构必须作为独立实验维度。

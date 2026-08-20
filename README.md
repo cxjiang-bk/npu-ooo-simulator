@@ -196,6 +196,21 @@ PYTHONPATH=src python3 -m npu_ooo.cli sweep-two-mm \
 
 顶层的 `sweep.csv` / `sweep.json` 汇总 tile size、total cycles、相对 static 的 speedup、ROB/ready peak、stall 分解和 pipeline drain；各 case 子目录保留 `manifest.json`、`summary.json`、`tasks.csv`、`address_dependencies.json`、`perfetto.json`、`swimlane.svg` 和 `swimlane.png`。
 
+跨算子和跨模型结构的实验使用 `sweep-workloads`。它复用 lowering registry，把每个 workload 编译到同一套 ExecutionGraph/SchedulerResult artifact：
+
+```bash
+PYTHONPATH=src python3 -m npu_ooo.cli sweep-workloads \
+  --workloads elementwise,layernorm,decoder-block \
+  --architectures minimal,wide-mxu \
+  --policies static_pipeline,dynamic_ready_queue \
+  --windows 4,8 \
+  --robs 4,8 \
+  --tile-sizes 16,32 \
+  --output-dir out/sweep-workloads
+```
+
+每个 case 目录同时保留 `operator_graph.json`、`execution_graph.json`、`summary.json`、`tasks.csv`、`perfetto.json`、`swimlane.svg` 和 `swimlane.png`，顶层 `sweep.csv/json` 增加 workload 字段并计算相对 static 的 speedup。
+
 ## 参考项目
 
 - TileFlow/Timeloop：tiling、mapping、memory traffic 和 aggregate cost；
