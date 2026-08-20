@@ -1,0 +1,65 @@
+# 研究发现与决策
+
+## 需求
+
+- 从顶层算子建立独立编译与仿真栈；
+- 后端架构参数可配置，不能固定为当前 NPU；
+- 支持不同调度策略的泳道图和整体执行周期；
+- 复现 TISA 论文中的 sequential、static/dynamic dual/triple staged pipeline；
+- 旧 `operator-opt` 只作为只读参考。
+
+## 已确认事实
+
+- `operator-opt` 已覆盖 Fusion IR、Tiling Tree、Attention/2mm TileFlow mapping 和 aggregate cost，但缺少 per-tile execution lowering 和事件仿真；
+- 其 `LpuTaskGraph` 有 resource/duration/predecessor/start/finish，可作为粗粒度参考，不足以表达 queue、II、地址范围和 runtime wake-up；
+- TileFlow 的 `Sequential/Pipeline` 主要通过 cycle sum/max 构造 aggregate estimate，不直接产生论文所需的 per-tile issue/completion trace；
+- 当前可运行后端有较多 Attention 专用命名和路径规则，因此新项目必须采用 operator lowering registry；
+- Static 与 Dynamic 公平比较必须共享 tile graph、buffer、地址、依赖、latency 和 hardware config。
+
+## 开源参考定位
+
+| 项目 | 参考内容 | 不直接复用的部分 |
+|---|---|---|
+| TileFlow/Timeloop | mapping、tiling、memory traffic、aggregate cost | per-tile event simulation |
+| TVM-VTA | LOAD/COMPUTE/STORE、dependency token、static pipeline | VTA 固定 ISA/三级 pipeline |
+| Gemmini | queues、ROB、access/execute decoupling | RISC-V/RoCC 和 Gemmini 专用实现 |
+| SCALE-Sim | MXU/systolic timing、bandwidth/stall | 多 execution-unit OOO scheduler |
+| Perfetto | 多 lane event trace | scheduling semantics |
+
+## 技术决策
+
+| 决策 | 理由 |
+|---|---|
+| canonical MachineConfig 独立于 RTL parser | 支持手写探索 profile、RTL-derived profile 和未来其他 NPU |
+| 四层 IR 明确分离 | 防止 schedule factor、runtime tile 和 hardware task 混淆 |
+| 独立 ExecutionTask graph | 现有 aggregate task graph 无法承载 tile address/queue/event 语义 |
+| 确定性离散事件 simulator | 便于手算验证、回归和可复现实验 |
+| latency 与 initiation interval 分离 | 必须表达流水化执行单元的 overlap |
+| 2mm 先行，Attention 后接 | 先验证核心机制，再增加 softmax/barrier/cache 生命周期 |
+
+## 视觉发现
+
+论文示意图的五条时间线可以统一为 iteration-specific stage DAG：
+
+```text
+Sequential
+Static dual-stage
+Dynamic dual-stage
+Static triple-stage
+Dynamic triple-stage
+```
+
+彩色块表示不同 iteration 的 stage task；虚线表示静态 stage/iteration 边界；尾部阴影 `E*` 表示 pipeline drain 或依赖/资源造成的结束差异。新 simulator 必须显式输出 task start/end 和 drain cycles，不能只返回一个总 Cycle。
+
+## 待验证
+
+- TISA 原文对 tile dependency table、地址范围、窗口和完成事件的精确定义；
+- 当前 NPU ISA 的 issue/completion、SET/WAIT/FENCE 和 buffer address 语义；
+- 哪些 latency 可从 RTL source 提取，哪些必须通过 waveform/hardware counter 校准；
+- TileFlow mapping 到新 Schedule IR 的完整信息保真度。
+
+## 资源
+
+- 论文：`/home/lora/OpenTPU/ooo_research/Song 等 - Dynamic scheduling for AI accelerators via TISA.pdf`
+- 参考仓库：`/home/lora/OpenTPU/operator-opt`，仅只读使用；
+- 新项目：`https://github.com/cxjiang-bk/npu-ooo-simulator`。
