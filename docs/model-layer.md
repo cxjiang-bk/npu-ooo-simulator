@@ -72,6 +72,7 @@ GraphTemplate
 BenchmarkCase
   model_id
   case_id
+  evaluation_scope: one_block | layer | full_model
   batch
   sequence_length / image_height / image_width
   phase: train | prefill | decode
@@ -84,7 +85,7 @@ BenchmarkCase
   scheduler_profile
 ```
 
-Table IX 中的每一行应成为一个独立 `BenchmarkCase`，不能把 `DeepSeek prefill` 和 `DeepSeek decode` 混成同一个 case。
+论文中 Table VI 的 `GPTJ(oneblk)` / `LLaMA2(oneblk)` 与 Table IX 的端到端延迟不是同一评估粒度，因此 `evaluation_scope` 必须显式记录。Table IX 中的每一行应成为一个独立 `BenchmarkCase`，不能把 `DeepSeek prefill` 和 `DeepSeek decode` 混成同一个 case。
 
 ## 4. 运行阶段模型
 

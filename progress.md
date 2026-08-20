@@ -15,7 +15,7 @@
 
 ### 当前状态
 
-阶段 0 进行中：已确认需要在 Operator Graph 之上增加 Model/Benchmark IR，并把 semantic operator 与 lowering primitive 分离；下一步需要冻结 ModelConfig、MachineConfig、IR、event 和 manifest 的可执行 schema。
+阶段 0 进行中：已确认需要在 Operator Graph 之上增加 Model/Benchmark IR，并把 semantic operator 与 lowering primitive 分离；同时补充 `evaluation_scope` 以区分 one-block、layer 和 full-model 结果。下一步需要冻结 ModelConfig、MachineConfig、IR、event 和 manifest 的可执行 schema。
 
 ### 创建/修改文件
 

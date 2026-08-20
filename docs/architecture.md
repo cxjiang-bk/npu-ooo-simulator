@@ -62,6 +62,7 @@ ModelSpec {
 
 BenchmarkCase {
   model_id
+  evaluation_scope: one_block | layer | full_model
   batch, sequence_length, image_size
   phase: prefill | decode | train
   precision, quantization
