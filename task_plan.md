@@ -34,6 +34,7 @@
 - [x] 首批 semantic operator 的 lowering registry 与 mixed-graph handoff 契约；
 - [x] LayerNorm mean/variance barrier lowering 与 micro-test；
 - [x] workload sweep 的 dynamic priority 维度与 Static 配对 baseline；
+- [x] 单头 attention `QK^T -> Softmax -> PV` mixed graph 与 CLI；
 - [ ] 冻结五层 IR 的 normalized schema；
 - [ ] 冻结 ExecutionTask dependency/address schema；
 - [ ] 冻结 simulator event/tie-break 语义；
@@ -100,6 +101,7 @@
 | 旧仓库规划追加补丁首次锚点不匹配 | 1 | 使用稳定尾部锚点追加，之后按用户要求完整移除本轮追加内容 |
 | artifact 验证命令包含 `rm -rf` 被执行策略拒绝 | 1 | 不清理目录，直接由确定性导出覆盖同名 artifact |
 | LayerNorm barrier 测试错误假设首 tile 完成均值 | 1 | 按实际 M 外层/N 内层 tile 顺序断言每行最后一个 reduction tile |
+| Attention tile count 测试把三个阶段相乘 | 1 | 按 QK、Softmax、PV 三个独立 operator 的 tile 数求和，默认小图为 12 |
 
 ## 备注
 

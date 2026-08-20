@@ -208,6 +208,30 @@ class CliArtifactTest(unittest.TestCase):
             primitives = {task["primitive"] for task in execution_graph["tasks"]}
             self.assertTrue({"reduce_sum", "layernorm_mean", "center", "reduce_sum_square", "layernorm"}.issubset(primitives))
 
+    def test_attention_exports_qk_softmax_pv_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            output = Path(directory)
+            exit_code = main(
+                [
+                    "attention",
+                    "--arch",
+                    "minimal",
+                    "--policy",
+                    "dynamic_ready_queue",
+                    "--output-dir",
+                    str(output),
+                ]
+            )
+            self.assertEqual(exit_code, 0)
+            operator_graph = json.loads((output / "operator_graph.json").read_text())
+            self.assertEqual(
+                [operator["op_id"] for operator in operator_graph["operators"]],
+                ["attention_scores", "attention_softmax", "attention_context"],
+            )
+            execution_graph = json.loads((output / "execution_graph.json").read_text())
+            primitives = {task["primitive"] for task in execution_graph["tasks"]}
+            self.assertTrue({"matmul", "reduce_max", "normalize"}.issubset(primitives))
+
     def test_workload_sweep_keeps_graph_artifacts_per_case(self) -> None:
         with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
             output = Path(directory)

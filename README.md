@@ -143,6 +143,17 @@ PYTHONPATH=src python3 -m npu_ooo.cli decoder-block \
 
 该命令会同时生成 RMSNorm、Matmul、ResidualAdd 的 execution graph，以及跨算子 root-memory handoff 依赖。Static 与 Dynamic 应使用同一输出目录之外的同一 graph/machine 配置进行对比。
 
+`attention` 提供首个 attention 级闭环，固定为单头、无 mask/cache 的 `Q @ K^T -> Softmax -> P @ V`：
+
+```bash
+PYTHONPATH=src python3 -m npu_ooo.cli attention \
+  --arch minimal \
+  --policy dynamic_ready_queue \
+  --output-dir out/attention-dynamic
+```
+
+这是 attention 数据流和调度实验的最小 fragment，不等同完整 GQA/MQA、RoPE、KV-cache 或 flash attention 实现。
+
 当前已实现到 `Execution Graph -> analytical event simulator -> SchedulerResult`，输出 CSV/SVG、Perfetto/Chrome Trace 和 runtime queue/ROB 指标。后端仍是 analytical timing，不是 RTL cycle-accurate；真实 ISA/RTL timing 后续通过 `TimingModel` 接入。
 
 ### 快速运行
