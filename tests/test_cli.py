@@ -83,14 +83,17 @@ class CliArtifactTest(unittest.TestCase):
                     "1",
                     "--robs",
                     "1",
+                    "--tile-sizes",
+                    "16,32",
                     "--output-dir",
                     str(output),
                 ]
             )
             self.assertEqual(exit_code, 0)
             sweep = json.loads((output / "sweep.json").read_text())
-            self.assertEqual(len(sweep), 2)
+            self.assertEqual(len(sweep), 4)
             self.assertEqual({row["policy"] for row in sweep}, {"static_pipeline", "dynamic_ready_queue"})
+            self.assertEqual({row["tile_size"] for row in sweep}, {16, 32})
             for row in sweep:
                 case_dir = output / row["case_id"]
                 self.assertTrue((case_dir / "manifest.json").exists())

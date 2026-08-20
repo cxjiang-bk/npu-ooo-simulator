@@ -152,6 +152,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sweep.add_argument("--windows", default="4,8")
     sweep.add_argument("--robs", default="4,8")
+    sweep.add_argument("--tile-sizes", default="32")
     sweep.add_argument("--output-dir", type=Path, default=Path("out/sweep-two-mm"))
     sweep.add_argument("--address-scoreboard", action="store_true")
     sweep.add_argument("--dynamic-priority", choices=("critical_path", "oldest_first"), default="critical_path")
@@ -500,24 +501,26 @@ def run_sweep_two_mm(args: argparse.Namespace) -> int:
         raise ValueError(f"unsupported scheduler policy(s): {', '.join(unknown_policies)}")
     windows = _parse_positive_int_list(args.windows, name="--windows")
     robs = _parse_positive_int_list(args.robs, name="--robs")
+    tile_sizes = _parse_positive_int_list(args.tile_sizes, name="--tile-sizes")
     stage_offsets = _parse_offsets(args.static_stage_offsets)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     model = build_two_matmul_model()
     records: list[dict[str, object]] = []
-    results: dict[tuple[str, str, int, int], object] = {}
-    lowered_by_arch: dict[str, tuple[object, object, object]] = {}
-    for architecture, policy, dependency_window, rob_entries in product(architectures, policies, windows, robs):
+    results: dict[tuple[str, str, int, int, int], object] = {}
+    lowered_by_arch: dict[tuple[str, int], tuple[object, object, object]] = {}
+    for architecture, policy, dependency_window, rob_entries, tile_size in product(architectures, policies, windows, robs, tile_sizes):
         machine = _machine(architecture)
-        if architecture not in lowered_by_arch:
+        lowering_key = (architecture, tile_size)
+        if lowering_key not in lowered_by_arch:
             case = build_two_matmul_case(
                 architecture_profile=architecture,
                 scheduler_profile=SchedulerPolicy.STATIC_PIPELINE.value,
             )
             instance = model.instantiate(case)
-            schedule = default_two_matmul_schedule(instance.graph)
-            lowered_by_arch[architecture] = (instance, schedule, lower_two_matmul(instance, machine, schedule))
-        instance, schedule, lowered = lowered_by_arch[architecture]
+            schedule = default_two_matmul_schedule(instance.graph, tile_size=tile_size)
+            lowered_by_arch[lowering_key] = (instance, schedule, lower_two_matmul(instance, machine, schedule))
+        instance, schedule, lowered = lowered_by_arch[lowering_key]
         case = build_two_matmul_case(
             architecture_profile=architecture,
             scheduler_profile=policy,
@@ -537,9 +540,9 @@ def run_sweep_two_mm(args: argparse.Namespace) -> int:
             policy,
             simulator_config=simulator_config,
         )
-        key = (architecture, policy, dependency_window, rob_entries)
+        key = (architecture, policy, dependency_window, rob_entries, tile_size)
         results[key] = result
-        case_id = f"{architecture}__{policy}__window{dependency_window}__rob{rob_entries}"
+        case_id = f"{architecture}__{policy}__tile{tile_size}__window{dependency_window}__rob{rob_entries}"
         case_dir = args.output_dir / case_id
         case_dir.mkdir(parents=True, exist_ok=True)
         write_json(result, case_dir / "summary.json")
@@ -565,18 +568,19 @@ def run_sweep_two_mm(args: argparse.Namespace) -> int:
         )
 
     static_cycles = {
-        (architecture, dependency_window, rob_entries): results[(architecture, SchedulerPolicy.STATIC_PIPELINE.value, dependency_window, rob_entries)].total_cycles
-        for architecture, dependency_window, rob_entries in product(architectures, windows, robs)
-        if (architecture, SchedulerPolicy.STATIC_PIPELINE.value, dependency_window, rob_entries) in results
+        (architecture, dependency_window, rob_entries, tile_size): results[(architecture, SchedulerPolicy.STATIC_PIPELINE.value, dependency_window, rob_entries, tile_size)].total_cycles
+        for architecture, dependency_window, rob_entries, tile_size in product(architectures, windows, robs, tile_sizes)
+        if (architecture, SchedulerPolicy.STATIC_PIPELINE.value, dependency_window, rob_entries, tile_size) in results
     }
-    for (architecture, policy, dependency_window, rob_entries), result in results.items():
-        baseline = static_cycles.get((architecture, dependency_window, rob_entries))
+    for (architecture, policy, dependency_window, rob_entries, tile_size), result in results.items():
+        baseline = static_cycles.get((architecture, dependency_window, rob_entries, tile_size))
         metrics = result.metrics
         records.append(
             {
-                "case_id": f"{architecture}__{policy}__window{dependency_window}__rob{rob_entries}",
+                "case_id": f"{architecture}__{policy}__tile{tile_size}__window{dependency_window}__rob{rob_entries}",
                 "architecture": architecture,
                 "policy": policy,
+                "tile_size": tile_size,
                 "dependency_window": dependency_window,
                 "rob_entries": rob_entries,
                 "total_cycles": result.total_cycles,
@@ -593,7 +597,7 @@ def run_sweep_two_mm(args: argparse.Namespace) -> int:
                 "completed_tile_count": metrics.get("completed_tile_count", 0),
             }
         )
-    records.sort(key=lambda record: (str(record["architecture"]), str(record["policy"]), int(record["dependency_window"]), int(record["rob_entries"])))
+    records.sort(key=lambda record: (str(record["architecture"]), int(record["tile_size"]), str(record["policy"]), int(record["dependency_window"]), int(record["rob_entries"])))
     with (args.output_dir / "sweep.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=tuple(records[0]))
         writer.writeheader()

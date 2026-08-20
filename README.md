@@ -154,12 +154,13 @@ perfetto.json           Perfetto/Chrome Trace
 PYTHONPATH=src python3 -m npu_ooo.cli sweep-two-mm \
   --architectures minimal,wide-mxu \
   --policies static_pipeline,dynamic_ready_queue \
+  --tile-sizes 16,32 \
   --windows 4,8 \
   --robs 4,8 \
   --output-dir out/sweep-two-mm
 ```
 
-顶层的 `sweep.csv` / `sweep.json` 汇总 total cycles、相对 static 的 speedup、ROB/ready peak、stall 分解和 pipeline drain；各 case 子目录保留 `manifest.json`、`summary.json`、`tasks.csv`、`address_dependencies.json`、`perfetto.json` 和 `swimlane.svg`。
+顶层的 `sweep.csv` / `sweep.json` 汇总 tile size、total cycles、相对 static 的 speedup、ROB/ready peak、stall 分解和 pipeline drain；各 case 子目录保留 `manifest.json`、`summary.json`、`tasks.csv`、`address_dependencies.json`、`perfetto.json` 和 `swimlane.svg`。
 
 ## 参考项目
 

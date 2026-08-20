@@ -74,6 +74,28 @@ class PipelineTest(unittest.TestCase):
             minimal_result.metrics["resource_busy_cycles"]["MXU"],
         )
 
+    def test_two_mm_schedule_tile_size_changes_tile_graph_only(self) -> None:
+        coarse = lower_two_matmul(
+            self.instance,
+            minimal_machine_config(),
+            ScheduleSpec(
+                "two_mm_tile16",
+                tuple(
+                    OperatorSchedule(
+                        operator_id=operator.op_id,
+                        tile_sizes=tuple(
+                            (name, min(16, int(extent)))
+                            for name, extent in (*operator.iteration_dims, *operator.reduction_dims)
+                        ),
+                    )
+                    for operator in self.instance.graph.operators
+                ),
+            ),
+        )
+        fine = lower_two_matmul(self.instance, minimal_machine_config(), default_two_matmul_schedule(self.instance.graph))
+        self.assertGreater(coarse.statistics["tile_count"], fine.statistics["tile_count"])
+        self.assertNotEqual(coarse.statistics["task_count"], fine.statistics["task_count"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -52,6 +52,7 @@
 | address scoreboard 作为可选 runtime layer | 基于 active `BufferRegion` 生成 RAW/WAR/WAW issue stall，COMPLETE 后释放范围；不改写默认 graph，方便和 compile-time dependency 做公平对照 |
 | Elementwise/residual-add 先于 reduce/softmax 接入 | 它能验证多输入同形 tile、ARU primitive 和 producer-consumer store/load 依赖，同时不引入 reduction barrier 与指数近似等额外语义 |
 | Dynamic priority 必须作为独立实验维度 | Softmax 的 ARU/DMA 竞争反例中，`window=8/ROB=8` 下 critical-path heuristic 为 4808 cycles，oldest-first 为 3784 cycles；动态机制本身不保证某个启发式总是占优 |
+| Tile size 属于 mapping 实验维度，不属于 scheduler policy | 2mm `tile_size=16` 与 `32` 产生不同 tile/task graph 和周期，但每个 tile size 内 Static/Dynamic 仍共享完全相同的 lowered graph；sweep manifest 必须把 tile size 单独记录 |
 
 ## 视觉发现
 

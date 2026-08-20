@@ -140,13 +140,16 @@ class ScheduleSpec:
         }
 
 
-def default_two_matmul_schedule(graph: OperatorGraph) -> ScheduleSpec:
+def default_two_matmul_schedule(graph: OperatorGraph, *, tile_size: int = 32) -> ScheduleSpec:
     """Return a small, explicit schedule used by the first end-to-end example."""
+
+    if isinstance(tile_size, bool) or not isinstance(tile_size, int) or tile_size <= 0:
+        raise ValueError("2mm tile_size must be a positive integer")
 
     schedules: list[OperatorSchedule] = []
     for operator in graph.operators:
         dims = dict((*operator.iteration_dims, *operator.reduction_dims))
-        sizes = {name: min(32, extent) for name, extent in dims.items() if isinstance(extent, int)}
+        sizes = {name: min(tile_size, extent) for name, extent in dims.items() if isinstance(extent, int)}
         if len(sizes) != len(dims):
             raise ValueError("default 2mm schedule requires a resolved graph")
         schedules.append(
