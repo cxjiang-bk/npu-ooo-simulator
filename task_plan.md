@@ -6,7 +6,7 @@
 
 ## 当前阶段
 
-阶段 4：离散事件 backend、运行时窗口和 TISA-like address scoreboard。
+阶段 4-6：动态/TISA-like backend、算子覆盖和实验矩阵并行推进。
 
 ## 阶段状态
 
@@ -36,7 +36,7 @@
 - [ ] 冻结 trace/summary/manifest schema；
 - [x] 为 dual/triple pipeline 编写手算 golden case（dual reservation + drain 已由测试固定；stage_count 支持 triple）。
 
-阶段 0 目前已落地 Model/Operator/MachineConfig、Schedule/Tile/Execution、trace/summary/manifest 基础 schema；triple stage 仍需在实验矩阵中补充更复杂的 golden case。
+阶段 0 目前已落地 Model/Operator/MachineConfig、Schedule/Tile/Execution、trace/summary/manifest 基础 schema；核心 dual/triple golden case 已有，完整 normalized schema 版本策略和真实 ISA 契约仍待冻结。
 
 ## 第一里程碑
 
