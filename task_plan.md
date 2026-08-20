@@ -6,16 +6,16 @@
 
 ## 当前阶段
 
-阶段 0：Model IR、Operator taxonomy 与 timing 契约冻结。
+阶段 2/3：2mm tile graph、primitive lowering 与第一版 analytical scheduler。
 
 ## 阶段状态
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | 0 | Model IR、MachineConfig、IR、trace 和 experiment schema | in_progress |
-| 1 | Model IR、MachineConfig 与基础 Operator Graph IR | pending |
-| 2 | 2mm tile instance 和 primitive lowering | pending |
-| 3 | Static discrete-event simulator 与 trace | pending |
+| 1 | Model IR、MachineConfig 与基础 Operator Graph IR | completed |
+| 2 | 2mm tile instance 和 primitive lowering | completed |
+| 3 | Static discrete-event simulator 与 trace | in_progress |
 | 4 | Dynamic/TISA-like scheduler | pending |
 | 5 | Elementwise/Reduce/Softmax/Attention | pending |
 | 6 | Architecture x Schedule x Policy 实验框架 | pending |
@@ -36,6 +36,8 @@
 - [ ] 冻结 trace/summary/manifest schema；
 - [ ] 为 dual/triple pipeline 编写手算 golden case。
 
+阶段 0 目前已落地 Model/Operator/MachineConfig、Schedule/Tile/Execution 基础 schema；trace/experiment manifest 和手算 dual/triple golden case 仍待独立冻结。
+
 ## 第一里程碑
 
 ```text
@@ -48,6 +50,8 @@
 ```
 
 验收必须覆盖两个 architecture profile，并证明 Static/Dynamic 只改变 scheduler policy。
+
+当前已有两个 architecture profile 的 analytical cycle 对比和 Perfetto JSON；PNG swimlane、独立 CSV exporter、ROB/window 约束仍待后续提交。
 
 ## 关键问题
 

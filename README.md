@@ -16,7 +16,7 @@
   -> 总周期、利用率、stall 分解和泳道图
 ```
 
-当前阶段只冻结架构和实施计划，不包含 simulator 实现。
+当前已经具备第一条可执行闭环：2mm 模型实例化、显式 tiling、primitive execution graph，以及基于 MachineConfig 的 sequential/static-pipeline/dynamic-ready-queue analytical scheduler。输出包含总周期、等待分解和 Perfetto/Chrome Trace 事件；数值仍标记为 analytical，尚未宣称 RTL cycle-accurate。
 
 模型层是必要的：论文 benchmark 同时覆盖 ResNet50、BERT、GPT-J、LLaMA2 和 DeepSeek-R1，并区分 CNN、Transformer、prefill、decode、batch、sequence length 和 dtype。Operator IR 负责描述“一个算子做什么”，Model IR 负责描述“哪些算子以什么拓扑、重复次数和运行阶段组成一个 workload”。
 
@@ -84,6 +84,21 @@ npu-ooo-simulator/
 ```
 
 在该闭环稳定后，再加入 ARU/reduction、Attention 和更复杂的硬件资源。
+
+当前已实现到 `Execution Graph -> SchedulerResult`，CSV/SVG exporter 和独立的 event simulator 将在下一阶段拆出；现有 `ScheduleResult.perfetto_trace()` 已可被 Chrome/Perfetto 消费。
+
+### 快速运行
+
+无需安装第三方运行时依赖时，可直接从源码运行：
+
+```bash
+PYTHONPATH=src python3 -m npu_ooo.cli two-mm \
+  --arch minimal \
+  --policy dynamic_ready_queue \
+  --output-dir out/two-mm-dynamic
+```
+
+命令会生成 `summary.json`、`tasks.csv` 和 `swimlane.svg`。`--arch` 可选 `minimal`、`wide-mxu`、`lpu-like`；`--policy` 可选 `sequential`、`static_pipeline`、`dynamic_ready_queue`。
 
 ## 参考项目
 

@@ -42,6 +42,12 @@
 | 2mm 先行，Attention 后接 | 先验证核心机制，再增加 softmax/barrier/cache 生命周期 |
 | Model IR 先于 Operator Graph 实例化 | 模型重复 block、运行 phase、KV cache、mask 和 benchmark shape 不属于单个算子 |
 | semantic operator 与 primitive task 分离 | Dynamic scheduler 需要知道 `SOFTMAX`/`RMSNORM` 等语义，而 simulator 仍需计时 `reduce_max/exp/reduce_sum` 等 primitive |
+| ScheduleSpec 明确保存 tile factor、loop order、residency 和 stage | 让 mapping 结果可序列化，并与实际边界 tile、runtime task 解耦 |
+| TileInstance 的 coordinates 保存 tile index，bounds 保存实际 `[start, stop)` | 边界 tile 不会被错误地当成满 tile，后续地址/traffic 统计可直接复用 |
+| ExecutionTask 显式携带 BufferRegion 和 predecessor | 统一承载 TISA operand 的 TileShape/TileMem/AccessType 语义，scheduler 不需要猜 tensor 地址或依赖 |
+| Matmul lowering 对每个 K tile 建立累加链，最终 tile 才生成 store | 保留 partial-sum 生命周期，同时让跨算子 producer store -> consumer load 依赖可观察 |
+| Policy 只改变 ready-task 选择；task graph 与 MachineConfig 作为共享输入 | 保证 Static/Dynamic 周期差异归因于调度策略，而不是重新切 tile 或更换 timing model |
+| 第一版 scheduler 使用 unit latency + initiation interval 的确定性 list scheduling | 可快速生成可复现 timing/trace；队列、ROB、地址 scoreboard 将在独立 event simulator 阶段加入 |
 
 ## 视觉发现
 

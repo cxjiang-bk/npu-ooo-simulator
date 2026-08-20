@@ -15,7 +15,7 @@
 
 ### 当前状态
 
-阶段 0 进行中：已确认需要在 Operator Graph 之上增加 Model/Benchmark IR，并把 semantic operator 与 lowering primitive 分离；同时补充 `evaluation_scope` 以区分 one-block、layer 和 full-model 结果。下一步需要冻结 ModelConfig、MachineConfig、IR、event 和 manifest 的可执行 schema。
+阶段 2/3 进行中：Model/Benchmark、Operator Graph、MachineConfig、Schedule/Tile/Execution IR 已有标准库实现；默认 2mm 已完成 tile 展开、matmul load/compute/store lowering，并接入三种 deterministic analytical scheduling policy。下一步是拆出独立 event simulator、trace CSV/PNG exporter、窗口/ROB 约束和 dynamic scoreboard。
 
 ### 创建/修改文件
 
@@ -25,6 +25,16 @@
 - `task_plan.md`
 - `findings.md`
 - `progress.md`
+
+### 本轮实现
+
+- 新增 `src/npu_ooo/ir/schedule.py`：显式 tile factor、loop order、residency 和 stage schema；提供默认 2mm schedule。
+- 新增 `src/npu_ooo/ir/tile.py`：展开实际 tile bounds，保留边界 tile，并建立跨算子 tile dependency。
+- 新增 `src/npu_ooo/ir/execution.py`：primitive task、BufferRegion、读写地址范围和显式 predecessor graph。
+- 新增 `src/npu_ooo/lowering/matmul.py`：2mm `load -> matmul -> store` lowering、K 方向累加依赖、producer-consumer region 依赖和 MAC/traffic 统计。
+- 新增 `src/npu_ooo/scheduler/core.py`：sequential、static pipeline、dynamic ready queue，以及 task timing、stall 分解、Perfetto trace JSON。
+- 新增 `src/npu_ooo/trace/export.py` 和 `src/npu_ooo/cli.py`：命令行运行 2mm，并导出 summary JSON、task CSV 和无依赖 SVG 泳道图。
+- 新增 `tests/test_pipeline.py`：覆盖边界 tile、2mm 统计、跨算子依赖、policy 差异和 architecture profile 差异。
 - `docs/model-layer.md`
 - `docs/operator-taxonomy.md`
 
@@ -39,6 +49,21 @@
 | Old `operator-opt` planning files | no remaining changes from this session | pass |
 | Implementation code | intentionally not created | pass |
 | Paper benchmark/model-layer review | Table IX, compiler stack, TISA operand/instruction fields reviewed | pass |
+| Python unit tests | 11 tests passed | pass |
+| Python compileall | `src` and `tests` compile successfully | pass |
+| `git diff --check` | no whitespace errors | pass |
+
+### 当前 2mm analytical 结果
+
+默认 `M=128,K=64,L=96,N=80`、fp16、minimal profile 下：
+
+```text
+sequential          25856 cycles
+static_pipeline     21184 cycles
+dynamic_ready_queue 17984 cycles
+```
+
+这些数值用于验证调度趋势和 trace 语义，manifest 中应标记为 `calibration_status=analytical`。
 
 ## 五问重启检查
 
