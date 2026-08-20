@@ -15,7 +15,7 @@
 
 ### 当前状态
 
-阶段 0 进行中：文档层系统边界和路线图已确定，下一步需要冻结 MachineConfig、IR、event 和 manifest 的可执行 schema。
+阶段 0 进行中：已确认需要在 Operator Graph 之上增加 Model/Benchmark IR，并把 semantic operator 与 lowering primitive 分离；下一步需要冻结 ModelConfig、MachineConfig、IR、event 和 manifest 的可执行 schema。
 
 ### 创建/修改文件
 
@@ -25,6 +25,8 @@
 - `task_plan.md`
 - `findings.md`
 - `progress.md`
+- `docs/model-layer.md`
+- `docs/operator-taxonomy.md`
 
 ## 验证记录
 
@@ -36,12 +38,13 @@
 | Draft PR | `cxjiang-bk/npu-ooo-simulator#1` targets `main` | pass |
 | Old `operator-opt` planning files | no remaining changes from this session | pass |
 | Implementation code | intentionally not created | pass |
+| Paper benchmark/model-layer review | Table IX, compiler stack, TISA operand/instruction fields reviewed | pass |
 
 ## 五问重启检查
 
 | 问题 | 答案 |
 |---|---|
-| 我在哪里？ | 新项目阶段 0：契约冻结 |
+| 我在哪里？ | 新项目阶段 0：Model IR、算子分类和契约冻结 |
 | 我要去哪里？ | 2mm Static/Dynamic 可配置仿真第一里程碑 |
 | 目标是什么？ | 从顶层算子到参数化 NPU cycle simulator 的完整研究栈 |
 | 我学到了什么？ | 见 `findings.md` |

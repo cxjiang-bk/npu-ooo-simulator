@@ -5,7 +5,13 @@
 本项目研究的是 NPU 上的 tile-level scheduling，而不是仅做 loop mapping，也不是第一步就复刻某一款 NPU 的 RTL。
 
 ```text
-Operator Graph
+Model/Benchmark Case
+      |
+      v
+Model IR / Graph Template
+      |
+      v
+Operator Graph IR -------- Framework/StableHLO bridge
       |
       v
 Schedule/Tiling IR -------- Mapping search (optional)
@@ -25,11 +31,69 @@ Primitive Execution Graph <-------- MachineConfig
                  Trace + Cycle Summary
 ```
 
-Mapping 层决定 tile 如何切分、循环顺序和驻留；execution 层决定具体 tile 在哪些资源上、何时执行。两层不能混为一谈。
+Model 层决定 workload 的拓扑、重复结构、shape environment 和 execution phase；Operator 层决定单个算子的数学语义；Mapping 层决定 tile 如何切分、循环顺序和驻留；execution 层决定具体 tile 在哪些资源上、何时执行。四层不能混为一谈。
 
-## 2. 四层 IR
+论文中的 `Framework bridge -> Graph compiler -> Fusion compiler -> TISA generator -> backend` 对应本项目的 Model import、Operator Graph、Schedule/Tiling、Tile/TISA 和 simulator/backend。
 
-### 2.1 Operator Graph IR
+## 1.1 Model IR：为什么需要这一层
+
+只拥有 Operator Graph 不足以复现论文的 benchmark 表。以下信息不属于单个 operator：
+
+- 模型家族、版本和 block template；
+- block 重复次数、权重共享和跨层连接；
+- batch、sequence length、image resolution、hidden/head dimensions；
+- inference phase：`train`、`prefill`、`decode`；
+- KV cache、causal mask、position state 和其他 runtime state；
+- dtype、quantization、layout 和 benchmark warmup/repetition；
+- optional routing，例如 MoE token dispatch 和 expert capacity。
+
+因此 Model IR 不保存完整权重，也不把每一层无条件展开成巨型图，而是同时支持 `GraphTemplate` 和 `GraphInstance`：模板表达重复 block，实例化参数表达当前 benchmark case。
+
+一个最小 Model IR 可以表示为：
+
+```text
+ModelSpec {
+  name, family, version
+  shape_env, dtype, layout
+  execution_phase
+  graph_templates, top_level_nodes
+  persistent_state
+}
+
+BenchmarkCase {
+  model_id
+  batch, sequence_length, image_size
+  phase: prefill | decode | train
+  precision, quantization
+  model_config_id, architecture_config_id
+}
+```
+
+`ModelSpec` 经过实例化后才生成 Operator Graph IR。这样同一个 LLaMA block 可以复用于不同 sequence length、batch 和 prefill/decode case。
+
+## 2. 五层 IR
+
+### 2.1 Model/Benchmark IR
+
+描述 workload 的模型级语义：
+
+```text
+model family and version
+block templates and repetition
+shape environment and execution phase
+state/cache/parameter metadata
+benchmark case and measurement protocol
+```
+
+首批 model family：
+
+- `cnn_residual`：ResNet50；
+- `encoder_transformer`：BERT-Base；
+- `decoder_transformer`：GPT-J、LLaMA2；
+- `decoder_reasoning`：DeepSeek-R1-16B；
+- `moe_decoder`：作为可选扩展，不对 DeepSeek-R1 是否使用 MoE 做未经证实的假设。
+
+### 2.2 Operator Graph IR
 
 描述计算语义，不包含具体硬件：
 
@@ -47,7 +111,7 @@ Edge: producer, consumer, tensor
 - `softmax`，先作为可展开的 composite op；
 - Conv2D 只预留接口，后续再处理 halo、padding 和 layout。
 
-### 2.2 Schedule/Tiling IR
+### 2.3 Schedule/Tiling IR
 
 描述编译期 mapping 决策：
 
@@ -63,7 +127,7 @@ explicit child dependencies
 
 这一层允许手写 schedule，也允许以后接 TileFlow/Timeloop 或其他 mapper。
 
-### 2.3 Tile Instance IR
+### 2.4 Tile Instance IR
 
 把 schedule 中的切分规则展开成实际运行实例：
 
@@ -80,7 +144,7 @@ program order
 
 `M=32` 是 schedule factor；`M=[64,96)` 才是 tile instance。边界 tile 必须保留实际 shape。
 
-### 2.4 Primitive Execution Graph
+### 2.5 Primitive Execution Graph
 
 一个 operator tile 根据 MachineConfig lower 成若干 primitive task：
 

@@ -7,6 +7,7 @@
 - 支持不同调度策略的泳道图和整体执行周期；
 - 复现 TISA 论文中的 sequential、static/dynamic dual/triple staged pipeline；
 - 旧 `operator-opt` 只作为只读参考。
+- 论文 benchmark 需要 Model/Benchmark layer，不能只建立孤立 Operator Graph。
 
 ## 已确认事实
 
@@ -15,6 +16,9 @@
 - TileFlow 的 `Sequential/Pipeline` 主要通过 cycle sum/max 构造 aggregate estimate，不直接产生论文所需的 per-tile issue/completion trace；
 - 当前可运行后端有较多 Attention 专用命名和路径规则，因此新项目必须采用 operator lowering registry；
 - Static 与 Dynamic 公平比较必须共享 tile graph、buffer、地址、依赖、latency 和 hardware config。
+- TISA 原文的 compiler stack 是 `Framework bridge -> Graph compiler -> Fusion compiler -> TISA generator -> backend`，并使用 StableHLO/MLIR 保留 operator semantics；这直接支持在 Operator Graph 上增加 Model/Benchmark IR。
+- Table IX 的 benchmark case 具有不同 model family、dtype、batch、sequence/image shape 和 prefill/decode phase；每一行都应是独立 BenchmarkCase。
+- 论文 TISA instruction 不是只含 opcode：`OpType + Operands(TileShape/TileMem/AccessType) + Attributes + UnitMap`；这要求 semantic operator context 在 lowering 后仍保留。
 
 ## 开源参考定位
 
@@ -36,6 +40,8 @@
 | 确定性离散事件 simulator | 便于手算验证、回归和可复现实验 |
 | latency 与 initiation interval 分离 | 必须表达流水化执行单元的 overlap |
 | 2mm 先行，Attention 后接 | 先验证核心机制，再增加 softmax/barrier/cache 生命周期 |
+| Model IR 先于 Operator Graph 实例化 | 模型重复 block、运行 phase、KV cache、mask 和 benchmark shape 不属于单个算子 |
+| semantic operator 与 primitive task 分离 | Dynamic scheduler 需要知道 `SOFTMAX`/`RMSNORM` 等语义，而 simulator 仍需计时 `reduce_max/exp/reduce_sum` 等 primitive |
 
 ## 视觉发现
 
@@ -57,6 +63,9 @@ Dynamic triple-stage
 - 当前 NPU ISA 的 issue/completion、SET/WAIT/FENCE 和 buffer address 语义；
 - 哪些 latency 可从 RTL source 提取，哪些必须通过 waveform/hardware counter 校准；
 - TileFlow mapping 到新 Schedule IR 的完整信息保真度。
+- Model import 的 StableHLO/ONNX/PyTorch adapter 最小公共字段；
+- DeepSeek-R1-16B benchmark 的实际 dense/MoE 配置与 KV-cache/attention 细节；
+- ResNet50 inference 中 BatchNorm 是否已 fold 到 Conv；
 
 ## 资源
 

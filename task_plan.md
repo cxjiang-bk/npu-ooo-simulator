@@ -6,14 +6,14 @@
 
 ## 当前阶段
 
-阶段 0：契约冻结。
+阶段 0：Model IR、Operator taxonomy 与 timing 契约冻结。
 
 ## 阶段状态
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
-| 0 | MachineConfig、IR、trace 和 experiment schema | in_progress |
-| 1 | MachineConfig 与基础 Operator Graph IR | pending |
+| 0 | Model IR、MachineConfig、IR、trace 和 experiment schema | in_progress |
+| 1 | Model IR、MachineConfig 与基础 Operator Graph IR | pending |
 | 2 | 2mm tile instance 和 primitive lowering | pending |
 | 3 | Static discrete-event simulator 与 trace | pending |
 | 4 | Dynamic/TISA-like scheduler | pending |
@@ -27,7 +27,9 @@
 - [x] 确定系统分层和项目边界；
 - [x] 确定分阶段路线图和第一里程碑；
 - [ ] 冻结 MachineConfig 字段和版本策略；
-- [ ] 冻结四层 IR 的 normalized schema；
+- [ ] 冻结 Model/Benchmark IR 的 normalized schema；
+- [ ] 冻结 semantic operator 与 lowering primitive taxonomy；
+- [ ] 冻结五层 IR 的 normalized schema；
 - [ ] 冻结 ExecutionTask dependency/address schema；
 - [ ] 冻结 simulator event/tie-break 语义；
 - [ ] 冻结 trace/summary/manifest schema；
@@ -61,7 +63,10 @@
 | 新建 `cxjiang-bk/npu-ooo-simulator`，不在 `operator-opt` 上实现 | 研究后端需要独立的契约、测试和演进节奏，旧仓库只作为参考 |
 | 后端以 MachineConfig 驱动 | 支持不同 NPU、资源数量、queue/window、latency 和 bandwidth 探索 |
 | Static/Dynamic 共用 graph 和 simulator | 将性能差异严格归因到 scheduler policy |
-| 第一条闭环使用 2mm | 同时具备 producer-consumer pipeline 和可手算规模，适合验证依赖与 overlap |
+| 第一条闭环使用 2mm | 同时具备 producer-consumer pipeline 和可手算规模，适合验证依赖与 overlap；Model IR 仍从第一天保留 |
+| 在 Operator Graph 上增加 Model/Benchmark IR | 论文 benchmark 横跨 CNN/encoder/decoder、prefill/decode 和不同 batch/seq，单个算子图无法表达这些 workload 语义 |
+| semantic operator 与 lowering primitive 分离 | 保留 Attention/Softmax/Norm/MoE 的调度语义，同时允许硬件 timing 拆成 vector/reduction/transfer tasks |
+| 使用 GraphTemplate + GraphInstance | 避免重复 block 展开成巨型 graph，同时保留 layer/template provenance |
 | Trace 同时输出 cycle-native CSV/JSON 和 Perfetto JSON | 前者适合测试与数据分析，后者适合交互式泳道观察 |
 | Conv2D 后置 | halo、padding、layout 会过早扩大 lowering 复杂度 |
 | 第一版不宣称 cycle-accurate | timing model 需要经过外部模型和 RTL observation 分层校准 |
@@ -73,6 +78,7 @@
 - RTL/UVM 集成；
 - 未校准 energy 常数；
 - 将 TileFlow aggregate pipeline cycle 当作 event trace。
+- 把 DeepSeek-R1-16B 未经配置证据直接假设为 dense 或 MoE。
 
 ## 遇到的错误
 

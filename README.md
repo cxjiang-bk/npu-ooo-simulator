@@ -5,7 +5,8 @@
 项目目标是建立一条独立、可复现的研究链路：
 
 ```text
-顶层算子/融合图
+模型/benchmark case
+  -> Model IR
   -> Operator Graph IR
   -> Schedule/Tiling IR
   -> Tile Instance IR
@@ -17,9 +18,12 @@
 
 当前阶段只冻结架构和实施计划，不包含 simulator 实现。
 
+模型层是必要的：论文 benchmark 同时覆盖 ResNet50、BERT、GPT-J、LLaMA2 和 DeepSeek-R1，并区分 CNN、Transformer、prefill、decode、batch、sequence length 和 dtype。Operator IR 负责描述“一个算子做什么”，Model IR 负责描述“哪些算子以什么拓扑、重复次数和运行阶段组成一个 workload”。
+
 ## 研究目标
 
 - 支持 GEMM、2mm、elementwise、reduction/softmax 和 Attention benchmark；
+- 支持 CNN、encoder Transformer、decoder Transformer、长上下文和可选 MoE workload；
 - 在同一 tile graph 和同一硬件配置上公平比较 Static 与 Dynamic 调度；
 - 支持 sequential、static dual/triple pipeline 和 TISA-like dynamic dual/triple pipeline；
 - 后端架构参数可配置，不绑定某一版 NPU RTL；
@@ -52,7 +56,7 @@ npu-ooo-simulator/
 │   └── experiments/         # benchmark matrix
 ├── benchmarks/              # operator/fusion graph descriptions
 ├── src/npu_ooo/
-│   ├── ir/                  # operator, schedule, tile, execution IR
+│   ├── ir/                  # model, operator, schedule, tile, execution IR
 │   ├── arch/                # machine schema, validators, profile importers
 │   ├── lowering/            # operator tile -> primitive tasks
 │   ├── scheduler/           # sequential, static pipeline, dynamic ready queue
@@ -69,6 +73,7 @@ npu-ooo-simulator/
 
 ```text
 2mm
+  -> Model IR benchmark case
   -> 手写 Operator Graph
   -> 显式 tiling schedule
   -> tile instance graph

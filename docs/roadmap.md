@@ -6,21 +6,21 @@
 
 ## 阶段 0：契约冻结
 
-目标：确定 MachineConfig、四层 IR、Trace 和 Experiment manifest 的 schema。
+目标：确定 MachineConfig、Model/Benchmark IR、Operator/Schedule/Tile/Execution IR、Trace 和 Experiment manifest 的 schema。
 
 交付物：
 
 - MachineConfig schema 与校验规则；
-- Operator/Schedule/Tile/Execution IR 字段定义；
+- Model/Benchmark、Operator/Schedule/Tile/Execution IR 字段定义；
 - scheduler policy 接口；
 - event/summary/manifest schema；
 - 两个手算 pipeline 示例。
 
 验收：给定一张 dual-stage/triple-stage DAG，能够仅根据文档人工推导预期时间线；所有字段都能解释论文图中的 iteration、stage、尾部 drain 和总周期。
 
-## 阶段 1：MachineConfig 与基础 IR
+## 阶段 1：MachineConfig、Model IR 与基础 Operator IR
 
-目标：实现通用架构配置和 Operator Graph IR。
+目标：实现通用架构配置、Model/Benchmark IR 和 Operator Graph IR。
 
 首批 profile：
 
@@ -31,12 +31,15 @@
 验收：
 
 - profile 可序列化、校验并生成稳定 hash；
+- ModelSpec 支持 graph template、重复 block、shape environment 和 prefill/decode phase；
+- Table IX 的每个 model/config/phase 组合可以表达为独立 BenchmarkCase；
+- Operator Graph 保存 model/layer/template provenance；
 - 非法 memory parent、path 和 resource 引用在仿真前失败；
 - 修改 queue、bandwidth、MXU shape 不需要修改 simulator 代码。
 
 ## 阶段 2：2mm Tile Graph
 
-目标：跑通 `Operator Graph -> Schedule -> Tile Instance -> Execution Graph`。
+目标：跑通 `Model/Benchmark -> Operator Graph -> Schedule -> Tile Instance -> Execution Graph`。
 
 交付物：
 
@@ -96,19 +99,20 @@
 - 扩大 window 的收益和代价能从 trace/queue 指标解释；
 - Static/Dynamic 只切换 policy，不改变 graph 或 latency。
 
-## 阶段 5：算子与融合扩展
+## 阶段 5：模型与算子覆盖扩展
 
-目标：验证后端不是 2mm 专用 simulator。
+目标：验证后端不是 2mm 专用 simulator，并覆盖论文 benchmark 所需的模型结构。
 
 顺序：
 
-1. Elementwise；
-2. Reduce；
-3. Softmax composite lowering；
-4. Attention；
-5. Conv2D，后置处理 halo/layout。
+1. Elementwise/Reduce；
+2. ResNet bottleneck：Conv2D/Norm/Activation/Residual/Pooling；
+3. Softmax/LayerNorm/RMSNorm composite lowering；
+4. Decoder block：QKV/Attention/MLP/RoPE/KV cache；
+5. BERT/GPT-J/LLaMA2/DeepSeek benchmark templates；
+6. Conv2D halo/layout 和 optional MoE routing 作为后续扩展。
 
-验收：每种算子都有独立 lowering、micro-test 和至少一组 Static/Dynamic trace；scheduler 中无算子名称分支。
+验收：每种 P0 semantic operator 都有独立 lowering、micro-test 和至少一组 Static/Dynamic trace；模型层能实例化 CNN、encoder 和 decoder template；scheduler 中无模型或算子名称分支。
 
 ## 阶段 6：实验框架
 
