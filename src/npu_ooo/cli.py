@@ -6,7 +6,7 @@ import json
 from itertools import product
 from pathlib import Path
 
-from npu_ooo.arch import lpu_like_machine_config, minimal_machine_config, wide_mxu_machine_config
+from npu_ooo.arch import load_machine_config, lpu_like_machine_config, minimal_machine_config, wide_mxu_machine_config
 from npu_ooo.benchmarks import (
     build_decoder_block_case,
     build_decoder_block_model,
@@ -60,7 +60,9 @@ from npu_ooo.trace import (
 )
 
 
-def _machine(name: str):
+def _machine(name: str, config_path: Path | None = None):
+    if config_path is not None:
+        return load_machine_config(config_path)
     factories = {
         "minimal": minimal_machine_config,
         "wide-mxu": wide_mxu_machine_config,
@@ -109,6 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     two_mm = subparsers.add_parser("two-mm", help="compile and schedule the 2mm benchmark")
     two_mm.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
+    two_mm.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
     two_mm.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
     two_mm.add_argument("--output-dir", type=Path, default=Path("out/two-mm"))
     two_mm.add_argument("--instruction-queue-depth", type=int)
@@ -125,6 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
     two_mm.add_argument("--static-stage-ii", type=float, default=1.0)
     elementwise = subparsers.add_parser("elementwise", help="compile and schedule a residual-add benchmark")
     elementwise.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
+    elementwise.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
     elementwise.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
     elementwise.add_argument("--output-dir", type=Path, default=Path("out/elementwise"))
     elementwise.add_argument("--instruction-queue-depth", type=int)
@@ -138,6 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
     elementwise.add_argument("--static-stage-ii", type=float, default=1.0)
     reduce = subparsers.add_parser("reduce", help="compile and schedule a row-reduction benchmark")
     reduce.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
+    reduce.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
     reduce.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
     reduce.add_argument("--output-dir", type=Path, default=Path("out/reduce"))
     reduce.add_argument("--instruction-queue-depth", type=int)
@@ -151,6 +156,7 @@ def build_parser() -> argparse.ArgumentParser:
     reduce.add_argument("--static-stage-ii", type=float, default=1.0)
     softmax = subparsers.add_parser("softmax", help="compile and schedule a row-softmax benchmark")
     softmax.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
+    softmax.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
     softmax.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
     softmax.add_argument("--output-dir", type=Path, default=Path("out/softmax"))
     softmax.add_argument("--instruction-queue-depth", type=int)
@@ -164,6 +170,7 @@ def build_parser() -> argparse.ArgumentParser:
     softmax.add_argument("--static-stage-ii", type=float, default=1.0)
     rmsnorm = subparsers.add_parser("rmsnorm", help="compile and schedule an RMSNorm benchmark")
     rmsnorm.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
+    rmsnorm.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
     rmsnorm.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
     rmsnorm.add_argument("--output-dir", type=Path, default=Path("out/rmsnorm"))
     rmsnorm.add_argument("--instruction-queue-depth", type=int)
@@ -180,6 +187,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="compile and schedule an RMSNorm -> Matmul -> ResidualAdd fragment",
     )
     decoder_block.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
+    decoder_block.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
     decoder_block.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
     decoder_block.add_argument("--output-dir", type=Path, default=Path("out/decoder-block"))
     decoder_block.add_argument("--instruction-queue-depth", type=int)
@@ -193,6 +201,7 @@ def build_parser() -> argparse.ArgumentParser:
     decoder_block.add_argument("--static-stage-ii", type=float, default=1.0)
     layernorm = subparsers.add_parser("layernorm", help="compile and schedule a row-LayerNorm benchmark")
     layernorm.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
+    layernorm.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
     layernorm.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
     layernorm.add_argument("--output-dir", type=Path, default=Path("out/layernorm"))
     layernorm.add_argument("--instruction-queue-depth", type=int)
@@ -206,6 +215,7 @@ def build_parser() -> argparse.ArgumentParser:
     layernorm.add_argument("--static-stage-ii", type=float, default=1.0)
     sweep = subparsers.add_parser("sweep-two-mm", help="sweep 2mm architecture and scheduler parameters")
     sweep.add_argument("--architectures", default="minimal,wide-mxu")
+    sweep.add_argument("--machine-config", type=Path, help="use one canonical MachineConfig JSON for every case")
     sweep.add_argument(
         "--policies",
         default=",".join(policy.value for policy in SchedulerPolicy),
@@ -227,6 +237,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="two-mm,elementwise,reduce,softmax,rmsnorm,layernorm,decoder-block",
     )
     workload_sweep.add_argument("--architectures", default="minimal,wide-mxu")
+    workload_sweep.add_argument("--machine-config", type=Path, help="use one canonical MachineConfig JSON for every case")
     workload_sweep.add_argument(
         "--policies",
         default=",".join(policy.value for policy in SchedulerPolicy),
@@ -269,7 +280,7 @@ def _simulator_config(
 
 
 def run_two_mm(args: argparse.Namespace) -> int:
-    machine = _machine(args.arch)
+    machine = _machine(args.arch, args.machine_config)
     model = build_two_matmul_model()
     case = build_two_matmul_case(
         architecture_profile=args.arch,
@@ -359,7 +370,7 @@ def run_two_mm(args: argparse.Namespace) -> int:
 
 
 def run_elementwise(args: argparse.Namespace) -> int:
-    machine = _machine(args.arch)
+    machine = _machine(args.arch, args.machine_config)
     model = build_elementwise_model()
     case = build_elementwise_case(
         architecture_profile=args.arch,
@@ -434,7 +445,7 @@ def run_elementwise(args: argparse.Namespace) -> int:
 
 
 def run_reduce(args: argparse.Namespace) -> int:
-    machine = _machine(args.arch)
+    machine = _machine(args.arch, args.machine_config)
     model = build_reduce_model()
     case = build_reduce_case(
         architecture_profile=args.arch,
@@ -504,7 +515,7 @@ def run_reduce(args: argparse.Namespace) -> int:
 
 
 def run_softmax(args: argparse.Namespace) -> int:
-    machine = _machine(args.arch)
+    machine = _machine(args.arch, args.machine_config)
     model = build_softmax_model()
     case = build_softmax_case(
         architecture_profile=args.arch,
@@ -574,7 +585,7 @@ def run_softmax(args: argparse.Namespace) -> int:
 
 
 def run_rmsnorm(args: argparse.Namespace) -> int:
-    machine = _machine(args.arch)
+    machine = _machine(args.arch, args.machine_config)
     model = build_rmsnorm_model()
     case = build_rmsnorm_case(
         architecture_profile=args.arch,
@@ -644,7 +655,7 @@ def run_rmsnorm(args: argparse.Namespace) -> int:
 
 
 def run_decoder_block(args: argparse.Namespace) -> int:
-    machine = _machine(args.arch)
+    machine = _machine(args.arch, args.machine_config)
     model = build_decoder_block_model()
     case = build_decoder_block_case(
         architecture_profile=args.arch,
@@ -730,7 +741,7 @@ def run_decoder_block(args: argparse.Namespace) -> int:
 
 
 def run_layernorm(args: argparse.Namespace) -> int:
-    machine = _machine(args.arch)
+    machine = _machine(args.arch, args.machine_config)
     model = build_layernorm_model()
     case = build_layernorm_case(
         architecture_profile=args.arch,
@@ -832,7 +843,7 @@ def run_sweep_two_mm(args: argparse.Namespace) -> int:
     results: dict[tuple[str, str, int, int, int], object] = {}
     lowered_by_arch: dict[tuple[str, int], tuple[object, object, object]] = {}
     for architecture, policy, dependency_window, rob_entries, tile_size in product(architectures, policies, windows, robs, tile_sizes):
-        machine = _machine(architecture)
+        machine = _machine(architecture, args.machine_config)
         lowering_key = (architecture, tile_size)
         if lowering_key not in lowered_by_arch:
             case = build_two_matmul_case(
@@ -971,7 +982,7 @@ def run_sweep_workloads(args: argparse.Namespace) -> int:
         workloads, architectures, policies, windows, robs, tile_sizes
     ):
         cache_key = (workload, architecture, tile_size)
-        machine = _machine(architecture)
+        machine = _machine(architecture, args.machine_config)
         if cache_key not in lowered_cache:
             model_builder, _case_builder = builders[workload]
             model = model_builder()

@@ -27,6 +27,7 @@
 - [x] 确定系统分层和项目边界；
 - [x] 确定分阶段路线图和第一里程碑；
 - [ ] 冻结 MachineConfig 字段和版本策略；
+- [x] MachineConfig canonical JSON round-trip 与 CLI 外部配置入口；
 - [ ] 冻结 Model/Benchmark IR 的 normalized schema；
 - [ ] 冻结 `evaluation_scope=one_block|layer|full_model` 语义；
 - [ ] 冻结 semantic operator 与 lowering primitive taxonomy；

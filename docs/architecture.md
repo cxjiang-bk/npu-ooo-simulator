@@ -173,6 +173,8 @@ load-left -> load-right -> mxu-compute -> psum-update -> store-output
 
 MachineConfig 是 TileFlow emitter、operator lowering 和 simulator 的共同事实来源。
 
+除内置 profile 外，`MachineConfig.to_dict()` 产生的 canonical JSON 可以通过 `MachineConfig.from_dict()` / `load_machine_config()` 读回，并由 CLI 的 `--machine-config` 直接使用。这样实验矩阵可来自 profile 名称，也可来自版本化的外部架构文件；两者都必须将 `stable_hash()` 写入 manifest。
+
 ### 3.1 Memory
 
 每个 memory level 至少包含：

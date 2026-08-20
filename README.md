@@ -178,7 +178,7 @@ swimlane.png            PNG 资源泳道图（由 ImageMagick/librsvg 导出）
 perfetto.json           Perfetto/Chrome Trace
 ```
 
-同时提供 `operator_graph.dot`、`tile_graph.dot`、`execution_graph.dot`，用于 Graphviz 或其他图分析工具。`--arch` 可选 `minimal`、`wide-mxu`、`lpu-like`；`--policy` 可选 `sequential`、`static_pipeline`、`dynamic_ready_queue`。
+同时提供 `operator_graph.dot`、`tile_graph.dot`、`execution_graph.dot`，用于 Graphviz 或其他图分析工具。`--arch` 可选 `minimal`、`wide-mxu`、`lpu-like`；`--machine-config path/to/machine.json` 可以直接加载 canonical MachineConfig JSON，用于探索任意自定义 memory/unit/path 参数；`--policy` 可选 `sequential`、`static_pipeline`、`dynamic_ready_queue`。manifest 中的 `machine_hash` 是实际加载配置的稳定标识。
 
 运行时容量可以通过 `--instruction-queue-depth`、`--rob-entries`、`--max-inflight-tiles`、`--dependency-window` 和 `--ready-queue-depth` 覆盖 MachineConfig 默认值；实际生效值会写入 `manifest.json` 和 `summary.json`。`--address-scoreboard` 启用运行时 range scoreboard：活跃 task 的重叠 `BufferRegion` 会产生 RAW/WAR/WAW issue stall，完成后释放并唤醒等待者。动态 policy 可用 `--dynamic-priority critical_path|oldest_first` 切换启发式。静态流水线可用 `--static-stage-offsets 0,200 --static-stage-ii 250` 显式指定 stage reservation；不提供该参数时保留默认 program-order static baseline。
 

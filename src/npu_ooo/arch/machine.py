@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import hashlib
 import json
+from pathlib import Path
 from typing import Any, Mapping
 
 
@@ -195,6 +196,10 @@ class MachineConfig:
     scheduler: SchedulerCapacityConfig = field(default_factory=SchedulerCapacityConfig)
     attributes: Mapping[str, Any] = field(default_factory=dict)
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "MachineConfig":
+        return machine_config_from_dict(payload)
+
     def validate(self) -> tuple[str, ...]:
         issues: list[str] = []
         if not self.config_id:
@@ -359,3 +364,86 @@ def _raise_if_invalid(config: MachineConfig) -> None:
     issues = config.validate()
     if issues:
         raise ValueError("; ".join(issues))
+
+
+def machine_config_from_dict(payload: Mapping[str, Any]) -> MachineConfig:
+    """Decode the canonical MachineConfig JSON schema without binding to a profile name."""
+
+    if not isinstance(payload, Mapping):
+        raise ValueError("machine config payload must be an object")
+    try:
+        memory_levels = tuple(
+            MemoryLevelConfig(
+                name=item["name"],
+                parent=item.get("parent"),
+                capacity_bytes=item.get("capacity_bytes"),
+                read_bandwidth_bytes_per_cycle=item["read_bandwidth_bytes_per_cycle"],
+                write_bandwidth_bytes_per_cycle=item["write_bandwidth_bytes_per_cycle"],
+                read_latency_cycles=item.get("read_latency_cycles", 0.0),
+                write_latency_cycles=item.get("write_latency_cycles", 0.0),
+                read_ports=item.get("read_ports", 1),
+                write_ports=item.get("write_ports", 1),
+                bank_count=item.get("bank_count", 1),
+                bank_width_bytes=item.get("bank_width_bytes"),
+                alignment_bytes=item.get("alignment_bytes", 1),
+                attributes=item.get("attributes", {}),
+            )
+            for item in payload["memory_levels"]
+        )
+        execution_units = tuple(
+            ExecutionUnitConfig(
+                name=item["name"],
+                count=item.get("count", 1),
+                supported_ops=tuple(item.get("supported_ops", ())),
+                queue_depth=item.get("queue_depth", 1),
+                issue_width=item.get("issue_width", 1),
+                pipeline_depth=item.get("pipeline_depth", 1),
+                latency_cycles=item.get("latency_cycles", 1.0),
+                initiation_interval_cycles=item.get("initiation_interval_cycles", 1.0),
+                attributes=item.get("attributes", {}),
+            )
+            for item in payload["execution_units"]
+        )
+        transfer_paths = tuple(
+            TransferPathConfig(
+                source=item["source"],
+                target=item["target"],
+                engine=item["engine"],
+                channel_count=item.get("channel_count", 1),
+                bandwidth_bytes_per_cycle=item.get("bandwidth_bytes_per_cycle", 1.0),
+                setup_latency_cycles=item.get("setup_latency_cycles", 0.0),
+                transform=item.get("transform"),
+                transform_latency_cycles=item.get("transform_latency_cycles", 0.0),
+                can_overlap=item.get("can_overlap", True),
+                attributes=item.get("attributes", {}),
+            )
+            for item in payload["transfer_paths"]
+        )
+        scheduler_payload = payload.get("scheduler", {})
+        scheduler = SchedulerCapacityConfig(
+            instruction_queue_depth=scheduler_payload.get("instruction_queue_depth", 16),
+            rob_entries=scheduler_payload.get("rob_entries", 8),
+            max_inflight_tiles=scheduler_payload.get("max_inflight_tiles", 8),
+            dependency_window=scheduler_payload.get("dependency_window", 8),
+        )
+        config = MachineConfig(
+            config_id=payload["config_id"],
+            memory_levels=memory_levels,
+            execution_units=execution_units,
+            transfer_paths=transfer_paths,
+            scheduler=scheduler,
+            attributes=payload.get("attributes", {}),
+        )
+    except (KeyError, TypeError, AttributeError) as exc:
+        raise ValueError("invalid machine config payload") from exc
+    _raise_if_invalid(config)
+    return config
+
+
+def load_machine_config(path: str | Path) -> MachineConfig:
+    config_path = Path(path)
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot load machine config '{config_path}': {exc}") from exc
+    return machine_config_from_dict(payload)

@@ -2,7 +2,9 @@
 
 from .machine import (
     ExecutionUnitConfig,
+    load_machine_config,
     MachineConfig,
+    machine_config_from_dict,
     MemoryLevelConfig,
     SchedulerCapacityConfig,
     TransferPathConfig,
@@ -13,7 +15,9 @@ from .machine import (
 
 __all__ = [
     "ExecutionUnitConfig",
+    "load_machine_config",
     "MachineConfig",
+    "machine_config_from_dict",
     "MemoryLevelConfig",
     "SchedulerCapacityConfig",
     "TransferPathConfig",

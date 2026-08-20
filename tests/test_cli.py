@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from npu_ooo.arch import minimal_machine_config
 from npu_ooo.cli import main
 
 
@@ -241,6 +242,30 @@ class CliArtifactTest(unittest.TestCase):
                 self.assertTrue((case_dir / "operator_graph.json").exists())
                 self.assertTrue((case_dir / "execution_graph.json").exists())
                 self.assertTrue((case_dir / "swimlane.png").exists())
+
+    def test_cli_accepts_canonical_machine_config_json(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "machine.json"
+            output = Path(directory) / "run"
+            config_path.write_text(
+                json.dumps(minimal_machine_config().to_dict()),
+                encoding="utf-8",
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                exit_code = main(
+                    [
+                        "elementwise",
+                        "--machine-config",
+                        str(config_path),
+                        "--policy",
+                        "dynamic_ready_queue",
+                        "--output-dir",
+                        str(output),
+                    ]
+                )
+            self.assertEqual(exit_code, 0)
+            manifest = json.loads((output / "manifest.json").read_text())
+            self.assertEqual(manifest["machine_hash"], minimal_machine_config().stable_hash())
 
 
 if __name__ == "__main__":

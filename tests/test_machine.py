@@ -5,6 +5,7 @@ from npu_ooo.arch import (
     MemoryLevelConfig,
     lpu_like_machine_config,
     minimal_machine_config,
+    machine_config_from_dict,
     wide_mxu_machine_config,
 )
 
@@ -52,6 +53,13 @@ class MachineConfigTest(unittest.TestCase):
             transfer_paths=(),
         )
         self.assertTrue(any("cycle" in issue for issue in broken.validate()))
+
+    def test_canonical_dict_round_trip_is_configurable(self) -> None:
+        base = minimal_machine_config()
+        decoded = machine_config_from_dict(base.to_dict())
+        self.assertEqual(decoded.to_dict(), base.to_dict())
+        self.assertEqual(decoded.stable_hash(), base.stable_hash())
+        self.assertEqual(MachineConfig.from_dict(base.to_dict()).config_id, "minimal")
 
 
 if __name__ == "__main__":
