@@ -10,6 +10,8 @@
 - 确定项目独立于 `operator-opt`，旧仓库只作为参考；
 - 编写总体架构、路线图、任务计划和研究发现；
 - 明确第一条闭环是 2mm + configurable DMA/MXU + Static/Dynamic trace。
+- 在 `codex/initial-research-plan` 分支提交规划文档，并创建 draft PR：
+  `https://github.com/cxjiang-bk/npu-ooo-simulator/pull/1`。
 
 ### 当前状态
 
@@ -30,6 +32,8 @@
 |---|---|---|
 | GitHub repository created | `cxjiang-bk/npu-ooo-simulator` | pass |
 | Local remote | `origin` points to GitHub repository | pass |
+| Planning commit | `24d9497` on `codex/initial-research-plan` | pass |
+| Draft PR | `cxjiang-bk/npu-ooo-simulator#1` targets `main` | pass |
 | Old `operator-opt` planning files | no remaining changes from this session | pass |
 | Implementation code | intentionally not created | pass |
 
