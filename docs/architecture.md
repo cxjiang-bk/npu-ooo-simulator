@@ -248,6 +248,16 @@ issue width
 
 Scheduler 只消费统一的 ExecutionTask，不包含算子专用分支。
 
+当前 registry 已支持 `matmul/batched_matmul/gemv`、`elementwise/residual_add`、`reduce`、`softmax`、`rmsnorm` 和 `layernorm`。`lower_mixed_graph` 对 heterogeneous graph 按拓扑逐算子调用插件，再将每个插件的任务合并为一个 ExecutionGraph：
+
+```text
+Operator A store(root, tensor T)
+       -- DataEdge(T) + BufferRegion overlap -->
+Operator B load(root, tensor T)
+```
+
+这是一版保守的跨算子 handoff，明确要求上游写回 root memory、下游从 root memory 读取。它适合先比较调度策略，避免 scheduler 猜测 tensor 地址；后续 mapping/residency 优化可以替换为 local-memory handoff 或真正的 fusion lowering，而不改动 policy 接口。
+
 首批 lowering 顺序：
 
 ```text

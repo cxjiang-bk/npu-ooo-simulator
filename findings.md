@@ -54,6 +54,11 @@
 | Dynamic priority 必须作为独立实验维度 | Softmax 的 ARU/DMA 竞争反例中，`window=8/ROB=8` 下 critical-path heuristic 为 4808 cycles，oldest-first 为 3784 cycles；动态机制本身不保证某个启发式总是占优 |
 | Tile size 属于 mapping 实验维度，不属于 scheduler policy | 2mm `tile_size=16` 与 `32` 产生不同 tile/task graph 和周期，但每个 tile size 内 Static/Dynamic 仍共享完全相同的 lowered graph；sweep manifest 必须把 tile size 单独记录 |
 | RMSNorm 可先建模为 sum-square barrier | `square -> reduce_sum_square -> rmsnorm` 保留跨 reduction tile 的生命周期和完成依赖；epsilon/scale 的数值语义留在 operator attributes，当前 analytical timing 不宣称数值精确 |
+| 混合图使用 lowering registry 而不是 scheduler 分支 | registry 按 semantic operator type 选择插件；dispatcher 只负责拓扑拼接、全局 program order 和显式 DataEdge 的 root-memory region handoff，因而 Static/Dynamic 仍消费同一 ExecutionGraph |
+| 混合图首个 decoder fragment | `RMSNorm -> Matmul -> ResidualAdd` 覆盖 decoder block 常见 pre-norm/projection/residual 数据流；当前以 shape-only 权重和 conservative GM store/load handoff 表达，不等同完整 GPT-J/LLaMA attention block |
+| PNG 泳道导出 | SVG 作为 canonical trace visualization，PNG 由可替换的 ImageMagick/librsvg 外部 rasterizer 生成；缺少转换器时应报告环境缺失，不把 SVG 冒充 PNG |
+| LayerNorm barrier 建模 | 每个 row 先串行累加 `reduce_sum`，再发射单个 `layernorm_mean`；之后按 tile 做 `center` 和串行 `reduce_sum_square`，最终 `layernorm` 等待完整 variance barrier。该 DAG 比 RMSNorm 多一个全行统计阶段，适合观察 window/priority 对 barrier 的影响 |
+| LayerNorm 动态反例 | 默认 `128x96`、minimal、同一 graph/machine 下，static pipeline 为 3808 cycles，dynamic `critical_path` 为 4696 cycles；动态 priority 不能被解释成总是优于 static，必须同时 sweep priority、window、ROB 并查看 stall/occupancy trace |
 
 ## 视觉发现
 

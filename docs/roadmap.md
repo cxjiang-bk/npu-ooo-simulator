@@ -107,8 +107,8 @@
 
 1. Elementwise/Reduce（elementwise/residual-add、row-reduce 已完成 lowering 闭环）；
 2. ResNet bottleneck：Conv2D/Norm/Activation/Residual/Pooling；
-3. Softmax/LayerNorm/RMSNorm composite lowering（softmax 和 RMSNorm 已展开 composite primitive）；
-4. Decoder block：QKV/Attention/MLP/RoPE/KV cache；
+3. Softmax/LayerNorm/RMSNorm composite lowering（softmax、LayerNorm 和 RMSNorm 已展开 composite primitive）；
+4. Decoder block：已先接入 `RMSNorm -> Matmul -> ResidualAdd` 混合 fragment；下一步扩展 QKV/Attention/MLP/RoPE/KV cache；
 5. BERT/GPT-J/LLaMA2/DeepSeek benchmark templates；
 6. Conv2D halo/layout 和 optional MoE routing 作为后续扩展。
 
@@ -134,6 +134,7 @@ architecture profile
 - `sweep-two-mm` 批量扫描 architecture × tile size × policy × window × ROB；
 - 每个 case 独立 manifest；
 - 汇总 CSV/JSON；
+- 单 workload CLI 已统一输出 SVG 和 PNG 泳道图；
 - total cycle、speedup、utilization、stall、drain、buffer/queue peak；
 - 可复现的泳道图目录。
 

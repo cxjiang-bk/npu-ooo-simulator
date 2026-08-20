@@ -255,3 +255,61 @@ def default_rmsnorm_schedule(graph: OperatorGraph) -> ScheduleSpec:
     if issues:
         raise ValueError("; ".join(issues))
     return result
+
+
+def default_layernorm_schedule(graph: OperatorGraph) -> ScheduleSpec:
+    """Return a 32x32 iteration/reduction tile schedule for LayerNorm."""
+
+    schedules: list[OperatorSchedule] = []
+    for operator in graph.operators:
+        if operator.normalized_type != "layernorm":
+            raise ValueError(f"default LayerNorm schedule does not support '{operator.normalized_type}'")
+        dimensions = tuple((*operator.iteration_dims, *operator.reduction_dims))
+        schedules.append(
+            OperatorSchedule(
+                operator_id=operator.op_id,
+                tile_sizes=tuple((name, min(32, int(extent))) for name, extent in dimensions),
+                loop_order=tuple(name for name, _ in dimensions),
+            )
+        )
+    result = ScheduleSpec("layernorm_default", tuple(schedules), attributes={"source": "hand-written"})
+    issues = result.validate(graph)
+    if issues:
+        raise ValueError("; ".join(issues))
+    return result
+
+
+def default_mixed_schedule(graph: OperatorGraph, *, tile_size: int = 32) -> ScheduleSpec:
+    """Build a resolved, topology-staged schedule for heterogeneous operator graphs."""
+
+    if isinstance(tile_size, bool) or not isinstance(tile_size, int) or tile_size <= 0:
+        raise ValueError("mixed schedule tile_size must be a positive integer")
+    stage_by_operator = {
+        operator_id: stage_id
+        for stage_id, operator_id in enumerate(graph.topological_order())
+    }
+    schedules: list[OperatorSchedule] = []
+    for operator in graph.operators:
+        dimensions = tuple((*operator.iteration_dims, *operator.reduction_dims))
+        if any(not isinstance(extent, int) for _name, extent in dimensions):
+            raise ValueError("default mixed schedule requires a resolved graph")
+        schedules.append(
+            OperatorSchedule(
+                operator_id=operator.op_id,
+                tile_sizes=tuple(
+                    (name, min(tile_size, int(extent)))
+                    for name, extent in dimensions
+                ),
+                loop_order=tuple(name for name, _extent in dimensions),
+                stage_id=stage_by_operator[operator.op_id],
+            )
+        )
+    result = ScheduleSpec(
+        "mixed_default",
+        tuple(schedules),
+        attributes={"source": "hand-written", "tile_size": tile_size},
+    )
+    issues = result.validate(graph)
+    if issues:
+        raise ValueError("; ".join(issues))
+    return result

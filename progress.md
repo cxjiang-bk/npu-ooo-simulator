@@ -15,7 +15,30 @@
 
 ### 当前状态
 
-阶段 4 进行中、阶段 5/6 已启动：Model/Benchmark、Operator Graph、MachineConfig、Schedule/Tile/Execution IR 和独立 analytical event backend 已实现；2mm 已完成 tile 展开、matmul lowering、queue/ROB/window 约束、completion wake-up、CSV/SVG/Perfetto trace、显式 static stage reservation、runtime RAW/WAR/WAW range scoreboard，以及 stall/ROB/queue occupancy 指标。`sweep-two-mm` 已能批量扫描 architecture × tile size × policy × window × ROB；residual-add、row-reduce、softmax 和 RMSNorm 已完成独立 lowering/CLI，下一步是 LayerNorm 和跨算子 mixed graph。
+阶段 4 进行中、阶段 5/6 已启动：Model/Benchmark、Operator Graph、MachineConfig、Schedule/Tile/Execution IR 和独立 analytical event backend 已实现；2mm 已完成 tile 展开、matmul lowering、queue/ROB/window 约束、completion wake-up、CSV/SVG/Perfetto trace、显式 static stage reservation、runtime RAW/WAR/WAW range scoreboard，以及 stall/ROB/queue occupancy 指标。`sweep-two-mm` 已能批量扫描 architecture × tile size × policy × window × ROB；residual-add、row-reduce、softmax 和 RMSNorm 已完成独立 lowering/CLI，混合 lowering registry 和 decoder block fragment 已接入，下一步是 LayerNorm 和更广的 workload sweep。
+
+## 2026-08-20：混合算子 lowering 与 PNG 泳道
+
+### 已完成
+
+- 新增 `LoweringRegistry`：按 semantic operator type 注册 Matmul、Elementwise、Reduce、Softmax、RMSNorm lowerer；scheduler 不增加算子分支。
+- 新增 `lower_mixed_graph/lower_mixed_model`：对 heterogeneous Operator Graph 按拓扑逐算子 lowering，重新编号全局 `program_order`，并根据显式 `DataEdge` 和 root-memory `BufferRegion` overlap 注入跨算子 store -> load 依赖。
+- 新增 `default_mixed_schedule`：为每个 semantic operator 生成 resolved tile sizes、loop order 和 topology stage。
+- 新增 decoder one-block benchmark：`RMSNorm -> Matmul -> ResidualAdd`，支持 `decoder-block` CLI，生成完整 Model/Operator/Tile/Execution graph、summary、CSV、Perfetto、SVG/PNG 泳道。
+- 新增 `write_png` trace exporter，使用本机 ImageMagick/librsvg 进行 SVG 栅格化；PNG 后端缺失时会给出明确错误。
+- 新增 LayerNorm lowering/benchmark/CLI：显式 `reduce_sum -> layernorm_mean -> center -> reduce_sum_square -> layernorm` 双 barrier primitive DAG。
+
+### 验证
+
+```text
+37 tests passed
+decoder-block static_pipeline: 9504 cycles, 30 tiles, 114 tasks
+decoder-block dynamic_ready_queue: 9504 cycles, same graph and machine
+cross-operator dependencies: 24
+layernorm static_pipeline: 3808 cycles; dynamic_ready_queue (critical_path): 4696 cycles
+```
+
+当前结果仍为 `calibration_status=analytical`。Decoder fragment 在 minimal profile 下 Static/Dynamic 恰好同周期；LayerNorm 则出现 dynamic critical-path 慢于 static 的反例。两者都说明动态机制、priority heuristic、window/ROB 和 barrier 结构必须作为独立实验维度。
 
 ### 2026-08-20：阶段 4 后端语义推进
 

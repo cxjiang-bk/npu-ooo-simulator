@@ -4,6 +4,9 @@ import csv
 import html
 import json
 from pathlib import Path
+import shutil
+import subprocess
+import tempfile
 from typing import Any
 
 from npu_ooo.scheduler import ScheduleResult
@@ -102,3 +105,23 @@ def write_svg(result: ScheduleResult, path: str | Path, *, width: int = 1600, ro
         )
     elements.append("</svg>")
     Path(path).write_text("\n".join(elements), encoding="utf-8")
+
+
+def write_png(result: ScheduleResult, path: str | Path, *, width: int = 1600, row_height: int = 28) -> None:
+    """Rasterize the swimlane SVG using an installed ImageMagick or librsvg binary."""
+
+    converter = shutil.which("convert") or shutil.which("magick") or shutil.which("rsvg-convert")
+    if converter is None:
+        raise RuntimeError("PNG swimlane export requires ImageMagick ('convert') or 'rsvg-convert'")
+    target = Path(path)
+    with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as handle:
+        temporary_svg = Path(handle.name)
+    try:
+        write_svg(result, temporary_svg, width=width, row_height=row_height)
+        if Path(converter).name == "rsvg-convert":
+            command = [converter, str(temporary_svg), "-o", str(target)]
+        else:
+            command = [converter, str(temporary_svg), str(target)]
+        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    finally:
+        temporary_svg.unlink(missing_ok=True)

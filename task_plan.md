@@ -30,6 +30,8 @@
 - [ ] 冻结 Model/Benchmark IR 的 normalized schema；
 - [ ] 冻结 `evaluation_scope=one_block|layer|full_model` 语义；
 - [ ] 冻结 semantic operator 与 lowering primitive taxonomy；
+- [x] 首批 semantic operator 的 lowering registry 与 mixed-graph handoff 契约；
+- [x] LayerNorm mean/variance barrier lowering 与 micro-test；
 - [ ] 冻结五层 IR 的 normalized schema；
 - [ ] 冻结 ExecutionTask dependency/address schema；
 - [ ] 冻结 simulator event/tie-break 语义；
@@ -51,7 +53,7 @@
 
 验收必须覆盖两个 architecture profile，并证明 Static/Dynamic 只改变 scheduler policy。
 
-当前已有两个 architecture profile 的 analytical cycle 对比、CSV/SVG/Perfetto 输出、ROB/window/queue 指标、显式 static stage reservation、runtime address scoreboard 和 occupancy timeline；`sweep-two-mm` 已能批量生成 architecture × policy × window × ROB 结果。PNG swimlane 与真实 MXU/memory timing 校准仍待后续提交。
+当前已有两个 architecture profile 的 analytical cycle 对比、CSV/SVG/PNG/Perfetto 输出、ROB/window/queue 指标、显式 static stage reservation、runtime address scoreboard 和 occupancy timeline；`sweep-two-mm` 已能批量生成 architecture × policy × window × ROB 结果。混合 decoder block 已完成第一条跨算子 lowering 闭环；真实 MXU/memory timing 校准仍待后续提交。
 
 ## 关键问题
 
@@ -94,6 +96,8 @@
 | 错误 | 尝试次数 | 解决方案 |
 |---|---:|---|
 | 旧仓库规划追加补丁首次锚点不匹配 | 1 | 使用稳定尾部锚点追加，之后按用户要求完整移除本轮追加内容 |
+| artifact 验证命令包含 `rm -rf` 被执行策略拒绝 | 1 | 不清理目录，直接由确定性导出覆盖同名 artifact |
+| LayerNorm barrier 测试错误假设首 tile 完成均值 | 1 | 按实际 M 外层/N 内层 tile 顺序断言每行最后一个 reduction tile |
 
 ## 备注
 

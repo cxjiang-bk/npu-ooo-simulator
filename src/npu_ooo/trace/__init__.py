@@ -1,6 +1,6 @@
 """Trace exporters for schedule results."""
 
-from .export import write_artifact_json, write_csv, write_json, write_svg
+from .export import write_artifact_json, write_csv, write_json, write_png, write_svg
 from .graph import (
     write_execution_graph_dot,
     write_operator_graph_dot,
@@ -13,6 +13,7 @@ __all__ = [
     "write_csv",
     "write_execution_graph_dot",
     "write_json",
+    "write_png",
     "write_operator_graph_dot",
     "write_operator_graph_svg",
     "write_svg",

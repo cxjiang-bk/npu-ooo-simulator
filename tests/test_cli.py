@@ -45,6 +45,7 @@ class CliArtifactTest(unittest.TestCase):
                 "schedule.json",
                 "summary.json",
                 "swimlane.svg",
+                "swimlane.png",
                 "tasks.csv",
                 "tile_graph.dot",
                 "tile_graph.json",
@@ -155,6 +156,56 @@ class CliArtifactTest(unittest.TestCase):
             execution_graph = json.loads((output / "execution_graph.json").read_text())
             primitives = {task["primitive"] for task in execution_graph["tasks"]}
             self.assertTrue({"square", "reduce_sum_square", "rmsnorm"}.issubset(primitives))
+
+    def test_decoder_block_exports_mixed_operator_and_execution_graphs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            output = Path(directory)
+            exit_code = main(
+                [
+                    "decoder-block",
+                    "--arch",
+                    "minimal",
+                    "--policy",
+                    "dynamic_ready_queue",
+                    "--output-dir",
+                    str(output),
+                ]
+            )
+            self.assertEqual(exit_code, 0)
+            operator_graph = json.loads((output / "operator_graph.json").read_text())
+            self.assertEqual(
+                [operator["op_type"] for operator in operator_graph["operators"]],
+                ["rmsnorm", "matmul", "residual_add"],
+            )
+            execution_graph = json.loads((output / "execution_graph.json").read_text())
+            primitives = {task["primitive"] for task in execution_graph["tasks"]}
+            self.assertTrue({"rmsnorm", "matmul", "elementwise"}.issubset(primitives))
+            self.assertGreater(
+                execution_graph["attributes"]["cross_operator_dependency_count"],
+                0,
+            )
+            manifest = json.loads((output / "manifest.json").read_text())
+            self.assertEqual(manifest["calibration_status"], "analytical")
+            self.assertEqual((output / "swimlane.png").read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+
+    def test_layernorm_exports_two_reduction_barriers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            output = Path(directory)
+            exit_code = main(
+                [
+                    "layernorm",
+                    "--arch",
+                    "minimal",
+                    "--policy",
+                    "dynamic_ready_queue",
+                    "--output-dir",
+                    str(output),
+                ]
+            )
+            self.assertEqual(exit_code, 0)
+            execution_graph = json.loads((output / "execution_graph.json").read_text())
+            primitives = {task["primitive"] for task in execution_graph["tasks"]}
+            self.assertTrue({"reduce_sum", "layernorm_mean", "center", "reduce_sum_square", "layernorm"}.issubset(primitives))
 
 
 if __name__ == "__main__":
