@@ -320,16 +320,35 @@ Simulator 维护：
 
 每个 task 的开始时间由依赖、资源、queue、initiation interval 和 buffer 状态共同决定。
 
+当前实现将这一层拆成两个接口：
+
+```text
+SchedulerPolicy
+  -> 从 visible ready queue 选择 task
+
+TimingModel / EventBackend
+  -> 计算 issue/start/complete
+  -> 维护 unit queue、II、ROB、dependency window、tile window
+  -> 在 COMPLETE 时唤醒后继 task
+```
+
+`AnalyticalTimingModel` 只消费 `ExecutionTask.duration_cycles` 和 `MachineConfig` 的 unit 默认值；它是可替换的 timing provider，不代表真实硬件。`SimulatorConfig` 可以覆盖 instruction queue、ROB、ready queue、dependency window 和 max in-flight tiles。
+
+`--address-scoreboard` 启用第一版范围 hazard augmentation：根据相同 `tensor/memory` 上的 `BufferRegion` 重叠关系增加 RAW/WAR/WAW predecessor。它用于验证地址依赖契约，尚不是从真实 TISA 指令动态解析出的硬件 scoreboard。
+
 ## 8. Trace 与结果
 
 一次仿真至少输出：
 
 ```text
-events.csv
+tasks.csv
 summary.json
 manifest.json
-trace.json
-swimlane.png
+perfetto.json
+swimlane.svg
+operator_graph.json / operator_graph.svg
+tile_graph.json
+execution_graph.json
 ```
 
 `events.csv` 使用 cycle-native 字段：

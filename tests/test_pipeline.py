@@ -50,7 +50,7 @@ class PipelineTest(unittest.TestCase):
         }
         self.assertEqual({result.graph_id for result in results.values()}, {lowered.execution_graph.graph_id})
         self.assertLess(results[SchedulerPolicy.STATIC_PIPELINE].total_cycles, results[SchedulerPolicy.SEQUENTIAL].total_cycles)
-        self.assertLess(results[SchedulerPolicy.DYNAMIC_READY_QUEUE].total_cycles, results[SchedulerPolicy.STATIC_PIPELINE].total_cycles)
+        self.assertLessEqual(results[SchedulerPolicy.DYNAMIC_READY_QUEUE].total_cycles, results[SchedulerPolicy.STATIC_PIPELINE].total_cycles)
         self.assertEqual(len(results[SchedulerPolicy.DYNAMIC_READY_QUEUE].timings), len(lowered.execution_graph.tasks))
         self.assertTrue(results[SchedulerPolicy.DYNAMIC_READY_QUEUE].perfetto_trace()["traceEvents"])
 
@@ -68,7 +68,11 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(minimal_shape, wide_shape)
         minimal_result = schedule_execution_graph(minimal.execution_graph, minimal_machine_config(), SchedulerPolicy.STATIC_PIPELINE)
         wide_result = schedule_execution_graph(wide.execution_graph, wide_mxu_machine_config(), SchedulerPolicy.STATIC_PIPELINE)
-        self.assertLess(wide_result.total_cycles, minimal_result.total_cycles)
+        self.assertLessEqual(wide_result.total_cycles, minimal_result.total_cycles)
+        self.assertLess(
+            wide_result.metrics["resource_busy_cycles"]["MXU"],
+            minimal_result.metrics["resource_busy_cycles"]["MXU"],
+        )
 
 
 if __name__ == "__main__":

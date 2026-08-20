@@ -85,7 +85,7 @@ npu-ooo-simulator/
 
 在该闭环稳定后，再加入 ARU/reduction、Attention 和更复杂的硬件资源。
 
-当前已实现到 `Execution Graph -> SchedulerResult`，CSV/SVG exporter 和独立的 event simulator 将在下一阶段拆出；现有 `ScheduleResult.perfetto_trace()` 已可被 Chrome/Perfetto 消费。
+当前已实现到 `Execution Graph -> analytical event simulator -> SchedulerResult`，输出 CSV/SVG、Perfetto/Chrome Trace 和 runtime queue/ROB 指标。后端仍是 analytical timing，不是 RTL cycle-accurate；真实 ISA/RTL timing 后续通过 `TimingModel` 接入。
 
 ### 快速运行
 
@@ -95,6 +95,8 @@ npu-ooo-simulator/
 PYTHONPATH=src python3 -m npu_ooo.cli two-mm \
   --arch minimal \
   --policy dynamic_ready_queue \
+  --dependency-window 8 \
+  --rob-entries 8 \
   --output-dir out/two-mm-dynamic
 ```
 
@@ -109,6 +111,7 @@ operator_graph.svg      可直接查看的顶层计算图
 schedule.json           tile factor、loop order、stage
 tile_graph.json         具体 tile 实例和依赖
 execution_graph.json    load/matmul/store task 及依赖
+address_dependencies.json  RAW/WAR/WAW 增补依赖
 machine.json            本次 MachineConfig
 manifest.json           配置 hash、policy、周期和统计
 tasks.csv               task start/finish 时间
@@ -117,6 +120,8 @@ perfetto.json           Perfetto/Chrome Trace
 ```
 
 同时提供 `operator_graph.dot`、`tile_graph.dot`、`execution_graph.dot`，用于 Graphviz 或其他图分析工具。`--arch` 可选 `minimal`、`wide-mxu`、`lpu-like`；`--policy` 可选 `sequential`、`static_pipeline`、`dynamic_ready_queue`。
+
+运行时容量可以通过 `--instruction-queue-depth`、`--rob-entries`、`--max-inflight-tiles`、`--dependency-window` 和 `--ready-queue-depth` 覆盖 MachineConfig 默认值；实际生效值会写入 `manifest.json` 和 `summary.json`。加上 `--address-scoreboard` 后，会根据 `BufferRegion` 自动加入同一 tensor/memory range 的 RAW/WAR/WAW 依赖。
 
 ## 参考项目
 

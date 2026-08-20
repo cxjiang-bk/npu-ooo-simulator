@@ -47,7 +47,9 @@
 | ExecutionTask 显式携带 BufferRegion 和 predecessor | 统一承载 TISA operand 的 TileShape/TileMem/AccessType 语义，scheduler 不需要猜 tensor 地址或依赖 |
 | Matmul lowering 对每个 K tile 建立累加链，最终 tile 才生成 store | 保留 partial-sum 生命周期，同时让跨算子 producer store -> consumer load 依赖可观察 |
 | Policy 只改变 ready-task 选择；task graph 与 MachineConfig 作为共享输入 | 保证 Static/Dynamic 周期差异归因于调度策略，而不是重新切 tile 或更换 timing model |
-| 第一版 scheduler 使用 unit latency + initiation interval 的确定性 list scheduling | 可快速生成可复现 timing/trace；队列、ROB、地址 scoreboard 将在独立 event simulator 阶段加入 |
+| scheduler policy 与 event backend 分离 | policy 只选择 ready task；event backend 统一处理 issue/start/complete、queue、ROB、II、in-flight tile 和 completion wake-up |
+| `SimulatorConfig` 覆盖 MachineConfig runtime capacity | 可以对 dependency window、ROB、instruction queue、ready queue 和 tile window 做实验 sweep |
+| address scoreboard 先作为可选 hazard augmentation | 基于 BufferRegion 生成 RAW/WAR/WAW predecessor，能够验证地址依赖而不改变默认 baseline；真正 runtime range scoreboard 仍待补充 |
 
 ## 视觉发现
 

@@ -15,7 +15,7 @@
 
 ### 当前状态
 
-阶段 2/3 进行中：Model/Benchmark、Operator Graph、MachineConfig、Schedule/Tile/Execution IR 已有标准库实现；默认 2mm 已完成 tile 展开、matmul load/compute/store lowering，并接入三种 deterministic analytical scheduling policy。下一步是拆出独立 event simulator、trace CSV/PNG exporter、窗口/ROB 约束和 dynamic scoreboard。
+阶段 4 进行中：Model/Benchmark、Operator Graph、MachineConfig、Schedule/Tile/Execution IR 和独立 analytical event backend 已实现；默认 2mm 已完成 tile 展开、matmul lowering、queue/ROB/window 约束、completion wake-up、CSV/SVG/Perfetto trace，以及可选 RAW/WAR/WAW address scoreboard。下一步是完善 static dual/triple stage 约束、runtime range scoreboard 和外部 MXU timing adapter。
 
 ### 创建/修改文件
 
@@ -35,6 +35,9 @@
 - 新增 `src/npu_ooo/scheduler/core.py`：sequential、static pipeline、dynamic ready queue，以及 task timing、stall 分解、Perfetto trace JSON。
 - 新增 `src/npu_ooo/trace/export.py` 和 `src/npu_ooo/cli.py`：命令行运行 2mm，并导出 summary JSON、task CSV 和无依赖 SVG 泳道图。
 - CLI 进一步导出 Model/Operator/Schedule/Tile/Execution Graph JSON、DOT 和 `operator_graph.svg`，把计算图 artifact 与时间线 artifact 明确分开。
+- 新增 `src/npu_ooo/simulator/core.py`：独立的 analytical timing model 和离散事件 backend，实际处理 instruction queue、ROB、dependency window、in-flight tile、unit queue/II、completion wake-up 和 backpressure 指标。
+- `schedule_execution_graph()` 现在只是 scheduler policy wrapper；`--dependency-window`、`--rob-entries` 等 CLI 参数可以覆盖运行时容量。
+- 新增可选 address scoreboard prepass：根据 `BufferRegion` 增加 RAW/WAR/WAW predecessor，并通过 `--address-scoreboard` 记录到 manifest。
 - 新增 `tests/test_pipeline.py`：覆盖边界 tile、2mm 统计、跨算子依赖、policy 差异和 architecture profile 差异。
 - `docs/model-layer.md`
 - `docs/operator-taxonomy.md`
@@ -50,17 +53,17 @@
 | Old `operator-opt` planning files | no remaining changes from this session | pass |
 | Implementation code | intentionally not created | pass |
 | Paper benchmark/model-layer review | Table IX, compiler stack, TISA operand/instruction fields reviewed | pass |
-| Python unit tests | 12 tests passed | pass |
+| Python unit tests | 15 tests passed | pass |
 | Python compileall | `src` and `tests` compile successfully | pass |
 | `git diff --check` | no whitespace errors | pass |
 
 ### 当前 2mm analytical 结果
 
-默认 `M=128,K=64,L=96,N=80`、fp16、minimal profile 下：
+默认 `M=128,K=64,L=96,N=80`、fp16、minimal profile 下，event backend（默认容量 `ROB=8`、`dependency_window=8`）当前为：
 
 ```text
 sequential          25856 cycles
-static_pipeline     21184 cycles
+static_pipeline     17984 cycles
 dynamic_ready_queue 17984 cycles
 ```
 
@@ -70,8 +73,8 @@ dynamic_ready_queue 17984 cycles
 
 | 问题 | 答案 |
 |---|---|
-| 我在哪里？ | 新项目阶段 0：Model IR、算子分类和契约冻结 |
-| 我要去哪里？ | 2mm Static/Dynamic 可配置仿真第一里程碑 |
+| 我在哪里？ | 新项目阶段 4：event backend、runtime window 和 address scoreboard |
+| 我要去哪里？ | 完善 static dual/triple pipeline，并接入可校准 MXU/memory timing |
 | 目标是什么？ | 从顶层算子到参数化 NPU cycle simulator 的完整研究栈 |
 | 我学到了什么？ | 见 `findings.md` |
 | 我做了什么？ | 见本日志和 `task_plan.md` |

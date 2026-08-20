@@ -30,6 +30,8 @@ def write_csv(result: ScheduleResult, path: str | Path) -> None:
                 "start",
                 "finish",
                 "duration",
+                "queue_wait",
+                "ready_wait",
                 "dependency_ready",
                 "resource_ready",
             ),

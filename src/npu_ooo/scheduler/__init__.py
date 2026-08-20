@@ -5,6 +5,7 @@ from .core import (
     SchedulerPolicy,
     TaskTiming,
     TraceEvent,
+    SimulatorConfig,
     schedule_execution_graph,
 )
 
@@ -13,5 +14,6 @@ __all__ = [
     "SchedulerPolicy",
     "TaskTiming",
     "TraceEvent",
+    "SimulatorConfig",
     "schedule_execution_graph",
 ]

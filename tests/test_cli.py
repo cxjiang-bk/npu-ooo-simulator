@@ -19,6 +19,11 @@ class CliArtifactTest(unittest.TestCase):
                     "minimal",
                     "--policy",
                     "dynamic_ready_queue",
+                    "--dependency-window",
+                    "4",
+                    "--rob-entries",
+                    "4",
+                    "--address-scoreboard",
                     "--output-dir",
                     str(output),
                 ]
@@ -26,6 +31,7 @@ class CliArtifactTest(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             expected = {
                 "benchmark_case.json",
+                "address_dependencies.json",
                 "execution_graph.dot",
                 "execution_graph.json",
                 "machine.json",
@@ -50,6 +56,11 @@ class CliArtifactTest(unittest.TestCase):
             self.assertEqual([operator["op_id"] for operator in operator_graph["operators"]], ["gemm0", "gemm1"])
             self.assertEqual(len(execution_graph["tasks"]), 204)
             self.assertEqual(manifest["calibration_status"], "analytical")
+            self.assertEqual(manifest["backend"], "analytical")
+            self.assertEqual(manifest["simulator_config"]["dependency_window"], 4)
+            self.assertEqual(manifest["simulator_config"]["rob_entries"], 4)
+            self.assertTrue(manifest["simulator_config"]["address_scoreboard"])
+            self.assertEqual(manifest["address_dependency_count"], len(json.loads((output / "address_dependencies.json").read_text())))
             self.assertIn("gemm0", (output / "operator_graph.svg").read_text())
 
 
