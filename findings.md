@@ -67,6 +67,9 @@
 | Priority sweep 反例 | `sweep-workloads --workloads layernorm --windows 8 --robs 8` 显示 static=3808；dynamic `oldest_first`=3808，而 dynamic `critical_path`=4696（speedup 0.811）。因此 priority 必须成为 manifest/sweep 的显式键 |
 | Attention 首个闭环 | 单头无 mask/cache 的 `Q @ K^T -> Softmax -> P @ V` 由两个 Matmul 和一个 Softmax semantic op 组成，默认 `64x64x32` 生成 12 tiles、54 primitive tasks、8 个跨算子 handoff；minimal analytical profile 下 static=4520、dynamic critical-path=4532 |
 | Transformer block skeleton | `LayerNorm -> QK^T -> Softmax -> PV -> residual -> MLP1 -> activation -> MLP2 -> residual` 默认生成 9 semantic operators、30 tiles、126 tasks、28 个 root-memory handoff；minimal analytical profile 下 static/dynamic critical-path 均为 10540 cycles，但这只是 shape-only skeleton |
+| Model presets | `model-block` 已将 BERT、GPT-J、LLaMA2-7B 和 DeepSeek-R1-16B 暴露为模型层 preset；默认使用小型 proxy shape，native hidden/head/intermediate metadata 和 assumptions 会写入 ModelSpec/BenchmarkCase。DeepSeek preset 明确不对 dense/MoE 做事实判断，当前仅作为 dense shape-only proxy |
+| Model sweep registration | 这些 preset 复用 `sweep-workloads` 的 lowering cache 和 Static baseline 配对逻辑，因此模型维度不会引入新的 scheduler 分支；`workload` 字段保留 preset 名称，case manifest 仍记录真实 model_id 和 proxy metadata |
+| Model proxy sweep sizing | 四个 preset 使用同一 `16x16x16x32` proxy shape 时生成 16 个配对 case，Static/Dynamic 均为 1300 cycles；这只证明 graph/machine/policy 的公平配对。按 preset 区分小规模 proxy shape（BERT 16/16/16/32、GPT-J 16/16/24/48、LLaMA2 16/16/32/64、DeepSeek 16/16/40/80）后，minimal analytical cycles 分别为 1372、1900、2528、3392，仍属于 shape-only 趋势探针 |
 
 ## 视觉发现
 

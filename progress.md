@@ -35,6 +35,9 @@
 - `sweep-workloads` 增加 `--dynamic-priorities` 维度；LayerNorm priority demo 捕获 `critical_path` 慢于 `oldest_first` 的可复现实验。
 - 新增单头 attention fragment 和 `attention` CLI：`QK^T -> Softmax -> PV` 复用 registry，保留矩阵乘/softmax 跨算子依赖；static=4520、dynamic critical-path=4532（analytical）。
 - 新增 `transformer-block` skeleton：LayerNorm + 单头 attention + MLP + residual 串接为 9-operator mixed graph；默认 30 tiles/126 tasks/28 handoffs，static/dynamic critical-path 均 10540 cycles（analytical）。
+- 新增模型层 `model-block` preset：BERT、GPT-J、LLaMA2-7B 和 DeepSeek-R1-16B 均可实例化为带 native metadata 的 one-block proxy；默认使用小 shape，`--tokens/--sequence/--head-dim/--intermediate` 可覆盖，DeepSeek 明确标注 dense/MoE 未确认且不包含 expert routing。
+- `sweep-workloads` 已注册上述四个模型 preset，可在不改变 scheduler/backend 的前提下生成模型 × policy × window/ROB × tile-size 的配对 artifact。
+- 模型 preset sweep 已验证：统一 `16x16x16x32` proxy shape 生成 16 个 case；按 preset 区分小规模 shape 的单独 Static/Dynamic probes 产生 BERT 1372、GPT-J 1900、LLaMA2 2528、DeepSeek 3392 cycles（均 analytical，不能替代真实模型 benchmark）。
 
 ### 验证
 

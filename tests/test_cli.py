@@ -252,6 +252,39 @@ class CliArtifactTest(unittest.TestCase):
             execution_graph = json.loads((output / "execution_graph.json").read_text())
             self.assertGreater(execution_graph["attributes"]["cross_operator_dependency_count"], 0)
 
+    def test_model_block_exports_named_proxy_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            output = Path(directory)
+            exit_code = main(
+                [
+                    "model-block",
+                    "--model-preset",
+                    "llama2-7b",
+                    "--tokens",
+                    "16",
+                    "--sequence",
+                    "16",
+                    "--head-dim",
+                    "16",
+                    "--intermediate",
+                    "32",
+                    "--policy",
+                    "dynamic_ready_queue",
+                    "--output-dir",
+                    str(output),
+                ]
+            )
+            self.assertEqual(exit_code, 0)
+            model = json.loads((output / "model_spec.json").read_text())
+            case = json.loads((output / "benchmark_case.json").read_text())
+            manifest = json.loads((output / "manifest.json").read_text())
+            self.assertEqual(model["model_id"], "llama2_7b")
+            self.assertEqual(model["attributes"]["benchmark_status"], "proxy")
+            self.assertEqual(model["attributes"]["proxy_shape"]["intermediate"], 32)
+            self.assertEqual(case["phase"], "prefill")
+            self.assertEqual(case["model_id"], "llama2_7b")
+            self.assertGreater(manifest["total_cycles"], 0)
+
     def test_workload_sweep_keeps_graph_artifacts_per_case(self) -> None:
         with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
             output = Path(directory)
@@ -289,6 +322,45 @@ class CliArtifactTest(unittest.TestCase):
                 self.assertTrue((case_dir / "operator_graph.json").exists())
                 self.assertTrue((case_dir / "execution_graph.json").exists())
                 self.assertTrue((case_dir / "swimlane.png").exists())
+
+    def test_workload_sweep_accepts_model_preset_shape_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            output = Path(directory)
+            exit_code = main(
+                [
+                    "sweep-workloads",
+                    "--workloads",
+                    "gpt-j",
+                    "--architectures",
+                    "minimal",
+                    "--policies",
+                    "static_pipeline,dynamic_ready_queue",
+                    "--windows",
+                    "1",
+                    "--robs",
+                    "1",
+                    "--tile-sizes",
+                    "8",
+                    "--dynamic-priorities",
+                    "critical_path",
+                    "--model-tokens",
+                    "8",
+                    "--model-sequence",
+                    "8",
+                    "--model-head-dim",
+                    "8",
+                    "--model-intermediate",
+                    "16",
+                    "--output-dir",
+                    str(output),
+                ]
+            )
+            self.assertEqual(exit_code, 0)
+            sweep = json.loads((output / "sweep.json").read_text())
+            self.assertEqual(len(sweep), 2)
+            self.assertEqual({row["workload"] for row in sweep}, {"gpt-j"})
+            model = json.loads(next(output.glob("*/model_spec.json")).read_text())
+            self.assertEqual(model["attributes"]["proxy_shape"]["head_dim"], 8)
 
     def test_cli_accepts_canonical_machine_config_json(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

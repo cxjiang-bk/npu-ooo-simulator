@@ -109,7 +109,7 @@
 2. ResNet bottleneck：Conv2D/Norm/Activation/Residual/Pooling；
 3. Softmax/LayerNorm/RMSNorm composite lowering（softmax、LayerNorm 和 RMSNorm 已展开 composite primitive）；
 4. Decoder block：已先接入 `RMSNorm -> Matmul -> ResidualAdd` 混合 fragment，并新增单头 `QK^T -> Softmax -> PV` attention fragment 与 LayerNorm + Attention + MLP skeleton；下一步扩展 QKV/Attention/MLP/RoPE/KV cache；
-5. BERT/GPT-J/LLaMA2/DeepSeek benchmark templates；
+5. BERT/GPT-J/LLaMA2/DeepSeek benchmark templates；已新增明确标注 proxy/shape-only 的 `model-block` presets，真实模型算子仍待扩展；
 6. Conv2D halo/layout 和 optional MoE routing 作为后续扩展。
 
 验收：每种 P0 semantic operator 都有独立 lowering、micro-test 和至少一组 Static/Dynamic trace；模型层能实例化 CNN、encoder 和 decoder template；scheduler 中无模型或算子名称分支。
@@ -133,6 +133,7 @@ architecture profile
 - 一条命令运行对比实验；
 - `sweep-two-mm` 批量扫描 architecture × tile size × policy × window × ROB；
 - `sweep-workloads` 已能扫描多个算子/模型 fragment × architecture × tile size × policy × window × ROB；
+- `sweep-workloads` 已注册 BERT/GPT-J/LLaMA2/DeepSeek proxy preset，并支持 `--model-*` shape override；
 - 每个 case 独立 manifest；
 - 汇总 CSV/JSON；
 - 单 workload CLI 已统一输出 SVG 和 PNG 泳道图；

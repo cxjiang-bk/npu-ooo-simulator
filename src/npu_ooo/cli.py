@@ -13,6 +13,8 @@ from npu_ooo.benchmarks import (
     build_decoder_block_model,
     build_attention_case,
     build_attention_model,
+    available_model_presets,
+    build_model_preset,
     build_transformer_block_case,
     build_transformer_block_model,
     build_elementwise_case,
@@ -251,6 +253,30 @@ def build_parser() -> argparse.ArgumentParser:
     transformer_block.add_argument("--dynamic-priority", choices=("critical_path", "oldest_first"), default="critical_path")
     transformer_block.add_argument("--static-stage-offsets")
     transformer_block.add_argument("--static-stage-ii", type=float, default=1.0)
+    model_block = subparsers.add_parser(
+        "model-block",
+        help="compile and schedule a named model's one-block proxy benchmark",
+    )
+    model_block.add_argument("--model-preset", choices=available_model_presets(), required=True)
+    model_block.add_argument("--phase", choices=("prefill", "decode"), default="prefill")
+    model_block.add_argument("--tokens", type=int)
+    model_block.add_argument("--sequence", type=int)
+    model_block.add_argument("--head-dim", type=int)
+    model_block.add_argument("--intermediate", type=int)
+    model_block.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
+    model_block.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
+    model_block.add_argument("--timing-config", type=Path, help="load primitive timing overrides from JSON")
+    model_block.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
+    model_block.add_argument("--output-dir", type=Path, default=Path("out/model-block"))
+    model_block.add_argument("--instruction-queue-depth", type=int)
+    model_block.add_argument("--rob-entries", type=int)
+    model_block.add_argument("--max-inflight-tiles", type=int)
+    model_block.add_argument("--dependency-window", type=int)
+    model_block.add_argument("--ready-queue-depth", type=int)
+    model_block.add_argument("--address-scoreboard", action="store_true")
+    model_block.add_argument("--dynamic-priority", choices=("critical_path", "oldest_first"), default="critical_path")
+    model_block.add_argument("--static-stage-offsets")
+    model_block.add_argument("--static-stage-ii", type=float, default=1.0)
     layernorm = subparsers.add_parser("layernorm", help="compile and schedule a row-LayerNorm benchmark")
     layernorm.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
     layernorm.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
@@ -300,6 +326,10 @@ def build_parser() -> argparse.ArgumentParser:
     workload_sweep.add_argument("--windows", default="4,8")
     workload_sweep.add_argument("--robs", default="4,8")
     workload_sweep.add_argument("--tile-sizes", default="32")
+    workload_sweep.add_argument("--model-tokens", type=int, help="override token rows for named model presets")
+    workload_sweep.add_argument("--model-sequence", type=int, help="override sequence columns for named model presets")
+    workload_sweep.add_argument("--model-head-dim", type=int, help="override attention head dimension for named model presets")
+    workload_sweep.add_argument("--model-intermediate", type=int, help="override MLP intermediate dimension for named model presets")
     workload_sweep.add_argument("--output-dir", type=Path, default=Path("out/sweep-workloads"))
     workload_sweep.add_argument("--address-scoreboard", action="store_true")
     workload_sweep.add_argument("--dynamic-priority", choices=("critical_path", "oldest_first"), default="critical_path")
@@ -882,11 +912,23 @@ def run_attention(args: argparse.Namespace) -> int:
 
 def run_transformer_block(args: argparse.Namespace) -> int:
     machine = _machine(args.arch, args.machine_config)
-    model = build_transformer_block_model()
-    case = build_transformer_block_case(
-        architecture_profile=args.arch,
-        scheduler_profile=args.policy,
-    )
+    if getattr(args, "model_preset", None):
+        model, case = build_model_preset(
+            args.model_preset,
+            architecture_profile=args.arch,
+            scheduler_profile=args.policy,
+            tokens=args.tokens,
+            sequence=args.sequence,
+            head_dim=args.head_dim,
+            intermediate=args.intermediate,
+            phase=args.phase,
+        )
+    else:
+        model = build_transformer_block_model()
+        case = build_transformer_block_case(
+            architecture_profile=args.arch,
+            scheduler_profile=args.policy,
+        )
     instance = model.instantiate(case)
     schedule = default_mixed_schedule(instance.graph)
     lowered = lower_mixed_model(instance, machine, schedule)
@@ -1164,8 +1206,45 @@ def run_sweep_two_mm(args: argparse.Namespace) -> int:
     return 0
 
 
-def _workload_builders():
-    return {
+def _named_model_preset_builders(
+    name: str,
+    *,
+    tokens: int | None = None,
+    sequence: int | None = None,
+    head_dim: int | None = None,
+    intermediate: int | None = None,
+):
+    def model_builder():
+        return build_model_preset(
+            name,
+            tokens=tokens,
+            sequence=sequence,
+            head_dim=head_dim,
+            intermediate=intermediate,
+        )[0]
+
+    def case_builder(*, architecture_profile: str = "minimal", scheduler_profile: str = "sequential"):
+        return build_model_preset(
+            name,
+            architecture_profile=architecture_profile,
+            scheduler_profile=scheduler_profile,
+            tokens=tokens,
+            sequence=sequence,
+            head_dim=head_dim,
+            intermediate=intermediate,
+        )[1]
+
+    return model_builder, case_builder
+
+
+def _workload_builders(
+    *,
+    model_tokens: int | None = None,
+    model_sequence: int | None = None,
+    model_head_dim: int | None = None,
+    model_intermediate: int | None = None,
+):
+    builders = {
         "two-mm": (build_two_matmul_model, build_two_matmul_case),
         "elementwise": (build_elementwise_model, build_elementwise_case),
         "reduce": (build_reduce_model, build_reduce_case),
@@ -1176,13 +1255,31 @@ def _workload_builders():
         "attention": (build_attention_model, build_attention_case),
         "transformer-block": (build_transformer_block_model, build_transformer_block_case),
     }
+    builders.update(
+        {
+            name: _named_model_preset_builders(
+                name,
+                tokens=model_tokens,
+                sequence=model_sequence,
+                head_dim=model_head_dim,
+                intermediate=model_intermediate,
+            )
+            for name in available_model_presets()
+        }
+    )
+    return builders
 
 
 def run_sweep_workloads(args: argparse.Namespace) -> int:
     workloads = _parse_list(args.workloads, name="--workloads")
     architectures = _parse_list(args.architectures, name="--architectures")
     policies = _parse_list(args.policies, name="--policies")
-    builders = _workload_builders()
+    builders = _workload_builders(
+        model_tokens=args.model_tokens,
+        model_sequence=args.model_sequence,
+        model_head_dim=args.model_head_dim,
+        model_intermediate=args.model_intermediate,
+    )
     unknown_workloads = sorted(set(workloads) - set(builders))
     if unknown_workloads:
         raise ValueError(f"unknown workload(s): {', '.join(unknown_workloads)}")
@@ -1377,6 +1474,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "attention":
         return run_attention(args)
     if args.command == "transformer-block":
+        return run_transformer_block(args)
+    if args.command == "model-block":
         return run_transformer_block(args)
     if args.command == "layernorm":
         return run_layernorm(args)

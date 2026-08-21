@@ -165,6 +165,40 @@ PYTHONPATH=src python3 -m npu_ooo.cli transformer-block \
 
 它是 shape-only 的 decoder block skeleton，默认生成 9 个 semantic operators、30 tiles、126 primitive tasks；目前仍不包含真实 Q/K/V projection、GQA、RoPE、KV-cache、causal mask 或 fused flash attention。
 
+`model-block` 在同一 skeleton 上增加模型级 benchmark preset。当前提供 `bert-base`、`gpt-j`、`llama2-7b` 和 `deepseek-r1-16b`，每个 preset 都把 native model metadata 和明确的 proxy assumptions 写入 `model_spec.json` / `benchmark_case.json`。默认使用小型 proxy shape，便于快速观察调度；可用 `--tokens`、`--sequence`、`--head-dim` 和 `--intermediate` 放大或缩小实例：
+
+```bash
+PYTHONPATH=src python3 -m npu_ooo.cli model-block \
+  --model-preset llama2-7b \
+  --tokens 16 \
+  --sequence 16 \
+  --head-dim 16 \
+  --intermediate 32 \
+  --policy dynamic_ready_queue \
+  --output-dir out/model-block-llama2
+```
+
+这些 preset 是模型层和调度链路的 proxy benchmark，不等同于真实 GPT-J/LLaMA2/BERT/DeepSeek 的完整算子图。尤其 DeepSeek-R1 的 dense/MoE 配置仍需外部模型配置确认；当前 preset 明确标记为 dense shape-only proxy，不包含 expert routing。
+
+模型 preset 也可直接加入统一 sweep（这里用小 tile 只做调度趋势探针）：
+
+```bash
+PYTHONPATH=src python3 -m npu_ooo.cli sweep-workloads \
+  --workloads bert-base,gpt-j,llama2-7b,deepseek-r1-16b \
+  --architectures minimal \
+  --policies static_pipeline,dynamic_ready_queue \
+  --windows 4 \
+  --robs 4 \
+  --tile-sizes 16 \
+  --model-tokens 16 \
+  --model-sequence 16 \
+  --model-head-dim 16 \
+  --model-intermediate 32 \
+  --output-dir out/sweep-model-proxies
+```
+
+`--model-*` 只作用于命名 model preset；同一组覆盖值会让各模型共享 shape，适合先验证调度公平性。要比较不同 proxy 规模，应为每个 preset 单独运行 `model-block`，并保留 `proxy_shape` 作为结果索引。
+
 当前已实现到 `Execution Graph -> analytical event simulator -> SchedulerResult`，输出 CSV/SVG、Perfetto/Chrome Trace 和 runtime queue/ROB 指标。后端仍是 analytical timing，不是 RTL cycle-accurate；真实 ISA/RTL timing 后续通过 `TimingModel` 接入。
 
 ### 快速运行

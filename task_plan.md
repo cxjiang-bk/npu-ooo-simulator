@@ -17,7 +17,7 @@
 | 2 | 2mm tile instance 和 primitive lowering | completed |
 | 3 | Static discrete-event simulator 与 trace | completed |
 | 4 | Dynamic/TISA-like scheduler | in_progress |
-| 5 | Elementwise/Reduce/Softmax/Attention | in_progress |
+| 5 | Elementwise/Reduce/Softmax/Attention/Model presets | in_progress |
 | 6 | Architecture x Schedule x Policy 实验框架 | in_progress |
 | 7 | TileFlow/SCALE-Sim/RTL 校准 | pending |
 
@@ -38,6 +38,7 @@
 - [x] workload sweep 的 dynamic priority 维度与 Static 配对 baseline；
 - [x] 单头 attention `QK^T -> Softmax -> PV` mixed graph 与 CLI；
 - [x] LayerNorm + attention + MLP + residual transformer block skeleton；
+- [x] BERT/GPT-J/LLaMA2/DeepSeek 的 proxy model preset 与 `model-block` CLI；
 - [ ] 冻结五层 IR 的 normalized schema；
 - [ ] 冻结 ExecutionTask dependency/address schema；
 - [ ] 冻结 simulator event/tie-break 语义；
@@ -107,6 +108,7 @@
 | Attention tile count 测试把三个阶段相乘 | 1 | 按 QK、Softmax、PV 三个独立 operator 的 tile 数求和，默认小图为 12 |
 | Transformer block handoff count 测试把 tile/task 数混同 | 1 | 依赖计数按 root-memory 相交的 store/load 边统计，默认 skeleton 为 8 |
 | timing-config 使用文档占位路径导致 FileNotFoundError | 1 | 添加仓库内 smoke table，README 改用真实路径，CLI 捕获 ValueError 输出简洁错误 |
+| 模型 preset sweep 默认维度过大导致事件仿真耗时过长 | 1 | 为 `sweep-workloads` 增加 `--model-tokens/--model-sequence/--model-head-dim/--model-intermediate` 覆盖；大规模 proxy 维度改为按模型分批运行 |
 
 ## 备注
 

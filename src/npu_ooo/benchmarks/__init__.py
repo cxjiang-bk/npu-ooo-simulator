@@ -13,6 +13,7 @@ from .norm import (
     build_rmsnorm_model,
 )
 from .two_mm import build_two_matmul_case, build_two_matmul_model
+from .model_presets import MODEL_PRESETS, ModelPreset, available_model_presets, build_model_preset
 
 __all__ = [
     "build_elementwise_case",
@@ -33,4 +34,8 @@ __all__ = [
     "build_layernorm_model",
     "build_two_matmul_case",
     "build_two_matmul_model",
+    "MODEL_PRESETS",
+    "ModelPreset",
+    "available_model_presets",
+    "build_model_preset",
 ]
