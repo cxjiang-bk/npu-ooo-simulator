@@ -106,6 +106,7 @@
 | LayerNorm barrier 测试错误假设首 tile 完成均值 | 1 | 按实际 M 外层/N 内层 tile 顺序断言每行最后一个 reduction tile |
 | Attention tile count 测试把三个阶段相乘 | 1 | 按 QK、Softmax、PV 三个独立 operator 的 tile 数求和，默认小图为 12 |
 | Transformer block handoff count 测试把 tile/task 数混同 | 1 | 依赖计数按 root-memory 相交的 store/load 边统计，默认 skeleton 为 8 |
+| timing-config 使用文档占位路径导致 FileNotFoundError | 1 | 添加仓库内 smoke table，README 改用真实路径，CLI 捕获 ValueError 输出简洁错误 |
 
 ## 备注
 

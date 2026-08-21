@@ -216,7 +216,17 @@ Timing 也可以从 JSON 表覆盖，而不修改 lowering 或 simulator：
 }
 ```
 
-运行时传入 `--timing-config path/to/timing.json`。匹配优先级是 `timing_key`、task id、`resource:primitive`、primitive、resource、`default`；未覆盖的 task 回退到 analytical timing。结果的 `backend` 会记录 timing table 名称。
+仓库提供了一个可以直接运行的示例表 `configs/timing/attention_probe.json`：
+
+```bash
+PYTHONPATH=src python3 -m npu_ooo.cli attention \
+  --arch minimal \
+  --timing-config configs/timing/attention_probe.json \
+  --policy dynamic_ready_queue \
+  --output-dir out/attention-calibrated
+```
+
+匹配优先级是 `timing_key`、task id、`resource:primitive`、primitive、resource、`default`；未覆盖的 task 回退到 analytical timing。结果的 `backend` 会记录 timing table 名称。`path/to/timing.json` 只是占位写法，不能直接作为命令运行。
 
 批量比较使用 `sweep-two-mm`。它对每个 architecture/policy/window/ROB 组合重新执行相同的 2mm lowering 和 simulator，并为每个组合写入独立目录：
 
