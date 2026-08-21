@@ -21,7 +21,27 @@ mxu_gemm, vector_add, vector_mul, vector_exp,
 reduce_max, reduce_sum, barrier, cache_read, cache_write
 ```
 
-TISA-like scheduler 应看到 `OpType=SOFTMAX` 以及它的 `TileMem/UnitMap`，而不是只看到失去上下文的四个 `exp/add/div`。Primitive task 仍然需要存在，供 timing simulator 计时和画 lane。
+TISA-like scheduler 应看到 `OpType=SOFTMAX` 以及它的 `TileMem/UnitMap`，而不是只看到失去上下文的四个 `exp/add/div`。Primitive task 仍然需要存在，供 backend timing simulator 计时和画 lane，但它们不应成为论文对齐后的唯一 scheduler IR。
+
+每个 semantic tile 在 TISA 层至少形成：
+
+```text
+TISAInstruction
+  OpType
+  Operands: TileShape + TileMem(base, scope) + AccessType
+  Attributes: reorder/sync/partial-ready constraints
+  UnitMap: unit class, quantity, affinity
+  Deps: source, RAW/WAR/WAW, condition
+```
+
+目标 lowering 顺序应是：
+
+```text
+semantic operator
+  -> TileInstance
+  -> TISAInstruction
+  -> backend primitive tasks
+```
 
 ## 2. 按论文 benchmark 的算子需求
 
@@ -121,8 +141,9 @@ semantic_op_type()
 infer_output_shapes()
 tile_access_regions()
 required_buffers()
-lower_to_execution_tasks()
-dependency_rules()
+lower_to_tisa_instructions()
+dependency_rules()          # typed Deps + conditions
+backend_expand_to_tasks()   # DMA/MXU/ARU-specific, optional
 latency_request()
 ```
 

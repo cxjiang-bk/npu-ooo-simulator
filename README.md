@@ -5,15 +5,18 @@
 项目目标是建立一条独立、可复现的研究链路：
 
 ```text
-模型/benchmark case
-  -> Model IR
-  -> Operator Graph IR
+PyTorch / ONNX / StableHLO
+  -> ExecuTorch / Frontend Adapter
+  -> Model + Canonical Operator Graph IR
+  -> Compiler PassManager
   -> Schedule/Tiling IR
   -> Tile Instance IR
-  -> Primitive Execution Graph
-  -> Static 或 Dynamic Scheduler
-  -> 参数化离散事件 Simulator
-  -> 总周期、利用率、stall 分解和泳道图
+  -> TISAProgram / Semantic Tile Instruction IR
+  -> RuntimeSubmission (shape/state/address/command binding)
+  -> TISA Device Scheduler (Static 或 Dynamic)
+  -> Backend primitive expansion/timing
+  -> 热插拔 Timing/Event/System Backend
+  -> 总周期、runtime/device 分解、stall 和泳道图
 ```
 
 当前已经具备 2mm、residual-add、row-reduce、softmax 和 RMSNorm 五条可执行算子闭环，并新增一个 `RMSNorm -> Matmul -> ResidualAdd` decoder block 混合图。混合图通过 lowering registry 按拓扑逐算子展开，再按显式 tensor edge 和 root-memory region overlap 建立跨算子依赖。所有 workload 都经过模型实例化、显式 tiling、primitive execution graph，以及基于 MachineConfig 的 sequential/static-pipeline/dynamic-ready-queue analytical scheduler。输出包含总周期、等待分解和 Perfetto/Chrome Trace 事件；数值仍标记为 analytical，尚未宣称 RTL cycle-accurate。
@@ -32,15 +35,18 @@
 
 ## 设计原则
 
-1. **架构与调度分离**：MachineConfig 描述硬件，SchedulerPolicy 只描述 issue 决策。
+1. **编译、runtime 与设备调度分离**：Compiler 生成 task，Runtime 负责提交，Device Scheduler 只负责已提交 task 的 issue 决策。
 2. **Static/Dynamic 共用执行模型**：tile、地址、依赖、buffer、资源和 latency 完全一致。
-3. **Mapping 与 timing 分层**：TileFlow/Timeloop 可提供 mapping 与 aggregate cost，但不冒充 per-tile 时间线。
-4. **算子 lowering 可扩展**：scheduler 不依赖 `ProduceQ` 等特定算子或 tensor 名称。
-5. **先可解释、再校准**：第一版是确定性的离散事件模型，不宣称 RTL cycle-accurate。
+3. **TISA 语义层独立存在**：TileInstance 描述几何 bounds，TISAInstruction 描述 OpType/Operand/UnitMap/typed Deps，ExecutionTask 只表示 backend primitive。
+4. **Backend 热插拔**：TimingProvider、EventBackend 和可选 SystemBackend 通过统一 compiled/runtime contract 接入。
+5. **Mapping 与 timing 分层**：TileFlow/Timeloop 可提供 mapping 与 aggregate cost，但不冒充 per-tile 时间线。
+6. **算子 lowering 可扩展**：scheduler 不依赖 `ProduceQ` 等特定算子或 tensor 名称。
+7. **先可解释、再校准**：第一版是确定性的离散事件模型，不宣称 RTL cycle-accurate。
 
 ## 文档
 
 - [总体架构](docs/architecture.md)
+- [TISA 对齐说明](docs/tisa-alignment.md)
 - [实施路线图](docs/roadmap.md)
 - [持续任务计划](task_plan.md)
 - [研究发现与决策](findings.md)
@@ -56,25 +62,29 @@ npu-ooo-simulator/
 │   └── experiments/         # benchmark matrix
 ├── benchmarks/              # operator/fusion graph descriptions
 ├── src/npu_ooo/
-│   ├── ir/                  # model, operator, schedule, tile, execution IR
+│   ├── frontend/            # planned: ExecuTorch/torch.export adapters
+│   ├── compiler/            # planned: pass manager and tile planning
+│   ├── runtime/             # planned: buffer binding and submission
+│   ├── backend/             # planned: hot-pluggable backends
+│   ├── ir/                  # model, operator, schedule, tile, program, execution IR
 │   ├── arch/                # machine schema, validators, profile importers
 │   ├── lowering/            # operator tile -> primitive tasks
 │   ├── scheduler/           # sequential, static pipeline, dynamic ready queue
 │   ├── simulator/           # deterministic discrete-event engine
 │   ├── trace/               # CSV/JSON/Perfetto exporters
-│   └── cli/                 # compile, simulate, compare
+│   └── cli.py              # compile, simulate, compare entry points
 ├── tests/
 └── docs/
 ```
 
 ## 第一条闭环
 
-第一条可运行路径固定为：
+当前已完成的第一条可运行路径是：
 
 ```text
 2mm
   -> Model IR benchmark case
-  -> 手写 Operator Graph
+  -> 手写 Operator Graph（仅作为 baseline/fixture）
   -> 显式 tiling schedule
   -> tile instance graph
   -> configurable DMA/MXU tasks
@@ -83,7 +93,22 @@ npu-ooo-simulator/
   -> Static/Dynamic 对比泳道图
 ```
 
-在该闭环稳定后，再加入 ARU/reduction、Attention 和更复杂的硬件资源。
+ARU/reduction、Attention、模型 proxy 和多架构 sweep 已在该 baseline 上扩展；下一步重点转向自动 frontend、runtime submission 和热插拔 backend。
+
+下一条开发路径将替换手写 graph 入口：
+
+```text
+PyTorch module
+  -> torch.export / ExecuTorch
+  -> Canonical OperatorGraph
+  -> Compiler PassManager
+  -> TISAProgram
+  -> RuntimeSubmission
+  -> analytical TISA Device Scheduler
+  -> primitive timing backend
+```
+
+runtime 和 device scheduler 将分别记录提交顺序与硬件 issue 顺序，并支持 static/dynamic runtime × static/dynamic device 的四种组合实验。
 
 ### Elementwise benchmark
 
@@ -296,10 +321,15 @@ PYTHONPATH=src python3 -m npu_ooo.cli sweep-workloads \
 
 ## 参考项目
 
+- ExecuTorch：`torch.export()`、Core ATen graph 和 backend partition；
+- TVM/TileLang：Relax/TensorIR 分层、tile schedule、pipeline 和 layout；
+- TileRT：软件 tile task runtime、event 和 compute/I/O overlap；
 - TileFlow/Timeloop：tiling、mapping、memory traffic 和 aggregate cost；
 - TVM-VTA：静态 LOAD/COMPUTE/STORE pipeline 和 dependency token；
-- Gemmini：load/execute/store queues、ROB 和参数化 accelerator；
+- Gemmini/NVDLA：参数化或工业风格 accelerator queue、DMA、scratchpad 和 RTL 参考；
 - SCALE-Sim：systolic array timing 和 memory bandwidth 模型；
+- Ramulator2/DRAMSys：DRAM 请求和 bank timing；
+- gem5/gem5-SALAM：可选的 CPU + NPU full-system backend；
 - Perfetto：多资源泳道和事件分析。
 
-这些项目只作为架构与实现参考。该仓库保持自己的 canonical IR、MachineConfig 和 trace schema。
+这些项目只作为架构与局部 backend 参考。该仓库保持自己的 canonical IR、TISAProgram/RuntimeSubmission contract、MachineConfig 和 trace schema。

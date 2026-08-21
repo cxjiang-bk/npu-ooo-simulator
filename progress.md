@@ -127,3 +127,51 @@ dynamic_ready_queue 17984 cycles
 | 目标是什么？ | 从顶层算子到参数化 NPU cycle simulator 的完整研究栈 |
 | 我学到了什么？ | 见 `findings.md` |
 | 我做了什么？ | 见本日志和 `task_plan.md` |
+
+## 2026-08-21：ExecuTorch、Runtime 与热插拔 Backend 架构更新
+
+### 本轮完成
+
+- 重新定义总体架构为：`Frontend Adapter -> Canonical Operator IR -> Compiler PassManager -> Schedule/Tile -> CompiledProgram/TISA Command -> RuntimeSubmission -> Device Backend`；
+- 选择 ExecuTorch/`torch.export()` 作为第一模型前端，暂不把完整 MLIR/IREE toolchain 引入第一版；
+- 明确 `CompiledProgram` 与 `RuntimeSubmission` 的职责边界：前者保存逻辑 task/region/dependency/address expression，后者绑定 shape/state、物理地址、command buffer 和提交顺序；
+- 将 Runtime software dynamic 与 TISA device dynamic 分开，规划四种组合实验：static/dynamic runtime × static/dynamic device；
+- 将 backend 设计为 `TimingProvider`、`EventBackend`、可选 `SystemBackend` 三层热插拔接口；
+- 保留当前 analytical discrete-event backend 作为默认 TISA device model，并规划 SCALE-Sim、Ramulator/DRAMSys、RTL/Verilator、Gemmini/VTA 和 gem5/SALAM 的组合接入边界；
+- 更新 `README.md`、`docs/architecture.md`、`docs/model-layer.md`、`docs/roadmap.md`、`task_plan.md` 和 `findings.md`，新增阶段 8-12 的开发计划和验收条件；
+- 本轮未修改实现代码，未改变现有 simulator 行为。
+
+### 当前工作位置
+
+```text
+已有：手写 Model/Operator Graph -> TileGraph -> ExecutionGraph -> analytical device simulator
+下一步：ExecuTorch -> Canonical OperatorGraph -> 自动 Compiler PassManager
+随后：RuntimeSubmission -> 热插拔 Device Backend -> runtime/device 组合实验
+```
+
+### 验证
+
+- 文档检查：架构图、IR 层次、runtime/device 边界、backend 分层和 roadmap 已同步；
+- 代码/测试：本轮没有实现代码变更，因此未重新运行测试；后续阶段 8 开始前需先建立 frontend adapter micro-test。
+
+## 2026-08-21：TISA 抽象层复核与 IR gap 识别
+
+### 本轮确认
+
+- 重新从论文原文核对 Table II/III、Section III-VI 和 Algorithm 1/2：TISA 是硬件消费的 tile-level scheduling-semantics ISA，不是最终 per-unit 微指令，也不是普通 compiler-only IR；
+- 确认论文 dynamic scheduler 的关键实现位于 AI-core hardware layer：per-unit WQ/IQ/Fu、7--9 cycle dispatch 和 RTL synthesis；host software runtime 只负责 descriptor/command stream 入口；
+- 确认论文 compiler 在 tile granularity 截止 lowering：`TISAInstruction` 之后才进入 backend-specific execution ISA；
+- 确认 StableHLO 在论文中承担 semantic OpType 对齐，不只是 graph serialization；ExecuTorch adapter 必须保留 source/composite provenance；
+- 识别当前设计的主要 gap：`TileInstance -> ExecutionTask` 跳过了结构化 `TISAInstruction`，导致 OpType、Operand(TileShape/TileMem/AccessType)、UnitMap、typed Deps 和 partial-ready condition 没有独立契约；
+- 将目标路径修正为：`TileInstance -> TISAProgram -> hardware-like TISA scheduler -> backend primitive ExecutionTask`；
+- 新增 `docs/tisa-alignment.md`，集中记录论文 TISA 字段、当前 IR 映射、抽象层次偏差和迁移顺序；
+- 更新 `README.md`、`docs/architecture.md`、`docs/operator-taxonomy.md`、`docs/roadmap.md`、`task_plan.md` 和 `findings.md`，将 TISA semantic IR、backend expansion 和硬件/runtime 边界写入持久化文档；
+- 本轮仍未修改实现代码。
+
+### 环境检查
+
+- 当前 Python 环境未安装 `torch` 和 `executorch`；本轮只完成论文/架构复核，阶段 8 实现前需单独固定依赖版本并运行 export smoke test。
+
+### 当前设计结论
+
+现有 Model IR、OperatorGraph、ScheduleSpec、MachineConfig、Static/Dynamic baseline 和 analytical event simulator 可以保留；下一阶段不能继续只扩展 primitive lowering，应先冻结 `TISAInstruction/TISAProgram` 和 typed dependency schema。

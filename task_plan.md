@@ -6,7 +6,7 @@
 
 ## 当前阶段
 
-阶段 4-6：动态/TISA-like backend、算子覆盖和实验矩阵并行推进。
+阶段 8 设计准备：先冻结 TISAInstruction/TISAProgram/BackendArtifact 契约，再进入 ExecuTorch 前端、统一 Compiler PassManager、软件 Runtime 和热插拔 Device Backend。阶段 4-6 的 analytical primitive-task baseline 已可运行，但尚不能称为论文 TISA tile scheduler 复现；阶段 7 外部 timing/RTL 校准仍作为后续 backend 适配工作。
 
 ## 阶段状态
 
@@ -16,10 +16,15 @@
 | 1 | Model IR、MachineConfig 与基础 Operator Graph IR | completed |
 | 2 | 2mm tile instance 和 primitive lowering | completed |
 | 3 | Static discrete-event simulator 与 trace | completed |
-| 4 | Dynamic/TISA-like scheduler | in_progress |
-| 5 | Elementwise/Reduce/Softmax/Attention/Model presets | in_progress |
-| 6 | Architecture x Schedule x Policy 实验框架 | in_progress |
+| 4 | Dynamic/TISA-like scheduler baseline | completed |
+| 5 | Elementwise/Reduce/Softmax/Attention/Model presets baseline | completed |
+| 6 | Architecture x Schedule x Policy 实验框架 baseline | completed |
 | 7 | TileFlow/SCALE-Sim/RTL 校准 | pending |
+| 8 | TISA Contract + ExecuTorch Frontend Adapter | pending |
+| 9 | Compiler PassManager 与自动 TileGraph | pending |
+| 10 | Runtime Submission 与 runtime/device 分层仿真 | pending |
+| 11 | Hot-pluggable Timing/Event/System Backend | pending |
+| 12 | 模型级自动编译与 TISA 实验矩阵 | pending |
 
 ## 阶段 0 检查表
 
@@ -39,13 +44,18 @@
 - [x] 单头 attention `QK^T -> Softmax -> PV` mixed graph 与 CLI；
 - [x] LayerNorm + attention + MLP + residual transformer block skeleton；
 - [x] BERT/GPT-J/LLaMA2/DeepSeek 的 proxy model preset 与 `model-block` CLI；
-- [ ] 冻结五层 IR 的 normalized schema；
+- [ ] 冻结 Model/Operator/Schedule/Tile/Program/Runtime/Execution IR 的 normalized schema；
 - [ ] 冻结 ExecutionTask dependency/address schema；
+- [ ] 冻结 FrontendAdapter/TISAProgram/RuntimeSubmission schema；
+- [ ] 冻结 Runtime policy 与 Device Scheduler policy 的独立配置键；
+- [ ] 冻结 CodegenBackend/TimingProvider/EventBackend/SystemBackend capability contract；
 - [ ] 冻结 simulator event/tie-break 语义；
 - [ ] 冻结 trace/summary/manifest schema；
 - [x] 为 dual/triple pipeline 编写手算 golden case（dual reservation + drain 已由测试固定；stage_count 支持 triple）。
 
 阶段 0 目前已落地 Model/Operator/MachineConfig、Schedule/Tile/Execution、trace/summary/manifest 基础 schema；核心 dual/triple golden case 已有，完整 normalized schema 版本策略和真实 ISA 契约仍待冻结。
+
+阶段 4-6 的“completed”表示基线闭环完成，不表示后续功能不再扩展。下一轮工作必须保持这些 baseline 的输入/输出兼容，并以自动前端和 runtime/backend 分层作为增量演进。
 
 ## 第一里程碑
 
@@ -62,13 +72,16 @@
 
 当前已有两个 architecture profile 的 analytical cycle 对比、CSV/SVG/PNG/Perfetto 输出、ROB/window/queue 指标、显式 static stage reservation、runtime address scoreboard 和 occupancy timeline；`sweep-two-mm` 已能批量生成 architecture × policy × window × ROB 结果。混合 decoder block 已完成第一条跨算子 lowering 闭环；真实 MXU/memory timing 校准仍待后续提交。
 
-## 关键问题
+## 下一阶段关键问题
 
-1. TISA 论文中的 tile address/range 依赖应在 compile-time graph、runtime scoreboard 还是两者中表达？
-2. 第一版 StaticPipeline 使用 list schedule、modulo schedule 还是两者都提供？
-3. Latency model 的 analytical、source-derived 和 RTL-observed 状态如何进入配置与 manifest？
-4. TileFlow mapping 输出如何无损转换为本项目 Schedule/Tiling IR？
-5. 当前 NPU ISA 中哪些指令应视作一个 primitive task，哪些需要拆成 issue 和 completion 两个事件？
+1. ExecuTorch Core ATen 到 Canonical OperatorGraph 的最小公共字段是什么？
+2. `TISAInstruction` 如何同时表达 OpType、Operand、UnitMap、typed Deps 和 runtime-bindable address expression？
+3. `TISAInstruction -> BackendArtifact(descriptor + payload) -> ExecutionTask` 如何保持 scheduler 在 tile 粒度决策？
+4. Runtime command-buffer chunk、launch latency 和 software ready queue 如何加入总周期而不改变 device graph？
+5. Backend plugin 是只替换 TimingProvider，还是需要替换完整 EventBackend？
+6. TISA 论文中的 tile address/range 依赖应在 compile-time graph、runtime binding 还是 device scoreboard 之间如何分工？
+7. Latency model 的 analytical、source-derived 和 RTL-observed 状态如何进入配置与 manifest？
+8. 当前 NPU ISA 中哪些指令应视作一个 primitive task，哪些需要拆成 issue 和 completion 两个事件？
 
 ## 已做决策
 
@@ -80,6 +93,10 @@
 | 第一条闭环使用 2mm | 同时具备 producer-consumer pipeline 和可手算规模，适合验证依赖与 overlap；Model IR 仍从第一天保留 |
 | 在 Operator Graph 上增加 Model/Benchmark IR | 论文 benchmark 横跨 CNN/encoder/decoder、prefill/decode 和不同 batch/seq，单个算子图无法表达这些 workload 语义 |
 | semantic operator 与 lowering primitive 分离 | 保留 Attention/Softmax/Norm/MoE 的调度语义，同时允许硬件 timing 拆成 vector/reduction/transfer tasks |
+| TISAInstruction 独立于 TileInstance 和 ExecutionTask | TileInstance 只描述 tile bounds；TISAInstruction 携带 OpType、Operand、TileMem、AccessType、UnitMap 和 typed Deps；ExecutionTask 是 TISA 之后的 backend-specific primitive，不应成为唯一 scheduler IR |
+| 论文中的 dynamic scheduler 归入 device backend | 论文虽称 runtime scheduler，但明确给出 AI-core 7--9 cycle dispatch、per-unit WQ/IQ/in-flight table 和 RTL synthesis；host runtime 只负责 descriptor/command stream 接口，核心 reorder/issue 是硬件行为 |
+| TISA 是 virtual/high-level ISA，但具有硬件消费的 ISA 契约 | 它不是最终 MXU/Vector/DMA 微指令，也不是纯 compiler IR；Epoch 有 binary encoding，TISA metadata 由硬件 scheduler 直接读取，backend 再 lower 到 per-unit execution ISA |
+| BackendArtifact 同时保留 descriptor 和 execution payload | backend-specific codegen 可在 runtime 前产生 per-unit binary/primitive template，但硬件 scheduler 只读取 TISA descriptor 并以 tile 为单位触发关联 payload；不能让 primitive 自行进入全局 OOO window |
 | 使用 GraphTemplate + GraphInstance | 避免重复 block 展开成巨型 graph，同时保留 layer/template provenance |
 | Trace 同时输出 cycle-native CSV/JSON 和 Perfetto JSON | 前者适合测试与数据分析，后者适合交互式泳道观察 |
 | Conv2D 后置 | halo、padding、layout 会过早扩大 lowering 复杂度 |
@@ -87,6 +104,12 @@
 | scheduler policy 与 event backend 分离 | policy 只选择 ready task；queue、ROB、II、资源占用和 completion wake-up 由 simulator 统一处理 |
 | `SimulatorConfig` 覆盖 MachineConfig runtime capacity | 便于直接 sweep instruction queue、ROB、dependency window、in-flight tile，而不修改编译图 |
 | address scoreboard 作为可选 runtime layer | 基于 active `BufferRegion` 生成 RAW/WAR/WAW issue stall，COMPLETE 后释放范围；不改写默认 graph，方便和 compile-time dependency 做公平对照 |
+| ExecuTorch 作为第一模型前端 | `torch.export()`/Core ATen graph 已经规范化 PyTorch 输入、shape constraint 和 backend partition；先解决自动模型导入，不立即承担完整 MLIR/IREE 集成成本 |
+| Runtime 与 Device Backend 分离 | Runtime 负责 buffer/address binding、command submission 和软件动态行为；Device Backend 负责已提交 task 的 static/dynamic issue、ROB、scoreboard 和 cycle timing |
+| TISAProgram/RuntimeSubmission 作为新边界 | Compiler 输出可复用的语义 tile instruction 和逻辑地址表达式；Runtime 绑定物理地址并分批提交；Device Backend 不反向修改图或 schedule |
+| Backend 热插拔 | 以 `TimingProvider`、`EventBackend`、`SystemBackend` 分层；当前 analytical backend 是默认实现，SCALE-Sim、Ramulator/DRAMSys、RTL/Verilator 和 gem5/SALAM 作为可选实现 |
+| 四种 runtime/device 组合必须可比较 | `static runtime + static/dynamic device` 与 `dynamic runtime + static/dynamic device` 分离报告，避免把软件提交收益误归因于 TISA issue |
+| 没有单一外部 simulator 直接替代当前 backend | gem5 更强在 full-system，Gemmini/VTA 更强在具体 NPU，SCALE-Sim 更强在 MXU，Timeloop 更强在 mapping；当前 TISA tile OOO 语义继续由本项目维护 |
 
 ## 暂不做
 
@@ -95,6 +118,10 @@
 - RTL/UVM 集成；
 - 未校准 energy 常数；
 - 将 TileFlow aggregate pipeline cycle 当作 event trace。
+- 在 ExecuTorch adapter 完成前继续增加 benchmark-specific graph builder。
+- 在 TISAInstruction/typed dependency schema 冻结前继续扩大 primitive lowering 覆盖。
+- 把 runtime submission order 和 device issue order 写成同一个时间线或同一个 policy。
+- 让外部 timing backend 改写 compiler graph，破坏 Static/Dynamic 公平性。
 - 把当前 analytical timing 或 address prepass 宣称为真实 TISA/RTL scoreboard。
 - 把 DeepSeek-R1-16B 未经配置证据直接假设为 dense 或 MoE。
 

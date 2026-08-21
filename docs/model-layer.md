@@ -4,6 +4,8 @@
 
 应该在 Operator Graph 之上增加 Model/Benchmark Layer，而且它不是可选的装饰层。
 
+模型图的来源不再限定为 benchmark 手写 builder。下一阶段优先通过 ExecuTorch/`torch.export()` 导入规范化 Core ATen graph，再由 frontend adapter 映射到本项目的 ModelSpec 和 Canonical OperatorGraph；GraphTemplate 仍然用于表达重复 block、persistent state 和 benchmark scope，不能被 frontend import 直接抹平。
+
 原因是论文的评估对象不是几个孤立算子，而是不同模型和运行阶段：
 
 | Model | Family | Case shape/phase |

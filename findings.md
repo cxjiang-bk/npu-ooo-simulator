@@ -100,3 +100,100 @@ Dynamic triple-stage
 - 论文：`/home/lora/OpenTPU/ooo_research/Song 等 - Dynamic scheduling for AI accelerators via TISA.pdf`
 - 参考仓库：`/home/lora/OpenTPU/operator-opt`，仅只读使用；
 - 新项目：`https://github.com/cxjiang-bk/npu-ooo-simulator`。
+
+## 2026-08-21：Frontend、Runtime 与热插拔 Backend 决策
+
+### 架构决策
+
+- ExecuTorch/`torch.export()` 作为第一模型前端：先获取规范化 Core ATen graph，再转换为项目自己的 Canonical OperatorGraph；ONNX、StableHLO 和 Torch-MLIR 作为后续 adapter，不直接改变下游 IR。
+- Compiler 与 runtime 分离：Compiler 生成 `CompiledProgram`/TISA Command 模板、逻辑 region、依赖、UnitMap 和地址表达式；Runtime 负责 shape/state binding、buffer allocation、physical address binding、command-buffer chunk 和提交事件。
+- Runtime 与 device scheduler 分离：Runtime 动态决定任务何时进入设备；TISA device backend 在已提交窗口内决定每个 cycle 发射哪条 task。两者分别建模并分别统计收益。
+- 当前 `ExecutionGraph -> SchedulerPolicy -> DiscreteEventBackend` 保留为默认 device backend；不能因为引入 ExecuTorch 或外部 simulator 而改变 Static/Dynamic 的共同输入。
+- Backend 采用热插拔分层：`TimingProvider`、`EventBackend`、可选 `SystemBackend`。backend selection、timing source 和 calibration status 必须进入 manifest。
+- Static/Dynamic 实验扩展为四种组合：`static runtime + static/dynamic device` 与 `dynamic runtime + static/dynamic device`，以区分软件提交收益和硬件 issue 收益。
+
+### 开源 backend 的组合定位
+
+| 项目 | 进入项目的层 | 结论 |
+|---|---|---|
+| SCALE-Sim | TimingProvider | 校准 MXU/systolic duration、II、带宽 stall，不替代 TISA scheduler |
+| Timeloop/Accelergy | Mapping/traffic/energy | 生成 mapping 和 aggregate 参考，不生成 per-tile event trace |
+| Ramulator2/DRAMSys | Memory timing provider | 提供 DRAM request completion，不接管 NPU task dependency |
+| Gemmini/VTA | Hardware/ISA reference | 参考 queue、DMA、scratchpad、静态 pipeline 和 RTL timing，不直接作为通用 TISA backend |
+| gem5/gem5-SALAM | Optional SystemBackend | 未来研究 CPU+NPU、runtime、DMA、内存和同步；需要自行实现 NPU device model |
+| TileRT | Runtime reference | 借鉴 tile task、event、compute/I/O overlap，不作为 cycle-level NPU simulator |
+
+没有一个项目同时提供可配置 NPU、通用 tile OOO、runtime、memory 和论文泳道图。因此当前项目保留 TISA device semantics，通过插件接入外部局部模型。
+
+### 新的 IR/运行时边界
+
+```text
+Canonical OperatorGraph
+    -> Schedule/Tiling IR
+    -> TileGraph
+    -> CompiledProgram / TISA Command
+    -> RuntimeSubmission
+    -> Device Backend / ExecutionGraph
+```
+
+`CompiledProgram` 不绑定物理地址和 issue policy；`RuntimeSubmission` 绑定实际 shape、persistent state、buffer base 和提交顺序；Device Backend 只消费提交结果，不回写 OperatorGraph/ScheduleSpec。
+
+### 仍待验证
+
+- ExecuTorch 当前版本导出图中需要支持的 Core ATen operator set 和动态 shape constraint 表达；
+- `CompiledProgram` 地址表达式与真实 NPU ISA descriptor 的对应关系；
+- runtime allocation/command queue 的开销参数来源；
+- backend capability negotiation：TimingProvider 不足以表达 bank/port/conflict 时如何升级为 EventBackend；
+- SCALE-Sim、Gemmini/Verilator 和 RTL trace 的 timing 对账粒度。
+
+## 2026-08-21：重新核对 TISA 原文后的修正
+
+### 论文原文确认
+
+- 论文明确把 TISA 定义为 `TISA_Inst = (OpType, Operands, Attributes, UnitMap)`，Operand 为 `(TileShape, TileMem, AccessType)`，并另外定义 typed dependencies `Deps = (src, type, condition)`；`type` 包括 RAW/WAR/WAW。
+- TISA 的粒度是 tile-level semantic instruction：比 kernel stream 更细，比 raw per-unit ISA instruction 更粗。论文明确写道 compiler 在 tile granularity 截止 lowering，不需要把每个 tile 继续展开成细粒度 ISA 指令。
+- TISA 不是普通 compiler-only IR。论文称其为 hardware-consumed scheduling-semantics layer，并说明 Epoch 上存在 concrete binary encoding；它补充而不是替代 MXU、Vector、DMA 等 per-unit execution ISA。
+- 论文中的 `tisa::load`、`tisa::load_transpose`、`tisa::gemm`、`tisa::softmax` 说明一个 TISA instruction 可以是一个语义明确的 tile operation；一个完整 tile 可能在 backend 内部进一步产生 DMA/MXU/ARU micro-events。
+- 论文的 dynamic scheduler 逻辑上被称为 runtime scheduler，但实现目标是 AI-core 内的硬件 scheduler：论文给出 7--9 cycle dispatch budget、每个 unit 的 WQ/IQ/Fu/in-flight table，并报告 RTL synthesis。论文同时指出控制处理器上的 software runtime 会有 microsecond 级开销，无法承担 tile-level dispatch。
+- 编译链是 `torchxla -> XLA/StableHLO -> MLIR Graph Compiler -> MLIR Fusion Compiler/custom TISA dialect -> TISA generator -> LLVM/backend-specific lowering`。TISA-CPU backend 用于功能验证，TISA-NPU backend 将 metadata 置入最终 binary 并由硬件 scheduler 消费。
+- 论文选择 torchxla -> XLA/StableHLO 不只是为了导出 graph，也是为了让 `OpType` 对齐稳定的高层 semantic taxonomy。ExecuTorch 作为第一入口时必须保留 source module/composite provenance，不能只输出打散后的 Core ATen primitive。
+
+### 对当前设计的影响
+
+当前设计方向没有推翻，但存在一个必须修正的 IR gap：
+
+```text
+当前：TileInstance -> operator-specific lowering -> ExecutionTask -> scheduler
+目标：TileInstance -> TISAInstruction -> device scheduler -> backend primitive ExecutionTask
+```
+
+具体问题：
+
+1. `TileInstance` 目前只有 `operator_id`、coordinates、bounds、stage 和松散 attributes，缺少 `OpType`、Operand、TileMem scope、AccessType、UnitMap、typed Deps 和 partial-ready condition；它只能作为几何 tile，而不是 TISA scheduler 输入。
+2. `ExecutionTask` 当前已经是 `load/matmul/store/reduce` primitive。若直接在这一层做 dynamic issue，会比论文的 tile-level scheduler 更细，并且在 primitive lowering 时丢失 operator semantics、resource affinity 和 typed dependency。
+3. `BufferRegion` 已接近 TileMem，但仍缺少结构化 `base/scope`、symbolic address expression、operand grouping 和 partial region readiness；应作为 TISA Operand 的底层实现，而不是让 scheduler 从 tensor 名称猜地址。
+4. `ExecutionTask.resource` 只有一个资源字符串，不能表达 `UnitMap=(unit, quantity, affinity)`；需要在 TISA 层表达合法 unit class、数量和 affinity，backend 再选择具体 instance。
+5. `TileDependency`/`ExecutionTask.predecessors` 当前主要是 untyped string edges；需要增加 `RAW/WAR/WAW + condition`，并区分 compile-time dependency、TISA typed dependency 和 device-observed address hazard。
+6. 当前 `TimingModel` 直接给 primitive task duration；TISA 对齐后需要额外建模 TISA dispatch/decode/scheduler overhead，以及 TISA instruction 到 backend primitive expansion 的边界。
+
+### 不属于问题的部分
+
+- 继续保留 `Model IR -> OperatorGraph -> ScheduleSpec` 是正确的；它对应论文 framework bridge、graph compiler 和 software-scheduled tile graph 的前半段。
+- `LoweringRegistry` 仍然有价值，但它应先生成 TISA semantic instruction，再由 backend lowering registry 生成 `ExecutionTask`；不是简单删除所有算子专用 lowering。
+- 当前 analytical event simulator、Static/Dynamic policy、MachineConfig 和 trace schema 可以继续复用，作为 TISA device backend 的 baseline implementation。
+- ExecuTorch 仍然适合作为第一 frontend；它替代的是论文的 torchxla/StableHLO framework bridge，不替代 TISA dialect 或 device scheduler。
+- 当前环境未安装 `torch`/`executorch`，因此真实 API 兼容性尚未验证；实现前需要在项目环境中固定版本并建立最小 export smoke test。
+
+### 修正后的对齐架构
+
+```text
+ExecuTorch / StableHLO
+        -> Canonical OperatorGraph
+        -> Schedule/Tiling + fusion
+        -> TileInstance (bounds/provenance)
+        -> TISAProgram (semantic tile instructions)
+        -> Runtime descriptor emission / binding
+        -> Hardware-like TISA scheduler (WQ/IQ/Fu)
+        -> Backend primitive expansion and timing
+        -> Execution trace
+```
