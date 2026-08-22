@@ -201,3 +201,19 @@ dynamic_ready_queue 17984 cycles
 - `TorchExportAdapter` 已建立边界，但当前环境没有 `torch`/`executorch`，且 torch FX metadata/operator overload 的版本兼容性尚未在本机验证。
 - 目前 TISA program 是对既有 primitive lowering 的语义封装；device scheduler 仍消费 primitive ExecutionGraph。下一阶段必须实现 TISA target scheduler：先 issue TISA tile，再激活不可跨 tile 重排的 payload group。
 - 当前默认 schedule 仍是 compiler 内的 deterministic heuristic，不是完整 MLIR/StableHLO pass manager；StableHLO adapter 和 composite semantic preservation 后续接入同一 FrontendImport。
+
+## 2026-08-22：按阶段整理输出 artifact
+
+### 已完成
+
+- 新增 `src/npu_ooo/trace/layout.py`，统一定义 `00_frontend` 到 `07_trace` 八个阶段目录、文件映射、输出目录 README 和 `artifact_index.json`。
+- 所有通用 JSON/CSV/SVG/PNG/Graphviz exporter 自动写入规范阶段目录；普通 benchmark、`compile-model` 和 sweep case 共用同一布局。`sweep-two-mm` case 现在也会保存模型、算子图、schedule/tile 和 backend graph，而不只保存最终仿真结果。
+- 顶层保留 `manifest.json`、`summary.json`、`artifact_index.json` 和 `README.md`；原有平级文件名以相对符号链接保留，兼容现有 CLI/tests/脚本。
+- README 的项目目录和运行输出说明已改为中文，并加入从 frontend 到 trace 的完整目录树、每层职责、典型查看顺序和 sweep 说明。
+- `docs/architecture.md` 同步记录 staged artifact schema，避免文档仍描述旧的 flatten 输出。
+
+### 验证
+
+- 全量 `PYTHONPATH=src python3 -m unittest discover -s tests -q`：62 tests passed。
+- 普通 `two-mm`、`compile-model` 和 `sweep-two-mm` smoke 均生成八个阶段目录；`artifact_index.json` 可列出规范文件，兼容符号链接可正常被旧测试读取。
+- `git diff --check` 通过。

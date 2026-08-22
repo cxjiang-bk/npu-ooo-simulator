@@ -687,15 +687,22 @@ TimingModel / EventBackend
 一次仿真至少输出：
 
 ```text
-tasks.csv
-summary.json
 manifest.json
-perfetto.json
-swimlane.svg
-operator_graph.json / operator_graph.svg
-tile_graph.json
-execution_graph.json
+artifact_index.json
+00_frontend/{model_spec,benchmark_case,model_instance}.json
+01_graph_ir/{operator_graph.json,operator_graph.svg,operator_graph.dot}
+02_schedule_tile/{schedule.json,tile_graph.json,tile_graph.dot}
+03_tisa/{tisa_program.json,compiled_artifact.json}
+04_backend/{machine.json,backend_artifact.json,execution_graph.json}
+05_runtime/address_dependencies.json
+06_simulation/{summary.json,tasks.csv}
+07_trace/{perfetto.json,swimlane.svg,swimlane.png}
 ```
+
+artifact 的规范位置按编号目录组织，顶层同名文件只作为兼容旧脚本的相对符号链接；
+`artifact_index.json` 记录每个阶段实际生成的文件。这样可以按
+`frontend -> graph -> schedule/tile -> TISA -> backend -> runtime -> simulation/trace`
+顺序检查一次实验，而不必在一个目录中区分几十个平级文件。
 
 `events.csv` 使用 cycle-native 字段：
 

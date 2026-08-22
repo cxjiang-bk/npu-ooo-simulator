@@ -52,30 +52,90 @@ PyTorch / ONNX / StableHLO
 - [研究发现与决策](findings.md)
 - [进度日志](progress.md)
 
-## 计划目录
+## 项目目录与输出目录
 
 ```text
 npu-ooo-simulator/
-├── configs/
-│   ├── architectures/       # MachineConfig profiles
-│   ├── schedules/           # static/dynamic scheduler configs
-│   └── experiments/         # benchmark matrix
-├── benchmarks/              # operator/fusion graph descriptions
+├── configs/                 # 可版本化的架构、时序和实验配置
+│   ├── architectures/       # MachineConfig 架构 profile
+│   ├── schedules/           # Static/Dynamic 调度参数
+│   ├── timing/              # primitive 时序覆盖表
+│   └── experiments/         # benchmark 矩阵
+├── benchmarks/              # 算子、融合图和模型 proxy 定义
 ├── src/npu_ooo/
-│   ├── frontend/            # JSON/canonical bridge and optional torch.export adapter
-│   ├── compiler/            # canonical graph -> schedule/tile/TISA/backend pipeline
-│   ├── runtime/             # planned: buffer binding and submission
-│   ├── backend/             # planned: hot-pluggable backends
-│   ├── ir/                  # model, operator, schedule, tile, program, execution IR
-│   ├── arch/                # machine schema, validators, profile importers
-│   ├── lowering/            # operator tile -> primitive tasks
-│   ├── scheduler/           # sequential, static pipeline, dynamic ready queue
-│   ├── simulator/           # deterministic discrete-event engine
-│   ├── trace/               # CSV/JSON/Perfetto exporters
-│   └── cli.py              # compile, simulate, compare entry points
-├── tests/
-└── docs/
+│   ├── frontend/            # framework bridge：JSON、torch.export/ExecuTorch 适配器
+│   ├── compiler/            # Canonical Graph -> Schedule/Tile -> TISA/Backend
+│   ├── runtime/             # 规划中：地址绑定、command buffer 和提交策略
+│   ├── backend/             # 规划中：可热插拔的 timing/event/system backend
+│   ├── ir/                  # Model、Operator、Schedule、Tile、TISA、Execution IR
+│   ├── arch/                # MachineConfig schema、校验和 profile 导入
+│   ├── lowering/            # semantic operator -> backend primitive task
+│   ├── scheduler/           # sequential、Static pipeline、Dynamic ready queue
+│   ├── simulator/           # 确定性离散事件仿真和 address scoreboard
+│   ├── trace/               # JSON、CSV、SVG、PNG、Perfetto 导出与输出布局
+│   └── cli.py               # 编译、仿真、sweep 和对比实验入口
+├── tests/                   # 单元测试和 golden case
+├── docs/                    # 架构、TISA 对齐、路线图和研究记录
+├── task_plan.md             # 当前阶段和验收条件
+├── findings.md              # 论文/开源项目研究结论
+└── progress.md              # 持续进度与验证日志
 ```
+
+每次运行命令的 `--output-dir` 都会生成一个独立的实验目录。例如：
+
+```text
+out/attention-dynamic/
+├── README.md                # 本次运行的目录说明和推荐查看顺序
+├── artifact_index.json      # 阶段目录到文件的机器可读索引
+├── manifest.json            # benchmark、架构、policy、backend、配置 hash
+├── 00_frontend/             # 输入模型、benchmark case、frontend provenance
+│   ├── model_spec.json
+│   ├── benchmark_case.json
+│   └── model_instance.json
+├── 01_graph_ir/             # Canonical OperatorGraph 和图可视化
+│   ├── operator_graph.json
+│   ├── operator_graph.dot
+│   └── operator_graph.svg
+├── 02_schedule_tile/        # tile factor、loop order、边界 tile 和依赖
+│   ├── schedule.json
+│   ├── tile_graph.json
+│   └── tile_graph.dot
+├── 03_tisa/                 # TISA descriptor、语义指令和编译产物
+│   ├── tisa_program.json
+│   └── compiled_artifact.json
+├── 04_backend/              # MachineConfig、backend payload 和 primitive graph
+│   ├── machine.json
+│   ├── backend_artifact.json
+│   └── execution_graph.json
+├── 05_runtime/              # 地址绑定/运行时观察到的依赖和 hazard
+│   └── address_dependencies.json
+├── 06_simulation/           # 周期、stall、队列指标和每个 task 的时序
+│   ├── summary.json
+│   └── tasks.csv
+└── 07_trace/                # 适合浏览器/图形工具查看的时间线
+    ├── perfetto.json
+    ├── swimlane.svg
+    └── swimlane.png
+```
+
+目录编号对应从前端到后端的实际处理顺序，便于定位问题：
+
+1. `00_frontend` 为空或内容不对，说明模型导入/shape 约束有问题；
+2. `01_graph_ir` 反映规范化后的算子语义和 tensor 拓扑；
+3. `02_schedule_tile` 反映切分、边界 tile、loop order 和 compile-time 依赖；
+4. `03_tisa` 用来检查 `OpType`、`TileMem`、`UnitMap` 和 typed dependency 是否保留；
+5. `04_backend` 用来检查具体机器参数以及 TISA 到 primitive payload 的展开；
+6. `05_runtime` 用来区分地址冲突等运行时观察，不把它们误认为编译期依赖；
+7. `06_simulation` 和 `07_trace` 用来比较总周期、stall 分解和不同调度策略的泳道。
+
+当前已有的 primitive baseline 命令仍直接生成 `ExecutionGraph`，因此它们的
+`03_tisa/` 可能暂时为空；`compile-model` 路径已经生成 `TISAProgram`/`BackendArtifact`，
+后续 TISA target scheduler 接入后，所有自动编译路径都会填充该目录。
+
+为兼容旧脚本，常用文件名仍会在实验目录顶层生成相对符号链接，例如
+`operator_graph.json -> 01_graph_ir/operator_graph.json`。规范位置以编号目录为准；
+批量 sweep 的 `sweep.csv`、`sweep.json` 和每个 case 目录仍保留在 sweep 根目录下，
+便于批量扫描工具直接读取。
 
 ### Framework bridge 层级
 
@@ -261,27 +321,16 @@ PYTHONPATH=src python3 -m npu_ooo.cli two-mm \
   --output-dir out/two-mm-dynamic
 ```
 
-命令会同时生成编译图和调度结果：
+命令会按 `00_frontend` 到 `07_trace` 的阶段目录生成编译图和调度结果；各目录的
+文件含义见上面的输出树。顶层 `artifact_index.json` 会列出本次实际生成的规范文件，
+不需要逐个猜测文件位置。Graphviz 文件位于 `01_graph_ir`、`02_schedule_tile` 和
+`04_backend`，时间线位于 `06_simulation`/`07_trace`。顶层同名符号链接仅用于兼容旧
+脚本，不代表新的规范布局。
 
-```text
-model_spec.json         模型模板
-benchmark_case.json     本次 benchmark 参数
-model_instance.json     shape 实例化后的模型
-operator_graph.json     semantic operator/tensor 计算图
-operator_graph.svg      可直接查看的顶层计算图
-schedule.json           tile factor、loop order、stage
-tile_graph.json         具体 tile 实例和依赖
-execution_graph.json    load/matmul/store task 及依赖
-address_dependencies.json  运行时观测到的 RAW/WAR/WAW 冲突
-machine.json            本次 MachineConfig
-manifest.json           配置 hash、policy、周期和统计
-tasks.csv               task start/finish 时间
-swimlane.svg            资源泳道图
-swimlane.png            PNG 资源泳道图（由 ImageMagick/librsvg 导出）
-perfetto.json           Perfetto/Chrome Trace
-```
-
-同时提供 `operator_graph.dot`、`tile_graph.dot`、`execution_graph.dot`，用于 Graphviz 或其他图分析工具。`--arch` 可选 `minimal`、`wide-mxu`、`lpu-like`；`--machine-config path/to/machine.json` 可以直接加载 canonical MachineConfig JSON，用于探索任意自定义 memory/unit/path 参数；`--policy` 可选 `sequential`、`static_pipeline`、`dynamic_ready_queue`。manifest 中的 `machine_hash` 是实际加载配置的稳定标识。
+`--arch` 可选 `minimal`、`wide-mxu`、`lpu-like`；`--machine-config path/to/machine.json`
+可以直接加载 canonical MachineConfig JSON，用于探索任意自定义 memory/unit/path 参数；
+`--policy` 可选 `sequential`、`static_pipeline`、`dynamic_ready_queue`。manifest 中的
+`machine_hash` 是实际加载配置的稳定标识。
 
 运行时容量可以通过 `--instruction-queue-depth`、`--rob-entries`、`--max-inflight-tiles`、`--dependency-window` 和 `--ready-queue-depth` 覆盖 MachineConfig 默认值；实际生效值会写入 `manifest.json` 和 `summary.json`。`--address-scoreboard` 启用运行时 range scoreboard：活跃 task 的重叠 `BufferRegion` 会产生 RAW/WAR/WAW issue stall，完成后释放并唤醒等待者。动态 policy 可用 `--dynamic-priority critical_path|oldest_first` 切换启发式。静态流水线可用 `--static-stage-offsets 0,200 --static-stage-ii 250` 显式指定 stage reservation；不提供该参数时保留默认 program-order static baseline。
 
@@ -337,7 +386,9 @@ PYTHONPATH=src python3 -m npu_ooo.cli sweep-workloads \
   --output-dir out/sweep-workloads
 ```
 
-每个 case 目录同时保留 `operator_graph.json`、`execution_graph.json`、`summary.json`、`tasks.csv`、`perfetto.json`、`swimlane.svg` 和 `swimlane.png`，顶层 `sweep.csv/json` 增加 workload、dynamic priority 字段并计算相对 static 的 speedup。Static baseline 会对每个 priority 值重复记录，确保比较键完全一致。
+每个 case 目录也采用相同的 `00_frontend` 到 `07_trace` 布局；顶层 `sweep.csv/json`
+增加 workload、dynamic priority 字段并计算相对 static 的 speedup。Static baseline 会
+对每个 priority 值重复记录，确保比较键完全一致。
 
 使用外部架构文件时，sweep 的 architecture label 可以是任意字符串；实际硬件参数来自 `--machine-config`，label 和 `machine_hash` 会同时写入 manifest。
 

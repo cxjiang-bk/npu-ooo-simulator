@@ -5,6 +5,8 @@ from pathlib import Path
 
 from npu_ooo.ir import ExecutionGraph, OperatorGraph, TileGraph
 
+from .layout import artifact_path, finalize_artifact
+
 
 def _quote(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
@@ -27,7 +29,10 @@ def write_operator_graph_dot(graph: OperatorGraph, path: str | Path) -> None:
         for tensor in operator.outputs:
             lines.append(f"  {_quote('op:' + operator.op_id)} -> {_quote('tensor:' + tensor)};")
     lines.append("}")
-    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    target, compatibility = artifact_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    finalize_artifact(target, compatibility)
 
 
 def write_tile_graph_dot(graph: TileGraph, path: str | Path) -> None:
@@ -42,7 +47,10 @@ def write_tile_graph_dot(graph: TileGraph, path: str | Path) -> None:
             f"  {_quote(dependency.producer)} -> {_quote(dependency.consumer)} [label={_quote(label)},fontsize=8];"
         )
     lines.append("}")
-    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    target, compatibility = artifact_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    finalize_artifact(target, compatibility)
 
 
 def write_execution_graph_dot(graph: ExecutionGraph, path: str | Path) -> None:
@@ -61,7 +69,10 @@ def write_execution_graph_dot(graph: ExecutionGraph, path: str | Path) -> None:
         for predecessor in task.predecessors:
             lines.append(f"  {_quote(predecessor)} -> {_quote(task.task_id)};")
     lines.append("}")
-    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    target, compatibility = artifact_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    finalize_artifact(target, compatibility)
 
 
 def write_operator_graph_svg(graph: OperatorGraph, path: str | Path) -> None:
@@ -145,4 +156,7 @@ def write_operator_graph_svg(graph: OperatorGraph, path: str | Path) -> None:
             elements.append(f'<text x="{x + node_width / 2}" y="{y + 22}" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="bold">{html.escape(name)}</text>')
             elements.append(f'<text x="{x + node_width / 2}" y="{y + 41}" text-anchor="middle" font-family="sans-serif" font-size="11">{html.escape(shape + ' ' + tensor.dtype)}</text>')
     elements.append("</svg>")
-    Path(path).write_text("\n".join(elements), encoding="utf-8")
+    target, compatibility = artifact_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("\n".join(elements), encoding="utf-8")
+    finalize_artifact(target, compatibility)

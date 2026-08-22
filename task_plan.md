@@ -108,6 +108,7 @@
 | Runtime 与 Device Backend 分离 | Runtime 负责 buffer/address binding、command submission 和软件动态行为；Device Backend 负责已提交 task 的 static/dynamic issue、ROB、scoreboard 和 cycle timing |
 | TISAProgram/RuntimeSubmission 作为新边界 | Compiler 输出可复用的语义 tile instruction 和逻辑地址表达式；Runtime 绑定物理地址并分批提交；Device Backend 不反向修改图或 schedule |
 | Backend 热插拔 | 以 `TimingProvider`、`EventBackend`、`SystemBackend` 分层；当前 analytical backend 是默认实现，SCALE-Sim、Ramulator/DRAMSys、RTL/Verilator 和 gem5/SALAM 作为可选实现 |
+| Artifact 输出布局 | 编译/仿真输出按 `00_frontend` 到 `07_trace` 分阶段保存；顶层保留 manifest/summary/index，旧文件名用相对符号链接兼容 | 既便于按处理链路定位问题，又不破坏已有脚本 |
 | 四种 runtime/device 组合必须可比较 | `static runtime + static/dynamic device` 与 `dynamic runtime + static/dynamic device` 分离报告，避免把软件提交收益误归因于 TISA issue |
 | 没有单一外部 simulator 直接替代当前 backend | gem5 更强在 full-system，Gemmini/VTA 更强在具体 NPU，SCALE-Sim 更强在 MXU，Timeloop 更强在 mapping；当前 TISA tile OOO 语义继续由本项目维护 |
 

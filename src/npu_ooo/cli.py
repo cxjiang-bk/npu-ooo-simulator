@@ -67,6 +67,7 @@ from npu_ooo.trace import (
     write_operator_graph_svg,
     write_svg,
     write_tile_graph_dot,
+    ensure_output_layout,
 )
 
 
@@ -407,7 +408,7 @@ def run_compile_model(args: argparse.Namespace) -> int:
     )
     machine = _machine(args.arch, args.machine_config)
     compiled = compile_frontend_import(imported, machine, tile_size=args.tile_size)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_output_layout(args.output_dir)
     write_artifact_json(imported, args.output_dir / "frontend_import.json")
     write_artifact_json(compiled.graph, args.output_dir / "canonical_graph.json")
     write_artifact_json(compiled.schedule, args.output_dir / "schedule.json")
@@ -529,7 +530,7 @@ def run_two_mm(args: argparse.Namespace) -> int:
         timing_model=_timing_model(args.timing_config),
         simulator_config=simulator_config,
     )
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_output_layout(args.output_dir)
     write_artifact_json(model, args.output_dir / "model_spec.json")
     write_artifact_json(case, args.output_dir / "benchmark_case.json")
     write_artifact_json(instance, args.output_dir / "model_instance.json")
@@ -619,7 +620,7 @@ def run_elementwise(args: argparse.Namespace) -> int:
         timing_model=_timing_model(args.timing_config),
         simulator_config=simulator_config,
     )
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_output_layout(args.output_dir)
     write_artifact_json(model, args.output_dir / "model_spec.json")
     write_artifact_json(case, args.output_dir / "benchmark_case.json")
     write_artifact_json(instance, args.output_dir / "model_instance.json")
@@ -689,7 +690,7 @@ def run_reduce(args: argparse.Namespace) -> int:
         ),
     )
     result = schedule_execution_graph(lowered.execution_graph, machine, args.policy, timing_model=_timing_model(args.timing_config), simulator_config=simulator_config)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_output_layout(args.output_dir)
     write_artifact_json(model, args.output_dir / "model_spec.json")
     write_artifact_json(case, args.output_dir / "benchmark_case.json")
     write_artifact_json(instance, args.output_dir / "model_instance.json")
@@ -759,7 +760,7 @@ def run_softmax(args: argparse.Namespace) -> int:
         ),
     )
     result = schedule_execution_graph(lowered.execution_graph, machine, args.policy, timing_model=_timing_model(args.timing_config), simulator_config=simulator_config)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_output_layout(args.output_dir)
     write_artifact_json(model, args.output_dir / "model_spec.json")
     write_artifact_json(case, args.output_dir / "benchmark_case.json")
     write_artifact_json(instance, args.output_dir / "model_instance.json")
@@ -829,7 +830,7 @@ def run_rmsnorm(args: argparse.Namespace) -> int:
         ),
     )
     result = schedule_execution_graph(lowered.execution_graph, machine, args.policy, timing_model=_timing_model(args.timing_config), simulator_config=simulator_config)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_output_layout(args.output_dir)
     write_artifact_json(model, args.output_dir / "model_spec.json")
     write_artifact_json(case, args.output_dir / "benchmark_case.json")
     write_artifact_json(instance, args.output_dir / "model_instance.json")
@@ -905,7 +906,7 @@ def run_decoder_block(args: argparse.Namespace) -> int:
         timing_model=_timing_model(args.timing_config),
         simulator_config=simulator_config,
     )
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_output_layout(args.output_dir)
     write_artifact_json(model, args.output_dir / "model_spec.json")
     write_artifact_json(case, args.output_dir / "benchmark_case.json")
     write_artifact_json(instance, args.output_dir / "model_instance.json")
@@ -986,7 +987,7 @@ def run_attention(args: argparse.Namespace) -> int:
         ),
     )
     result = schedule_execution_graph(lowered.execution_graph, machine, args.policy, timing_model=_timing_model(args.timing_config), simulator_config=simulator_config)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_output_layout(args.output_dir)
     write_artifact_json(model, args.output_dir / "model_spec.json")
     write_artifact_json(case, args.output_dir / "benchmark_case.json")
     write_artifact_json(instance, args.output_dir / "model_instance.json")
@@ -1079,7 +1080,7 @@ def run_transformer_block(args: argparse.Namespace) -> int:
         ),
     )
     result = schedule_execution_graph(lowered.execution_graph, machine, args.policy, timing_model=_timing_model(args.timing_config), simulator_config=simulator_config)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_output_layout(args.output_dir)
     write_artifact_json(model, args.output_dir / "model_spec.json")
     write_artifact_json(case, args.output_dir / "benchmark_case.json")
     write_artifact_json(instance, args.output_dir / "model_instance.json")
@@ -1160,7 +1161,7 @@ def run_layernorm(args: argparse.Namespace) -> int:
         ),
     )
     result = schedule_execution_graph(lowered.execution_graph, machine, args.policy, timing_model=_timing_model(args.timing_config), simulator_config=simulator_config)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_output_layout(args.output_dir)
     write_artifact_json(model, args.output_dir / "model_spec.json")
     write_artifact_json(case, args.output_dir / "benchmark_case.json")
     write_artifact_json(instance, args.output_dir / "model_instance.json")
@@ -1227,7 +1228,7 @@ def run_sweep_two_mm(args: argparse.Namespace) -> int:
     tile_sizes = _parse_positive_int_list(args.tile_sizes, name="--tile-sizes")
     stage_offsets = _parse_offsets(args.static_stage_offsets)
     timing_model = _timing_model(args.timing_config)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_output_layout(args.output_dir)
 
     model = build_two_matmul_model()
     records: list[dict[str, object]] = []
@@ -1270,6 +1271,19 @@ def run_sweep_two_mm(args: argparse.Namespace) -> int:
         case_id = f"{architecture}__{policy}__tile{tile_size}__window{dependency_window}__rob{rob_entries}"
         case_dir = args.output_dir / case_id
         case_dir.mkdir(parents=True, exist_ok=True)
+        ensure_output_layout(case_dir)
+        write_artifact_json(model, case_dir / "model_spec.json")
+        write_artifact_json(case, case_dir / "benchmark_case.json")
+        write_artifact_json(instance, case_dir / "model_instance.json")
+        write_artifact_json(instance.graph, case_dir / "operator_graph.json")
+        write_artifact_json(schedule, case_dir / "schedule.json")
+        write_artifact_json(lowered.tile_graph, case_dir / "tile_graph.json")
+        write_artifact_json(lowered.execution_graph, case_dir / "execution_graph.json")
+        write_artifact_json(machine, case_dir / "machine.json")
+        write_operator_graph_dot(instance.graph, case_dir / "operator_graph.dot")
+        write_operator_graph_svg(instance.graph, case_dir / "operator_graph.svg")
+        write_tile_graph_dot(lowered.tile_graph, case_dir / "tile_graph.dot")
+        write_execution_graph_dot(lowered.execution_graph, case_dir / "execution_graph.dot")
         write_json(result, case_dir / "summary.json")
         write_csv(result, case_dir / "tasks.csv")
         write_svg(result, case_dir / "swimlane.svg")
@@ -1428,7 +1442,7 @@ def run_sweep_workloads(args: argparse.Namespace) -> int:
         raise ValueError(f"unsupported dynamic priority(s): {', '.join(unknown_priorities)}")
     stage_offsets = _parse_offsets(args.static_stage_offsets)
     timing_model = _timing_model(args.timing_config)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    ensure_output_layout(args.output_dir)
 
     lowered_cache: dict[tuple[str, str, int], tuple[object, object, object, object]] = {}
     results: dict[tuple[str, str, str, int, int, int, str], object] = {}

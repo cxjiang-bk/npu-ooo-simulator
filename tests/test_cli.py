@@ -52,6 +52,15 @@ class CliArtifactTest(unittest.TestCase):
                 "tile_graph.json",
             }
             self.assertTrue(expected.issubset({path.name for path in output.iterdir()}))
+            self.assertTrue((output / "00_frontend" / "model_spec.json").exists())
+            self.assertTrue((output / "01_graph_ir" / "operator_graph.json").exists())
+            self.assertTrue((output / "02_schedule_tile" / "tile_graph.json").exists())
+            self.assertTrue((output / "04_backend" / "execution_graph.json").exists())
+            self.assertTrue((output / "06_simulation" / "summary.json").exists())
+            self.assertTrue((output / "07_trace" / "swimlane.svg").exists())
+            artifact_index = json.loads((output / "artifact_index.json").read_text())
+            self.assertEqual(artifact_index["layout"], "staged")
+            self.assertIn("01_graph_ir", {item["directory"] for item in artifact_index["stages"]})
             operator_graph = json.loads((output / "operator_graph.json").read_text())
             execution_graph = json.loads((output / "execution_graph.json").read_text())
             manifest = json.loads((output / "manifest.json").read_text())
@@ -101,6 +110,11 @@ class CliArtifactTest(unittest.TestCase):
                 self.assertTrue((case_dir / "manifest.json").exists())
                 self.assertTrue((case_dir / "summary.json").exists())
                 self.assertTrue((case_dir / "swimlane.svg").exists())
+                self.assertTrue((case_dir / "00_frontend" / "model_spec.json").exists())
+                self.assertTrue((case_dir / "01_graph_ir" / "operator_graph.json").exists())
+                self.assertTrue((case_dir / "02_schedule_tile" / "tile_graph.json").exists())
+                self.assertTrue((case_dir / "04_backend" / "execution_graph.json").exists())
+                self.assertTrue((case_dir / "07_trace" / "perfetto.json").exists())
             self.assertTrue((output / "sweep.csv").exists())
 
     def test_elementwise_exports_aru_execution_graph(self) -> None:

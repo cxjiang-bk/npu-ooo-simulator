@@ -101,6 +101,13 @@ Dynamic triple-stage
 - 参考仓库：`/home/lora/OpenTPU/operator-opt`，仅只读使用；
 - 新项目：`https://github.com/cxjiang-bk/npu-ooo-simulator`。
 
+## 2026-08-22：Artifact 输出布局
+
+- 之前每个 benchmark 输出目录把 model、graph、schedule、backend、simulation 和 trace 文件全部平铺，人工检查时难以对应编译链路。
+- 现在规范布局使用八个编号目录：`00_frontend`、`01_graph_ir`、`02_schedule_tile`、`03_tisa`、`04_backend`、`05_runtime`、`06_simulation`、`07_trace`。
+- 顶层保留 `manifest.json`、`summary.json`、`artifact_index.json` 和 `README.md`；旧的平级 artifact 文件名通过相对符号链接保留，确保已有测试、脚本和用户命令不需要立刻改写。
+- `artifact_index.json` 是机器可读的阶段索引，输出目录中的 `README.md` 给出本次运行的中文查看顺序；sweep 的每个 case 复用相同布局，顶层 `sweep.csv/json` 仍用于汇总。
+
 ## 2026-08-21：Frontend、Runtime 与热插拔 Backend 决策
 
 ### 架构决策

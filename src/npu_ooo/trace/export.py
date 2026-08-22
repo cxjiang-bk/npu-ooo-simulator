@@ -11,18 +11,28 @@ from typing import Any
 
 from npu_ooo.scheduler import ScheduleResult
 
+from .layout import artifact_path, finalize_artifact
+
 
 def write_artifact_json(artifact: Any, path: str | Path) -> None:
     payload = artifact.to_dict() if hasattr(artifact, "to_dict") else artifact
-    Path(path).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    target, compatibility = artifact_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    finalize_artifact(target, compatibility)
 
 
 def write_json(result: ScheduleResult, path: str | Path) -> None:
-    Path(path).write_text(json.dumps(result.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
+    target, compatibility = artifact_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(result.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
+    finalize_artifact(target, compatibility)
 
 
 def write_csv(result: ScheduleResult, path: str | Path) -> None:
-    with Path(path).open("w", newline="", encoding="utf-8") as handle:
+    target, compatibility = artifact_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
             handle,
             fieldnames=(
@@ -59,11 +69,14 @@ def write_csv(result: ScheduleResult, path: str | Path) -> None:
                     "primitive": details.get("primitive", ""),
                 }
             )
+    finalize_artifact(target, compatibility)
 
 
 def write_svg(result: ScheduleResult, path: str | Path, *, width: int = 1600, row_height: int = 28) -> None:
     """Write a dependency-free SVG swimlane for quick local inspection."""
 
+    target, compatibility = artifact_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
     lanes = sorted({(timing.resource, timing.instance) for timing in result.timings})
     lane_index = {lane: index for index, lane in enumerate(lanes)}
     label_width = 180
@@ -104,7 +117,8 @@ def write_svg(result: ScheduleResult, path: str | Path, *, width: int = 1600, ro
             f'<rect x="{x:.2f}" y="{y}" width="{rect_width:.2f}" height="{row_height - 8}" fill="{color}" rx="2"><title>{html.escape(task.task_id)} [{task.start:g}, {task.finish:g}]</title></rect>'
         )
     elements.append("</svg>")
-    Path(path).write_text("\n".join(elements), encoding="utf-8")
+    target.write_text("\n".join(elements), encoding="utf-8")
+    finalize_artifact(target, compatibility)
 
 
 def write_png(result: ScheduleResult, path: str | Path, *, width: int = 1600, row_height: int = 28) -> None:
@@ -113,7 +127,8 @@ def write_png(result: ScheduleResult, path: str | Path, *, width: int = 1600, ro
     converter = shutil.which("convert") or shutil.which("magick") or shutil.which("rsvg-convert")
     if converter is None:
         raise RuntimeError("PNG swimlane export requires ImageMagick ('convert') or 'rsvg-convert'")
-    target = Path(path)
+    target, compatibility = artifact_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as handle:
         temporary_svg = Path(handle.name)
     try:
@@ -123,5 +138,6 @@ def write_png(result: ScheduleResult, path: str | Path, *, width: int = 1600, ro
         else:
             command = [converter, str(temporary_svg), str(target)]
         subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        finalize_artifact(target, compatibility)
     finally:
         temporary_svg.unlink(missing_ok=True)
