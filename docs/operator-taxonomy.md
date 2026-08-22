@@ -23,7 +23,13 @@ reduce_max, reduce_sum, barrier, cache_read, cache_write
 
 TISA-like scheduler 应看到 `OpType=SOFTMAX` 以及它的 `TileMem/UnitMap`，而不是只看到失去上下文的四个 `exp/add/div`。Primitive task 仍然需要存在，供 backend timing simulator 计时和画 lane，但它们不应成为论文对齐后的唯一 scheduler IR。
 
-每个 semantic tile 在 TISA 层至少形成：
+每个 semantic tile 在 TISA 层至少形成一组 instruction。若该 tile 的 backend
+payload 跨越 DMA、Tensor、Vector 等 EU，compiler 必须按 EU 边界拆成多条
+TISA instruction，并用 typed dependencies 串联；同一个 EU 内的多个 primitive
+（例如 Softmax 的 max/exp/sum/normalize）可以保留在同一条 TISA instruction
+的 payload 中。每条 TISA instruction 仍只绑定一个主要 UnitMap 类别。
+
+每条 semantic tile instruction 至少形成：
 
 ```text
 TISAInstruction

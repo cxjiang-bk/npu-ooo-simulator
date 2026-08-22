@@ -6,7 +6,7 @@
 
 ## 当前阶段
 
-阶段 8 设计准备：先冻结 TISAInstruction/TISAProgram/BackendArtifact 契约，再进入 ExecuTorch 前端、统一 Compiler PassManager、软件 Runtime 和热插拔 Device Backend。阶段 4-6 的 analytical primitive-task baseline 已可运行，但尚不能称为论文 TISA tile scheduler 复现；阶段 7 外部 timing/RTL 校准仍作为后续 backend 适配工作。
+阶段 9 实施中：阶段 8 已冻结最小 TISA semantic contract，并搭建从 framework bridge/ExecuTorch 或 JSON graph 到 Canonical OperatorGraph、Schedule/Tiling、TISA/Backend artifact 的前端闭环；当前进入统一 PassManager、TISA target scheduler 和 runtime binding 之前的自动 tile/compiler 收敛。阶段 4-6 的 analytical primitive-task baseline 已可运行，但尚不能称为论文 TISA tile scheduler 复现；阶段 7 外部 timing/RTL 校准仍作为后续 backend 适配工作。
 
 ## 阶段状态
 
@@ -20,8 +20,8 @@
 | 5 | Elementwise/Reduce/Softmax/Attention/Model presets baseline | completed |
 | 6 | Architecture x Schedule x Policy 实验框架 baseline | completed |
 | 7 | TileFlow/SCALE-Sim/RTL 校准 | pending |
-| 8 | TISA Contract + ExecuTorch Frontend Adapter | pending |
-| 9 | Compiler PassManager 与自动 TileGraph | pending |
+| 8 | TISA Contract + ExecuTorch Frontend Adapter | completed |
+| 9 | Compiler PassManager 与自动 TileGraph | in_progress |
 | 10 | Runtime Submission 与 runtime/device 分层仿真 | pending |
 | 11 | Hot-pluggable Timing/Event/System Backend | pending |
 | 12 | 模型级自动编译与 TISA 实验矩阵 | pending |

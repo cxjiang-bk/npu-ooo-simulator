@@ -31,6 +31,15 @@ from .schedule import (
 )
 from .tile import TileDependency, TileGraph, TileInstance, build_tile_graph, enumerate_operator_tiles
 from .execution import AccessType, BufferRegion, ExecutionGraph, ExecutionTask
+from .tisa import (
+    BackendArtifact,
+    TISADependency,
+    TISAInstruction,
+    TISAOperand,
+    TISAProgram,
+    TileMem,
+    UnitMap,
+)
 
 __all__ = [
     "BenchmarkCase",
@@ -51,6 +60,13 @@ __all__ = [
     "BufferRegion",
     "ExecutionGraph",
     "ExecutionTask",
+    "BackendArtifact",
+    "TISADependency",
+    "TISAInstruction",
+    "TISAOperand",
+    "TISAProgram",
+    "TileMem",
+    "UnitMap",
     "OperatorSchedule",
     "ScheduleSpec",
     "TensorResidency",

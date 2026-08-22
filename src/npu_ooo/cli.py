@@ -8,6 +8,8 @@ from itertools import product
 from pathlib import Path
 
 from npu_ooo.arch import load_machine_config, lpu_like_machine_config, minimal_machine_config, wide_mxu_machine_config
+from npu_ooo.compiler import compile_frontend_import
+from npu_ooo.frontend import JsonGraphAdapter
 from npu_ooo.benchmarks import (
     build_decoder_block_case,
     build_decoder_block_model,
@@ -121,6 +123,38 @@ def _parse_positive_int_list(value: str, *, name: str) -> tuple[int, ...]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run configurable NPU tile scheduling experiments")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    compile_model = subparsers.add_parser(
+        "compile-model",
+        help="import a canonical graph and compile it through the unified frontend/backend pipeline",
+    )
+    compile_model.add_argument(
+        "--graph-json",
+        type=Path,
+        required=True,
+        help="canonical OperatorGraph JSON (operator_graph.json or a graph wrapper)",
+    )
+    compile_model.add_argument("--model-id", default=None)
+    compile_model.add_argument("--variant", default="imported-v0")
+    compile_model.add_argument(
+        "--shape",
+        action="append",
+        default=[],
+        metavar="SYMBOL=VALUE",
+        help="override a symbolic graph dimension; repeat for multiple symbols",
+    )
+    compile_model.add_argument("--tile-size", type=int, default=32)
+    compile_model.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
+    compile_model.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
+    compile_model.add_argument("--timing-config", type=Path, help="load primitive timing overrides from JSON")
+    compile_model.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
+    compile_model.add_argument("--output-dir", type=Path, default=Path("out/compile-model"))
+    compile_model.add_argument("--instruction-queue-depth", type=int)
+    compile_model.add_argument("--rob-entries", type=int)
+    compile_model.add_argument("--max-inflight-tiles", type=int)
+    compile_model.add_argument("--dependency-window", type=int)
+    compile_model.add_argument("--ready-queue-depth", type=int)
+    compile_model.add_argument("--address-scoreboard", action="store_true")
+    compile_model.add_argument("--dynamic-priority", choices=("critical_path", "oldest_first"), default="critical_path")
     two_mm = subparsers.add_parser("two-mm", help="compile and schedule the 2mm benchmark")
     two_mm.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
     two_mm.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
@@ -337,6 +371,99 @@ def build_parser() -> argparse.ArgumentParser:
     workload_sweep.add_argument("--static-stage-offsets")
     workload_sweep.add_argument("--static-stage-ii", type=float, default=1.0)
     return parser
+
+
+def _parse_shape_overrides(values: list[str]) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for item in values:
+        if "=" not in item:
+            raise ValueError("--shape must use SYMBOL=VALUE")
+        name, raw_value = item.split("=", 1)
+        name = name.strip()
+        try:
+            value = int(raw_value.strip())
+        except ValueError as exc:
+            raise ValueError(f"--shape value for '{name}' must be an integer") from exc
+        if not name or value <= 0:
+            raise ValueError("--shape symbols and values must be positive")
+        if name in result and result[name] != value:
+            raise ValueError(f"--shape symbol '{name}' is specified more than once")
+        result[name] = value
+    return result
+
+
+def run_compile_model(args: argparse.Namespace) -> int:
+    try:
+        payload = json.loads(args.graph_json.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"graph JSON does not exist: {args.graph_json}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid graph JSON '{args.graph_json}': {exc}") from exc
+    imported = JsonGraphAdapter.from_payload(
+        payload,
+        model_id=args.model_id,
+        variant=args.variant,
+        shape_environment=_parse_shape_overrides(args.shape),
+    )
+    machine = _machine(args.arch, args.machine_config)
+    compiled = compile_frontend_import(imported, machine, tile_size=args.tile_size)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    write_artifact_json(imported, args.output_dir / "frontend_import.json")
+    write_artifact_json(compiled.graph, args.output_dir / "canonical_graph.json")
+    write_artifact_json(compiled.schedule, args.output_dir / "schedule.json")
+    write_artifact_json(compiled.tile_graph, args.output_dir / "tile_graph.json")
+    write_artifact_json(compiled.tisa_program, args.output_dir / "tisa_program.json")
+    write_artifact_json(compiled.backend_artifact, args.output_dir / "backend_artifact.json")
+    write_artifact_json(compiled.backend_artifact.execution_graph, args.output_dir / "execution_graph.json")
+    write_artifact_json(compiled, args.output_dir / "compiled_artifact.json")
+    write_operator_graph_dot(compiled.graph, args.output_dir / "operator_graph.dot")
+    write_operator_graph_svg(compiled.graph, args.output_dir / "operator_graph.svg")
+    write_tile_graph_dot(compiled.tile_graph, args.output_dir / "tile_graph.dot")
+    write_execution_graph_dot(compiled.backend_artifact.execution_graph, args.output_dir / "execution_graph.dot")
+
+    simulator_config = SimulatorConfig(
+        instruction_queue_depth=args.instruction_queue_depth,
+        rob_entries=args.rob_entries,
+        max_inflight_tiles=args.max_inflight_tiles,
+        dependency_window=args.dependency_window,
+        ready_queue_depth=args.ready_queue_depth,
+        address_scoreboard=args.address_scoreboard,
+        dynamic_priority=args.dynamic_priority,
+    )
+    result = schedule_execution_graph(
+        compiled.backend_artifact.execution_graph,
+        machine,
+        args.policy,
+        timing_model=_timing_model(args.timing_config),
+        simulator_config=simulator_config,
+    )
+    write_json(result, args.output_dir / "summary.json")
+    write_csv(result, args.output_dir / "tasks.csv")
+    write_svg(result, args.output_dir / "swimlane.svg")
+    write_png(result, args.output_dir / "swimlane.png")
+    write_artifact_json(
+        {
+            "schema_version": 1,
+            "compiler_pipeline": compiled.attributes["compiler_pipeline"],
+            "frontend": imported.frontend.value if hasattr(imported.frontend, "value") else str(imported.frontend),
+            "model_id": imported.model_id,
+            "architecture": args.arch,
+            "policy": result.policy,
+            "total_cycles": result.total_cycles,
+            "tisa_instruction_count": len(compiled.tisa_program.instructions),
+            "primitive_task_count": len(compiled.backend_artifact.execution_graph.tasks),
+            "calibration_status": result.metrics["calibration_status"],
+        },
+        args.output_dir / "manifest.json",
+    )
+    print(json.dumps({
+        "frontend": imported.frontend.value if hasattr(imported.frontend, "value") else str(imported.frontend),
+        "tisa_instructions": len(compiled.tisa_program.instructions),
+        "primitive_tasks": len(compiled.backend_artifact.execution_graph.tasks),
+        "total_cycles": result.total_cycles,
+        "output_dir": str(args.output_dir),
+    }, sort_keys=True))
+    return 0
 
 
 def _simulator_config(
@@ -1459,6 +1586,8 @@ def run_sweep_workloads(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "compile-model":
+        return run_compile_model(args)
     if args.command == "two-mm":
         return run_two_mm(args)
     if args.command == "elementwise":

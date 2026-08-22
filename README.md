@@ -62,8 +62,8 @@ npu-ooo-simulator/
 │   └── experiments/         # benchmark matrix
 ├── benchmarks/              # operator/fusion graph descriptions
 ├── src/npu_ooo/
-│   ├── frontend/            # planned: ExecuTorch/torch.export adapters
-│   ├── compiler/            # planned: pass manager and tile planning
+│   ├── frontend/            # JSON/canonical bridge and optional torch.export adapter
+│   ├── compiler/            # canonical graph -> schedule/tile/TISA/backend pipeline
 │   ├── runtime/             # planned: buffer binding and submission
 │   ├── backend/             # planned: hot-pluggable backends
 │   ├── ir/                  # model, operator, schedule, tile, program, execution IR
@@ -76,6 +76,28 @@ npu-ooo-simulator/
 ├── tests/
 └── docs/
 ```
+
+### Framework bridge 层级
+
+论文中的 `torchxla` 属于最上游的 framework bridge：它把 PyTorch/JAX/TensorFlow
+程序导出到 XLA/StableHLO 图。`StableHLO` 是 bridge 之后、Graph Compiler 之前的
+可移植图/算子 IR；它不是 TISA，也不是 NPU backend ISA。Graph Compiler 在
+StableHLO 上做 fusion、tiling、layout 和 memory planning，Fusion Compiler/TISA
+Generator 再输出语义 tile 指令。
+
+本项目先采用不依赖大型 MLIR 工具链的等价边界：
+
+```text
+torch.export / ExecuTorch       (framework bridge, optional dependency)
+canonical JSON / in-memory IR   (framework-independent bridge for tests)
+              -> Canonical OperatorGraph
+              -> compiler pipeline (schedule -> TileGraph -> TISAProgram)
+              -> BackendArtifact (descriptor + analytical primitive payload)
+```
+
+`TorchExportAdapter` 只在被调用时导入 `torch`，所以没有 PyTorch 的环境仍可使用
+JSON/canonical frontend 和后端 simulator。未来的 StableHLO adapter 应汇入同一个
+`FrontendImport`，而不应把 StableHLO node name 直接暴露给 scheduler。
 
 ## 第一条闭环
 

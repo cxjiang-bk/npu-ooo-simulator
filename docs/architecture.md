@@ -128,6 +128,39 @@ BenchmarkCase {
 
 ## 2. 编译、运行时与设备 IR
 
+### 2.0 Framework bridge：torchxla、StableHLO 与本项目 frontend
+
+论文的 frontend 不是直接从 PyTorch kernel 进入 TISA。其层次是：
+
+```text
+PyTorch/JAX/TF
+    -> torchxla framework bridge
+    -> XLA / StableHLO portable graph IR
+    -> MLIR Graph Compiler
+    -> Fusion Compiler / TISA dialect
+    -> TISA generator
+```
+
+`torchxla` 是导出/连接框架，属于 compiler pipeline 最上游的 framework bridge；
+`StableHLO` 是 bridge 之后的可移植 semantic graph IR，位置类似本项目的
+`Canonical OperatorGraph`，但不是最终 TISA 指令。它保留跨框架可识别的算子语义，
+供 Graph Compiler 做 decomposition、fusion、layout、tiling 和 shape analysis。
+
+本项目第一版不强制依赖 XLA/MLIR，而是保留相同的契约：
+
+```text
+torch.export / ExecuTorch (optional)
+canonical JSON (dependency-light smoke path)
+              -> FrontendImport
+              -> Canonical OperatorGraph
+              -> Compiler pipeline
+```
+
+其中 `TorchExportAdapter` 对应论文的 framework bridge，`FrontendImport` 是
+StableHLO/ExecuTorch/JSON 汇合的边界；后续新增 StableHLO adapter 时，下游
+Schedule/Tiling/TISA/Backend 不需要修改。这样可以先验证从 graph 到 TISA/backend
+的结构和依赖，再单独固定 PyTorch/ExecuTorch 版本。
+
 ### 2.1 Model/Benchmark IR
 
 描述 workload 的模型级语义：
@@ -404,7 +437,7 @@ Compiler 输出：
 
 ```text
 TISAProgram
-  - semantic tile instruction stream
+  - semantic tile instruction stream (one or more EU-bound instructions per tile)
   - OpType and operator/tile provenance
   - Operand(TileShape/TileMem/AccessType)
   - typed Deps(RAW/WAR/WAW + condition)

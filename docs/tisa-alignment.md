@@ -49,7 +49,7 @@ High-level framework / StableHLO
 Graph + Fusion + Tiling compiler
         |
         v
-TISA semantic tile instruction       <-- 论文的调度契约
+TISA semantic tile instruction(s)    <-- 论文的调度契约；跨 EU 时按 EU 拆分
         |
         v
 per-unit execution ISA / DMA-MXU-Vector micro-events

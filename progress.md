@@ -175,3 +175,29 @@ dynamic_ready_queue 17984 cycles
 ### 当前设计结论
 
 现有 Model IR、OperatorGraph、ScheduleSpec、MachineConfig、Static/Dynamic baseline 和 analytical event simulator 可以保留；下一阶段不能继续只扩展 primitive lowering，应先冻结 `TISAInstruction/TISAProgram` 和 typed dependency schema。
+
+## 2026-08-21：阶段 8 前端与统一 compiler 第一版
+
+### 已完成
+
+- 新增 `ir/tisa.py`：冻结最小 `TileMem`、`TISAOperand`、`UnitMap`、typed `TISADependency`、`TISAInstruction`、`TISAProgram` 和 `BackendArtifact` schema；每条 TISA instruction 绑定一个 semantic tile，payload 通过 `tisa_id -> ExecutionTask tuple` 关联。
+- 新增 `frontend/bridge.py`：`FrontendImport` 统一 framework bridge 输出；`JsonGraphAdapter` 作为无外部依赖的 canonical graph 入口；`TorchExportAdapter` 对 `torch.export` 做惰性导入和明确缺依赖错误。
+- 新增 `compiler/pipeline.py`：从 Canonical OperatorGraph 自动生成默认 Schedule/Tiling、复用 lowering registry、构造一条 TISA instruction/semantic tile，并输出 `BackendArtifact`，保持现有 analytical ExecutionGraph 可供 simulator 回归。
+- 修正 TISA codegen 的 EU 边界：同一 tile 内的 `DMA -> Tensor -> DMA` primitive 不再错误地打包为一条跨 EU TISA instruction，而是按连续 resource group 输出 `load<dma>`、`gemm<tensor>`、`store<dma>`；Vector/ARU 内部的 `reduce/exp/normalize` 仍作为一个 semantic payload。一个 tile 可有多条 TISA instruction，但每条只绑定一个 EU 类别，并通过 `semantic_tile_id` 保留 tile provenance。
+- 新增 `compile-model` CLI：输入 `operator_graph.json`，自动导出 frontend/canonical/schedule/tile/TISA/backend/execution artifact 和泳道图；不再要求为该入口手写 benchmark-specific lowering 分支。
+- 新增 `tests/test_frontend_compiler.py`，覆盖 JSON adapter、shape symbol resolve、TISA/payload 数量对齐和无 torch 时的 frontend 诊断。
+- 更新 `README.md` 与 `docs/architecture.md`：明确 `torchxla` 是 framework bridge，StableHLO 是 bridge 后的 portable semantic graph IR，ExecuTorch/torch.export 是本项目可替代入口，不属于 backend 或 device scheduler。
+
+### 验证
+
+- `PYTHONPATH=src python3 -m npu_ooo.cli two-mm ...` 回归通过：minimal/static_pipeline 仍输出 204 primitive tasks、17984 analytical cycles。
+- `PYTHONPATH=src python3 -m npu_ooo.cli compile-model --graph-json out/rmsnorm-dynamic/operator_graph.json ...` 通过：36 EU-bound TISA instructions、60 primitive tasks、3472 analytical cycles，并生成 `tisa_program.json`、`backend_artifact.json` 和 swimlane artifact。
+- TISA 边界 smoke：2mm 的 60 tiles 生成 144 条 EU-bound TISA instructions；attention 的 DMA/Tensor/Vector groups 均通过 `CompiledArtifact.validate()`。
+- `git diff --check` 通过。
+- 当前环境没有安装 `pytest`；使用 `PYTHONPATH=src python3 -m unittest discover -s tests -q` 验证通过，当前共 62 tests；另以 CLI 和 Python smoke test 验证核心路径。
+
+### 当前限制
+
+- `TorchExportAdapter` 已建立边界，但当前环境没有 `torch`/`executorch`，且 torch FX metadata/operator overload 的版本兼容性尚未在本机验证。
+- 目前 TISA program 是对既有 primitive lowering 的语义封装；device scheduler 仍消费 primitive ExecutionGraph。下一阶段必须实现 TISA target scheduler：先 issue TISA tile，再激活不可跨 tile 重排的 payload group。
+- 当前默认 schedule 仍是 compiler 内的 deterministic heuristic，不是完整 MLIR/StableHLO pass manager；StableHLO adapter 和 composite semantic preservation 后续接入同一 FrontendImport。
