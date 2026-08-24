@@ -517,3 +517,21 @@ git diff --check: passed
 - 修正 Softmax 的跨 tile sum barrier 与 LayerNorm 的 variance barrier；验证器改为检查 backend owner edge 在 TISA dependency DAG 中可达，避免绑定到某个 primitive lowerer 的直接边形状。
 - `TISAInstruction.op_type` 现在表示 scheduler-visible stage（如 `load`、`matmul`、`reduce_sum`、`load_transpose`），`attributes.semantic_op_type` 保留 composite semantic operator family，兼顾论文的 stage issue 粒度与前端语义 provenance。
 - 验证：`tests.test_frontend_compiler` + `tests.test_tisa_simulator` 共 38 项通过；`unittest discover -s tests -q` 共 95 项通过；`compileall` 通过。
+
+## 2026-08-24：阶段 10.0 RuntimeSubmission v1
+
+- 阶段 9.9 已提交为 `cedd49b`（`完成阶段9.9 TISA-first backend codegen`），提交前全量 96 tests passed。
+- 新增 `src/npu_ooo/ir/runtime.py`：定义 `BufferBinding`、`RuntimeOperandBinding`、`RuntimeCommandChunk` 和 `RuntimeSubmission`，所有结构均有独立 validation 与 JSON 序列化。
+- 新增线性 physical buffer allocator：按 resolved tensor shape/dtype 分配互不重叠的 DRAM 地址，支持外部 base address 和 alignment。
+- `create_runtime_submission()` 将 logical TISA operands 绑定到 physical buffer；当阶段 9.9 的 logical tile shape 仍过粗时，显式记录 `size_source=buffer_capacity_fallback`，避免把近似范围伪装成 compiler 已给出的精确地址。
+- static runtime 按 TISA program order 提交；dynamic-ready runtime 对 TISA dependency DAG 做 fanout-first ready-queue 拓扑排序，保证 dependency-before-consumer，但不改变编译产物和 device issue policy。
+- `compile-model` 新增 `--runtime-policy`、`--runtime-chunk-size`、`--runtime-base-address`、`--runtime-alignment`、`--runtime-launch-latency` 和 `--runtime-synchronization-cycles`，并输出 `05_runtime/runtime_submission.json`；manifest 分别记录 runtime/device policy、chunk/buffer count、device 起止周期和端到端周期。
+- RuntimeSubmission 已进入 TISA simulator 的 descriptor reception path：每个 chunk 完成后 descriptor 才可进入接收窗口；static device 保持接收顺序，dynamic device 只在已接收窗口内做 ready selection。
+- SVG 新增 `Runtime/Submit[0]` 泳道与图例，Perfetto 使用独立 `pid=0` 输出 runtime submit 事件；`compile-model` 同时落盘 `07_trace/perfetto.json`。
+- address scoreboard 在存在 RuntimeSubmission 时消费 concrete physical address range；同一 logical tensor 的不相交绑定可并发，重叠绑定仍产生 RAW/WAR/WAW stall。没有 RuntimeSubmission 时保留 logical `TileMem` fallback。
+- 新增 `run_runtime_device_matrix()` 与 `compile-model --runtime-device-matrix`：四种 runtime/device policy 组合共享同一 `BackendArtifact` 和 physical allocation，分别输出 runtime submission、summary、Perfetto、SVG/PNG，并汇总 `sweep.csv/json`。
+- dynamic runtime submission 使用 tile-affine fanout-first 拓扑顺序：保持 dependency-before-consumer，同时优先补齐已开始 tile 的 ready stage，避免 static device 的有限 in-flight tile window 被不完整 tile packet 占满而死锁。
+- compiler TISA region legalizer v1 已从 semantic operator/tile bounds 计算 dense tensor 的 starts、tile shape、byte offset 和 byte size，覆盖 matmul/batched_matmul/gemv、broadcast elementwise、reduce、softmax、RMSNorm 和 LayerNorm affine 参数；two-matmul 324 个 TISA operands 全部使用 `size_source=tile_mem`，不再依赖 coarse fallback。
+- StableHLO Matmul CLI smoke：15 TISA / 21 primitive / 3 physical buffers / 33 operand bindings / 5 chunks（chunk size=3）；runtime/device policy 均为 dynamic_ready_queue，device cycles 仍为 120。
+- 全量回归：`PYTHONPATH=src:. /usr/bin/python3.12 -m unittest discover -s tests -q` 共 103 tests passed；`compileall` 与 `git diff --check` 通过。
+- 官方 StableHLO Matmul + policy matrix smoke：3 TISA / 4 primitive / 1 command chunk；runtime submit=2、device start=2、device finish=54、device cycles=52、synchronization=5、end-to-end=59 cycles，四个 matrix cell 均生成独立 Perfetto trace。

@@ -7,7 +7,14 @@ import heapq
 from typing import Any
 
 from npu_ooo.arch import ExecutionUnitConfig, MachineConfig
-from npu_ooo.ir import AccessType, BackendArtifact, TISAInstruction, TISAOperand
+from npu_ooo.ir import (
+    AccessType,
+    BackendArtifact,
+    RuntimeOperandBinding,
+    RuntimeSubmission,
+    TISAInstruction,
+    TISAOperand,
+)
 
 from .core import (
     AnalyticalTimingModel,
@@ -157,6 +164,42 @@ def _address_conflict(
     return None
 
 
+def _runtime_reads(operand: RuntimeOperandBinding) -> bool:
+    return operand.access_type in {
+        AccessType.READ.value,
+        AccessType.READ_WRITE.value,
+    }
+
+
+def _runtime_writes(operand: RuntimeOperandBinding) -> bool:
+    return operand.access_type in {
+        AccessType.WRITE.value,
+        AccessType.READ_WRITE.value,
+    }
+
+
+def _runtime_address_conflict(
+    active: tuple[RuntimeOperandBinding, ...],
+    candidate: tuple[RuntimeOperandBinding, ...],
+) -> str | None:
+    for left in active:
+        for right in candidate:
+            if left.physical_scope != right.physical_scope:
+                continue
+            if not (
+                left.address < right.address + right.size_bytes
+                and right.address < left.address + left.size_bytes
+            ):
+                continue
+            if _runtime_writes(left) and _runtime_reads(right):
+                return "RAW"
+            if _runtime_reads(left) and _runtime_writes(right):
+                return "WAR"
+            if _runtime_writes(left) and _runtime_writes(right):
+                return "WAW"
+    return None
+
+
 def _critical_path_lengths(
     instructions: tuple[TISAInstruction, ...],
     plans: dict[str, _PayloadPlan],
@@ -181,6 +224,7 @@ def simulate_tisa_artifact(
     *,
     timing_model: TimingModel | None = None,
     config: SimulatorConfig | None = None,
+    runtime_submission: RuntimeSubmission | None = None,
 ) -> SimulationResult:
     """Schedule TISA instructions and execute each bound payload atomically.
 
@@ -196,6 +240,16 @@ def simulate_tisa_artifact(
     machine_issues = machine.validate()
     if artifact_issues or machine_issues:
         raise ValueError("; ".join((*artifact_issues, *machine_issues)))
+    if runtime_submission is not None:
+        submission_issues = runtime_submission.validate(artifact.program)
+        if runtime_submission.artifact_id not in {None, artifact.artifact_id}:
+            submission_issues = (
+                *submission_issues,
+                f"runtime submission artifact '{runtime_submission.artifact_id}' does not match "
+                f"'{artifact.artifact_id}'",
+            )
+        if submission_issues:
+            raise ValueError("; ".join(submission_issues))
     timing_model = timing_model or AnalyticalTimingModel()
     config = (config or SimulatorConfig()).resolved(machine)
     if config.static_pipeline is not None:
@@ -207,7 +261,34 @@ def simulate_tisa_artifact(
     instruction_by_id = {
         instruction.tisa_id: instruction for instruction in instructions
     }
-    order = {instruction.tisa_id: index for index, instruction in enumerate(instructions)}
+    if runtime_submission is None:
+        descriptor_stream = tuple(
+            (0.0, instruction.tisa_id, "implicit.chunk0000")
+            for instruction in instructions
+        )
+        runtime_chunks = ()
+        runtime_policy = "implicit_static"
+        runtime_submit_cycles = 0.0
+        synchronization_cycles = 0.0
+    else:
+        runtime_chunks = runtime_submission.commands
+        runtime_policy = runtime_submission.policy
+        launch_latency = runtime_submission.launch_latency_cycles
+        descriptor_stream = tuple(
+            (
+                (chunk.submission_order + 1) * launch_latency,
+                tisa_id,
+                chunk.chunk_id,
+            )
+            for chunk in runtime_chunks
+            for tisa_id in chunk.tisa_ids
+        )
+        runtime_submit_cycles = len(runtime_chunks) * launch_latency
+        synchronization_cycles = runtime_submission.synchronization_cycles
+    order = {
+        tisa_id: index
+        for index, (_ready, tisa_id, _chunk_id) in enumerate(descriptor_stream)
+    }
     plans = {
         instruction.tisa_id: _payload_plan(
             artifact, instruction.tisa_id, machine, timing_model
@@ -237,6 +318,14 @@ def simulate_tisa_artifact(
         )
         for instruction in instructions
     }
+    runtime_operands_by_tisa: dict[str, tuple[RuntimeOperandBinding, ...]] = {}
+    if runtime_submission is not None:
+        for instruction in instructions:
+            runtime_operands_by_tisa[instruction.tisa_id] = tuple(
+                operand
+                for operand in runtime_submission.operands
+                if operand.tisa_id == instruction.tisa_id
+            )
     tile_instruction_count: dict[str, int] = {}
     tile_completed_count: dict[str, int] = {}
     for instruction in instructions:
@@ -253,7 +342,48 @@ def simulate_tisa_artifact(
     completion_time: dict[str, float] = {}
     instruction_timings: dict[str, TaskTiming] = {}
     primitive_timings: dict[str, TaskTiming] = {}
+    runtime_timings: list[TaskTiming] = []
     events: list[TraceEvent] = []
+    if runtime_submission is not None:
+        for chunk in runtime_chunks:
+            start = chunk.submission_order * runtime_submission.launch_latency_cycles
+            finish = start + runtime_submission.launch_latency_cycles
+            details = {
+                "runtime_policy": runtime_submission.policy,
+                "queue": chunk.queue,
+                "submission_order": chunk.submission_order,
+                "descriptor_count": len(chunk.tisa_ids),
+            }
+            runtime_timings.append(
+                TaskTiming(
+                    task_id=chunk.chunk_id,
+                    resource="Runtime/Submit",
+                    instance=0,
+                    issue=start,
+                    start=start,
+                    finish=finish,
+                    dependency_ready=start,
+                    resource_ready=start,
+                )
+            )
+            events.extend(
+                (
+                    TraceEvent(
+                        start,
+                        "RUNTIME_SUBMIT_START",
+                        chunk.chunk_id,
+                        "Runtime/Submit",
+                        details=details,
+                    ),
+                    TraceEvent(
+                        finish,
+                        "RUNTIME_SUBMIT_COMPLETE",
+                        chunk.chunk_id,
+                        "Runtime/Submit",
+                        details=details,
+                    ),
+                )
+            )
     event_queue: list[tuple[float, int, str, str, int]] = []
     event_serial = 0
     next_receive = 0
@@ -271,6 +401,13 @@ def simulate_tisa_artifact(
         "policy": policy,
         "scheduler_target": "tisa",
         "payload_execution": "run_to_completion",
+        "runtime_policy": runtime_policy,
+        "runtime_launch_count": len(runtime_chunks),
+        "runtime_submit_cycles": runtime_submit_cycles,
+        "runtime_synchronization_cycles": synchronization_cycles,
+        "address_scoreboard_scope": (
+            "runtime_physical" if runtime_submission is not None else "compiler_logical"
+        ),
         "primitive_reordering_scope": "instruction_local",
         "simulator_config": config.to_dict(),
         "tisa_instruction_count": len(instructions),
@@ -315,8 +452,11 @@ def simulate_tisa_artifact(
 
     def receive_descriptors() -> None:
         nonlocal next_receive
-        while next_receive < len(instructions) and len(waiting) < queue_depth:
-            instruction = instructions[next_receive]
+        while next_receive < len(descriptor_stream) and len(waiting) < queue_depth:
+            ready_cycle, tisa_id, chunk_id = descriptor_stream[next_receive]
+            if ready_cycle > now + 1e-9:
+                break
+            instruction = instruction_by_id[tisa_id]
             resource = plans[instruction.tisa_id].resource
             resource_waiting = sum(
                 plans[tisa_id].resource == resource for tisa_id in waiting
@@ -336,6 +476,8 @@ def simulate_tisa_artifact(
                 "operator_id": instruction.operator_id,
                 "tile_id": instruction.tile_id,
                 "unit_map": instruction.unit_map.unit,
+                "runtime_chunk_id": chunk_id,
+                "runtime_ready_cycle": ready_cycle,
             }
             events.append(
                 TraceEvent(
@@ -362,7 +504,13 @@ def simulate_tisa_artifact(
             return None
         candidate = instruction_by_id[tisa_id]
         for active_id in sorted(active, key=order.__getitem__):
-            kind = _address_conflict(instruction_by_id[active_id], candidate)
+            if runtime_submission is None:
+                kind = _address_conflict(instruction_by_id[active_id], candidate)
+            else:
+                kind = _runtime_address_conflict(
+                    runtime_operands_by_tisa[active_id],
+                    runtime_operands_by_tisa[tisa_id],
+                )
             if kind is not None:
                 return active_id, kind
         return None
@@ -404,6 +552,8 @@ def simulate_tisa_artifact(
             metrics["completed_task_count"] += len(artifact.payloads[tisa_id])
             receive_descriptors()
             record_occupancy("TISA_COMPLETE")
+
+        receive_descriptors()
 
         issued_at_now = 0
         while True:
@@ -597,6 +747,14 @@ def simulate_tisa_artifact(
 
         if len(completed) >= len(instructions):
             break
+        next_descriptor_time = (
+            descriptor_stream[next_receive][0]
+            if next_receive < len(descriptor_stream)
+            else None
+        )
+        if not event_queue and next_descriptor_time is not None and next_descriptor_time > now + 1e-9:
+            now = next_descriptor_time
+            continue
         if not event_queue:
             unresolved = sorted(waiting, key=order.__getitem__)
             raise RuntimeError(
@@ -604,17 +762,21 @@ def simulate_tisa_artifact(
                 f"received={len(received)}, issued={len(issued)}, completed={len(completed)}"
             )
         next_time = event_queue[0][0]
+        if next_descriptor_time is not None and next_descriptor_time > now + 1e-9:
+            next_time = min(next_time, next_descriptor_time)
         if next_time <= now + 1e-9:
             raise RuntimeError("TISA simulator made no time progress")
         now = next_time
 
     event_order = {
-        "TISA_RECEIVE": 0,
-        "TISA_ISSUE": 1,
-        "ISSUE": 2,
-        "START": 3,
-        "COMPLETE": 4,
-        "TISA_COMPLETE": 5,
+        "RUNTIME_SUBMIT_START": 0,
+        "RUNTIME_SUBMIT_COMPLETE": 1,
+        "TISA_RECEIVE": 2,
+        "TISA_ISSUE": 3,
+        "ISSUE": 4,
+        "START": 5,
+        "COMPLETE": 6,
+        "TISA_COMPLETE": 7,
     }
     events.sort(
         key=lambda event: (
@@ -624,19 +786,28 @@ def simulate_tisa_artifact(
             event.instance,
         )
     )
-    total_cycles = max(
+    device_finish_cycle = max(
         (timing.finish for timing in instruction_timings.values()), default=0.0
     )
+    device_start_cycle = min(
+        (timing.issue for timing in instruction_timings.values()), default=0.0
+    )
+    device_cycles = max(0.0, device_finish_cycle - device_start_cycle)
+    total_cycles = device_finish_cycle + synchronization_cycles
     metrics["resource_utilization"] = {
         unit.name: (
             metrics["resource_busy_cycles"].get(unit.name, 0.0)
-            / (total_cycles * unit.count)
-            if total_cycles > 0
+            / (device_cycles * unit.count)
+            if device_cycles > 0
             else 0.0
         )
         for unit in machine.execution_units
     }
     metrics["completed_tile_count"] = len(tile_instruction_count)
+    metrics["device_start_cycle"] = device_start_cycle
+    metrics["device_finish_cycle"] = device_finish_cycle
+    metrics["device_cycles"] = device_cycles
+    metrics["total_cycles_including_runtime"] = total_cycles
     return SimulationResult(
         backend=timing_model.name,
         policy=policy,
@@ -650,6 +821,7 @@ def simulate_tisa_artifact(
             instruction_timings[instruction.tisa_id]
             for instruction in instructions
         ),
+        runtime_timings=tuple(runtime_timings),
         events=tuple(events),
         metrics=metrics,
     )

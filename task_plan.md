@@ -6,7 +6,7 @@
 
 ## 当前阶段
 
-阶段 9 实施中：受限的 `PyTorch -> torch.export -> torch-xla -> official StableHLO -> Canonical OperatorGraph -> TileGraph -> TISA/BackendArtifact` 前端闭环已经可运行。阶段 9.8 已把 TISA 从描述性 artifact 提升为 device scheduler 的真实输入：Static/Dynamic 在同一 `TISAProgram` 上按 TISA instruction issue，primitive payload 只能在所属 instruction 发射后执行。阶段 9.9 已完成第一版 TISA-first codegen：先由 `TileGraph` 生成 semantic `TISAProgram`，再由 analytical backend 生成并绑定 primitive payload。阶段 4-6 的 analytical primitive-task baseline 继续保留为兼容对照；RuntimeSubmission 和外部 timing/RTL backend 仍后置。
+阶段 9 已完成第一版自动前端、TISA device scheduler 和 TISA-first backend codegen。当前处于阶段 10：`TISAProgram/BackendArtifact -> RuntimeSubmission -> descriptor reception -> TISA device scheduler` 已形成第一条闭环，runtime launch/synchronization 与 device cycles 分层统计，默认零开销保持旧 baseline。下一步补齐同一 compiled artifact 上的 static/dynamic runtime x static/dynamic device 批量对照。阶段 4-6 的 analytical primitive-task baseline 继续保留为兼容对照。
 
 阶段 9 的前端目标边界：先支持静态 shape、推理场景和小型真实 PyTorch 模型，覆盖 RMSNorm、LayerNorm、Linear/Matmul、ResidualAdd、Softmax 和 attention micrograph；不在第一轮承诺完整 ATen、动态控制流、训练语义或完整 StableHLO/MLIR 工具链。现有手写 benchmark 继续作为 canonical IR/lowering/simulator 回归基线，不能被自动前端重构破坏。
 
@@ -24,7 +24,7 @@
 | 7 | TileFlow/SCALE-Sim/RTL 校准 | pending |
 | 8 | TISA Contract + ExecuTorch Frontend Adapter | completed |
 | 9 | Compiler PassManager 与自动 TileGraph | in_progress |
-| 10 | Runtime Submission 与 runtime/device 分层仿真 | pending |
+| 10 | Runtime Submission 与 runtime/device 分层仿真 | in_progress |
 | 11 | Hot-pluggable Timing/Event/System Backend | pending |
 | 12 | 模型级自动编译与 TISA 实验矩阵 | pending |
 
@@ -48,7 +48,7 @@
 - [x] BERT/GPT-J/LLaMA2/DeepSeek 的 proxy model preset 与 `model-block` CLI；
 - [ ] 冻结 Model/Operator/Schedule/Tile/Program/Runtime/Execution IR 的 normalized schema；
 - [ ] 冻结 ExecutionTask dependency/address schema；
-- [ ] 冻结 FrontendAdapter/TISAProgram/RuntimeSubmission schema；
+- [ ] 冻结 FrontendAdapter/TISAProgram/RuntimeSubmission schema；（RuntimeSubmission v1 已有第一版实现，完整 runtime timing schema 仍待冻结）
 - [ ] 冻结 Runtime policy 与 Device Scheduler policy 的独立配置键；
 - [ ] 冻结 CodegenBackend/TimingProvider/EventBackend/SystemBackend capability contract；
 - [ ] 冻结 simulator event/tie-break 语义；
@@ -99,6 +99,9 @@
 - 9.7 基础入口完成：`compile-model` 支持互斥的 canonical JSON、StableHLO file 和 `--torch-module MODULE:FACTORY`，并通过 `--through-stablehlo` 选择论文形态 round-trip；StableHLO 默认 `official` 且不静默回退；均输出完整 staged artifact 和泳道图。标准模型 preset、动态 shape 与复杂输入 binding 尚未完成。
 - 9.8 已完成第一版：`compile-model` 默认使用 TISA target，Static/Dynamic 消费同一 artifact，payload run-to-completion，输出 TISA/primitive 双层 trace；attention 回归为 120 次 TISA decision / 120 instructions。
 - 9.9 已完成第一版：`TISASemanticBuilder` 只消费 graph/schedule/tile/machine，先构造 stage、logical operands 和 typed dependencies；`AnalyticalBackendCodegen` 再复用同一 `TileGraph` 生成并绑定 primitive payload。`BackendArtifact.validate()` 检查 payload ownership、单资源约束、TISA 依赖可达性和未绑定 task；覆盖 matmul/batched_matmul/gemv、elementwise/residual_add、reduce、softmax、rmsnorm、layernorm。前端+TISA 回归 38 项、全量回归 95 项通过。
+- 10.0 已完成第一版：新增 `BufferBinding`、`RuntimeOperandBinding`、`RuntimeCommandChunk`、`RuntimeSubmission` 和线性 allocator；command chunk completion 驱动 descriptor reception，runtime/device policy 独立，launch/synchronization latency 分层进入 summary、manifest、SVG 和 Perfetto。启用 scoreboard 时优先消费 runtime physical address range。
+- 10.1 已完成第一版：`--runtime-device-matrix` 在一次编译结果和一次 physical allocation 上运行 static/dynamic runtime x static/dynamic device 四种组合；每个 cell 输出独立 submission/summary/trace，顶层汇总周期和相对 static/static speedup。
+- 10.2 进行中：compiler TISA region legalizer v1 已覆盖 matmul/batched_matmul/gemv、broadcast elementwise、reduce、softmax、RMSNorm 和 LayerNorm（含 affine 参数），将 dense starts/shape 转为 byte offset/size；剩余工作是 request availability、buffer lifetime/reuse，以及对未覆盖动态/布局情况继续保持显式 fallback，不能把 fallback hazard 解释为真实硬件结论。
 
 阶段 4-6 的“completed”表示基线闭环完成，不表示后续功能不再扩展。下一轮工作必须保持这些 baseline 的输入/输出兼容，并以自动前端和 runtime/backend 分层作为增量演进。
 

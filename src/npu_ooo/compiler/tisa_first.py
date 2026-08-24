@@ -10,6 +10,7 @@ primitive belongs to exactly one stage.
 """
 
 from dataclasses import dataclass, replace
+import math
 from typing import Any, Mapping
 
 from npu_ooo.arch import MachineConfig
@@ -154,13 +155,148 @@ def _stages_for_tile(operator: Any, tile: TileInstance) -> tuple[TISAStage, ...]
     )
 
 
-def _operand_shape(operator: Any, tile: TileInstance) -> tuple[int, ...]:
-    shape = tuple(stop - start for _name, start, stop in tile.bounds)
-    return shape or (1,)
+def _dtype_bytes(dtype: str) -> int:
+    normalized = str(dtype).lower().replace("torch.", "")
+    return {
+        "bool": 1,
+        "int8": 1,
+        "uint8": 1,
+        "int16": 2,
+        "float16": 2,
+        "fp16": 2,
+        "bfloat16": 2,
+        "bf16": 2,
+        "int32": 4,
+        "float32": 4,
+        "fp32": 4,
+        "int64": 8,
+        "float64": 8,
+        "fp64": 8,
+    }.get(normalized, 2)
 
 
-def _stage_operands(operator: Any, tile: TileInstance, stage: TISAStage) -> tuple[TISAOperand, ...]:
-    shape = _operand_shape(operator, tile)
+def _resolved_tensor_shape(tensor: Any) -> tuple[int, ...] | None:
+    shape = tuple(tensor.shape)
+    if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in shape):
+        return None
+    return shape
+
+
+def _dense_region(
+    tensor: Any,
+    starts: tuple[int, ...],
+    shape: tuple[int, ...],
+) -> tuple[int, int] | None:
+    full_shape = _resolved_tensor_shape(tensor)
+    if full_shape is None or len(full_shape) != len(starts) or len(shape) != len(full_shape):
+        return None
+    if any(start < 0 or extent <= 0 or start + extent > limit for start, extent, limit in zip(starts, shape, full_shape)):
+        return None
+    strides: list[int] = []
+    stride = 1
+    for extent in reversed(full_shape):
+        strides.append(stride)
+        stride *= extent
+    strides.reverse()
+    offset_elements = sum(start * stride_value for start, stride_value in zip(starts, strides))
+    return offset_elements * _dtype_bytes(tensor.dtype), math.prod(shape) * _dtype_bytes(tensor.dtype)
+
+
+def _tile_bounds(tile: TileInstance) -> dict[str, tuple[int, int]]:
+    return tile.bound_map
+
+
+def _dim_geometry(bounds: Mapping[str, tuple[int, int]], dimensions: tuple[str, ...]) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    return (
+        tuple(bounds[name][0] for name in dimensions),
+        tuple(bounds[name][1] - bounds[name][0] for name in dimensions),
+    )
+
+
+def _operand_geometry(
+    operator: Any,
+    tile: TileInstance,
+    tensor: Any,
+) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
+    """Return dense tensor starts/shape for one semantic tile operand."""
+
+    bounds = _tile_bounds(tile)
+    iteration = tuple(name for name, _ in operator.iteration_dims)
+    reduction = tuple(name for name, _ in operator.reduction_dims)
+    op_type = operator.normalized_type
+    name = tensor.name
+    if op_type in {"matmul", "batched_matmul", "gemv"}:
+        if len(operator.inputs) < 2 or not operator.outputs:
+            return None
+        batch = iteration[:-2]
+        out0, out1 = iteration[-2:]
+        red = reduction[0] if len(reduction) == 1 else None
+        if red is None:
+            return None
+        batch_starts, batch_shape = _dim_geometry(bounds, batch)
+        out0_start, out0_stop = bounds[out0]
+        out1_start, out1_stop = bounds[out1]
+        red_start, red_stop = bounds[red]
+        out0_shape = out0_stop - out0_start
+        out1_shape = out1_stop - out1_start
+        red_shape = red_stop - red_start
+        if name == operator.inputs[0]:
+            return (*batch_starts, out0_start, red_start), (*batch_shape, out0_shape, red_shape)
+        if name == operator.inputs[1]:
+            broadcast_batch = bool(operator.attributes.get("rhs_broadcast_batch", False))
+            rhs_starts = () if broadcast_batch else batch_starts
+            rhs_shape = () if broadcast_batch else batch_shape
+            if operator.attributes.get("rhs_transposed"):
+                return (*rhs_starts, out1_start, red_start), (*rhs_shape, out1_shape, red_shape)
+            return (*rhs_starts, red_start, out1_start), (*rhs_shape, red_shape, out1_shape)
+        if name == operator.outputs[0]:
+            return (*batch_starts, out0_start, out1_start), (*batch_shape, out0_shape, out1_shape)
+        return None
+
+    if op_type in {"elementwise", "residual_add"}:
+        output = operator.outputs[0]
+        output_dims = iteration
+        output_starts, output_shape = _dim_geometry(bounds, output_dims)
+        output_tensor = tensor if name == output else None
+        if output_tensor is not None:
+            return output_starts, output_shape
+        full_shape = _resolved_tensor_shape(tensor)
+        if full_shape is None or len(full_shape) > len(output_shape):
+            return None
+        leading = len(output_shape) - len(full_shape)
+        starts: list[int] = []
+        shape: list[int] = []
+        for axis, extent in enumerate(full_shape):
+            output_axis = leading + axis
+            if extent == 1:
+                starts.append(0)
+                shape.append(1)
+            else:
+                starts.append(output_starts[output_axis])
+                shape.append(output_shape[output_axis])
+        return tuple(starts), tuple(shape)
+
+    all_dimensions = (*iteration, *reduction)
+    if name in operator.outputs and op_type == "reduce":
+        return _dim_geometry(bounds, iteration)
+    tensor_shape = _resolved_tensor_shape(tensor)
+    if tensor_shape is None:
+        return None
+    if len(tensor_shape) == len(all_dimensions):
+        return _dim_geometry(bounds, all_dimensions)
+    if len(tensor_shape) == len(iteration):
+        return _dim_geometry(bounds, iteration)
+    if reduction and len(tensor_shape) == len(reduction):
+        return _dim_geometry(bounds, reduction)
+    return None
+
+
+def _stage_operands(
+    operator: Any,
+    tile: TileInstance,
+    stage: TISAStage,
+    tensors: Mapping[str, Any],
+) -> tuple[TISAOperand, ...]:
     is_load = stage.primitive in {"load", "load_transpose"}
     is_store = stage.primitive == "store"
     names: list[tuple[str, AccessType]] = []
@@ -177,16 +313,24 @@ def _stage_operands(operator: Any, tile: TileInstance, stage: TISAStage) -> tupl
         if key in seen:
             continue
         seen.add(key)
+        tensor = tensors[name]
+        geometry = _operand_geometry(operator, tile, tensor)
+        operand_shape = geometry[1] if geometry is not None else tuple(
+            stop - start for _name, start, stop in tile.bounds
+        ) or (1,)
+        dense_region = _dense_region(tensor, *geometry) if geometry is not None else None
+        offset_bytes = dense_region[0] if dense_region is not None else None
+        size_bytes = dense_region[1] if dense_region is not None else None
         operands.append(
             TISAOperand(
                 name=f"{name}:{access.value}:{index}",
-                tile_shape=shape,
+                tile_shape=operand_shape,
                 tile_mem=TileMem(
                     base=name,
                     scope="logical",
                     tensor=name,
-                    offset_bytes=None,
-                    size_bytes=None,
+                    offset_bytes=offset_bytes,
+                    size_bytes=size_bytes,
                 ),
                 access_type=access,
             )
@@ -215,6 +359,7 @@ class TISASemanticBuilder:
                 "; ".join((*graph_issues, *schedule_issues, *tile_issues, *machine_issues))
             )
         operators = {operator.op_id: operator for operator in graph.operators}
+        tensors = {tensor.name: tensor for tensor in graph.tensors}
         tiles = {tile.tile_id: tile for tile in tile_graph.tiles}
         stage_map: dict[tuple[str, str], TISAStage] = {}
         instructions: list[TISAInstruction] = []
@@ -236,7 +381,7 @@ class TISASemanticBuilder:
                         # attributes so backend-independent analyses retain
                         # the composite identity (e.g. softmax/rmsnorm).
                         op_type=stage.primitive,
-                        operands=_stage_operands(operator, tile, stage),
+                        operands=_stage_operands(operator, tile, stage, tensors),
                         unit_map=stage.unit_map,
                         attributes={
                             **dict(tile.attributes),

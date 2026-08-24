@@ -16,6 +16,7 @@ from npu_ooo.compiler import (
     compile_torch_module_through_stablehlo,
 )
 from npu_ooo.frontend import JsonGraphAdapter
+from npu_ooo.experiments import run_runtime_device_matrix
 from npu_ooo.benchmarks import (
     build_decoder_block_case,
     build_decoder_block_model,
@@ -39,6 +40,8 @@ from npu_ooo.benchmarks import (
     build_two_matmul_model,
 )
 from npu_ooo.ir import (
+    allocate_buffer_bindings,
+    create_runtime_submission,
     default_elementwise_schedule,
     default_layernorm_schedule,
     default_mixed_schedule,
@@ -211,6 +214,42 @@ def build_parser() -> argparse.ArgumentParser:
     compile_model.add_argument("--ready-queue-depth", type=int)
     compile_model.add_argument("--address-scoreboard", action="store_true")
     compile_model.add_argument("--dynamic-priority", choices=("critical_path", "oldest_first"), default="critical_path")
+    compile_model.add_argument(
+        "--runtime-policy",
+        choices=("static", "dynamic_ready_queue"),
+        default="static",
+        help="software submission policy for RuntimeSubmission (device policy remains --policy)",
+    )
+    compile_model.add_argument(
+        "--runtime-chunk-size",
+        type=int,
+        default=None,
+        help="number of TISA descriptors per runtime command chunk; default submits one chunk",
+    )
+    compile_model.add_argument(
+        "--runtime-base-address",
+        type=lambda value: int(value, 0),
+        default=0x10000000,
+        help="base physical address for the runtime linear allocator (decimal or 0x-prefixed)",
+    )
+    compile_model.add_argument("--runtime-alignment", type=int, default=256)
+    compile_model.add_argument(
+        "--runtime-launch-latency",
+        type=float,
+        default=0.0,
+        help="software launch latency per command chunk in simulator cycles",
+    )
+    compile_model.add_argument(
+        "--runtime-synchronization-cycles",
+        type=float,
+        default=0.0,
+        help="host/device synchronization cost after device completion",
+    )
+    compile_model.add_argument(
+        "--runtime-device-matrix",
+        action="store_true",
+        help="run static/dynamic runtime x static/dynamic TISA device policies on one compiled artifact",
+    )
     two_mm = subparsers.add_parser("two-mm", help="compile and schedule the 2mm benchmark")
     two_mm.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
     two_mm.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
@@ -451,6 +490,8 @@ def _parse_shape_overrides(values: list[str]) -> dict[str, int]:
 def run_compile_model(args: argparse.Namespace) -> int:
     shape_environment = _parse_shape_overrides(args.shape)
     machine = _machine(args.arch, args.machine_config)
+    if args.runtime_device_matrix and args.scheduler_target != "tisa":
+        raise ValueError("--runtime-device-matrix requires --scheduler-target tisa")
     if args.through_stablehlo and args.torch_module is None:
         raise ValueError("--through-stablehlo is only valid with --torch-module")
     if args.stablehlo_exporter != "project" and not args.through_stablehlo:
@@ -553,6 +594,21 @@ def run_compile_model(args: argparse.Namespace) -> int:
     write_artifact_json(compiled.backend_artifact, args.output_dir / "backend_artifact.json")
     write_artifact_json(compiled.backend_artifact.execution_graph, args.output_dir / "execution_graph.json")
     write_artifact_json(compiled, args.output_dir / "compiled_artifact.json")
+    runtime_buffers = allocate_buffer_bindings(
+        compiled.graph.tensors,
+        base_address=args.runtime_base_address,
+        alignment_bytes=args.runtime_alignment,
+    )
+    runtime_submission = create_runtime_submission(
+        compiled.backend_artifact,
+        runtime_buffers,
+        submission_id=f"submission.{compiled.tisa_program.program_id}",
+        policy=args.runtime_policy,
+        chunk_size=args.runtime_chunk_size,
+        launch_latency_cycles=args.runtime_launch_latency,
+        synchronization_cycles=args.runtime_synchronization_cycles,
+    )
+    write_artifact_json(runtime_submission, args.output_dir / "runtime_submission.json")
     write_operator_graph_dot(compiled.graph, args.output_dir / "operator_graph.dot")
     write_operator_graph_svg(compiled.graph, args.output_dir / "operator_graph.svg")
     write_tile_graph_dot(compiled.tile_graph, args.output_dir / "tile_graph.dot")
@@ -575,6 +631,7 @@ def run_compile_model(args: argparse.Namespace) -> int:
             args.policy,
             timing_model=timing_model,
             simulator_config=simulator_config,
+            runtime_submission=runtime_submission,
         )
     else:
         result = schedule_execution_graph(
@@ -590,6 +647,7 @@ def run_compile_model(args: argparse.Namespace) -> int:
         write_instruction_csv(result, args.output_dir / "tisa_instructions.csv")
     write_svg(result, args.output_dir / "swimlane.svg")
     write_png(result, args.output_dir / "swimlane.png")
+    write_artifact_json(result.perfetto_trace(), args.output_dir / "perfetto.json")
     write_artifact_json(
         {
             "schema_version": 1,
@@ -617,10 +675,91 @@ def run_compile_model(args: argparse.Namespace) -> int:
             "primitive_task_count": len(compiled.backend_artifact.execution_graph.tasks),
             "tisa_decision_count": result.metrics.get("tisa_decision_count"),
             "payload_execution": result.metrics.get("payload_execution"),
+            "runtime_policy": runtime_submission.policy,
+            "runtime_applied_to_device": args.scheduler_target == "tisa",
+            "runtime_command_chunk_count": len(runtime_submission.commands),
+            "runtime_buffer_count": len(runtime_submission.buffers),
+            "runtime_submit_cycles": result.metrics.get("runtime_submit_cycles", 0.0),
+            "runtime_synchronization_cycles": result.metrics.get(
+                "runtime_synchronization_cycles", 0.0
+            ),
+            "device_start_cycle": result.metrics.get("device_start_cycle", 0.0),
+            "device_finish_cycle": result.metrics.get(
+                "device_finish_cycle", result.total_cycles
+            ),
+            "device_cycles": result.metrics.get("device_cycles", result.total_cycles),
+            "total_cycles_including_runtime": result.metrics.get(
+                "total_cycles_including_runtime", result.total_cycles
+            ),
             "calibration_status": result.metrics["calibration_status"],
         },
         args.output_dir / "manifest.json",
     )
+    if args.runtime_device_matrix:
+        matrix_root = args.output_dir / "policy_matrix"
+        matrix_root.mkdir(parents=True, exist_ok=True)
+        matrix_cases = run_runtime_device_matrix(
+            compiled.backend_artifact,
+            runtime_buffers,
+            machine,
+            chunk_size=args.runtime_chunk_size,
+            launch_latency_cycles=args.runtime_launch_latency,
+            synchronization_cycles=args.runtime_synchronization_cycles,
+            timing_model=timing_model,
+            simulator_config=simulator_config,
+        )
+        matrix_records: list[dict[str, object]] = []
+        static_baseline = next(
+            case.result.total_cycles
+            for case in matrix_cases
+            if case.runtime_policy == "static"
+            and case.device_policy == SchedulerPolicy.STATIC_PIPELINE.value
+        )
+        for case in matrix_cases:
+            case_dir = matrix_root / case.case_id
+            ensure_output_layout(case_dir)
+            write_artifact_json(case.submission, case_dir / "runtime_submission.json")
+            write_json(case.result, case_dir / "summary.json")
+            write_csv(case.result, case_dir / "tasks.csv")
+            write_instruction_csv(case.result, case_dir / "tisa_instructions.csv")
+            write_svg(case.result, case_dir / "swimlane.svg")
+            write_png(case.result, case_dir / "swimlane.png")
+            write_artifact_json(case.result.perfetto_trace(), case_dir / "perfetto.json")
+            record = {
+                **case.to_dict(),
+                "speedup_vs_static_runtime_static_device": (
+                    static_baseline / case.result.total_cycles
+                    if case.result.total_cycles
+                    else None
+                ),
+            }
+            matrix_records.append(record)
+            write_artifact_json(
+                {
+                    "schema_version": 1,
+                    **record,
+                    "shared_compiled_artifact": "../../03_tisa/compiled_artifact.json",
+                    "shared_backend_artifact": "../../04_backend/backend_artifact.json",
+                    "machine_hash": machine.stable_hash(),
+                    "calibration_status": case.result.metrics["calibration_status"],
+                },
+                case_dir / "manifest.json",
+            )
+        matrix_records.sort(
+            key=lambda item: (str(item["runtime_policy"]), str(item["device_policy"]))
+        )
+        with (matrix_root / "sweep.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=tuple(matrix_records[0]))
+            writer.writeheader()
+            writer.writerows(matrix_records)
+        write_artifact_json(matrix_records, matrix_root / "sweep.json")
+        (matrix_root / "README.md").write_text(
+            "# Runtime x Device policy matrix\n\n"
+            "四个 case 共享父目录中的 compiled/backend artifact 和 physical buffer allocation。\n"
+            "每个 case 只保存独立的 RuntimeSubmission、simulation result 和 trace。\n",
+            encoding="utf-8",
+        )
+        write_artifact_index(args.output_dir)
     print(json.dumps({
         "frontend": imported.frontend.value if hasattr(imported.frontend, "value") else str(imported.frontend),
         "tisa_instructions": len(compiled.tisa_program.instructions),

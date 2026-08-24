@@ -13,7 +13,7 @@ from npu_ooo.simulator import (
     simulate_execution_graph,
     simulate_tisa_artifact,
 )
-from npu_ooo.ir import BackendArtifact, ExecutionGraph
+from npu_ooo.ir import BackendArtifact, ExecutionGraph, RuntimeSubmission
 from npu_ooo.arch import MachineConfig
 
 
@@ -52,6 +52,7 @@ def schedule_tisa_program(
     *,
     timing_model: TimingModel | None = None,
     simulator_config: SimulatorConfig | None = None,
+    runtime_submission: RuntimeSubmission | None = None,
 ) -> ScheduleResult:
     """Schedule TISA descriptors, activating only their bound payload group."""
 
@@ -62,4 +63,5 @@ def schedule_tisa_program(
         normalized_policy,
         timing_model=timing_model or AnalyticalTimingModel(),
         config=simulator_config,
+        runtime_submission=runtime_submission,
     )

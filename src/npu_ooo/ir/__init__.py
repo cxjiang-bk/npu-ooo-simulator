@@ -40,6 +40,14 @@ from .tisa import (
     TileMem,
     UnitMap,
 )
+from .runtime import (
+    BufferBinding,
+    RuntimeCommandChunk,
+    RuntimeOperandBinding,
+    RuntimeSubmission,
+    allocate_buffer_bindings,
+    create_runtime_submission,
+)
 
 __all__ = [
     "BenchmarkCase",
@@ -67,6 +75,12 @@ __all__ = [
     "TISAProgram",
     "TileMem",
     "UnitMap",
+    "BufferBinding",
+    "RuntimeCommandChunk",
+    "RuntimeOperandBinding",
+    "RuntimeSubmission",
+    "allocate_buffer_bindings",
+    "create_runtime_submission",
     "OperatorSchedule",
     "ScheduleSpec",
     "TensorResidency",

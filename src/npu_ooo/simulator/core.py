@@ -340,6 +340,7 @@ class SimulationResult:
     events: tuple[TraceEvent, ...]
     metrics: Mapping[str, Any] = field(default_factory=dict)
     instruction_timings: tuple[TaskTiming, ...] = ()
+    runtime_timings: tuple[TaskTiming, ...] = ()
 
     def timing(self, task_id: str) -> TaskTiming:
         for timing in self.timings:
@@ -363,6 +364,7 @@ class SimulationResult:
             "instruction_timings": [
                 timing.to_dict() for timing in self.instruction_timings
             ],
+            "runtime_timings": [timing.to_dict() for timing in self.runtime_timings],
             "events": [event.to_dict() for event in self.events],
             "metrics": dict(self.metrics),
         }
@@ -376,6 +378,9 @@ class SimulationResult:
             elif event.event in {"TISA_ISSUE", "TISA_COMPLETE"}:
                 phase = "B" if event.event == "TISA_ISSUE" else "E"
                 pid = 1
+            elif event.event in {"RUNTIME_SUBMIT_START", "RUNTIME_SUBMIT_COMPLETE"}:
+                phase = "B" if event.event == "RUNTIME_SUBMIT_START" else "E"
+                pid = 0
             else:
                 continue
             trace_events.append(

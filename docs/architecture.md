@@ -405,13 +405,13 @@ UnitMap      (unit class, quantity, affinity)
 Deps         (source, RAW/WAR/WAW, condition)
 ```
 
-`TileInstance` 目前只有 `operator_id`、coordinates、bounds 和 stage；它在粒度上接近论文中的 tile，但还不是可供 TISA scheduler 使用的完整指令。后续必须由 compiler 将 TileInstance 和 operand region 组装为 `TISAInstruction`，而不是直接把它降成失去语义的 primitive task。
+`TileInstance` 只有 `operator_id`、coordinates、bounds 和 stage；它在粒度上接近论文中的 tile，但还不是可供 TISA scheduler 使用的完整指令。当前 compiler 已由 `TISASemanticBuilder` 将 TileInstance、operator 语义和 operand region 组装为 `TISAInstruction`，再由 backend 单独生成 primitive payload。
 
 一个命令模板可以在 runtime 阶段绑定 batch、KV-cache base、buffer base 和实际 tile 坐标，再形成一次 `RuntimeSubmission`。TISA scheduler 应在 TISAInstruction 粒度做 run-to-complete、non-preemptive 的 tile-level issue；只有在真正的 backend timing 或 RTL adapter 内部，才展开为 `ExecutionTask` primitive。
 
 ### 2.6 BackendArtifact / Runtime Binding IR
 
-BackendArtifact 保存与 TISA descriptor 关联的 target execution payload；Runtime 不重新编译数学语义，而是为 `BackendArtifact` 提供一次执行所需的动态状态：
+BackendArtifact 保存与 TISA descriptor 关联的 target execution payload；Runtime 不重新编译数学语义，而是为 `BackendArtifact` 提供一次执行所需的动态状态。当前已实现 RuntimeSubmission v1 的地址和 command chunk 绑定：
 
 ```text
 submission_id
@@ -424,7 +424,7 @@ launch/event synchronization
 runtime overhead model
 ```
 
-`RuntimeSubmission` 的输出是 Device Backend 可以接收的命令包。静态 runtime 可以按编译顺序提交；动态 runtime 可以根据软件 ready queue、buffer availability 或 request state 选择提交顺序，但两者必须引用同一份 compiled task metadata。
+`RuntimeSubmission` 的输出是 Device Backend 可以接收的命令包。当前 `create_runtime_submission()` 的静态 policy 按 TISA program order 分块；`dynamic_ready_queue` 对 dependency DAG 做确定性的 tile-affine fanout-first ready-queue 拓扑排序：同一 tile 已开始提交时优先发送其 ready stage，避免有限 device tile window 被大量不完整 tile packet 占满。两种 policy 都引用同一份 compiled metadata，且 submission order 不替代 device issue order。每个 chunk 的 launch latency 决定 descriptor 的 reception-ready cycle，最后的 synchronization cost 计入 device finish 之后；更真实的 request availability、buffer reuse 和异步 event graph 仍未实现。
 
 ### 2.7 Primitive Execution Graph
 
@@ -746,7 +746,7 @@ optional modulo initiation interval
 
 当前 simulator 将可执行的动态启发式显式化为 `SimulatorConfig.dynamic_priority`：`critical_path`（默认）或 `oldest_first`。这使得 softmax 等多阶段 DAG 可以把“动态 ready queue 机制”和“具体优先级函数”作为两个独立实验维度报告。
 
-TISA-like policy 现在支持可选 device-side address range scoreboard、窗口大小和 completion wake-up；scoreboard 不改写编译期图，而是只追踪 active task 的地址范围，因此能在 trace 中区分编译期依赖与设备运行时 address stall。
+TISA-like policy 现在支持可选 device-side address range scoreboard、窗口大小和 completion wake-up；scoreboard 不改写编译期图，而是只追踪 active task 的地址范围。存在 `RuntimeSubmission` 时使用 `RuntimeOperandBinding` 的 physical scope 和 concrete address range，否则回退到 compiler logical `TileMem`，因此能在 trace/metrics 中区分编译期依赖与设备运行时 address stall。
 
 ## 8. Runtime 与 Device Backend
 
@@ -781,8 +781,14 @@ dynamic_ready_queue
 `--scheduler-target primitive` 保留原来从 `ExecutionTask` 选择 task 的兼容 baseline。
 TISA instruction issue 后，绑定 payload 才在所选 EU instance 上按本地拓扑顺序运行，
 payload primitive 不进入全局 OOO window。Static/Dynamic 共用同一份 `TISAProgram`、
-`BackendArtifact`、地址、依赖、timing 和 MachineConfig；RuntimeSubmission 尚未接入，
-当前等价于一次性提交整个 descriptor stream。
+`BackendArtifact`、依赖、timing 和 MachineConfig。RuntimeSubmission v1 已接入
+`compile-model` 输出：默认用线性 allocator 生成 `BufferBinding`，为每个 TISA operand
+生成 `RuntimeOperandBinding`，并按 chunk 生成 `RuntimeCommandChunk`。Device reception
+按 chunk completion 接收 descriptor，非零 launch/synchronization latency 会进入 runtime
+泳道和端到端周期；默认 latency 为零以保持旧的 device-cycle baseline。Static device
+按 reception order issue，Dynamic device 仍可在已接收窗口内选择 ready TISA instruction。
+兼容的 primitive scheduler 不消费 RuntimeSubmission，并在 manifest 中显式记录
+`runtime_applied_to_device=false`。
 
 ### 8.3 热插拔 Backend 分层
 
@@ -897,7 +903,7 @@ artifact_index.json
 02_schedule_tile/{schedule.json,tile_graph.json,tile_graph.dot}
 03_tisa/{tisa_program.json,compiled_artifact.json}
 04_backend/{machine.json,backend_artifact.json,execution_graph.json}
-05_runtime/address_dependencies.json
+05_runtime/{runtime_submission,address_dependencies}.json
 06_simulation/{summary.json,tasks.csv,tisa_instructions.csv}
 07_trace/{perfetto.json,swimlane.svg,swimlane.png}
 ```
@@ -935,7 +941,10 @@ completed_tile_count
 runtime_submit_cycles
 runtime_launch_count
 command_buffer_bytes
+device_start_cycle
+device_finish_cycle
 device_cycles
+total_cycles_including_runtime
 runtime/device synchronization stalls
 ```
 

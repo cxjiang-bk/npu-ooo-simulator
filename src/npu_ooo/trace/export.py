@@ -16,6 +16,7 @@ from .layout import artifact_path, finalize_artifact
 
 
 _PRIMITIVE_PALETTE = {
+    "runtime_submit": "#546e7a",
     "tisa_instruction": "#263238",
     "load": "#377eb8",
     "load_transpose": "#00a6a6",
@@ -221,7 +222,7 @@ def write_svg(result: ScheduleResult, path: str | Path, *, width: int = 1600, ro
 
     target, compatibility = artifact_path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    all_timings = (*result.instruction_timings, *result.timings)
+    all_timings = (*result.runtime_timings, *result.instruction_timings, *result.timings)
     lanes = sorted({(timing.resource, timing.instance) for timing in all_timings})
     lane_index = {lane: index for index, lane in enumerate(lanes)}
     primitive_issue_details = {
@@ -234,6 +235,11 @@ def write_svg(result: ScheduleResult, path: str | Path, *, width: int = 1600, ro
         for event in result.events
         if event.event == "TISA_ISSUE"
     }
+    runtime_issue_details = {
+        event.task_id: dict(event.details)
+        for event in result.events
+        if event.event == "RUNTIME_SUBMIT_START"
+    }
     primitive_by_task = {
         timing.task_id: str(
             primitive_issue_details.get(timing.task_id, {}).get("primitive", "unknown")
@@ -242,6 +248,9 @@ def write_svg(result: ScheduleResult, path: str | Path, *, width: int = 1600, ro
     }
     primitive_by_task.update(
         {timing.task_id: "tisa_instruction" for timing in result.instruction_timings}
+    )
+    primitive_by_task.update(
+        {timing.task_id: "runtime_submit" for timing in result.runtime_timings}
     )
     present_primitives = set(primitive_by_task.values())
     primitive_rank = {primitive: index for index, primitive in enumerate(_PRIMITIVE_ORDER)}
@@ -266,9 +275,9 @@ def write_svg(result: ScheduleResult, path: str | Path, *, width: int = 1600, ro
     elements: list[str] = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         f'<title>{html.escape(result.policy)} scheduling swimlane</title>',
-        f'<desc>{len(result.instruction_timings)} TISA instructions and {len(result.timings)} payload tasks over {result.total_cycles:g} cycles.</desc>',
+        f'<desc>{len(result.runtime_timings)} runtime chunks, {len(result.instruction_timings)} TISA instructions and {len(result.timings)} payload tasks over {result.total_cycles:g} cycles.</desc>',
         '<rect width="100%" height="100%" fill="#ffffff"/>',
-        f'<text x="12" y="22" font-family="sans-serif" font-size="16" fill="#1f2933">policy={html.escape(result.policy)}  total={result.total_cycles:g} cycles  TISA={len(result.instruction_timings)}  payload={len(result.timings)}</text>',
+        f'<text x="12" y="22" font-family="sans-serif" font-size="16" fill="#1f2933">policy={html.escape(result.policy)}  total={result.total_cycles:g} cycles  runtime={len(result.runtime_timings)}  TISA={len(result.instruction_timings)}  payload={len(result.timings)}</text>',
         '<g id="legend" font-family="sans-serif" font-size="11" fill="#27313a">',
         f'<text x="12" y="{legend_top + 13}" font-weight="600">Primitive</text>',
     ]
@@ -278,7 +287,7 @@ def write_svg(result: ScheduleResult, path: str | Path, *, width: int = 1600, ro
             f'<rect x="{x}" y="{y + 2}" width="14" height="14" fill="{_primitive_color(primitive)}" stroke="#334155" stroke-width="0.5"/>'
         )
         elements.append(
-            f'<text x="{x + 20}" y="{y + 13}">{html.escape("TISA instruction" if primitive == "tisa_instruction" else primitive)}</text>'
+            f'<text x="{x + 20}" y="{y + 13}">{html.escape("TISA instruction" if primitive == "tisa_instruction" else "Runtime submit" if primitive == "runtime_submit" else primitive)}</text>'
         )
     elements.append("</g>")
 
@@ -331,7 +340,9 @@ def write_svg(result: ScheduleResult, path: str | Path, *, width: int = 1600, ro
         primitive = primitive_by_task[task.task_id]
         color = _primitive_color(primitive)
         details = (
-            tisa_issue_details.get(task.task_id, {})
+            runtime_issue_details.get(task.task_id, {})
+            if primitive == "runtime_submit"
+            else tisa_issue_details.get(task.task_id, {})
             if primitive == "tisa_instruction"
             else primitive_issue_details.get(task.task_id, {})
         )

@@ -65,9 +65,8 @@ npu-ooo-simulator/
 ├── src/npu_ooo/
 │   ├── frontend/            # framework bridge：JSON、torch.export/ExecuTorch 适配器
 │   ├── compiler/            # Canonical Graph -> Schedule/Tile -> TISA/Backend
-│   ├── runtime/             # 规划中：地址绑定、command buffer 和提交策略
 │   ├── backend/             # 规划中：可热插拔的 timing/event/system backend
-│   ├── ir/                  # Model、Operator、Schedule、Tile、TISA、Execution IR
+│   ├── ir/                  # Model、Operator、Schedule、Tile、TISA、Runtime、Execution IR
 │   ├── arch/                # MachineConfig schema、校验和 profile 导入
 │   ├── lowering/            # semantic operator -> backend primitive task
 │   ├── scheduler/           # sequential、Static pipeline、Dynamic ready queue
@@ -109,7 +108,8 @@ out/attention-dynamic/
 │   ├── machine.json
 │   ├── backend_artifact.json
 │   └── execution_graph.json
-├── 05_runtime/              # 地址绑定/运行时观察到的依赖和 hazard
+├── 05_runtime/              # 物理地址绑定、command chunk 和运行时观察到的依赖/hazard
+│   ├── runtime_submission.json
 │   └── address_dependencies.json
 ├── 06_simulation/           # 周期、stall、队列指标和每个 task 的时序
 │   ├── summary.json
@@ -127,7 +127,7 @@ out/attention-dynamic/
 3. `02_schedule_tile` 反映切分、边界 tile、loop order 和 compile-time 依赖；
 4. `03_tisa` 用来检查 `OpType`、`TileMem`、`UnitMap` 和 typed dependency 是否保留；
 5. `04_backend` 用来检查具体机器参数以及 TISA 到 primitive payload 的展开；
-6. `05_runtime` 用来区分地址冲突等运行时观察，不把它们误认为编译期依赖；
+6. `05_runtime` 用来检查物理 buffer、operand 地址、command chunk 和地址冲突等运行时观察，不把它们误认为编译期依赖；
 7. `06_simulation` 和 `07_trace` 用来比较总周期、stall 分解和不同调度策略的泳道。
 
 当前已有的 primitive baseline 命令仍直接生成 `ExecutionGraph`，因此它们的
@@ -138,7 +138,8 @@ out/attention-dynamic/
 阶段 artifact 只保存在编号目录中，不再在实验目录顶层创建副本或兼容性符号链接。
 复用旧版本生成的 `--output-dir` 时，已知的顶层扁平 artifact 和符号链接会自动删除。
 单次实验顶层只保留 `README.md`、`artifact_index.json` 和 `manifest.json`；批量 sweep
-根目录另外保留 `sweep.csv`、`sweep.json`，每个 case 仍使用相同的分阶段布局。
+根目录另外保留 `sweep.csv`、`sweep.json`，每个 case 仍使用相同的分阶段布局。启用
+`--runtime-device-matrix` 时顶层还会增加 `policy_matrix/`，它是实验矩阵而非编译阶段。
 
 ### Framework bridge 层级
 
@@ -208,8 +209,35 @@ PYTHONPATH=src:. /usr/bin/python3.12 -m npu_ooo.cli compile-model \
   --stablehlo-backend official \
   --arch minimal \
   --policy dynamic_ready_queue \
+  --runtime-policy static \
+  --runtime-chunk-size 4 \
+  --runtime-launch-latency 2 \
+  --runtime-synchronization-cycles 5 \
   --output-dir out/stablehlo-matmul
 ```
+
+这里的 `--runtime-policy` 决定 host 侧 descriptor 的提交顺序，`--policy` 决定
+device 侧 TISA issue 策略；两者是独立实验维度。每个 command chunk 串行消耗
+`--runtime-launch-latency`，descriptor 完成提交后才进入设备 reception queue；
+`--runtime-synchronization-cycles` 计入最后一条设备指令完成后的端到端周期。
+`manifest.json` 分别记录 `runtime_submit_cycles`、`device_start_cycle`、
+`device_finish_cycle`、`device_cycles` 和 `total_cycles_including_runtime`。这些 runtime
+时序目前只接入默认的 TISA scheduler target；使用兼容的 primitive target 时
+`runtime_applied_to_device=false`。
+
+增加 `--runtime-device-matrix` 后，一次编译会在 `policy_matrix/` 下运行四种组合：
+
+```text
+static runtime  x static device
+static runtime  x dynamic device
+dynamic runtime x static device
+dynamic runtime x dynamic device
+```
+
+四个 case 共享父目录的 `compiled_artifact.json`、`backend_artifact.json` 和 physical
+buffer allocation，只改变 RuntimeSubmission order 与 device issue policy。汇总结果写入
+`policy_matrix/sweep.csv` 和 `policy_matrix/sweep.json`，每个 case 另有独立 summary、
+Perfetto 和 SVG/PNG 泳道。
 
 真实 PyTorch module 也可通过零参数 factory 进入同一命令。默认路径直接使用
 `torch.export -> Canonical OperatorGraph`；加上 `--through-stablehlo` 可以显式走

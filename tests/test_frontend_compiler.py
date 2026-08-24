@@ -814,6 +814,15 @@ class FrontendCompilerTest(unittest.TestCase):
                     "minimal",
                     "--policy",
                     "dynamic_ready_queue",
+                    "--runtime-policy",
+                    "dynamic_ready_queue",
+                    "--runtime-chunk-size",
+                    "1",
+                    "--runtime-launch-latency",
+                    "2",
+                    "--runtime-synchronization-cycles",
+                    "3",
+                    "--runtime-device-matrix",
                     "--output-dir",
                     str(output),
                 ]
@@ -822,7 +831,9 @@ class FrontendCompilerTest(unittest.TestCase):
             self.assertTrue((output / "00_frontend" / "frontend_import.json").exists())
             self.assertTrue((output / "03_tisa" / "tisa_program.json").exists())
             self.assertTrue((output / "04_backend" / "backend_artifact.json").exists())
+            self.assertTrue((output / "05_runtime" / "runtime_submission.json").exists())
             self.assertTrue((output / "06_simulation" / "tisa_instructions.csv").exists())
+            self.assertTrue((output / "07_trace" / "perfetto.json").exists())
             manifest = json.loads((output / "manifest.json").read_text())
             self.assertEqual(manifest["compiler_pipeline"], "frontend->canonical->schedule->tile->tisa->analytical-backend")
             self.assertEqual(manifest["scheduler_target"], "tisa")
@@ -830,6 +841,21 @@ class FrontendCompilerTest(unittest.TestCase):
                 manifest["tisa_decision_count"], manifest["tisa_instruction_count"]
             )
             self.assertEqual(manifest["payload_execution"], "run_to_completion")
+            self.assertEqual(manifest["runtime_policy"], "dynamic_ready_queue")
+            self.assertTrue(manifest["runtime_applied_to_device"])
+            self.assertGreater(manifest["runtime_buffer_count"], 0)
+            self.assertGreater(manifest["runtime_command_chunk_count"], 0)
+            self.assertEqual(
+                manifest["runtime_submit_cycles"],
+                manifest["runtime_command_chunk_count"] * 2,
+            )
+            self.assertEqual(manifest["runtime_synchronization_cycles"], 3)
+            self.assertEqual(
+                manifest["total_cycles_including_runtime"], manifest["total_cycles"]
+            )
+            self.assertGreaterEqual(
+                manifest["device_finish_cycle"], manifest["device_start_cycle"]
+            )
             summary = json.loads(
                 (output / "06_simulation" / "summary.json").read_text()
             )
@@ -839,6 +865,48 @@ class FrontendCompilerTest(unittest.TestCase):
             swimlane = (output / "07_trace" / "swimlane.svg").read_text()
             self.assertIn(">TISA instruction</text>", swimlane)
             self.assertIn("TISA/", swimlane)
+            self.assertIn(">Runtime submit</text>", swimlane)
+            self.assertIn("Runtime/Submit[0]", swimlane)
+            perfetto = json.loads(
+                (output / "07_trace" / "perfetto.json").read_text()
+            )
+            runtime_events = [
+                event for event in perfetto["traceEvents"] if event["pid"] == 0
+            ]
+            self.assertEqual(
+                len(runtime_events), manifest["runtime_command_chunk_count"] * 2
+            )
+            compiled_artifact_id = json.loads(
+                (output / "04_backend" / "backend_artifact.json").read_text()
+            )["artifact_id"]
+            matrix = json.loads(
+                (output / "policy_matrix" / "sweep.json").read_text()
+            )
+            artifact_index = json.loads(
+                (output / "artifact_index.json").read_text()
+            )
+            self.assertIn("policy_matrix", artifact_index["top_level_directories"])
+            self.assertEqual(len(matrix), 4)
+            self.assertEqual(
+                {(row["runtime_policy"], row["device_policy"]) for row in matrix},
+                {
+                    ("static", "static_pipeline"),
+                    ("static", "dynamic_ready_queue"),
+                    ("dynamic_ready_queue", "static_pipeline"),
+                    ("dynamic_ready_queue", "dynamic_ready_queue"),
+                },
+            )
+            self.assertEqual({row["artifact_id"] for row in matrix}, {compiled_artifact_id})
+            for row in matrix:
+                matrix_case = output / "policy_matrix" / row["case_id"]
+                self.assertTrue(
+                    (matrix_case / "05_runtime" / "runtime_submission.json").exists()
+                )
+                self.assertTrue((matrix_case / "06_simulation" / "summary.json").exists())
+                self.assertTrue((matrix_case / "07_trace" / "perfetto.json").exists())
+                self.assertFalse(
+                    (matrix_case / "03_tisa" / "compiled_artifact.json").exists()
+                )
 
             primitive_output = root / "primitive-out"
             primitive_exit_code = main(
@@ -859,6 +927,7 @@ class FrontendCompilerTest(unittest.TestCase):
                 (primitive_output / "manifest.json").read_text()
             )
             self.assertEqual(primitive_manifest["scheduler_target"], "primitive")
+            self.assertFalse(primitive_manifest["runtime_applied_to_device"])
             self.assertFalse(
                 (primitive_output / "06_simulation" / "tisa_instructions.csv").exists()
             )

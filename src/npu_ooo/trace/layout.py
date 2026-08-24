@@ -44,6 +44,7 @@ _STAGE_BY_FILENAME: dict[str, str] = {
     "execution_graph.json": "04_backend",
     "execution_graph.dot": "04_backend",
     "address_dependencies.json": "05_runtime",
+    "runtime_submission.json": "05_runtime",
     "summary.json": "06_simulation",
     "tasks.csv": "06_simulation",
     "tisa_instructions.csv": "06_simulation",
@@ -59,7 +60,8 @@ def _root_readme() -> str:
         "",
         "规范 artifact 按编译和仿真阶段分目录保存。单次实验顶层只保留",
         "`README.md`、`artifact_index.json` 和 `manifest.json`；阶段 artifact 不创建",
-        "顶层副本或兼容性符号链接。批量实验根目录还会保留 `sweep.csv/json`。",
+        "顶层副本或兼容性符号链接。批量实验根目录还会保留 `sweep.csv/json`；",
+        "启用 runtime/device 四组合实验时会增加 `policy_matrix/`。",
         "",
         "| 目录 | 内容 |",
         "| --- | --- |",
@@ -69,8 +71,9 @@ def _root_readme() -> str:
         [
             "",
             "典型查看顺序：先看 `00_frontend` 确认输入，再看 `01_graph_ir` 和",
-            "`02_schedule_tile` 检查图与切分，接着看 `03_tisa`/`04_backend`，最后在",
-            "`06_simulation`、`07_trace` 中比较周期和泳道。",
+            "`02_schedule_tile` 检查图与切分，接着看 `03_tisa`/`04_backend`，在",
+            "`05_runtime` 检查物理地址与 command chunk，最后在 `06_simulation`、",
+            "`07_trace` 中比较周期和泳道。",
             "启用 StableHLO 路径时，可读程序是 `00_frontend/generated.mlir`；",
             "`stablehlo_module.json` 保存程序文本、producer、版本、验证状态和 provenance。",
             "旧的 primitive baseline 命令尚未经过 TISA codegen 时，`03_tisa/` 可能为空；",
@@ -155,6 +158,9 @@ def write_artifact_index(root: str | Path) -> None:
             name
             for name in ("README.md", "manifest.json", "artifact_index.json", "sweep.csv", "sweep.json")
             if (root_path / name).exists()
+        ],
+        "top_level_directories": [
+            name for name in ("policy_matrix",) if (root_path / name).is_dir()
         ],
     }
     (root_path / "artifact_index.json").write_text(
