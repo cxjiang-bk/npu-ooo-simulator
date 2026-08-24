@@ -823,17 +823,20 @@ SimulatorCodegenBackend
     + TISA descriptor / primitive template artifact
     +
 AnalyticalTimingProvider
-    + Current DiscreteEventBackend
+    + AnalyticalEventBackend
 ```
 
 当前已落地 `src/npu_ooo/backend/` 的第一版 contract：`BackendCapabilities` 统一声明
 primitive/resource/memory 支持范围和 `calibration_status`；`TimingProvider`、
 `EventBackend`、`SystemBackend`、`CodegenBackend` 使用 protocol 保持实现可替换；
-`TimingProviderRegistry` 已注册 analytical 与 timing-table 两个 provider。provider
+`TimingProviderRegistry` 已注册 analytical 与 timing-table 两个 provider，
+`EventBackendRegistry` 已注册 `analytical_event`。`schedule_tisa_program()` 通过
+EventBackend 接口进入设备事件引擎，CLI 使用 `--event-backend` 选择；event backend
+仍将 scheduler policy、RuntimeSubmission、TimingProvider 和 SimulatorConfig 作为独立输入。
+provider
 声明 capability 后，TISA simulator 会在第一次 issue 前验证整个 `BackendArtifact`，
-不支持的 primitive/resource/memory 显式失败，不静默使用未校准数字。当前 registry
-还没有外部 SCALE-Sim、DRAM 或 RTL adapter，EventBackend/SystemBackend protocol 先作为
-下一阶段的接入边界。
+不支持的 primitive/resource/memory 显式失败，不静默使用未校准数字。当前还没有外部
+SCALE-Sim、DRAM 或 RTL adapter，SystemBackend protocol 先作为下一阶段的接入边界。
 
 后续可插拔实现：
 

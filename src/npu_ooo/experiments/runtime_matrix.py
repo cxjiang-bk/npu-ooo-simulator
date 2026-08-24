@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Iterable, Mapping, Sequence
 
 from npu_ooo.arch import MachineConfig
+from npu_ooo.backend import EventBackend
 from npu_ooo.ir import BackendArtifact, BufferBinding, RuntimeSubmission, create_runtime_submission
 from npu_ooo.scheduler import SchedulerPolicy, schedule_tisa_program
 from npu_ooo.simulator import SimulationResult, SimulatorConfig, TimingModel
@@ -67,6 +68,7 @@ def run_runtime_device_matrix(
     descriptor_available_cycles: Mapping[str, float] | None = None,
     timing_model: TimingModel | None = None,
     simulator_config: SimulatorConfig | None = None,
+    event_backend: EventBackend | None = None,
 ) -> tuple[RuntimeDeviceCase, ...]:
     """Run policy combinations without recompiling or reallocating buffers."""
 
@@ -91,6 +93,7 @@ def run_runtime_device_matrix(
                 timing_model=timing_model,
                 simulator_config=simulator_config,
                 runtime_submission=submission,
+                event_backend=event_backend,
             )
             cases.append(
                 RuntimeDeviceCase(

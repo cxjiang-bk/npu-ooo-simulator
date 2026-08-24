@@ -6,7 +6,7 @@
 
 ## 当前阶段
 
-阶段 9 已完成第一版自动前端、TISA device scheduler 和 TISA-first backend codegen。当前处于阶段 10：`TISAProgram/BackendArtifact -> RuntimeSubmission -> descriptor reception -> TISA device scheduler` 已形成第一条闭环，runtime launch/synchronization 与 device cycles 分层统计，默认零开销保持旧 baseline。下一步补齐同一 compiled artifact 上的 static/dynamic runtime x static/dynamic device 批量对照。阶段 4-6 的 analytical primitive-task baseline 继续保留为兼容对照。
+阶段 9 已完成第一版自动前端、TISA device scheduler 和 TISA-first backend codegen，阶段 10 的 RuntimeSubmission、物理地址绑定、descriptor reception 与四象限策略矩阵也已闭环。当前处于阶段 11：已将 timing source 和 device event engine 拆成独立 registry，并把现有 TISA analytical simulator 包装为默认 `AnalyticalEventBackend`。下一步补齐 CodegenBackend registry，再接入第一种外部 timing adapter。阶段 4-6 的 analytical primitive-task baseline 继续保留为兼容对照。
 
 阶段 9 的前端目标边界：先支持静态 shape、推理场景和小型真实 PyTorch 模型，覆盖 RMSNorm、LayerNorm、Linear/Matmul、ResidualAdd、Softmax 和 attention micrograph；不在第一轮承诺完整 ATen、动态控制流、训练语义或完整 StableHLO/MLIR 工具链。现有手写 benchmark 继续作为 canonical IR/lowering/simulator 回归基线，不能被自动前端重构破坏。
 
@@ -102,8 +102,9 @@
 - 10.0 已完成第一版：新增 `BufferBinding`、`RuntimeOperandBinding`、`RuntimeCommandChunk`、`RuntimeSubmission` 和线性 allocator；command chunk completion 驱动 descriptor reception，runtime/device policy 独立，launch/synchronization latency 分层进入 summary、manifest、SVG 和 Perfetto。启用 scoreboard 时优先消费 runtime physical address range。
 - 10.1 已完成第一版：`--runtime-device-matrix` 在一次编译结果和一次 physical allocation 上运行 static/dynamic runtime x static/dynamic device 四种组合；每个 cell 输出独立 submission/summary/trace，顶层汇总周期和相对 static/static speedup。
 - 10.2 已完成第一版：compiler TISA region legalizer v1 已覆盖 matmul/batched_matmul/gemv、broadcast elementwise、reduce、softmax、RMSNorm 和 LayerNorm（含 affine 参数），将 dense starts/shape 转为 byte offset/size；runtime 新增 descriptor `availability_cycle`、static 队头等待、dynamic bypass、`runtime_request_wait_cycles`，以及基于 TISA dependency proof 的 `lifetime_reuse` allocator。动态 shape/非 dense layout 仍显式记录 fallback。
-- 10.3 下一步：把 request availability 从静态 JSON 映射扩展为 runtime event/state provider，并校准 buffer reuse 与 memory-bank/port timing；随后进入阶段 11 hot-pluggable backend contract。
-- 11.0 进行中：新增 `BackendCapabilities`、`TimingProvider`、`EventBackend`、`SystemBackend`、`CodegenBackend` protocol 和 timing provider registry；`compile-model` 可选择 analytical/timing_table provider，manifest 写入 capability/calibration metadata，TISA simulator 在 provider 声明 capability 时执行显式校验。
+- 10.3 后续扩展：把 request availability 从静态 JSON 映射扩展为 runtime event/state provider，并校准 buffer reuse 与 memory-bank/port timing；不阻塞阶段 11 backend 接口推进。
+- 11.0 已完成第一版：新增 `BackendCapabilities`、`TimingProvider`、`EventBackend`、`SystemBackend`、`CodegenBackend` protocol 和 timing provider registry；`compile-model` 可选择 analytical/timing_table provider，manifest 写入 capability/calibration metadata，TISA simulator 在 provider 声明 capability 时执行显式校验。
+- 11.1 已完成第一版：新增 `AnalyticalEventBackend` 和 `EventBackendRegistry`；`schedule_tisa_program` 不再直接绑定具体 TISA simulator，CLI 可用 `--event-backend analytical_event` 选择 event engine。runtime/device 四象限复用同一 backend instance，manifest 分开记录 codegen/runtime/event/timing backend。下一步是 CodegenBackend adapter/registry。
 
 阶段 4-6 的“completed”表示基线闭环完成，不表示后续功能不再扩展。下一轮工作必须保持这些 baseline 的输入/输出兼容，并以自动前端和 runtime/backend 分层作为增量演进。
 

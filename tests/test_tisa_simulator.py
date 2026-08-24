@@ -2,6 +2,7 @@ import unittest
 from dataclasses import replace
 
 from npu_ooo.arch import minimal_machine_config
+from npu_ooo.backend import AnalyticalEventBackend
 from npu_ooo.ir import (
     AccessType,
     BackendArtifact,
@@ -133,6 +134,24 @@ class TISADeviceSimulatorTest(unittest.TestCase):
         self.assertEqual(dynamic.metrics["tisa_decision_count"], 3)
         self.assertEqual(static.metrics["payload_task_count"], 3)
         self.assertEqual(dynamic.metrics["payload_task_count"], 3)
+        self.assertEqual(dynamic.metrics["event_backend"], "analytical_event")
+
+    def test_explicit_analytical_event_backend_matches_default_cycles(self) -> None:
+        artifact = self._critical_path_artifact()
+        machine = minimal_machine_config()
+        default = schedule_tisa_program(
+            artifact, machine, SchedulerPolicy.DYNAMIC_READY_QUEUE
+        )
+        explicit = schedule_tisa_program(
+            artifact,
+            machine,
+            SchedulerPolicy.DYNAMIC_READY_QUEUE,
+            event_backend=AnalyticalEventBackend(),
+        )
+
+        self.assertEqual(explicit.total_cycles, default.total_cycles)
+        self.assertEqual(explicit.timings, default.timings)
+        self.assertEqual(explicit.instruction_timings, default.instruction_timings)
 
     def test_tisa_dependency_requires_source_completion(self) -> None:
         artifact = self._critical_path_artifact()

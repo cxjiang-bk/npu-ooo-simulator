@@ -544,3 +544,12 @@ git diff --check: passed
 - StableHLO Matmul CLI smoke：15 TISA / 21 primitive / 3 physical buffers / 33 operand bindings / 5 chunks（chunk size=3）；runtime/device policy 均为 dynamic_ready_queue，device cycles 仍为 120。
 - 全量回归：`PYTHONPATH=src:. /usr/bin/python3.12 -m unittest discover -s tests -q` 共 103 tests passed；`compileall` 与 `git diff --check` 通过。
 - 官方 StableHLO Matmul + policy matrix smoke：3 TISA / 4 primitive / 1 command chunk；runtime submit=2、device start=2、device finish=54、device cycles=52、synchronization=5、end-to-end=59 cycles，四个 matrix cell 均生成独立 Perfetto trace。
+
+## 2026-08-24：阶段 11.1 Analytical EventBackend
+
+- 新增 `AnalyticalEventBackend`，把现有 `simulate_tisa_artifact()` 封装为正式 device event engine；scheduler policy、RuntimeSubmission、TimingProvider 和 SimulatorConfig 仍作为独立输入，未改变 TISA issue/payload run-to-completion 语义。
+- 新增 `EventBackendRegistry`，默认注册 `analytical_event`；`schedule_tisa_program()` 改为通过 EventBackend 调用，不再直接绑定具体 TISA simulator。
+- `compile-model` 新增 `--event-backend analytical_event`；runtime/device 四象限实验复用所选 backend，顶层和 case manifest 分别记录 event backend、capabilities、timing provider、codegen backend 与 runtime backend。
+- analytical event capability 的 resource 范围由 `MachineConfig` 决定，不硬编码 DMA/MXU/ARU 名称；primitive capability 仍显式枚举并在运行前验证。
+- 官方 StableHLO Matmul + policy matrix smoke 保持 3 TISA / 4 primitive / runtime submit 2 / device 52 / synchronization 5 / end-to-end 59 cycles，证明 adapter 迁移未改变数值。
+- 相关 backend/TISA/runtime matrix 测试 16 项通过；下一步补齐 analytical CodegenBackend adapter/registry。

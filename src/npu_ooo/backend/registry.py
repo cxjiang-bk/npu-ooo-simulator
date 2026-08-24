@@ -8,7 +8,7 @@ from typing import Callable, Mapping
 
 from npu_ooo.simulator.core import AnalyticalTimingModel, TimingModel, TimingTableModel
 
-from .contracts import BackendCapabilities, TimingProvider
+from .contracts import BackendCapabilities, EventBackend, TimingProvider
 
 
 _ANALYTICAL_PRIMITIVES = frozenset(
@@ -58,6 +58,7 @@ class TimingProviderAdapter:
 
 
 TimingFactory = Callable[[Path | None], TimingProvider]
+EventBackendFactory = Callable[[], EventBackend]
 
 
 class TimingProviderRegistry:
@@ -86,6 +87,34 @@ class TimingProviderRegistry:
         return tuple(sorted(self._factories))
 
 
+class EventBackendRegistry:
+    """Factory registry for device event engines."""
+
+    def __init__(self, factories: Mapping[str, EventBackendFactory] | None = None) -> None:
+        self._factories: dict[str, EventBackendFactory] = dict(factories or {})
+
+    def register(self, name: str, factory: EventBackendFactory) -> None:
+        if not name or not callable(factory):
+            raise ValueError("event backend name and factory must be valid")
+        if name in self._factories:
+            raise ValueError(f"event backend '{name}' is already registered")
+        self._factories[name] = factory
+
+    def create(self, name: str) -> EventBackend:
+        try:
+            backend = self._factories[name]()
+        except KeyError as exc:
+            raise ValueError(
+                f"unknown event backend '{name}'; available: {', '.join(sorted(self._factories))}"
+            ) from exc
+        if not hasattr(backend, "capabilities"):
+            raise TypeError(f"event backend '{name}' does not expose capabilities")
+        return backend
+
+    def names(self) -> tuple[str, ...]:
+        return tuple(sorted(self._factories))
+
+
 def default_timing_provider_registry() -> TimingProviderRegistry:
     registry = TimingProviderRegistry()
     registry.register(
@@ -106,9 +135,21 @@ def default_timing_provider_registry() -> TimingProviderRegistry:
     return registry
 
 
+def default_event_backend_registry() -> EventBackendRegistry:
+    # Keep the import lazy: the analytical adapter delegates to simulator.tisa,
+    # while simulator.tisa imports backend capability validation.
+    from .analytical import AnalyticalEventBackend
+
+    registry = EventBackendRegistry()
+    registry.register("analytical_event", AnalyticalEventBackend)
+    return registry
+
+
 __all__ = [
     "TimingProviderAdapter",
+    "EventBackendRegistry",
     "TimingProviderRegistry",
     "analytical_capabilities",
+    "default_event_backend_registry",
     "default_timing_provider_registry",
 ]

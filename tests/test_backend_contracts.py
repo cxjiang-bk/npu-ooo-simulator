@@ -4,7 +4,10 @@ from pathlib import Path
 
 from npu_ooo.arch import minimal_machine_config
 from npu_ooo.backend import (
+    AnalyticalEventBackend,
     BackendCapabilities,
+    EventBackendRegistry,
+    default_event_backend_registry,
     default_timing_provider_registry,
     validate_backend_capability,
 )
@@ -14,6 +17,21 @@ from npu_ooo.simulator import TimingTableModel
 
 
 class BackendContractTest(unittest.TestCase):
+    def test_default_event_registry_exposes_analytical_backend(self) -> None:
+        registry = default_event_backend_registry()
+        self.assertEqual(registry.names(), ("analytical_event",))
+        backend = registry.create("analytical_event")
+        self.assertIsInstance(backend, AnalyticalEventBackend)
+        self.assertEqual(backend.capabilities.calibration_status, "analytical")
+
+    def test_event_registry_rejects_duplicates_and_unknown_names(self) -> None:
+        registry = EventBackendRegistry()
+        registry.register("analytical_event", AnalyticalEventBackend)
+        with self.assertRaisesRegex(ValueError, "already registered"):
+            registry.register("analytical_event", AnalyticalEventBackend)
+        with self.assertRaisesRegex(ValueError, "unknown event backend"):
+            registry.create("missing")
+
     def test_default_registry_exposes_analytical_and_timing_table(self) -> None:
         registry = default_timing_provider_registry()
         self.assertEqual(registry.names(), ("analytical", "timing_table"))

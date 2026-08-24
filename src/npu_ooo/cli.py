@@ -10,7 +10,10 @@ from itertools import product
 from pathlib import Path
 
 from npu_ooo.arch import load_machine_config, lpu_like_machine_config, minimal_machine_config, wide_mxu_machine_config
-from npu_ooo.backend import default_timing_provider_registry
+from npu_ooo.backend import (
+    default_event_backend_registry,
+    default_timing_provider_registry,
+)
 from npu_ooo.compiler import (
     compile_frontend_import,
     compile_stablehlo_file,
@@ -103,6 +106,10 @@ def _machine(name: str, config_path: Path | None = None):
 def _timing_model(path: Path | None, provider: str | None = None):
     selected = provider or ("timing_table" if path is not None else "analytical")
     return default_timing_provider_registry().create(selected, path)
+
+
+def _event_backend(name: str):
+    return default_event_backend_registry().create(name)
 
 
 def _descriptor_availability(path: Path | None) -> dict[str, float]:
@@ -236,6 +243,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("analytical", "timing_table"),
         default=None,
         help="timing backend registry entry; defaults to timing_table when --timing-config is set",
+    )
+    compile_model.add_argument(
+        "--event-backend",
+        choices=default_event_backend_registry().names(),
+        default="analytical_event",
+        help="device event-engine backend for the TISA scheduler",
     )
     compile_model.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
     compile_model.add_argument(
@@ -688,6 +701,7 @@ def run_compile_model(args: argparse.Namespace) -> int:
         dynamic_priority=args.dynamic_priority,
     )
     timing_model = _timing_model(args.timing_config, args.timing_provider)
+    event_backend = _event_backend(args.event_backend)
     if args.scheduler_target == "tisa":
         result = schedule_tisa_program(
             compiled.backend_artifact,
@@ -696,6 +710,7 @@ def run_compile_model(args: argparse.Namespace) -> int:
             timing_model=timing_model,
             simulator_config=simulator_config,
             runtime_submission=runtime_submission,
+            event_backend=event_backend,
         )
     else:
         result = schedule_execution_graph(
@@ -734,6 +749,16 @@ def run_compile_model(args: argparse.Namespace) -> int:
                 if hasattr(timing_model, "capabilities")
                 else None
             ),
+            "event_backend": (
+                event_backend.name if args.scheduler_target == "tisa" else None
+            ),
+            "event_backend_capabilities": (
+                event_backend.capabilities.to_dict()
+                if args.scheduler_target == "tisa"
+                else None
+            ),
+            "codegen_backend": compiled.backend_artifact.backend,
+            "runtime_backend": "builtin_runtime_submission",
             "model_id": imported.model_id,
             "architecture": args.arch,
             "policy": result.policy,
@@ -789,6 +814,7 @@ def run_compile_model(args: argparse.Namespace) -> int:
             descriptor_available_cycles=runtime_descriptor_availability,
             timing_model=timing_model,
             simulator_config=simulator_config,
+            event_backend=event_backend,
         )
         matrix_records: list[dict[str, object]] = []
         static_baseline = next(
@@ -823,6 +849,9 @@ def run_compile_model(args: argparse.Namespace) -> int:
                     "shared_compiled_artifact": "../../03_tisa/compiled_artifact.json",
                     "shared_backend_artifact": "../../04_backend/backend_artifact.json",
                     "machine_hash": machine.stable_hash(),
+                    "event_backend": event_backend.name,
+                    "event_backend_capabilities": event_backend.capabilities.to_dict(),
+                    "timing_provider": getattr(timing_model, "name", "analytical"),
                     "calibration_status": case.result.metrics["calibration_status"],
                 },
                 case_dir / "manifest.json",

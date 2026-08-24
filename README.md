@@ -15,7 +15,7 @@ PyTorch / ONNX / StableHLO
   -> RuntimeSubmission (shape/state/address/command binding)
   -> TISA Device Scheduler (Static 或 Dynamic)
   -> Backend primitive expansion/timing
-  -> 热插拔 Timing/Event/System Backend（当前已落地 capability contract）
+  -> 热插拔 Timing/Event/System Backend（当前已有 analytical event backend）
   -> 总周期、runtime/device 分解、stall 和泳道图
 ```
 
@@ -65,7 +65,7 @@ npu-ooo-simulator/
 ├── src/npu_ooo/
 │   ├── frontend/            # framework bridge：JSON、torch.export/ExecuTorch 适配器
 │   ├── compiler/            # Canonical Graph -> Schedule/Tile -> TISA/Backend
-│   ├── backend/             # 规划中：可热插拔的 timing/event/system backend
+│   ├── backend/             # backend contract、registry 与 analytical event adapter
 │   ├── ir/                  # Model、Operator、Schedule、Tile、TISA、Runtime、Execution IR
 │   ├── arch/                # MachineConfig schema、校验和 profile 导入
 │   ├── lowering/            # semantic operator -> backend primitive task

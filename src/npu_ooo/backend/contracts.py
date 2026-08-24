@@ -20,7 +20,7 @@ from npu_ooo.ir import (
     TileGraph,
 )
 if TYPE_CHECKING:
-    from npu_ooo.simulator.core import SimulationResult, TaskTimingSpec
+    from npu_ooo.simulator.core import SimulationResult, SimulatorConfig, TaskTimingSpec
 
 
 @dataclass(frozen=True)
@@ -139,6 +139,7 @@ class EventBackend(Protocol):
         *,
         runtime_submission: RuntimeSubmission | None = None,
         timing_provider: TimingProvider | None = None,
+        simulator_config: SimulatorConfig | None = None,
     ) -> Any:
         ...
 

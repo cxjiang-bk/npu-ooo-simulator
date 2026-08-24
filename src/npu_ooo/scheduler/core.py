@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from npu_ooo.simulator import (
     AnalyticalTimingModel,
@@ -11,10 +12,12 @@ from npu_ooo.simulator import (
     TimingModel,
     TraceEvent,
     simulate_execution_graph,
-    simulate_tisa_artifact,
 )
 from npu_ooo.ir import BackendArtifact, ExecutionGraph, RuntimeSubmission
 from npu_ooo.arch import MachineConfig
+
+if TYPE_CHECKING:
+    from npu_ooo.backend import EventBackend
 
 
 class SchedulerPolicy(str, Enum):
@@ -53,15 +56,20 @@ def schedule_tisa_program(
     timing_model: TimingModel | None = None,
     simulator_config: SimulatorConfig | None = None,
     runtime_submission: RuntimeSubmission | None = None,
+    event_backend: EventBackend | None = None,
 ) -> ScheduleResult:
     """Schedule TISA descriptors, activating only their bound payload group."""
 
     normalized_policy = policy.value if isinstance(policy, SchedulerPolicy) else str(policy)
-    return simulate_tisa_artifact(
+    if event_backend is None:
+        from npu_ooo.backend import default_event_backend_registry
+
+        event_backend = default_event_backend_registry().create("analytical_event")
+    return event_backend.simulate(
         artifact,
         machine,
         normalized_policy,
-        timing_model=timing_model or AnalyticalTimingModel(),
-        config=simulator_config,
+        timing_provider=timing_model or AnalyticalTimingModel(),
+        simulator_config=simulator_config,
         runtime_submission=runtime_submission,
     )
