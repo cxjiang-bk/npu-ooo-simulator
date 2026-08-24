@@ -252,6 +252,16 @@ def simulate_tisa_artifact(
         if submission_issues:
             raise ValueError("; ".join(submission_issues))
     timing_model = timing_model or AnalyticalTimingModel()
+    timing_calibration_status = getattr(
+        getattr(timing_model, "capabilities", None),
+        "calibration_status",
+        "unspecified",
+    )
+    if not isinstance(timing_calibration_status, str) or not timing_calibration_status:
+        timing_calibration_status = "unspecified"
+    machine_calibration_status = machine.attributes.get(
+        "calibration_status", "unspecified"
+    )
     capability_issues = validate_backend_capability(artifact, machine, timing_model) \
         if hasattr(timing_model, "capabilities") else ()
     if capability_issues:
@@ -449,8 +459,12 @@ def simulate_tisa_artifact(
         "address_scoreboard_block_events": 0,
         "resource_busy_cycles": {},
         "queue_occupancy_timeline": [],
-        "calibration_status": machine.attributes.get(
-            "calibration_status", "unspecified"
+        "machine_calibration_status": machine_calibration_status,
+        "timing_calibration_status": timing_calibration_status,
+        "calibration_status": (
+            timing_calibration_status
+            if timing_calibration_status != "unspecified"
+            else machine_calibration_status
         ),
     }
 

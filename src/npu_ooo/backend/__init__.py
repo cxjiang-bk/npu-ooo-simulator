@@ -18,6 +18,7 @@ from .registry import (
 )
 from .analytical import AnalyticalEventBackend
 from .codegen import AnalyticalCodegenBackend
+from .mxu_profile import SystolicMXUProfileEntry, SystolicMXUProfileTimingProvider
 
 __all__ = [
     "BackendCapabilities",
@@ -28,6 +29,8 @@ __all__ = [
     "EventBackend",
     "EventBackendRegistry",
     "SystemBackend",
+    "SystolicMXUProfileEntry",
+    "SystolicMXUProfileTimingProvider",
     "TimingProvider",
     "TimingProviderAdapter",
     "TimingProviderRegistry",

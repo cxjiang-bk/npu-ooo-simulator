@@ -524,6 +524,28 @@ PYTHONPATH=src python3 -m npu_ooo.cli attention \
 
 匹配优先级是 `timing_key`、task id、`resource:primitive`、primitive、resource、`default`；未覆盖的 task 回退到 analytical timing。结果的 `backend` 会记录 timing table 名称。`path/to/timing.json` 只是占位写法，不能直接作为命令运行。
 
+对于 systolic MXU，可选择 `systolic_mxu_profile`。它读取离线生成的
+`npu_ooo.systolic_mxu_profile.v1` JSON，按每个 Matmul tile 的
+`batch,m,n,k` 精确匹配 duration/II；DMA 和 vector primitive 继续走明确标注的
+analytical fallback。该接口是 SCALE-Sim、RTL waveform 或 hardware counter exporter 的
+接入点，不在运行时调用这些外部工具，也不把示例 profile 宣称为实测数据。
+
+```bash
+PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-model \
+  --stablehlo-file examples/stablehlo/matmul.mlir \
+  --stablehlo-backend official \
+  --timing-provider systolic_mxu_profile \
+  --timing-config configs/timing/systolic_mxu_matmul_example.json \
+  --event-backend analytical_event \
+  --output-dir out/matmul-systolic-profile
+```
+
+`manifest.json` 会分别记录 `timing_provider_metadata`、profile path、source、dataflow、
+`unmatched_matmul` policy 和 calibration status。profile 未命中的 Matmul 默认回退到
+analytical；将 JSON 的 `unmatched_matmul` 设为 `error` 可强制拒绝未校准 tile。
+由于 DMA/vector 仍使用 analytical timing，仿真的 effective calibration status 会显式标为
+`mixed:<profile-status>+analytical-fallback`。
+
 批量比较使用 `sweep-two-mm`。它对每个 architecture/policy/window/ROB 组合重新执行相同的 2mm lowering 和 simulator，并为每个组合写入独立目录：
 
 ```bash

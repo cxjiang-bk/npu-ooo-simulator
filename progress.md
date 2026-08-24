@@ -562,3 +562,12 @@ git diff --check: passed
 - compiler attributes、顶层 manifest 与 policy-matrix case manifest 都记录 codegen/runtime/event/timing backend 和相应 capability metadata。
 - 官方 StableHLO Matmul + policy matrix smoke 保持 3 TISA / 4 primitive / runtime submit 2 / device 52 / synchronization 5 / end-to-end 59 cycles；backend/frontend/runtime 目标回归 44 项通过。
 - 下一步：为 matmul 引入可选外部 MXU timing adapter，未覆盖 primitive 必须显式保留 analytical fallback 或失败，并将 calibration source 写入 manifest。
+
+## 2026-08-24：阶段 11.3 External Systolic-MXU Profile Adapter
+
+- 环境检查确认本机没有安装 SCALE-Sim、Ramulator 或 gem5，也没有可复用的 SCALE-Sim checkout；因此没有伪造 runtime SCALE-Sim integration。
+- 新增 `SystolicMXUProfileTimingProvider` 和 `systolic_mxu_profile` registry entry：读取 versioned `npu_ooo.systolic_mxu_profile.v1` JSON，按 Matmul task 的 `(batch,m,n,k)` 精确查找 duration/II。
+- profile 只负责 MXU；non-matmul primitive 明确委托 `AnalyticalTimingModel`，未命中 Matmul 由 `unmatched_matmul=analytical|error` 控制。这样可研究局部校准对 TISA OOO trace 的影响，不会把 mixed timing 宣称为全芯片 RTL 结果。
+- Timing provider 的 calibration status 现在进入 common primitive simulator 和 TISA simulator 的 `timing_calibration_status`/effective `calibration_status`；顶层与 policy matrix manifest 新增 `timing_provider_metadata`。MXU-only profile 的 effective status 显式写成 `mixed:<profile-status>+analytical-fallback`。
+- 新增 `configs/timing/systolic_mxu_matmul_example.json`，其 source 明确标为格式示例而非测量。官方 StableHLO Matmul smoke 命中 `(1,4,12,8)` profile，保持 3 TISA/4 primitive，runtime submit=2、同步=5、总周期从 analytical 的 59 变为 64；profile 标记为 `source-derived-example`，仿真有效状态标为 mixed。
+- 下一步：实现 SCALE-Sim exporter 或真实 RTL trace importer，将外部原始结果转换为此 profile；外部工具仍只校准 timing，不替代 TISA scheduler。

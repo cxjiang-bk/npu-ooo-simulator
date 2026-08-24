@@ -242,10 +242,14 @@ def build_parser() -> argparse.ArgumentParser:
     compile_model.add_argument("--tile-size", type=int, default=32)
     compile_model.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
     compile_model.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
-    compile_model.add_argument("--timing-config", type=Path, help="load primitive timing overrides from JSON")
+    compile_model.add_argument(
+        "--timing-config",
+        type=Path,
+        help="load timing-table overrides or an external timing-provider profile JSON",
+    )
     compile_model.add_argument(
         "--timing-provider",
-        choices=("analytical", "timing_table"),
+        choices=default_timing_provider_registry().names(),
         default=None,
         help="timing backend registry entry; defaults to timing_table when --timing-config is set",
     )
@@ -768,6 +772,9 @@ def run_compile_model(args: argparse.Namespace) -> int:
                 if hasattr(timing_model, "capabilities")
                 else None
             ),
+            "timing_provider_metadata": dict(
+                getattr(timing_model, "metadata", {})
+            ),
             "event_backend": (
                 event_backend.name if args.scheduler_target == "tisa" else None
             ),
@@ -883,6 +890,9 @@ def run_compile_model(args: argparse.Namespace) -> int:
                     "event_backend": event_backend.name,
                     "event_backend_capabilities": event_backend.capabilities.to_dict(),
                     "timing_provider": getattr(timing_model, "name", "analytical"),
+                    "timing_provider_metadata": dict(
+                        getattr(timing_model, "metadata", {})
+                    ),
                     "calibration_status": case.result.metrics["calibration_status"],
                 },
                 case_dir / "manifest.json",

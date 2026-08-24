@@ -247,7 +247,8 @@ aten.softmax
 
 当前进度：Codegen/Timing/Event registry 均已接入统一编译器、scheduler 和
 `compile-model`；`AnalyticalCodegenBackend` 和 `AnalyticalEventBackend` 保持现有 analytical
-数值不变。SystemBackend concrete adapter 和外部 timing source 尚待后续子阶段。
+数值不变。`systolic_mxu_profile` 可重放外部 MXU tile profile，但尚未直接调用 SCALE-Sim；
+SystemBackend concrete adapter 与 SCALE-Sim exporter 尚待后续子阶段。
 
 候选 backend 顺序：
 

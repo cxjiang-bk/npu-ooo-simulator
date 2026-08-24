@@ -908,6 +908,25 @@ TimingModel / EventBackend
 
 `TimingTableModel` 是第一种外部校准入口：它从 JSON 读取 primitive/resource/task 的 duration 和 initiation interval，未命中的 task 回退到 `AnalyticalTimingModel`。因此 SCALE-Sim、RTL waveform 或硬件 counter 的局部结果可以先转换为 table，再通过同一 scheduler 重放；manifest 的 `backend` 会区分 table 名称和 analytical。
 
+阶段 11.3 增加了更窄的 `SystolicMXUProfileTimingProvider`，provider name 为
+`systolic_mxu_profile`。它不在仿真循环中启动 SCALE-Sim，而是消费外部 exporter 的稳定
+JSON profile：
+
+```text
+external SCALE-Sim / RTL / counter run
+  -> npu_ooo.systolic_mxu_profile.v1
+  -> exact (batch, m, n, k) MXU tile timing lookup
+  -> common TISA event scheduler
+```
+
+profile 仅覆盖 `matmul` primitive，按 `batch,m,n,k` 精确匹配 duration/II；非 MXU primitive
+始终通过明确记录的 analytical fallback 计时。未匹配的 Matmul 可在 profile 中选择
+`analytical` fallback 或 `error`。provider 的 `metadata`、profile path、source/dataflow、
+fallback policy 和 calibration status 会写入 manifest/summary，因此 mixed timing 不能被误读为
+完整 RTL/cycle-accurate 结果。仓库的 `systolic_mxu_matmul_example.json` 仅验证格式和流程，
+不是 SCALE-Sim 或硬件测量数据。effective calibration status 使用
+`mixed:<profile-status>+analytical-fallback`，profile 自身状态另存于 metadata。
+
 `--address-scoreboard` 启用 device-side range scoreboard：根据相同 `tensor/memory` 上的 `BufferRegion` 重叠关系，在 issue 前检查 active task 并产生 RAW/WAR/WAW stall；COMPLETE 后释放范围并继续调度。当前地址来自 canonical `ExecutionTask` metadata，尚不是从真实 TISA binary 动态解析出的硬件 scoreboard。
 
 ## 10. Trace 与结果

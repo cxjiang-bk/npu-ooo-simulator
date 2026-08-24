@@ -6,7 +6,7 @@
 
 ## 当前阶段
 
-阶段 9 已完成第一版自动前端、TISA device scheduler 和 TISA-first backend codegen，阶段 10 的 RuntimeSubmission、物理地址绑定、descriptor reception 与四象限策略矩阵也已闭环。当前处于阶段 11：codegen、timing source 和 device event engine 均已有独立 registry，现有 analytical payload lowerer 和 TISA simulator 已分别包装为默认 `AnalyticalCodegenBackend` 与 `AnalyticalEventBackend`。下一步接入第一种外部 timing adapter。阶段 4-6 的 analytical primitive-task baseline 继续保留为兼容对照。
+阶段 9 已完成第一版自动前端、TISA device scheduler 和 TISA-first backend codegen，阶段 10 的 RuntimeSubmission、物理地址绑定、descriptor reception 与四象限策略矩阵也已闭环。当前处于阶段 11：codegen、timing source 和 device event engine 均已有独立 registry，现有 analytical payload lowerer 和 TISA simulator 已分别包装为默认 `AnalyticalCodegenBackend` 与 `AnalyticalEventBackend`，并新增可重放外部 MXU tile profile 的 `systolic_mxu_profile` timing provider。下一步实现 SCALE-Sim profile exporter 或接入真实 RTL trace。阶段 4-6 的 analytical primitive-task baseline 继续保留为兼容对照。
 
 阶段 9 的前端目标边界：先支持静态 shape、推理场景和小型真实 PyTorch 模型，覆盖 RMSNorm、LayerNorm、Linear/Matmul、ResidualAdd、Softmax 和 attention micrograph；不在第一轮承诺完整 ATen、动态控制流、训练语义或完整 StableHLO/MLIR 工具链。现有手写 benchmark 继续作为 canonical IR/lowering/simulator 回归基线，不能被自动前端重构破坏。
 
@@ -106,6 +106,7 @@
 - 11.0 已完成第一版：新增 `BackendCapabilities`、`TimingProvider`、`EventBackend`、`SystemBackend`、`CodegenBackend` protocol 和 timing provider registry；`compile-model` 可选择 analytical/timing_table provider，manifest 写入 capability/calibration metadata，TISA simulator 在 provider 声明 capability 时执行显式校验。
 - 11.1 已完成第一版：新增 `AnalyticalEventBackend` 和 `EventBackendRegistry`；`schedule_tisa_program` 不再直接绑定具体 TISA simulator，CLI 可用 `--event-backend analytical_event` 选择 event engine。runtime/device 四象限复用同一 backend instance，manifest 分开记录 codegen/runtime/event/timing backend。
 - 11.2 已完成第一版：新增 `AnalyticalCodegenBackend` 和 `CodegenBackendRegistry`；compiler 先用 `TISASemanticBuilder` 构造 backend-independent program，再调用 registry 中的 codegen backend 生成 payload。所有 JSON/StableHLO/PyTorch 编译入口可接收同一个 CodegenBackend，CLI 通过 `--codegen-backend analytical` 选择，顶层和 matrix case manifest 均记录四层 backend metadata。下一步是外部 MXU timing adapter。
+- 11.3 已完成第一版：新增 `SystolicMXUProfileTimingProvider` 和 `systolic_mxu_profile` registry entry。profile 按 `batch,m,n,k` 精确匹配 matmul tile 的 duration/II，非 MXU primitive 继续显式 analytical fallback；未命中 Matmul 可选 fallback 或 error。该 adapter 重放外部 profile，不在运行时直接启动 SCALE-Sim；manifest/summary 已记录 source、dataflow、profile path、fallback，并将有效 calibration status 标为 mixed。下一步实现外部 exporter 或 RTL trace importer。
 
 阶段 4-6 的“completed”表示基线闭环完成，不表示后续功能不再扩展。下一轮工作必须保持这些 baseline 的输入/输出兼容，并以自动前端和 runtime/backend 分层作为增量演进。
 

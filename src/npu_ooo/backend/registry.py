@@ -161,6 +161,15 @@ def default_timing_provider_registry() -> TimingProviderRegistry:
         )
 
     registry.register("timing_table", create_timing_table)
+
+    def create_systolic_mxu_profile(path: Path | None) -> TimingProvider:
+        if path is None:
+            raise ValueError("systolic_mxu_profile provider requires --timing-config")
+        from .mxu_profile import SystolicMXUProfileTimingProvider
+
+        return SystolicMXUProfileTimingProvider.from_path(path)
+
+    registry.register("systolic_mxu_profile", create_systolic_mxu_profile)
     return registry
 
 

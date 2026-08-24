@@ -486,6 +486,16 @@ def simulate_execution_graph(
     if graph_issues or machine_issues:
         raise ValueError("; ".join((*graph_issues, *machine_issues)))
     timing_model = timing_model or AnalyticalTimingModel()
+    timing_calibration_status = getattr(
+        getattr(timing_model, "capabilities", None),
+        "calibration_status",
+        "unspecified",
+    )
+    if not isinstance(timing_calibration_status, str) or not timing_calibration_status:
+        timing_calibration_status = "unspecified"
+    machine_calibration_status = machine.attributes.get(
+        "calibration_status", "unspecified"
+    )
     config = (config or SimulatorConfig()).resolved(machine)
     if config.static_pipeline is not None and policy != "static_pipeline":
         raise ValueError("static_pipeline configuration is only valid with the static_pipeline policy")
@@ -915,7 +925,13 @@ def simulate_execution_graph(
         "inflight_tiles": metrics["inflight_tile_peak"],
     }
     metrics["completed_tile_count"] = len(tile_task_count)
-    metrics["calibration_status"] = machine.attributes.get("calibration_status", "unspecified")
+    metrics["machine_calibration_status"] = machine_calibration_status
+    metrics["timing_calibration_status"] = timing_calibration_status
+    metrics["calibration_status"] = (
+        timing_calibration_status
+        if timing_calibration_status != "unspecified"
+        else machine_calibration_status
+    )
     metrics["task_count"] = len(tasks)
     return SimulationResult(
         backend=timing_model.name,
