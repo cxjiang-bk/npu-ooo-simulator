@@ -29,6 +29,7 @@ from .rtl_trace import (
     import_rtl_completion_trace,
     load_rtl_completion_trace,
 )
+from .rtl_log import load_mxu_vcs_log, parse_mxu_vcs_log
 
 __all__ = [
     "BackendCapabilities",
@@ -49,6 +50,8 @@ __all__ = [
     "build_systolic_mxu_profile",
     "import_rtl_completion_trace",
     "load_rtl_completion_trace",
+    "load_mxu_vcs_log",
+    "parse_mxu_vcs_log",
     "TimingProvider",
     "TimingProviderAdapter",
     "TimingProviderRegistry",

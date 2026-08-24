@@ -602,3 +602,15 @@ git diff --check: passed
   并在 capability metadata 中标记 `isolated_matmul_compatible=false`。
 - 新增回归覆盖该拒绝路径；后续若要使用 descriptor-to-PSB latency，必须先把
   `CodegenBackend` payload 边界提升为 full MXU instruction。
+
+## 2026-08-24：阶段 11.5 MXU VCS console-log adapter
+
+- 新增 `src/npu_ooo/backend/rtl_log.py` 和 `import-rtl-log` CLI，解析仓库
+  `rtl/unit_test/mxu/tb_mxu.sv` 的 `Prepared instruction`、`instruction accepted`、
+  `Done Signal` 输出，生成 `npu_ooo.rtl_completion_trace.v1`。
+- 将 testbench 的 `K1` 按显式 `k_per_tile`（默认 RTL `K0=8`）还原为 profile 的 `k`，并将
+  shape、acceptance、done 的 provenance 写入 metadata/record attributes。
+- 明确该 testbench 只有 descriptor-to-completion 边界；跳过 `END instruction accepted` 和
+  `task_done=1` 控制事件，避免 FIFO 配对错位。没有制造 compute-start marker。
+- synthetic VCS log -> trace -> profile 链路已验证；下一步仍是让 RTL testbench 导出
+  matrix-array handshake/final compute boundary，或在 backend 中新增 full-MXU payload contract。

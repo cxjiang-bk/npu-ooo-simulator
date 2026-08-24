@@ -17,6 +17,7 @@ from npu_ooo.backend import (
     default_event_backend_registry,
     default_timing_provider_registry,
     import_rtl_completion_trace,
+    load_mxu_vcs_log,
 )
 from npu_ooo.compiler import (
     compile_frontend_import,
@@ -149,6 +150,27 @@ def run_import_rtl_trace(args) -> int:
     return 0
 
 
+def run_import_rtl_log(args) -> int:
+    """Convert the repository MXU VCS console log into trace JSON."""
+
+    trace = load_mxu_vcs_log(args.input, k_per_tile=args.k_per_tile)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(trace, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(
+        json.dumps(
+            {
+                "input": str(args.input),
+                "output": str(args.output),
+                "format": trace["format"],
+                "record_count": len(trace["records"]),
+                "intervals_available": trace["metadata"]["intervals_available"],
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def _descriptor_availability(path: Path | None) -> dict[str, float]:
     if path is None:
         return {}
@@ -227,6 +249,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="policy for compiled shapes absent from the generated profile",
     )
     rtl_trace.add_argument("--name", default="systolic_mxu_profile")
+    rtl_log = subparsers.add_parser(
+        "import-rtl-log",
+        help="parse the repository MXU testbench VCS console log into trace JSON",
+    )
+    rtl_log.add_argument("--input", type=Path, required=True, help="tb_mxu VCS console log")
+    rtl_log.add_argument("--output", type=Path, required=True, help="rtl_completion_trace.v1 JSON")
+    rtl_log.add_argument(
+        "--k-per-tile",
+        type=int,
+        default=8,
+        help="physical K elements represented by one MXU K1 tile (default: RTL K0=8)",
+    )
     compile_model = subparsers.add_parser(
         "compile-model",
         help="import a canonical graph and compile it through the unified frontend/backend pipeline",
@@ -2109,6 +2143,8 @@ def run_sweep_workloads(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "import-rtl-log":
+        return run_import_rtl_log(args)
     if args.command == "import-rtl-trace":
         return run_import_rtl_trace(args)
     if args.command == "compile-model":

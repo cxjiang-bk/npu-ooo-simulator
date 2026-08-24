@@ -109,6 +109,7 @@
 - 11.3 已完成第一版：新增 `SystolicMXUProfileTimingProvider` 和 `systolic_mxu_profile` registry entry。profile 按 `batch,m,n,k` 精确匹配 matmul tile 的 duration/II，非 MXU primitive 继续显式 analytical fallback；未命中 Matmul 可选 fallback 或 error。该 adapter 重放外部 profile，不在运行时直接启动 SCALE-Sim；manifest/summary 已记录 source、dataflow、profile path、fallback，并将有效 calibration status 标为 mixed。`timing_provider_coverage` 按唯一 compiled task 统计 exact/unmatched/fallback 范围。
 - 11.4 已完成第一版：新增 `rtl_completion_trace.v1` JSON/CSV importer、compute/descriptor 两种 interval、max/median/p95 聚合、II 推导、严格 unmatched policy 和 `import-rtl-trace` CLI。生成 profile 保留 trace format、interval、aggregation、source 和校准状态，且明确 isolated matmul 与 full instruction completion 的边界。下一步实现真实 RTL/VCD exporter 或 SCALE-Sim exporter。
 - 11.4 safety guard 已补齐：`SystolicMXUProfileTimingProvider` 读取 interval metadata，拒绝将 `descriptor_issue_to_done` profile 直接用于 isolated `matmul`，并在 capability 中暴露兼容性标记；full descriptor timing 需要先扩展 backend payload contract。
+- 11.5 已完成第一版：新增 MXU VCS console-log adapter 和 `import-rtl-log`，解析仓库 testbench 的 prepared/accepted/done 输出，按 `K1 * k_per_tile` 还原 shape，跳过 END 控制指令并生成 descriptor-only trace。真实 isolated compute 校准仍需 RTL 导出 matrix-array handshake/final output。
 
 阶段 4-6 的“completed”表示基线闭环完成，不表示后续功能不再扩展。下一轮工作必须保持这些 baseline 的输入/输出兼容，并以自动前端和 runtime/backend 分层作为增量演进。
 

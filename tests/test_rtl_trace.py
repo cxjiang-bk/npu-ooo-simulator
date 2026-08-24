@@ -9,6 +9,7 @@ from pathlib import Path
 from npu_ooo.backend import (
     import_rtl_completion_trace,
     load_rtl_completion_trace,
+    parse_mxu_vcs_log,
 )
 from npu_ooo.cli import main
 
@@ -45,6 +46,33 @@ def _trace_payload() -> dict:
 
 
 class RTLTraceImporterTest(unittest.TestCase):
+    def test_mxu_vcs_console_log_preserves_descriptor_boundary(self) -> None:
+        trace = parse_mxu_vcs_log(
+            """
+[100] Prepared instruction: M=16, N=8, K1=2, psum_en=0, bias_en=0
+[110] Test 1 instruction accepted
+[200] Prepared instruction: M=32, N=16, K1=1, psum_en=1, bias_en=0
+[210] Test 2 instruction accepted
+[220] Test 6 END instruction accepted
+[310] Done Signal #1: instr_idx=0, task_done=0
+[410] Done Signal #2: instr_idx=0, task_done=0
+[510] Done Signal #3: instr_idx=999, task_done=1
+"""
+        )
+        self.assertEqual(trace["metadata"]["compute_start_available"], False)
+        self.assertEqual(trace["records"][0]["k"], 16)
+        self.assertEqual(trace["records"][0]["descriptor_issue_cycle"], 110.0)
+        self.assertEqual(trace["records"][0]["psb_write_done_cycle"], 310.0)
+        self.assertEqual(trace["records"][1]["k"], 8)
+        self.assertEqual(trace["metadata"]["ignored_end_acceptance_count"], 1)
+        self.assertEqual(trace["metadata"]["ignored_end_done_count"], 1)
+
+    def test_mxu_vcs_console_log_rejects_unmatched_acceptance(self) -> None:
+        with self.assertRaisesRegex(ValueError, "only 0 acceptance events"):
+            parse_mxu_vcs_log(
+                "[1] Prepared instruction: M=16, N=8, K1=1, psum_en=0, bias_en=0\n"
+            )
+
     def test_json_import_aggregates_compute_interval_and_derives_ii(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trace.json"

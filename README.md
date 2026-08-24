@@ -568,6 +568,11 @@ PYTHONPATH=src python3 -m npu_ooo.cli import-rtl-trace \
 用于 isolated `matmul` 时显式报错；只有改变 backend payload 边界后，才应为 descriptor
 interval 增加新的 provider/primitive contract。
 
+对仓库 MXU testbench 的 VCS console log，可先运行 `import-rtl-log` 生成
+`rtl_completion_trace.v1`。该 adapter 使用 RTL 的 `K0` 参数还原 `K1`，并跳过 END 控制指令；
+由于 testbench 没有 compute-start handshake，这条路径只能生成 descriptor interval，不能
+替代 isolated compute 校准。
+
 批量比较使用 `sweep-two-mm`。它对每个 architecture/policy/window/ROB 组合重新执行相同的 2mm lowering 和 simulator，并为每个组合写入独立目录：
 
 ```bash

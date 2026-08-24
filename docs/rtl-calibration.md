@@ -40,6 +40,30 @@ JSON 输入必须是：
 `compute_start_cycle`、`compute_done_cycle` 和 `psb_write_done_cycle` 都是相对于同一
 RTL 时钟的 cycle index。CSV 也支持同名的扁平字段，第一行必须是字段名。
 
+仓库当前 MXU testbench (`rtl/unit_test/mxu/tb_mxu.sv`) 还提供了一条 console-log 适配路径。
+它解析 `Prepared instruction`、`instruction accepted` 和 `Done Signal` 三类 `$display`，
+并把 `K1` 按 `K1 * K0` 还原成 profile 的 `k`；`K0` 默认是 8，也可以通过参数覆盖：
+
+```bash
+PYTHONPATH=src python3 -m npu_ooo.cli import-rtl-log \
+  --input /path/to/tb_mxu.run.log \
+  --output /tmp/mxu-trace.json \
+  --k-per-tile 8
+PYTHONPATH=src python3 -m npu_ooo.cli import-rtl-trace \
+  --input /tmp/mxu-trace.json \
+  --output /tmp/mxu-rtl-profile.json \
+  --interval descriptor_issue_to_done \
+  --aggregation median
+```
+
+这条路径只得到 descriptor-to-completion interval，因为 testbench 没有打印
+compute-start/matrix-array handshake。它适合先检查 shape、instruction acceptance 和
+`done_if.vld` 对齐；生成的 profile 不能被当前 isolated `matmul` provider 消费，provider
+会明确报错。要校准 isolated compute，testbench 必须额外导出 matrix-array input handshake
+和 final compute output/PSB handoff，并将这些字段写入本契约。
+parser 会跳过 `END instruction accepted` 和 `task_done=1` 的控制指令，并把跳过数量写入
+trace metadata，避免控制指令打乱普通 Matmul 的 FIFO 配对。
+
 每条记录至少要能满足所选 interval：
 
 | interval | 起点 | 终点 | 映射边界 |
