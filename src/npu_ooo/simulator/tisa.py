@@ -7,6 +7,7 @@ import heapq
 from typing import Any
 
 from npu_ooo.arch import ExecutionUnitConfig, MachineConfig
+from npu_ooo.backend import validate_backend_capability
 from npu_ooo.ir import (
     AccessType,
     BackendArtifact,
@@ -251,6 +252,10 @@ def simulate_tisa_artifact(
         if submission_issues:
             raise ValueError("; ".join(submission_issues))
     timing_model = timing_model or AnalyticalTimingModel()
+    capability_issues = validate_backend_capability(artifact, machine, timing_model) \
+        if hasattr(timing_model, "capabilities") else ()
+    if capability_issues:
+        raise ValueError("backend capability validation failed: " + "; ".join(capability_issues))
     config = (config or SimulatorConfig()).resolved(machine)
     if config.static_pipeline is not None:
         raise ValueError(
@@ -274,16 +279,26 @@ def simulate_tisa_artifact(
         runtime_chunks = runtime_submission.commands
         runtime_policy = runtime_submission.policy
         launch_latency = runtime_submission.launch_latency_cycles
+        runtime_chunk_windows: dict[str, tuple[float, float]] = {}
+        runtime_cursor = 0.0
+        runtime_request_wait_cycles = 0.0
+        for chunk in runtime_chunks:
+            start = max(runtime_cursor, chunk.availability_cycle)
+            runtime_request_wait_cycles += start - runtime_cursor
+            finish = start + launch_latency
+            runtime_chunk_windows[chunk.chunk_id] = (start, finish)
+            runtime_cursor = finish
         descriptor_stream = tuple(
             (
-                (chunk.submission_order + 1) * launch_latency,
+                runtime_chunk_windows[chunk.chunk_id][1],
                 tisa_id,
                 chunk.chunk_id,
             )
             for chunk in runtime_chunks
             for tisa_id in chunk.tisa_ids
         )
-        runtime_submit_cycles = len(runtime_chunks) * launch_latency
+        runtime_submit_cycles = runtime_cursor
+        runtime_submit_busy_cycles = len(runtime_chunks) * launch_latency
         synchronization_cycles = runtime_submission.synchronization_cycles
     order = {
         tisa_id: index
@@ -346,13 +361,13 @@ def simulate_tisa_artifact(
     events: list[TraceEvent] = []
     if runtime_submission is not None:
         for chunk in runtime_chunks:
-            start = chunk.submission_order * runtime_submission.launch_latency_cycles
-            finish = start + runtime_submission.launch_latency_cycles
+            start, finish = runtime_chunk_windows[chunk.chunk_id]
             details = {
                 "runtime_policy": runtime_submission.policy,
                 "queue": chunk.queue,
                 "submission_order": chunk.submission_order,
                 "descriptor_count": len(chunk.tisa_ids),
+                "availability_cycle": chunk.availability_cycle,
             }
             runtime_timings.append(
                 TaskTiming(
@@ -404,6 +419,12 @@ def simulate_tisa_artifact(
         "runtime_policy": runtime_policy,
         "runtime_launch_count": len(runtime_chunks),
         "runtime_submit_cycles": runtime_submit_cycles,
+        "runtime_submit_busy_cycles": (
+            runtime_submit_busy_cycles if runtime_submission is not None else 0.0
+        ),
+        "runtime_request_wait_cycles": (
+            runtime_request_wait_cycles if runtime_submission is not None else 0.0
+        ),
         "runtime_synchronization_cycles": synchronization_cycles,
         "address_scoreboard_scope": (
             "runtime_physical" if runtime_submission is not None else "compiler_logical"

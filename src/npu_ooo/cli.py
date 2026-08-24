@@ -4,11 +4,13 @@ import argparse
 import csv
 import importlib
 import json
+import math
 import sys
 from itertools import product
 from pathlib import Path
 
 from npu_ooo.arch import load_machine_config, lpu_like_machine_config, minimal_machine_config, wide_mxu_machine_config
+from npu_ooo.backend import default_timing_provider_registry
 from npu_ooo.compiler import (
     compile_frontend_import,
     compile_stablehlo_file,
@@ -42,6 +44,8 @@ from npu_ooo.benchmarks import (
 from npu_ooo.ir import (
     allocate_buffer_bindings,
     create_runtime_submission,
+    derive_tensor_lifetimes,
+    derive_tensor_reuse_pairs,
     default_elementwise_schedule,
     default_layernorm_schedule,
     default_mixed_schedule,
@@ -66,7 +70,6 @@ from npu_ooo.scheduler import (
     schedule_execution_graph,
     schedule_tisa_program,
 )
-from npu_ooo.simulator import TimingTableModel
 from npu_ooo.trace import (
     write_artifact_json,
     write_csv,
@@ -97,8 +100,37 @@ def _machine(name: str, config_path: Path | None = None):
         raise ValueError(f"unknown architecture profile '{name}'") from exc
 
 
-def _timing_model(path: Path | None):
-    return TimingTableModel.from_path(path) if path is not None else None
+def _timing_model(path: Path | None, provider: str | None = None):
+    selected = provider or ("timing_table" if path is not None else "analytical")
+    return default_timing_provider_registry().create(selected, path)
+
+
+def _descriptor_availability(path: Path | None) -> dict[str, float]:
+    if path is None:
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"runtime availability config does not exist: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid runtime availability JSON '{path}': {exc}") from exc
+    if isinstance(payload, dict) and "descriptor_available_cycles" in payload:
+        payload = payload["descriptor_available_cycles"]
+    if not isinstance(payload, dict):
+        raise ValueError("runtime availability config must be a TISA-id to cycle mapping")
+    result: dict[str, float] = {}
+    for tisa_id, cycle in payload.items():
+        if not isinstance(tisa_id, str) or not tisa_id:
+            raise ValueError("runtime availability TISA ids must be non-empty strings")
+        if (
+            isinstance(cycle, bool)
+            or not isinstance(cycle, (int, float))
+            or not math.isfinite(cycle)
+            or cycle < 0
+        ):
+            raise ValueError(f"runtime availability for '{tisa_id}' must be non-negative")
+        result[tisa_id] = float(cycle)
+    return result
 
 
 def _parse_offsets(value: str | None) -> tuple[float, ...]:
@@ -199,6 +231,12 @@ def build_parser() -> argparse.ArgumentParser:
     compile_model.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
     compile_model.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
     compile_model.add_argument("--timing-config", type=Path, help="load primitive timing overrides from JSON")
+    compile_model.add_argument(
+        "--timing-provider",
+        choices=("analytical", "timing_table"),
+        default=None,
+        help="timing backend registry entry; defaults to timing_table when --timing-config is set",
+    )
     compile_model.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
     compile_model.add_argument(
         "--scheduler-target",
@@ -233,6 +271,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="base physical address for the runtime linear allocator (decimal or 0x-prefixed)",
     )
     compile_model.add_argument("--runtime-alignment", type=int, default=256)
+    compile_model.add_argument(
+        "--runtime-buffer-policy",
+        choices=("linear", "lifetime_reuse"),
+        default="linear",
+        help="physical buffer allocation policy; lifetime_reuse requires TISA dependency proof",
+    )
+    compile_model.add_argument(
+        "--runtime-availability-config",
+        type=Path,
+        help="JSON mapping from compiled TISA id to earliest host submission cycle",
+    )
     compile_model.add_argument(
         "--runtime-launch-latency",
         type=float,
@@ -594,10 +643,24 @@ def run_compile_model(args: argparse.Namespace) -> int:
     write_artifact_json(compiled.backend_artifact, args.output_dir / "backend_artifact.json")
     write_artifact_json(compiled.backend_artifact.execution_graph, args.output_dir / "execution_graph.json")
     write_artifact_json(compiled, args.output_dir / "compiled_artifact.json")
+    runtime_lifetimes = derive_tensor_lifetimes(compiled.tisa_program)
+    runtime_reuse_pairs = derive_tensor_reuse_pairs(compiled.tisa_program)
     runtime_buffers = allocate_buffer_bindings(
         compiled.graph.tensors,
         base_address=args.runtime_base_address,
         alignment_bytes=args.runtime_alignment,
+        lifetimes=runtime_lifetimes,
+        reuse_buffers=args.runtime_buffer_policy == "lifetime_reuse",
+        reuse_pairs=runtime_reuse_pairs,
+    )
+    runtime_descriptor_availability = _descriptor_availability(
+        args.runtime_availability_config
+    )
+    runtime_allocation_span = (
+        max(buffer.end_address for buffer in runtime_buffers)
+        - min(buffer.base_address for buffer in runtime_buffers)
+        if runtime_buffers
+        else 0
     )
     runtime_submission = create_runtime_submission(
         compiled.backend_artifact,
@@ -607,6 +670,7 @@ def run_compile_model(args: argparse.Namespace) -> int:
         chunk_size=args.runtime_chunk_size,
         launch_latency_cycles=args.runtime_launch_latency,
         synchronization_cycles=args.runtime_synchronization_cycles,
+        descriptor_available_cycles=runtime_descriptor_availability,
     )
     write_artifact_json(runtime_submission, args.output_dir / "runtime_submission.json")
     write_operator_graph_dot(compiled.graph, args.output_dir / "operator_graph.dot")
@@ -623,7 +687,7 @@ def run_compile_model(args: argparse.Namespace) -> int:
         address_scoreboard=args.address_scoreboard,
         dynamic_priority=args.dynamic_priority,
     )
-    timing_model = _timing_model(args.timing_config)
+    timing_model = _timing_model(args.timing_config, args.timing_provider)
     if args.scheduler_target == "tisa":
         result = schedule_tisa_program(
             compiled.backend_artifact,
@@ -664,6 +728,12 @@ def run_compile_model(args: argparse.Namespace) -> int:
             "stablehlo_version": compiled.attributes.get("stablehlo_version"),
             "stablehlo_fallback": compiled.attributes.get("stablehlo_fallback", False),
             "stablehlo_fallback_reason": compiled.attributes.get("stablehlo_fallback_reason"),
+            "timing_provider": getattr(timing_model, "name", "analytical"),
+            "timing_backend_capabilities": (
+                timing_model.capabilities.to_dict()
+                if hasattr(timing_model, "capabilities")
+                else None
+            ),
             "model_id": imported.model_id,
             "architecture": args.arch,
             "policy": result.policy,
@@ -677,9 +747,20 @@ def run_compile_model(args: argparse.Namespace) -> int:
             "payload_execution": result.metrics.get("payload_execution"),
             "runtime_policy": runtime_submission.policy,
             "runtime_applied_to_device": args.scheduler_target == "tisa",
+            "runtime_buffer_policy": args.runtime_buffer_policy,
             "runtime_command_chunk_count": len(runtime_submission.commands),
             "runtime_buffer_count": len(runtime_submission.buffers),
+            "runtime_allocation_span_bytes": runtime_allocation_span,
             "runtime_submit_cycles": result.metrics.get("runtime_submit_cycles", 0.0),
+            "runtime_submit_busy_cycles": result.metrics.get(
+                "runtime_submit_busy_cycles", 0.0
+            ),
+            "runtime_request_wait_cycles": result.metrics.get(
+                "runtime_request_wait_cycles", 0.0
+            ),
+            "runtime_descriptor_availability_count": len(
+                runtime_descriptor_availability
+            ),
             "runtime_synchronization_cycles": result.metrics.get(
                 "runtime_synchronization_cycles", 0.0
             ),
@@ -705,6 +786,7 @@ def run_compile_model(args: argparse.Namespace) -> int:
             chunk_size=args.runtime_chunk_size,
             launch_latency_cycles=args.runtime_launch_latency,
             synchronization_cycles=args.runtime_synchronization_cycles,
+            descriptor_available_cycles=runtime_descriptor_availability,
             timing_model=timing_model,
             simulator_config=simulator_config,
         )

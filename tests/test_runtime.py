@@ -8,6 +8,8 @@ from npu_ooo.ir import (
     RuntimeSubmission,
     allocate_buffer_bindings,
     create_runtime_submission,
+    derive_tensor_lifetimes,
+    derive_tensor_reuse_pairs,
 )
 
 
@@ -63,6 +65,43 @@ class RuntimeSubmissionTest(unittest.TestCase):
                 buffers,
                 operand_offsets={(instruction.tisa_id, operand.name): 10**9},
             )
+
+    def test_lifetime_allocator_reuses_only_dependency_ordered_tensors(self) -> None:
+        model = build_two_matmul_model()
+        instance = model.instantiate(build_two_matmul_case())
+        compiled = compile_model_instance(instance, minimal_machine_config(), tile_size=32)
+        lifetimes = derive_tensor_lifetimes(compiled.tisa_program)
+        reuse_pairs = derive_tensor_reuse_pairs(compiled.tisa_program)
+        bindings = allocate_buffer_bindings(
+            compiled.graph.tensors,
+            lifetimes=lifetimes,
+            reuse_buffers=True,
+            reuse_pairs=reuse_pairs,
+        )
+        by_tensor = {binding.tensor: binding for binding in bindings}
+
+        self.assertIn(("A", "D"), reuse_pairs)
+        self.assertNotIn(("C", "D"), reuse_pairs)
+        self.assertEqual(by_tensor["A"].base_address, by_tensor["D"].base_address)
+        self.assertNotEqual(by_tensor["C"].base_address, by_tensor["D"].base_address)
+        self.assertEqual(by_tensor["D"].attributes["reused_from"], "A")
+        submission = create_runtime_submission(compiled.backend_artifact, bindings)
+        self.assertEqual(submission.validate(compiled.tisa_program), ())
+
+    def test_lifetime_allocator_requires_dependency_proof_for_reuse(self) -> None:
+        model = build_two_matmul_model()
+        instance = model.instantiate(build_two_matmul_case())
+        compiled = compile_model_instance(instance, minimal_machine_config(), tile_size=32)
+        lifetimes = derive_tensor_lifetimes(compiled.tisa_program)
+        bindings = allocate_buffer_bindings(
+            compiled.graph.tensors,
+            lifetimes=lifetimes,
+            reuse_buffers=True,
+            reuse_pairs=frozenset(),
+        )
+
+        for left, right in zip(bindings, bindings[1:]):
+            self.assertLessEqual(left.end_address, right.base_address)
 
     def test_buffer_binding_validation_rejects_unaligned_address(self) -> None:
         binding = BufferBinding(

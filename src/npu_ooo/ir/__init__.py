@@ -47,6 +47,8 @@ from .runtime import (
     RuntimeSubmission,
     allocate_buffer_bindings,
     create_runtime_submission,
+    derive_tensor_lifetimes,
+    derive_tensor_reuse_pairs,
 )
 
 __all__ = [
@@ -81,6 +83,8 @@ __all__ = [
     "RuntimeSubmission",
     "allocate_buffer_bindings",
     "create_runtime_submission",
+    "derive_tensor_lifetimes",
+    "derive_tensor_reuse_pairs",
     "OperatorSchedule",
     "ScheduleSpec",
     "TensorResidency",

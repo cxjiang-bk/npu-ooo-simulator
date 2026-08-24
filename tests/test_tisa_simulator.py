@@ -346,6 +346,67 @@ class TISADeviceSimulatorTest(unittest.TestCase):
         self.assertEqual(overlapping_result.instruction_timing("tensor").issue, 10)
         self.assertGreater(overlapping_result.metrics["address_scoreboard_block_events"], 0)
 
+    def test_dynamic_runtime_bypasses_an_unavailable_independent_descriptor(self) -> None:
+        artifact = self._critical_path_artifact()
+        buffers = tuple(
+            BufferBinding(
+                tensor=f"buffer_{tisa_id}",
+                base_address=0x3000 + index * 0x100,
+                size_bytes=8,
+                memory="SRAM",
+                logical_scope="SRAM",
+                alignment_bytes=0x100,
+            )
+            for index, tisa_id in enumerate(("short", "critical", "consumer"))
+        )
+        availability = {"short": 10.0, "critical": 0.0, "consumer": 0.0}
+        static_submission = create_runtime_submission(
+            artifact,
+            buffers,
+            policy="static",
+            chunk_size=1,
+            launch_latency_cycles=1,
+            descriptor_available_cycles=availability,
+        )
+        dynamic_submission = create_runtime_submission(
+            artifact,
+            buffers,
+            policy="dynamic_ready_queue",
+            chunk_size=1,
+            launch_latency_cycles=1,
+            descriptor_available_cycles=availability,
+        )
+
+        self.assertEqual(
+            [item for chunk in static_submission.commands for item in chunk.tisa_ids],
+            ["short", "critical", "consumer"],
+        )
+        self.assertEqual(
+            [item for chunk in dynamic_submission.commands for item in chunk.tisa_ids],
+            ["critical", "consumer", "short"],
+        )
+        static_result = schedule_tisa_program(
+            artifact,
+            minimal_machine_config(),
+            SchedulerPolicy.DYNAMIC_READY_QUEUE,
+            runtime_submission=static_submission,
+        )
+        dynamic_result = schedule_tisa_program(
+            artifact,
+            minimal_machine_config(),
+            SchedulerPolicy.DYNAMIC_READY_QUEUE,
+            runtime_submission=dynamic_submission,
+        )
+
+        self.assertEqual(static_result.metrics["runtime_submit_cycles"], 13)
+        self.assertEqual(dynamic_result.metrics["runtime_submit_cycles"], 11)
+        self.assertEqual(static_result.metrics["runtime_request_wait_cycles"], 10)
+        self.assertEqual(dynamic_result.metrics["runtime_request_wait_cycles"], 8)
+        self.assertLess(
+            dynamic_result.instruction_timing("critical").issue,
+            static_result.instruction_timing("critical").issue,
+        )
+
     def test_backend_artifact_rejects_duplicate_unowned_and_multi_resource_payloads(self) -> None:
         first = _instruction("first", "tile_first", "dma")
         second = _instruction("second", "tile_second", "dma")

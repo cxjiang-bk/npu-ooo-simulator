@@ -805,6 +805,10 @@ class FrontendCompilerTest(unittest.TestCase):
             graph_path = root / "graph.json"
             output = root / "out"
             graph_path.write_text(json.dumps(instance.graph.to_dict()), encoding="utf-8")
+            availability_path = root / "availability.json"
+            availability_path.write_text(
+                json.dumps({"tisa.add0.t0000.s00": 4}), encoding="utf-8"
+            )
             exit_code = main(
                 [
                     "compile-model",
@@ -822,6 +826,10 @@ class FrontendCompilerTest(unittest.TestCase):
                     "2",
                     "--runtime-synchronization-cycles",
                     "3",
+                    "--runtime-buffer-policy",
+                    "lifetime_reuse",
+                    "--runtime-availability-config",
+                    str(availability_path),
                     "--runtime-device-matrix",
                     "--output-dir",
                     str(output),
@@ -843,12 +851,21 @@ class FrontendCompilerTest(unittest.TestCase):
             self.assertEqual(manifest["payload_execution"], "run_to_completion")
             self.assertEqual(manifest["runtime_policy"], "dynamic_ready_queue")
             self.assertTrue(manifest["runtime_applied_to_device"])
+            self.assertEqual(manifest["runtime_buffer_policy"], "lifetime_reuse")
+            self.assertGreater(manifest["runtime_allocation_span_bytes"], 0)
             self.assertGreater(manifest["runtime_buffer_count"], 0)
             self.assertGreater(manifest["runtime_command_chunk_count"], 0)
             self.assertEqual(
-                manifest["runtime_submit_cycles"],
+                manifest["runtime_submit_busy_cycles"],
                 manifest["runtime_command_chunk_count"] * 2,
             )
+            self.assertEqual(manifest["runtime_request_wait_cycles"], 4)
+            self.assertEqual(
+                manifest["runtime_submit_cycles"],
+                manifest["runtime_submit_busy_cycles"]
+                + manifest["runtime_request_wait_cycles"],
+            )
+            self.assertEqual(manifest["runtime_descriptor_availability_count"], 1)
             self.assertEqual(manifest["runtime_synchronization_cycles"], 3)
             self.assertEqual(
                 manifest["total_cycles_including_runtime"], manifest["total_cycles"]

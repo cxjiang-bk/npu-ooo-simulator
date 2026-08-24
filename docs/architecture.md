@@ -420,11 +420,12 @@ shape and phase bindings
 logical-to-physical buffer map
 command-buffer chunks
 submit order and queue
+descriptor availability cycle
 launch/event synchronization
 runtime overhead model
 ```
 
-`RuntimeSubmission` 的输出是 Device Backend 可以接收的命令包。当前 `create_runtime_submission()` 的静态 policy 按 TISA program order 分块；`dynamic_ready_queue` 对 dependency DAG 做确定性的 tile-affine fanout-first ready-queue 拓扑排序：同一 tile 已开始提交时优先发送其 ready stage，避免有限 device tile window 被大量不完整 tile packet 占满。两种 policy 都引用同一份 compiled metadata，且 submission order 不替代 device issue order。每个 chunk 的 launch latency 决定 descriptor 的 reception-ready cycle，最后的 synchronization cost 计入 device finish 之后；更真实的 request availability、buffer reuse 和异步 event graph 仍未实现。
+`RuntimeSubmission` 的输出是 Device Backend 可以接收的命令包。当前 `create_runtime_submission()` 的静态 policy 按 TISA program order 分块；`dynamic_ready_queue` 对 dependency DAG 做确定性的 tile-affine fanout-first ready-queue 拓扑排序：同一 tile 已开始提交时优先发送其 ready stage，避免有限 device tile window 被大量不完整 tile packet 占满。两种 policy 都引用同一份 compiled metadata，且 submission order 不替代 device issue order。每个 chunk 的 `availability_cycle` 表示 host/request state 最早可提交时间，launch latency 决定实际 descriptor completion/reception cycle；static runtime 队头阻塞，dynamic runtime 可绕过尚未 available 的独立 descriptor。最终 synchronization cost 计入 device finish 之后。更真实的异步 event graph 和 request state 仍未实现。
 
 ### 2.7 Primitive Execution Graph
 
@@ -765,7 +766,7 @@ launch latency
 host/device synchronization
 ```
 
-它可以选择先提交哪个 kernel/tile batch，但不会替代设备内部的 TISA issue policy。若暂时把 host runtime 开销设为零，仍然可以独立复现论文的 hardware dynamic scheduler；只有加入 command submission、launch latency 和 buffer allocation 后，才研究 compiler/runtime/device 的端到端总周期。
+它可以选择先提交哪个 kernel/tile batch，但不会替代设备内部的 TISA issue policy。若暂时把 host runtime 开销设为零，仍然可以独立复现论文的 hardware dynamic scheduler；只有加入 command submission、launch latency、availability 和 buffer allocation 后，才研究 compiler/runtime/device 的端到端总周期。`runtime_submit_busy_cycles` 是 host 实际发送时间，`runtime_request_wait_cycles` 是等待 descriptor availability 的时间，二者与 `device_cycles` 分开报告。
 
 ### 8.2 Device Scheduler Policy
 
@@ -787,6 +788,9 @@ payload primitive 不进入全局 OOO window。Static/Dynamic 共用同一份 `T
 按 chunk completion 接收 descriptor，非零 launch/synchronization latency 会进入 runtime
 泳道和端到端周期；默认 latency 为零以保持旧的 device-cycle baseline。Static device
 按 reception order issue，Dynamic device 仍可在已接收窗口内选择 ready TISA instruction。
+`lifetime_reuse` allocator 只接受 TISA dependency DAG 上全序的 tensor pair，并将
+`lifetime_start/lifetime_end/reused_from` 写入 `BufferBinding.attributes`；物理地址冲突
+仍由 runtime physical scoreboard 在 device 侧二次保护。
 兼容的 primitive scheduler 不消费 RuntimeSubmission，并在 manifest 中显式记录
 `runtime_applied_to_device=false`。
 
@@ -821,6 +825,15 @@ SimulatorCodegenBackend
 AnalyticalTimingProvider
     + Current DiscreteEventBackend
 ```
+
+当前已落地 `src/npu_ooo/backend/` 的第一版 contract：`BackendCapabilities` 统一声明
+primitive/resource/memory 支持范围和 `calibration_status`；`TimingProvider`、
+`EventBackend`、`SystemBackend`、`CodegenBackend` 使用 protocol 保持实现可替换；
+`TimingProviderRegistry` 已注册 analytical 与 timing-table 两个 provider。provider
+声明 capability 后，TISA simulator 会在第一次 issue 前验证整个 `BackendArtifact`，
+不支持的 primitive/resource/memory 显式失败，不静默使用未校准数字。当前 registry
+还没有外部 SCALE-Sim、DRAM 或 RTL adapter，EventBackend/SystemBackend protocol 先作为
+下一阶段的接入边界。
 
 后续可插拔实现：
 

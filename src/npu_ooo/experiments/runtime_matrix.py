@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 from npu_ooo.arch import MachineConfig
 from npu_ooo.ir import BackendArtifact, BufferBinding, RuntimeSubmission, create_runtime_submission
@@ -31,6 +31,12 @@ class RuntimeDeviceCase:
             "artifact_id": self.submission.artifact_id,
             "runtime_command_chunk_count": len(self.submission.commands),
             "runtime_submit_cycles": self.result.metrics.get("runtime_submit_cycles", 0.0),
+            "runtime_submit_busy_cycles": self.result.metrics.get(
+                "runtime_submit_busy_cycles", 0.0
+            ),
+            "runtime_request_wait_cycles": self.result.metrics.get(
+                "runtime_request_wait_cycles", 0.0
+            ),
             "runtime_synchronization_cycles": self.result.metrics.get(
                 "runtime_synchronization_cycles", 0.0
             ),
@@ -58,6 +64,7 @@ def run_runtime_device_matrix(
     chunk_size: int | None = None,
     launch_latency_cycles: float = 0.0,
     synchronization_cycles: float = 0.0,
+    descriptor_available_cycles: Mapping[str, float] | None = None,
     timing_model: TimingModel | None = None,
     simulator_config: SimulatorConfig | None = None,
 ) -> tuple[RuntimeDeviceCase, ...]:
@@ -74,6 +81,7 @@ def run_runtime_device_matrix(
             chunk_size=chunk_size,
             launch_latency_cycles=launch_latency_cycles,
             synchronization_cycles=synchronization_cycles,
+            descriptor_available_cycles=descriptor_available_cycles,
         )
         for device_policy in device_policies:
             result = schedule_tisa_program(

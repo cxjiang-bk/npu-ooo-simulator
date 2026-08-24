@@ -532,6 +532,15 @@ git diff --check: passed
 - 新增 `run_runtime_device_matrix()` 与 `compile-model --runtime-device-matrix`：四种 runtime/device policy 组合共享同一 `BackendArtifact` 和 physical allocation，分别输出 runtime submission、summary、Perfetto、SVG/PNG，并汇总 `sweep.csv/json`。
 - dynamic runtime submission 使用 tile-affine fanout-first 拓扑顺序：保持 dependency-before-consumer，同时优先补齐已开始 tile 的 ready stage，避免 static device 的有限 in-flight tile window 被不完整 tile packet 占满而死锁。
 - compiler TISA region legalizer v1 已从 semantic operator/tile bounds 计算 dense tensor 的 starts、tile shape、byte offset 和 byte size，覆盖 matmul/batched_matmul/gemv、broadcast elementwise、reduce、softmax、RMSNorm 和 LayerNorm affine 参数；two-matmul 324 个 TISA operands 全部使用 `size_source=tile_mem`，不再依赖 coarse fallback。
+- Runtime buffer allocator 新增显式 `linear|lifetime_reuse` policy；`derive_tensor_lifetimes()` 计算 TISA first/last use，`derive_tensor_reuse_pairs()` 只允许 dependency DAG 上全序的 tensor pair 复用地址，并写入 lifetime provenance。2mm 已验证 `A -> D` 可复用而 `C -> D` 不可复用。
+- Runtime command chunk 新增 `availability_cycle`；static runtime 对队头 descriptor 阻塞，dynamic runtime 在依赖允许且 request 已 available 时 bypass 独立 descriptor。summary/manifest 分开记录 `runtime_submit_busy_cycles`、`runtime_request_wait_cycles` 和 `runtime_submit_cycles`。
+
+## 2026-08-24：阶段 11.0 Backend Contract 第一版
+
+- 新增 `src/npu_ooo/backend/contracts.py`：定义 `BackendCapabilities`、`TimingProvider`、`CodegenBackend`、`EventBackend`、`SystemBackend` protocol；capability 校验覆盖 primitive/resource/memory 和 calibration status。
+- 新增 `src/npu_ooo/backend/registry.py`：注册 `analytical` 与 `timing_table` 两个 timing provider；现有 `AnalyticalTimingModel`/`TimingTableModel` 通过 adapter 接入，不改变原有 timing 数值。
+- `compile-model` 新增 `--timing-provider`，manifest 增加 `timing_provider` 和 `timing_backend_capabilities`；TISA simulator 对声明 capabilities 的 provider 执行显式校验，unsupported payload 直接失败。
+- 110 项测试通过；当前阶段 11 仍缺少真实 EventBackend/SystemBackend adapter 和 SCALE-Sim/RTL 外部 timing 接入。
 - StableHLO Matmul CLI smoke：15 TISA / 21 primitive / 3 physical buffers / 33 operand bindings / 5 chunks（chunk size=3）；runtime/device policy 均为 dynamic_ready_queue，device cycles 仍为 120。
 - 全量回归：`PYTHONPATH=src:. /usr/bin/python3.12 -m unittest discover -s tests -q` 共 103 tests passed；`compileall` 与 `git diff --check` 通过。
 - 官方 StableHLO Matmul + policy matrix smoke：3 TISA / 4 primitive / 1 command chunk；runtime submit=2、device start=2、device finish=54、device cycles=52、synchronization=5、end-to-end=59 cycles，四个 matrix cell 均生成独立 Perfetto trace。

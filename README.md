@@ -15,7 +15,7 @@ PyTorch / ONNX / StableHLO
   -> RuntimeSubmission (shape/state/address/command binding)
   -> TISA Device Scheduler (Static 或 Dynamic)
   -> Backend primitive expansion/timing
-  -> 热插拔 Timing/Event/System Backend
+  -> 热插拔 Timing/Event/System Backend（当前已落地 capability contract）
   -> 总周期、runtime/device 分解、stall 和泳道图
 ```
 
@@ -211,6 +211,7 @@ PYTHONPATH=src:. /usr/bin/python3.12 -m npu_ooo.cli compile-model \
   --policy dynamic_ready_queue \
   --runtime-policy static \
   --runtime-chunk-size 4 \
+  --runtime-buffer-policy lifetime_reuse \
   --runtime-launch-latency 2 \
   --runtime-synchronization-cycles 5 \
   --output-dir out/stablehlo-matmul
@@ -224,6 +225,13 @@ device 侧 TISA issue 策略；两者是独立实验维度。每个 command chun
 `device_finish_cycle`、`device_cycles` 和 `total_cycles_including_runtime`。这些 runtime
 时序目前只接入默认的 TISA scheduler target；使用兼容的 primitive target 时
 `runtime_applied_to_device=false`。
+
+`--runtime-buffer-policy lifetime_reuse` 会按 TISA dependency DAG 证明 tensor lifetime
+顺序后复用物理 block；默认 `linear` 保持每个 tensor 独立分配。若要模拟 host/request
+状态尚未准备好的 descriptor，可通过 `--runtime-availability-config availability.json`
+提供 `{ "tisa_id": cycle }` 映射。Static runtime 按 command stream 队头等待，Dynamic
+runtime 可以选择已经 ready 且 availability cycle 已到达的独立 descriptor；等待时间单独
+写入 `runtime_request_wait_cycles`，不能误算成 device stall。
 
 增加 `--runtime-device-matrix` 后，一次编译会在 `policy_matrix/` 下运行四种组合：
 

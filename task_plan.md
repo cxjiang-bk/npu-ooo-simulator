@@ -24,8 +24,8 @@
 | 7 | TileFlow/SCALE-Sim/RTL 校准 | pending |
 | 8 | TISA Contract + ExecuTorch Frontend Adapter | completed |
 | 9 | Compiler PassManager 与自动 TileGraph | in_progress |
-| 10 | Runtime Submission 与 runtime/device 分层仿真 | in_progress |
-| 11 | Hot-pluggable Timing/Event/System Backend | pending |
+| 10 | Runtime Submission 与 runtime/device 分层仿真 | completed |
+| 11 | Hot-pluggable Timing/Event/System Backend | in_progress |
 | 12 | 模型级自动编译与 TISA 实验矩阵 | pending |
 
 ## 阶段 0 检查表
@@ -101,7 +101,9 @@
 - 9.9 已完成第一版：`TISASemanticBuilder` 只消费 graph/schedule/tile/machine，先构造 stage、logical operands 和 typed dependencies；`AnalyticalBackendCodegen` 再复用同一 `TileGraph` 生成并绑定 primitive payload。`BackendArtifact.validate()` 检查 payload ownership、单资源约束、TISA 依赖可达性和未绑定 task；覆盖 matmul/batched_matmul/gemv、elementwise/residual_add、reduce、softmax、rmsnorm、layernorm。前端+TISA 回归 38 项、全量回归 95 项通过。
 - 10.0 已完成第一版：新增 `BufferBinding`、`RuntimeOperandBinding`、`RuntimeCommandChunk`、`RuntimeSubmission` 和线性 allocator；command chunk completion 驱动 descriptor reception，runtime/device policy 独立，launch/synchronization latency 分层进入 summary、manifest、SVG 和 Perfetto。启用 scoreboard 时优先消费 runtime physical address range。
 - 10.1 已完成第一版：`--runtime-device-matrix` 在一次编译结果和一次 physical allocation 上运行 static/dynamic runtime x static/dynamic device 四种组合；每个 cell 输出独立 submission/summary/trace，顶层汇总周期和相对 static/static speedup。
-- 10.2 进行中：compiler TISA region legalizer v1 已覆盖 matmul/batched_matmul/gemv、broadcast elementwise、reduce、softmax、RMSNorm 和 LayerNorm（含 affine 参数），将 dense starts/shape 转为 byte offset/size；剩余工作是 request availability、buffer lifetime/reuse，以及对未覆盖动态/布局情况继续保持显式 fallback，不能把 fallback hazard 解释为真实硬件结论。
+- 10.2 已完成第一版：compiler TISA region legalizer v1 已覆盖 matmul/batched_matmul/gemv、broadcast elementwise、reduce、softmax、RMSNorm 和 LayerNorm（含 affine 参数），将 dense starts/shape 转为 byte offset/size；runtime 新增 descriptor `availability_cycle`、static 队头等待、dynamic bypass、`runtime_request_wait_cycles`，以及基于 TISA dependency proof 的 `lifetime_reuse` allocator。动态 shape/非 dense layout 仍显式记录 fallback。
+- 10.3 下一步：把 request availability 从静态 JSON 映射扩展为 runtime event/state provider，并校准 buffer reuse 与 memory-bank/port timing；随后进入阶段 11 hot-pluggable backend contract。
+- 11.0 进行中：新增 `BackendCapabilities`、`TimingProvider`、`EventBackend`、`SystemBackend`、`CodegenBackend` protocol 和 timing provider registry；`compile-model` 可选择 analytical/timing_table provider，manifest 写入 capability/calibration metadata，TISA simulator 在 provider 声明 capability 时执行显式校验。
 
 阶段 4-6 的“completed”表示基线闭环完成，不表示后续功能不再扩展。下一轮工作必须保持这些 baseline 的输入/输出兼容，并以自动前端和 runtime/backend 分层作为增量演进。
 
