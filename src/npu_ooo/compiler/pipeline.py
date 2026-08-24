@@ -252,6 +252,25 @@ def _build_tisa_program(
                     "semantic_boundary": "tile",
                     "semantic_tile_id": tile_id,
                     "tile_group_index": group_index,
+                    **{
+                        key: value
+                        for key, value in (
+                            (
+                                "semantic_family",
+                                operator.attributes.get(
+                                    "semantic_family", operator.normalized_type
+                                ),
+                            ),
+                            ("semantic_op", operator.attributes.get("semantic_op")),
+                            ("stablehlo_op", operator.attributes.get("stablehlo_op")),
+                            ("operand_arity", operator.attributes.get("operand_arity")),
+                            (
+                                "backend_capability_key",
+                                operator.attributes.get("backend_capability_key"),
+                            ),
+                        )
+                        if value not in {None, ""}
+                    },
                 },
                 payload_ref=f"payload:{tisa_id}",
             )

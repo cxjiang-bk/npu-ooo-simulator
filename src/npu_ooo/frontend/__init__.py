@@ -14,6 +14,12 @@ from .bridge import (
     import_operator_graph,
 )
 from .stablehlo import StableHLOAdapter
+from .stablehlo_semantics import (
+    StableHLOOpCapability,
+    normalize_stablehlo_op_name,
+    registered_stablehlo_ops,
+    stablehlo_capability,
+)
 from .stablehlo_codegen import StableHLOGenerator, StableHLOModule, generate_stablehlo
 from .stablehlo_official import (
     OfficialStableHLOAdapter,
@@ -35,6 +41,10 @@ __all__ = [
     "TorchExportAdapter",
     "import_operator_graph",
     "StableHLOAdapter",
+    "StableHLOOpCapability",
+    "normalize_stablehlo_op_name",
+    "registered_stablehlo_ops",
+    "stablehlo_capability",
     "StableHLOGenerator",
     "StableHLOModule",
     "generate_stablehlo",

@@ -4,6 +4,7 @@ import io
 import importlib.util
 import json
 import tempfile
+from unittest import mock
 from pathlib import Path
 
 from npu_ooo.arch import minimal_machine_config
@@ -33,6 +34,7 @@ from npu_ooo.frontend import (
     torch_xla_available,
 )
 from npu_ooo.ir import DataEdge, OperatorGraph, OperatorSpec, TensorSpec
+from npu_ooo.simulator import simulate_execution_graph
 
 
 class _FakeValue:
@@ -606,11 +608,104 @@ class FrontendCompilerTest(unittest.TestCase):
         self.assertEqual([item.normalized_type for item in imported.graph.operators], [
             "elementwise", "reduce", "elementwise", "elementwise", "elementwise"
         ])
+        self.assertEqual(imported.graph.operators[0].attributes["operand_arity"], 2)
+        self.assertEqual(imported.graph.operators[0].inputs, ("arg0",))
         fused = PassManager().run(imported.graph)
         self.assertEqual([item.normalized_type for item in fused.graph.operators], ["rmsnorm"])
         compiled = compile_frontend_import(imported, minimal_machine_config(), tile_size=4)
         self.assertEqual(compiled.graph.operators[0].normalized_type, "rmsnorm")
         self.assertEqual(compiled.validate(), ())
+
+    def test_stablehlo_pointwise_registry_compiles_with_operation_identity(self) -> None:
+        text = """
+        module {
+          func.func @main(%x: tensor<2x4xf32>) -> tensor<2x4xf32> {
+            %zero = stablehlo.constant dense<0.0> : tensor<f32>
+            %sine = stablehlo.sine %x : tensor<2x4xf32>
+            %relu = stablehlo.maximum %x, %zero : tensor<2x4xf32>
+            %result = stablehlo.add %sine, %relu : tensor<2x4xf32>
+            return %result : tensor<2x4xf32>
+          }
+        }
+        """
+        compiled = compile_stablehlo_text(
+            text,
+            minimal_machine_config(),
+            model_id="pointwise-registry",
+            tile_size=4,
+            stablehlo_backend="textual",
+        )
+        self.assertEqual(
+            [operator.normalized_type for operator in compiled.graph.operators],
+            ["elementwise", "elementwise", "elementwise"],
+        )
+        sine = compiled.graph.operators[0]
+        self.assertEqual(sine.attributes["stablehlo_op"], "stablehlo.sine")
+        self.assertEqual(sine.attributes["semantic_family"], "elementwise")
+        self.assertEqual(sine.attributes["semantic_op"], "sine")
+        self.assertEqual(sine.attributes["backend_capability_key"], "pointwise.sine")
+        relu = compiled.graph.operators[1]
+        self.assertEqual(relu.attributes["operand_arity"], 2)
+        self.assertEqual(relu.inputs, ("x",))
+
+        compute = next(
+            task
+            for task in compiled.backend_artifact.execution_graph.tasks
+            if task.operator_id == sine.op_id and task.primitive == "elementwise"
+        )
+        self.assertEqual(compute.attributes["semantic_op"], "sine")
+        self.assertEqual(compute.attributes["frontend_target"], "stablehlo.sine")
+        self.assertEqual(compute.attributes["timing_key"], "pointwise.sine")
+        self.assertEqual(compute.attributes["operand_arity"], 1)
+        relu_compute = next(
+            task
+            for task in compiled.backend_artifact.execution_graph.tasks
+            if task.operator_id == relu.op_id and task.primitive == "elementwise"
+        )
+        self.assertEqual(relu_compute.attributes["operand_arity"], 2)
+        self.assertEqual(relu_compute.attributes["input_count"], 1)
+        sine_tiles = [tile for tile in compiled.tile_graph.tiles if tile.operator_id == sine.op_id]
+        self.assertTrue(sine_tiles)
+        self.assertTrue(all(tile.attributes["semantic_op"] == "sine" for tile in sine_tiles))
+        self.assertTrue(
+            all(
+                tile.attributes["backend_capability_key"] == "pointwise.sine"
+                for tile in sine_tiles
+            )
+        )
+        sine_tisa = [
+            instruction
+            for instruction in compiled.tisa_program.instructions
+            if instruction.operator_id == sine.op_id
+        ]
+        self.assertTrue(sine_tisa)
+        self.assertTrue(
+            all(instruction.attributes["semantic_op"] == "sine" for instruction in sine_tisa)
+        )
+
+        simulated = simulate_execution_graph(
+            compiled.backend_artifact.execution_graph,
+            minimal_machine_config(),
+            policy="dynamic_ready_queue",
+        )
+        self.assertGreater(simulated.total_cycles, 0)
+        self.assertTrue(simulated.perfetto_trace()["traceEvents"])
+        self.assertEqual(compiled.validate(), ())
+
+    def test_unregistered_stablehlo_op_fails_at_import_capability_boundary(self) -> None:
+        text = """
+        module {
+          func.func @main(%x: tensor<2x4xf32>) -> tensor<2x4xf32> {
+            %0 = stablehlo.custom_call %x : tensor<2x4xf32>
+            return %0 : tensor<2x4xf32>
+          }
+        }
+        """
+        with self.assertRaisesRegex(
+            FrontendImportError,
+            "import capability boundary",
+        ):
+            StableHLOAdapter.from_text(text)
 
     def test_stablehlo_matmul_compiles_to_tisa(self) -> None:
         text = """
@@ -700,9 +795,9 @@ class FrontendCompilerTest(unittest.TestCase):
                 ]
             )
             self.assertEqual(exit_code, 0)
-            self.assertTrue((output / "frontend_import.json").exists())
-            self.assertTrue((output / "tisa_program.json").exists())
-            self.assertTrue((output / "backend_artifact.json").exists())
+            self.assertTrue((output / "00_frontend" / "frontend_import.json").exists())
+            self.assertTrue((output / "03_tisa" / "tisa_program.json").exists())
+            self.assertTrue((output / "04_backend" / "backend_artifact.json").exists())
             manifest = json.loads((output / "manifest.json").read_text())
             self.assertEqual(manifest["compiler_pipeline"], "frontend->canonical->schedule->tile->tisa->analytical-backend")
 
@@ -732,7 +827,7 @@ class FrontendCompilerTest(unittest.TestCase):
                 str(output),
             ])
             self.assertEqual(exit_code, 0)
-            frontend = json.loads((output / "frontend_import.json").read_text())
+            frontend = json.loads((output / "00_frontend" / "frontend_import.json").read_text())
             self.assertEqual(frontend["frontend"], "stablehlo")
             self.assertTrue((output / "03_tisa" / "tisa_program.json").exists())
 
@@ -884,6 +979,55 @@ class FrontendCompilerTest(unittest.TestCase):
             len(direct.backend_artifact.execution_graph.tasks),
         )
         self.assertEqual(xla.validate(), ())
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("torch")
+        and official_stablehlo_available()
+        and torch_xla_available(),
+        "requires PyTorch, torch-xla and official StableHLO bindings",
+    )
+    def test_new_pointwise_module_exports_through_torch_xla_without_project_emitter(self) -> None:
+        import torch
+
+        class NewPointwiseOperator(torch.nn.Module):
+            def forward(self, x):
+                return torch.sin(x) + torch.relu(x)
+
+        with mock.patch(
+            "npu_ooo.frontend.stablehlo_codegen.StableHLOGenerator.generate",
+            side_effect=AssertionError("project StableHLO emitter must not run"),
+        ):
+            compiled = compile_torch_module_through_stablehlo(
+                NewPointwiseOperator(),
+                (torch.randn(2, 4),),
+                minimal_machine_config(),
+                tile_size=4,
+                model_id="xla-new-pointwise",
+                stablehlo_exporter="torch-xla",
+            )
+
+        self.assertEqual(compiled.stablehlo.producer, "torch-xla")
+        self.assertIn("stablehlo.sine", compiled.stablehlo.text)
+        self.assertIn("stablehlo.maximum", compiled.stablehlo.text)
+        self.assertEqual(
+            [operator.normalized_type for operator in compiled.graph.operators],
+            ["elementwise", "elementwise", "elementwise"],
+        )
+        self.assertEqual(
+            [operator.attributes["semantic_op"] for operator in compiled.graph.operators],
+            ["sine", "maximum", "add"],
+        )
+        self.assertTrue(compiled.tile_graph.tiles)
+        self.assertTrue(compiled.tisa_program.instructions)
+        self.assertTrue(compiled.backend_artifact.execution_graph.tasks)
+        simulated = simulate_execution_graph(
+            compiled.backend_artifact.execution_graph,
+            minimal_machine_config(),
+            policy="dynamic_ready_queue",
+        )
+        self.assertGreater(simulated.total_cycles, 0)
+        self.assertTrue(simulated.perfetto_trace()["traceEvents"])
+        self.assertEqual(compiled.validate(), ())
 
     @unittest.skipUnless(
         importlib.util.find_spec("torch")

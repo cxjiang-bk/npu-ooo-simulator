@@ -38,6 +38,25 @@ def _elementwise_timing(machine: MachineConfig, elements: int) -> tuple[float, f
     return float(duration), float(unit.initiation_interval_cycles), unit.name
 
 
+def _pointwise_identity(operator: Any) -> tuple[str, str, str]:
+    frontend_target = str(operator.attributes.get("frontend_target", ""))
+    semantic_op = str(operator.attributes.get("semantic_op", ""))
+    if not semantic_op:
+        normalized_target = frontend_target.lower().replace("::", ".")
+        if normalized_target.startswith(("stablehlo.", "mhlo.")):
+            semantic_op = normalized_target.split(".", 1)[1]
+        elif normalized_target.startswith("aten."):
+            semantic_op = normalized_target.removeprefix("aten.").split(".", 1)[0]
+        else:
+            semantic_op = operator.normalized_type
+    timing_key = str(
+        operator.attributes.get("backend_capability_key")
+        or operator.attributes.get("timing_key")
+        or f"pointwise.{semantic_op}"
+    )
+    return semantic_op, frontend_target, timing_key
+
+
 def _output_region(operator, tensors: dict[str, Any], tile: TileInstance, memory: str, access: AccessType) -> BufferRegion:
     output = tensors[operator.outputs[0]]
     dimensions = tuple(name for name, _ in operator.iteration_dims)
@@ -106,6 +125,7 @@ def lower_elementwise_graph(
             )
         if len(operator.outputs) != 1 or not operator.inputs:
             raise ValueError(f"elementwise operator '{operator.op_id}' requires inputs and one output")
+        semantic_op, frontend_target, timing_key = _pointwise_identity(operator)
         dimensions = tuple(name for name, _ in operator.iteration_dims)
         if not dimensions or operator.reduction_dims:
             raise ValueError(f"elementwise operator '{operator.op_id}' requires iteration dimensions only")
@@ -187,8 +207,15 @@ def lower_elementwise_graph(
                     program_order=task_order,
                     attributes={
                         "elements": tile_elements,
+                        "operand_arity": int(
+                            operator.attributes.get("operand_arity", len(operator.inputs))
+                        ),
                         "input_count": len(operator.inputs),
                         "iteration": tile.ordinal,
+                        "semantic_family": "elementwise",
+                        "semantic_op": semantic_op,
+                        "frontend_target": frontend_target,
+                        "timing_key": timing_key,
                     },
                 )
             )

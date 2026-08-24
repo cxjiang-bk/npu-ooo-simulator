@@ -546,6 +546,49 @@ BackendCapability
   - lowering and timing provider
 ```
 
+第一层 `StableHLOImportCapability` 的首个阶段已在
+`src/npu_ooo/frontend/stablehlo_semantics.py` 中实现，当前覆盖 operation name、operand arity、
+semantic family、recovery 标记和 backend key。importer 现在按完整 operation name
+精确查询，而不是用 `add`、`mul`、`exp` 等 substring 猜测类型；未注册 operation 会在
+frontend capability boundary 直接失败，不会以一个未知 `op_type` 延迟到 lowering 才报错。
+当前首批覆盖：
+
+```text
+pointwise unary
+  abs / cosine / exponential / log / negate / rsqrt / sine / sqrt / tanh
+
+pointwise binary
+  add / divide / maximum / minimum / multiply / power / subtract
+
+structural and reduction
+  dot_general / reduce / transpose / reshape / broadcast_in_dim
+
+recovery or compatibility
+  batch_norm_training / softmax / rms_norm / layer_norm
+```
+
+每个导入的 operation 至少携带：
+
+```text
+stablehlo_op             精确 StableHLO operation identity
+semantic_family          Canonical OperatorGraph 分类
+semantic_op              family 内的具体操作，如 sine、maximum、add
+operand_arity            StableHLO 原始 operand 数，包括常量和重复 operand
+requires_recovery        是否必须由 pattern/recovery pass 消除或改写
+backend_capability_key   backend/timing 查询键，如 pointwise.sine
+```
+
+这里必须区分 `operand_arity` 与 canonical `inputs`：例如 `x * x` 的两个 StableHLO operand
+会在 canonical tensor input 列表中去重；`maximum(x, 0)` 的常量 operand 不需要生成一次
+内存 load。两者都仍然是二元运算，因此具体语义和 timing 使用 `operand_arity=2`，而 backend
+task 的 `input_count` 只表示实际加载的 tensor 数。pointwise identity 和 capability key
+会继续保留到 TileInstance、ExecutionTask 与 TISA metadata，供分阶段产物检查、timing table
+和 trace 分析使用。
+
+StableHLO version/result arity 与 shape/dtype constraint 仍需补入第一层。第二层
+`BackendCapability` 也是下一阶段工作；当前 `LoweringRegistry` 只按 semantic family 选择
+lowering，dtype/layout/rank、EU 支持范围和 timing provider 尚未统一成声明式 registry。
+
 一个新标准 PyTorch 算子的接入流程是：先确认 torch-xla 可以导出且官方 verifier 通过，
 再增加或复用 StableHLO semantic-family 映射，最后检查 TISA/backend capability。只有新的
 复合模式或新的硬件语义族才应新增专用 recovery/lowering；普通 pointwise 算子不应各写
@@ -854,8 +897,9 @@ artifact_index.json
 07_trace/{perfetto.json,swimlane.svg,swimlane.png}
 ```
 
-artifact 的规范位置按编号目录组织，顶层同名文件只作为兼容旧脚本的相对符号链接；
-`artifact_index.json` 记录每个阶段实际生成的文件。这样可以按
+artifact 只按编号目录组织，不在顶层生成同名副本或符号链接；复用旧输出目录时会清理
+历史版本留下的已知扁平 artifact。单次实验顶层只保留 `README.md`、`manifest.json` 和
+`artifact_index.json`，后者记录每个阶段实际生成的文件。这样可以按
 `frontend -> graph -> schedule/tile -> TISA -> backend -> runtime -> simulation/trace`
 顺序检查一次实验，而不必在一个目录中区分几十个平级文件。
 

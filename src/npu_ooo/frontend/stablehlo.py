@@ -25,6 +25,7 @@ from npu_ooo.ir import (
 )
 
 from .bridge import FrontendImport, FrontendImportError, FrontendKind
+from .stablehlo_semantics import stablehlo_capability
 
 
 _TENSOR_TYPE = re.compile(r"tensor<([^>]+)>")
@@ -70,45 +71,6 @@ def _result_tensor_type(type_signature: str) -> tuple[tuple[int | str, ...], str
 
     result_text = type_signature.rsplit("->", 1)[-1]
     return _tensor_type(result_text)
-
-
-def _stablehlo_type(target: str) -> str:
-    name = target.lower().replace("::", ".")
-    if any(token in name for token in ("dot_general", "dot", "matmul")):
-        return SemanticOpType.MATMUL.value
-    if any(token in name for token in ("softmax",)):
-        return SemanticOpType.SOFTMAX.value
-    if any(token in name for token in ("reduce", "reduce_window")):
-        return SemanticOpType.REDUCE.value
-    if any(token in name for token in ("rms_norm", "rmsnorm")):
-        return SemanticOpType.RMSNORM.value
-    if any(token in name for token in ("layer_norm", "layernorm")):
-        return SemanticOpType.LAYERNORM.value
-    if any(
-        token in name
-        for token in (
-            "multiply",
-            "mul",
-            "add",
-            "subtract",
-            "sub",
-            "divide",
-            "div",
-            "rsqrt",
-            "sqrt",
-            "power",
-            "exp",
-            "exponential",
-            "maximum",
-            "minimum",
-        )
-    ):
-        return SemanticOpType.ELEMENTWISE.value
-    if any(token in name for token in ("reshape", "broadcast", "collapse", "expand")):
-        return SemanticOpType.RESHAPE.value
-    if any(token in name for token in ("transpose", "permute")):
-        return SemanticOpType.TRANSPOSE.value
-    return name.replace("::", ".")
 
 
 def _dimensions(text: str, rank: int) -> tuple[int, ...]:
@@ -349,6 +311,23 @@ def _graph_from_text(text: str, *, graph_id: str) -> OperatorGraph:
                 )
             continue
         all_values = _VALUE_NAME.findall(body)
+        operand_arity = len(all_values)
+        capability = stablehlo_capability(target)
+        if capability is None:
+            raise FrontendImportError(
+                f"unsupported StableHLO operation '{target}' at the import capability boundary; "
+                "register its semantic family before compiling it"
+            )
+        if not capability.supports_arity(operand_arity):
+            expected = (
+                str(capability.min_operands)
+                if capability.min_operands == capability.max_operands
+                else f"{capability.min_operands}..{capability.max_operands}"
+            )
+            raise FrontendImportError(
+                f"StableHLO operation '{target}' has {operand_arity} operands; "
+                f"the import capability expects {expected}"
+            )
         input_occurrences = tuple(
             name.removeprefix("%")
             for name in all_values
@@ -359,7 +338,7 @@ def _graph_from_text(text: str, *, graph_id: str) -> OperatorGraph:
             raise FrontendImportError(
                 f"StableHLO operation '{target}' has no tensor operands in supported form"
             )
-        op_type = _stablehlo_type(target)
+        op_type = capability.semantic_family
         input_shapes = [tensors[name.removeprefix("%")].shape for name in input_names]
         operation_attributes: dict[str, Any] = {}
         if op_type == SemanticOpType.MATMUL.value:
@@ -469,6 +448,12 @@ def _graph_from_text(text: str, *, graph_id: str) -> OperatorGraph:
                 attributes={
                     "frontend_target": target,
                     "frontend_node_op": "stablehlo",
+                    "stablehlo_op": capability.op_name,
+                    "semantic_family": capability.semantic_family,
+                    "semantic_op": capability.op_name.removeprefix("stablehlo."),
+                    "operand_arity": operand_arity,
+                    "requires_recovery": capability.requires_recovery,
+                    "backend_capability_key": capability.backend_capability_key,
                     "input_occurrences": list(input_occurrences),
                     "constant_args": {"args": constants_for_op, "kwargs": {}},
                     **operation_attributes,

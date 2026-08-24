@@ -136,6 +136,23 @@ def enumerate_operator_tiles(operator: OperatorSpec, schedule: OperatorSchedule)
             for dimension, (start, _stop) in zip(dimensions, selected)
         )
         bounds = tuple((dimension, start, stop) for dimension, (start, stop) in zip(dimensions, selected))
+        semantic_attributes = {
+            key: value
+            for key, value in (
+                (
+                    "semantic_family",
+                    operator.attributes.get("semantic_family", operator.normalized_type),
+                ),
+                ("semantic_op", operator.attributes.get("semantic_op")),
+                ("stablehlo_op", operator.attributes.get("stablehlo_op")),
+                ("operand_arity", operator.attributes.get("operand_arity")),
+                (
+                    "backend_capability_key",
+                    operator.attributes.get("backend_capability_key"),
+                ),
+            )
+            if value not in {None, ""}
+        }
         tiles.append(
             TileInstance(
                 tile_id=f"{operator.op_id}.t{ordinal:04d}",
@@ -144,6 +161,7 @@ def enumerate_operator_tiles(operator: OperatorSpec, schedule: OperatorSchedule)
                 coordinates=coordinates,
                 bounds=bounds,
                 stage_id=schedule.stage_id,
+                attributes=semantic_attributes,
             )
         )
     return tuple(tiles)

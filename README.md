@@ -134,10 +134,10 @@ out/attention-dynamic/
 `03_tisa/` 可能暂时为空；`compile-model` 路径已经生成 `TISAProgram`/`BackendArtifact`，
 后续 TISA target scheduler 接入后，所有自动编译路径都会填充该目录。
 
-为兼容旧脚本，常用文件名仍会在实验目录顶层生成相对符号链接，例如
-`operator_graph.json -> 01_graph_ir/operator_graph.json`。规范位置以编号目录为准；
-批量 sweep 的 `sweep.csv`、`sweep.json` 和每个 case 目录仍保留在 sweep 根目录下，
-便于批量扫描工具直接读取。
+阶段 artifact 只保存在编号目录中，不再在实验目录顶层创建副本或兼容性符号链接。
+复用旧版本生成的 `--output-dir` 时，已知的顶层扁平 artifact 和符号链接会自动删除。
+单次实验顶层只保留 `README.md`、`artifact_index.json` 和 `manifest.json`；批量 sweep
+根目录另外保留 `sweep.csv`、`sweep.json`，每个 case 仍使用相同的分阶段布局。
 
 ### Framework bridge 层级
 
@@ -447,8 +447,9 @@ PYTHONPATH=src python3 -m npu_ooo.cli two-mm \
 命令会按 `00_frontend` 到 `07_trace` 的阶段目录生成编译图和调度结果；各目录的
 文件含义见上面的输出树。顶层 `artifact_index.json` 会列出本次实际生成的规范文件，
 不需要逐个猜测文件位置。Graphviz 文件位于 `01_graph_ir`、`02_schedule_tile` 和
-`04_backend`，时间线位于 `06_simulation`/`07_trace`。顶层同名符号链接仅用于兼容旧
-脚本，不代表新的规范布局。
+`04_backend`，时间线位于 `06_simulation`/`07_trace`。StableHLO 的可读程序位于
+`00_frontend/generated.mlir`；`00_frontend/stablehlo_module.json` 是包含相同程序文本、
+producer、版本、校验状态和 provenance 的结构化封装。
 
 `--arch` 可选 `minimal`、`wide-mxu`、`lpu-like`；`--machine-config path/to/machine.json`
 可以直接加载 canonical MachineConfig JSON，用于探索任意自定义 memory/unit/path 参数；
@@ -493,7 +494,7 @@ PYTHONPATH=src python3 -m npu_ooo.cli sweep-two-mm \
   --output-dir out/sweep-two-mm
 ```
 
-顶层的 `sweep.csv` / `sweep.json` 汇总 tile size、total cycles、相对 static 的 speedup、ROB/ready peak、stall 分解和 pipeline drain；各 case 子目录保留 `manifest.json`、`summary.json`、`tasks.csv`、`address_dependencies.json`、`perfetto.json`、`swimlane.svg` 和 `swimlane.png`。
+顶层的 `sweep.csv` / `sweep.json` 汇总 tile size、total cycles、相对 static 的 speedup、ROB/ready peak、stall 分解和 pipeline drain；各 case 子目录顶层保留 `manifest.json`，其余结果分别位于 `05_runtime`、`06_simulation` 和 `07_trace`。
 
 跨算子和跨模型结构的实验使用 `sweep-workloads`。它复用 lowering registry，把每个 workload 编译到同一套 ExecutionGraph/SchedulerResult artifact：
 

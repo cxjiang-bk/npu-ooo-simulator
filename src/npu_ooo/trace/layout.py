@@ -1,9 +1,8 @@
 """Structured output layout for compiler and simulator artifacts.
 
-The CLI historically wrote every artifact directly into one directory.  This
-module keeps the old paths as lightweight symlinks while making numbered
-stage directories the canonical locations.  The layout is intentionally
-filesystem-only so it also works for sweep case directories.
+Numbered stage directories are the only locations for stage artifacts.  The
+layout layer also removes flattened files and compatibility symlinks produced
+by older versions when an output directory is reused.
 """
 
 from __future__ import annotations
@@ -57,9 +56,9 @@ def _root_readme() -> str:
     rows = [
         "# 本次运行输出",
         "",
-        "规范 artifact 按编译和仿真阶段分目录保存。顶层的 `manifest.json`、",
-        "`summary.json` 和 `artifact_index.json` 用于快速索引；旧文件名是兼容性链接，",
-        "新的脚本应优先使用下面的阶段目录。",
+        "规范 artifact 按编译和仿真阶段分目录保存。单次实验顶层只保留",
+        "`README.md`、`artifact_index.json` 和 `manifest.json`；阶段 artifact 不创建",
+        "顶层副本或兼容性符号链接。批量实验根目录还会保留 `sweep.csv/json`。",
         "",
         "| 目录 | 内容 |",
         "| --- | --- |",
@@ -71,6 +70,8 @@ def _root_readme() -> str:
             "典型查看顺序：先看 `00_frontend` 确认输入，再看 `01_graph_ir` 和",
             "`02_schedule_tile` 检查图与切分，接着看 `03_tisa`/`04_backend`，最后在",
             "`06_simulation`、`07_trace` 中比较周期和泳道。",
+            "启用 StableHLO 路径时，可读程序是 `00_frontend/generated.mlir`；",
+            "`stablehlo_module.json` 保存程序文本、producer、版本、验证状态和 provenance。",
             "旧的 primitive baseline 命令尚未经过 TISA codegen 时，`03_tisa/` 可能为空；",
             "使用 `compile-model` 或后续 TISA target pipeline 时该目录会出现 descriptor。",
         ]
@@ -78,14 +79,23 @@ def _root_readme() -> str:
     return "\n".join(rows) + "\n"
 
 
+def _remove_legacy_flat_artifacts(root: Path) -> None:
+    """Remove known root-level artifacts created by pre-staged layouts."""
+
+    for filename in _STAGE_BY_FILENAME:
+        candidate = root / filename
+        if candidate.is_symlink() or candidate.is_file():
+            candidate.unlink()
+
+
 def ensure_output_layout(root: str | Path) -> Path:
     root_path = Path(root)
     root_path.mkdir(parents=True, exist_ok=True)
+    _remove_legacy_flat_artifacts(root_path)
     for directory, _description in STAGE_DIRECTORIES:
         (root_path / directory).mkdir(parents=True, exist_ok=True)
     readme = root_path / "README.md"
-    if not readme.exists():
-        readme.write_text(_root_readme(), encoding="utf-8")
+    readme.write_text(_root_readme(), encoding="utf-8")
     return root_path
 
 
@@ -94,7 +104,7 @@ def _is_stage_directory(path: Path) -> bool:
 
 
 def artifact_path(path: str | Path) -> tuple[Path, Path | None]:
-    """Return ``(canonical_path, compatibility_link_path)`` for an artifact.
+    """Return ``(canonical_path, legacy_flat_path)`` for an artifact.
 
     Unknown files such as sweep summaries remain at their requested location.
     A path already inside a stage directory is never rewritten.
@@ -110,16 +120,14 @@ def artifact_path(path: str | Path) -> tuple[Path, Path | None]:
 
 
 def finalize_artifact(canonical: Path, compatibility: Path | None) -> None:
-    """Create a relative compatibility symlink and refresh the root index."""
+    """Remove any legacy flat artifact and refresh the root index."""
 
     root = compatibility.parent if compatibility is not None else canonical.parent
     if canonical.parent.name in {name for name, _description in STAGE_DIRECTORIES}:
         root = canonical.parent.parent
     if compatibility is not None and compatibility != canonical:
-        compatibility.parent.mkdir(parents=True, exist_ok=True)
-        if compatibility.is_symlink() or compatibility.exists():
+        if compatibility.is_symlink() or compatibility.is_file():
             compatibility.unlink()
-        compatibility.symlink_to(canonical.relative_to(compatibility.parent))
     if any((root / name).is_dir() for name, _description in STAGE_DIRECTORIES):
         write_artifact_index(root)
 
@@ -144,7 +152,7 @@ def write_artifact_index(root: str | Path) -> None:
         ],
         "top_level_indexes": [
             name
-            for name in ("README.md", "manifest.json", "summary.json", "artifact_index.json", "sweep.csv", "sweep.json")
+            for name in ("README.md", "manifest.json", "artifact_index.json", "sweep.csv", "sweep.json")
             if (root_path / name).exists()
         ],
     }
