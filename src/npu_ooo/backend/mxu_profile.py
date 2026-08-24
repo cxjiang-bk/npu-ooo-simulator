@@ -22,6 +22,8 @@ from .contracts import BackendCapabilities
 
 
 _PROFILE_FORMAT = "npu_ooo.systolic_mxu_profile.v1"
+_ISOLATED_MATMUL_INTERVAL = "compute_start_to_compute_done"
+_DESCRIPTOR_INTERVAL = "descriptor_issue_to_done"
 
 
 def _positive_int(value: object, *, field_name: str) -> int:
@@ -83,6 +85,7 @@ class SystolicMXUProfileTimingProvider:
     source_metadata: Mapping[str, Any] = field(default_factory=dict)
     unmatched_matmul: str = "analytical"
     profile_path: str | None = None
+    interval: str | None = None
     fallback: TimingModel = field(default_factory=AnalyticalTimingModel)
 
     @classmethod
@@ -102,6 +105,15 @@ class SystolicMXUProfileTimingProvider:
         calibration_status = metadata.get("calibration_status", "source-derived")
         if not isinstance(calibration_status, str) or not calibration_status:
             raise ValueError("systolic MXU profile calibration_status must be a non-empty string")
+        interval = metadata.get("interval")
+        if interval is not None and interval not in {
+            _ISOLATED_MATMUL_INTERVAL,
+            _DESCRIPTOR_INTERVAL,
+        }:
+            raise ValueError(
+                "systolic MXU profile metadata.interval must be "
+                "compute_start_to_compute_done or descriptor_issue_to_done"
+            )
         unmatched_matmul = payload.get("unmatched_matmul", "analytical")
         if unmatched_matmul not in {"analytical", "error"}:
             raise ValueError("systolic MXU profile unmatched_matmul must be analytical or error")
@@ -150,6 +162,7 @@ class SystolicMXUProfileTimingProvider:
             calibration_status=calibration_status,
             source_metadata=dict(metadata),
             unmatched_matmul=unmatched_matmul,
+            interval=interval,
         )
 
     @classmethod
@@ -167,6 +180,7 @@ class SystolicMXUProfileTimingProvider:
             source_metadata=provider.source_metadata,
             unmatched_matmul=provider.unmatched_matmul,
             profile_path=str(profile_path),
+            interval=provider.interval,
             fallback=provider.fallback,
         )
 
@@ -184,6 +198,8 @@ class SystolicMXUProfileTimingProvider:
                 "profile_calibration_status": self.calibration_status,
                 "unmatched_matmul": self.unmatched_matmul,
                 "non_matmul_fallback": getattr(self.fallback, "name", "analytical"),
+                "profile_interval": self.interval,
+                "isolated_matmul_compatible": self.interval in (None, _ISOLATED_MATMUL_INTERVAL),
             },
         )
 
@@ -196,12 +212,19 @@ class SystolicMXUProfileTimingProvider:
             "non_matmul_fallback": getattr(self.fallback, "name", "analytical"),
             "profile_path": self.profile_path,
             "profile_calibration_status": self.calibration_status,
+            "interval": self.interval,
             **dict(self.source_metadata),
         }
 
     def timing(self, task: ExecutionTask, machine: MachineConfig) -> TaskTimingSpec:
         if task.primitive != "matmul":
             return self.fallback.timing(task, machine)
+        if self.interval == _DESCRIPTOR_INTERVAL:
+            raise ValueError(
+                "systolic MXU profile uses descriptor_issue_to_done, which cannot be "
+                "applied to the isolated matmul payload; use a compute_start_to_compute_done "
+                "profile or change the backend payload boundary"
+            )
         shape = self._task_shape(task)
         if shape is not None:
             for entry in self.entries:

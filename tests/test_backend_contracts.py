@@ -147,6 +147,34 @@ class BackendContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no calibrated matmul tile"):
             provider.timing(task, minimal_machine_config())
 
+    def test_descriptor_interval_profile_cannot_be_used_for_isolated_matmul(self) -> None:
+        from npu_ooo.backend import SystolicMXUProfileTimingProvider
+
+        provider = SystolicMXUProfileTimingProvider.from_dict(
+            {
+                "format": "npu_ooo.systolic_mxu_profile.v1",
+                "metadata": {"interval": "descriptor_issue_to_done"},
+                "matmul_profiles": [
+                    {
+                        "shape": {"m": 4, "n": 12, "k": 8},
+                        "duration_cycles": 31,
+                        "initiation_interval_cycles": 10,
+                    }
+                ],
+            }
+        )
+        task = ExecutionTask(
+            "matmul.full-interval",
+            "tile.0",
+            "matmul",
+            "matmul",
+            "MXU",
+            attributes={"m_tile": 4, "n_tile": 12, "k_tile": 8},
+        )
+        self.assertFalse(provider.capabilities.attributes["isolated_matmul_compatible"])
+        with self.assertRaisesRegex(ValueError, "cannot be applied to the isolated matmul"):
+            provider.timing(task, minimal_machine_config())
+
     def test_capability_validation_rejects_unsupported_payload(self) -> None:
         model = build_elementwise_model(rows=8, cols=8)
         instance = model.instantiate(build_elementwise_case())

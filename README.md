@@ -564,7 +564,9 @@ PYTHONPATH=src python3 -m npu_ooo.cli import-rtl-trace \
 
 默认的 `compute_start_to_compute_done` 才能映射现有 isolated `matmul` primitive；
 `descriptor_issue_to_done` 是显式的 full descriptor interval，必须结合 profile metadata
-解释，不能直接当作单个 MXU 阵列 latency。
+解释，不能直接当作单个 MXU 阵列 latency。当前 provider 会读取该 metadata，并在它被
+用于 isolated `matmul` 时显式报错；只有改变 backend payload 边界后，才应为 descriptor
+interval 增加新的 provider/primitive contract。
 
 批量比较使用 `sweep-two-mm`。它对每个 architecture/policy/window/ROB 组合重新执行相同的 2mm lowering 和 simulator，并为每个组合写入独立目录：
 

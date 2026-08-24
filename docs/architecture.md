@@ -942,7 +942,10 @@ shape 和 non-MXU analytical fallback，不能用 timing query 次数代替 cove
 当前 RTL `done_if.out done` 包含 instruction manager、read generation、matrix control 和
 PSB write 链路。因而只有 compute interval 可以直接校准当前 isolated `matmul` payload；
 descriptor interval 必须被视为更大的 backend payload 边界，不能未经说明地复用为阵列
-compute latency。Importer 是离线格式转换器，不读取 VCD/VPD/FSDB，也不绑定某个仿真工具。
+compute latency。`SystolicMXUProfileTimingProvider` 会读取 profile 的 interval metadata，
+并拒绝将 descriptor interval 直接用于当前 isolated `matmul` payload；若要支持该区间，
+必须先增加对应的 full-instruction backend payload contract。Importer 是离线格式转换器，
+不读取 VCD/VPD/FSDB，也不绑定某个仿真工具。
 
 `--address-scoreboard` 启用 device-side range scoreboard：根据相同 `tensor/memory` 上的 `BufferRegion` 重叠关系，在 issue 前检查 active task 并产生 RAW/WAR/WAW stall；COMPLETE 后释放范围并继续调度。当前地址来自 canonical `ExecutionTask` metadata，尚不是从真实 TISA binary 动态解析出的硬件 scoreboard。
 

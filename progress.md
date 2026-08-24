@@ -593,3 +593,12 @@ git diff --check: passed
 - 默认 unmatched Matmul 为 `error`；只有显式选择 analytical fallback 才允许混合 timing。
 - 当前仍未接入 VCD/VPD/FSDB、VCS、Verilator 或 SCALE-Sim exporter；下一阶段是连接真实
   trace exporter，并校验 RTL signal boundary 与 TISA backend payload boundary。
+
+## 2026-08-24：阶段 11.4 interval safety guard
+
+- `SystolicMXUProfileTimingProvider` 读取 profile metadata 中的 `interval`；旧 profile 无该
+  字段时保持兼容，compute interval 仍可用于 isolated matmul。
+- provider 对 `descriptor_issue_to_done` profile 的 isolated `matmul` timing 查询显式失败，
+  并在 capability metadata 中标记 `isolated_matmul_compatible=false`。
+- 新增回归覆盖该拒绝路径；后续若要使用 descriptor-to-PSB latency，必须先把
+  `CodegenBackend` payload 边界提升为 full MXU instruction。
