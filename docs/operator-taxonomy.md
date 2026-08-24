@@ -25,9 +25,12 @@ TISA-like scheduler 应看到 `OpType=SOFTMAX` 以及它的 `TileMem/UnitMap`，
 
 每个 semantic tile 在 TISA 层至少形成一组 instruction。若该 tile 的 backend
 payload 跨越 DMA、Tensor、Vector 等 EU，compiler 必须按 EU 边界拆成多条
-TISA instruction，并用 typed dependencies 串联；同一个 EU 内的多个 primitive
-（例如 Softmax 的 max/exp/sum/normalize）可以保留在同一条 TISA instruction
-的 payload 中。每条 TISA instruction 仍只绑定一个主要 UnitMap 类别。
+TISA instruction，并用 typed dependencies 串联。同一个 EU 内也不能仅因为 resource
+相同就合并 primitive：Softmax 的 `reduce_max/exp/reduce_sum/normalize` 存在跨 reduction
+tile barrier，粗粒度 contraction 会把合法 primitive DAG 变成有环 TISA graph。当前按
+`resource + primitive` 形成 instruction；后续只有在证明 group contraction 保持 DAG、
+operand 和 completion 语义时才允许 payload fusion。每条 TISA instruction 仍只绑定一个
+主要 UnitMap 类别，并通过 `semantic_family` 保留所属 Softmax/Norm 等高层语义。
 
 每条 semantic tile instruction 至少形成：
 

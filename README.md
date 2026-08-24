@@ -19,7 +19,7 @@ PyTorch / ONNX / StableHLO
   -> 总周期、runtime/device 分解、stall 和泳道图
 ```
 
-当前已经具备 2mm、residual-add、row-reduce、softmax 和 RMSNorm 五条可执行算子闭环，并新增一个 `RMSNorm -> Matmul -> ResidualAdd` decoder block 混合图。混合图通过 lowering registry 按拓扑逐算子展开，再按显式 tensor edge 和 root-memory region overlap 建立跨算子依赖。所有 workload 都经过模型实例化、显式 tiling、primitive execution graph，以及基于 MachineConfig 的 sequential/static-pipeline/dynamic-ready-queue analytical scheduler。输出包含总周期、等待分解和 Perfetto/Chrome Trace 事件；数值仍标记为 analytical，尚未宣称 RTL cycle-accurate。
+当前已经具备 2mm、residual-add、row-reduce、softmax 和 RMSNorm 五条可执行算子闭环，并新增一个 `RMSNorm -> Matmul -> ResidualAdd` decoder block 混合图。混合图通过 lowering registry 按拓扑逐算子展开，再按显式 tensor edge 和 root-memory region overlap 建立跨算子依赖。旧 benchmark 命令保留 primitive scheduler baseline；自动 `compile-model` 路径默认消费 `TISAProgram/BackendArtifact`，在 TISA issue 后执行绑定 payload。输出包含总周期、等待分解、TISA/primitive 双层泳道和 Perfetto/Chrome Trace 事件；数值仍标记为 analytical，尚未宣称 RTL cycle-accurate。
 
 模型层是必要的：论文 benchmark 同时覆盖 ResNet50、BERT、GPT-J、LLaMA2 和 DeepSeek-R1，并区分 CNN、Transformer、prefill、decode、batch、sequence length 和 dtype。Operator IR 负责描述“一个算子做什么”，Model IR 负责描述“哪些算子以什么拓扑、重复次数和运行阶段组成一个 workload”。
 
@@ -132,7 +132,8 @@ out/attention-dynamic/
 
 当前已有的 primitive baseline 命令仍直接生成 `ExecutionGraph`，因此它们的
 `03_tisa/` 可能暂时为空；`compile-model` 路径已经生成 `TISAProgram`/`BackendArtifact`，
-后续 TISA target scheduler 接入后，所有自动编译路径都会填充该目录。
+并默认使用 TISA target scheduler。需要旧的全局 primitive 调度对照时，显式传入
+`--scheduler-target primitive`。
 
 阶段 artifact 只保存在编号目录中，不再在实验目录顶层创建副本或兼容性符号链接。
 复用旧版本生成的 `--output-dir` 时，已知的顶层扁平 artifact 和符号链接会自动删除。
@@ -254,8 +255,9 @@ PYTHONPATH=src:. PJRT_DEVICE=CPU /usr/bin/python3.12 -m npu_ooo.cli compile-mode
 
 这条命令真实执行
 `torch.export -> torch_xla.stablehlo.exported_program_to_stablehlo -> official verifier ->
-Canonical Graph -> TISA`。当前完整 block 结果为 13 个 semantic operators、33 tiles、
-112 TISA instructions、134 primitive tasks；与直接 TorchExport 路径的结构计数一致。
+Canonical Graph -> TISA`。修正同资源 composite primitive 的 TISA 分组后，当前完整 block
+结果为 13 个 semantic operators、33 tiles、120 TISA instructions、134 primitive tasks；
+与直接 TorchExport 路径的结构计数一致。
 torch-xla 合法地把 V projection 排到 Softmax 之后，因此不要求两条路径的 SSA 名称和
 拓扑序逐项相同。
 
@@ -279,7 +281,9 @@ TISAProgram、backend payload、周期汇总和泳道图。当前官方路径已
 row-wise 形态，或由 reshape 严格变换成 `[1, prod(outer), hidden]`；不满足时显式失败。
 尚未实现的是完整
 torch-xla/XLA legalization、动态 shape、通用 tuple result、复杂 region/layout、完整标准
-模型 one-block preset 和 TISA device scheduler。不能把官方 verifier 和这些受约束的
+模型 one-block preset 和 RuntimeSubmission。TISA device scheduler 已接入 analytical
+backend，但尚未建模论文的真实 dispatch latency 和 RTL queue 微结构。不能把官方
+verifier 和这些受约束的
 recovery pass 等同于完整 XLA Graph Compiler。
 
 ## 第一条闭环
@@ -298,7 +302,9 @@ recovery pass 等同于完整 XLA Graph Compiler。
   -> Static/Dynamic 对比泳道图
 ```
 
-ARU/reduction、Attention、模型 proxy 和多架构 sweep 已在该 baseline 上扩展；下一步重点转向自动 frontend、runtime submission 和热插拔 backend。
+ARU/reduction、Attention、模型 proxy 和多架构 sweep 已在该 baseline 上扩展；自动 frontend、
+第一版 analytical TISA device scheduler 和 TISA-first backend codegen 已接入，下一步重点是
+runtime submission 和 timing/event backend 校准。
 
 下一条开发路径将替换手写 graph 入口：
 

@@ -179,6 +179,9 @@ class TISAProgram:
         if not self.program_id:
             issues.append("TISA program id must not be empty")
         ids = {instruction.tisa_id for instruction in self.instructions}
+        instruction_index = {
+            instruction.tisa_id: index for index, instruction in enumerate(self.instructions)
+        }
         if len(ids) != len(self.instructions):
             issues.append("TISA instruction ids must be unique")
         for instruction in self.instructions:
@@ -187,6 +190,11 @@ class TISAProgram:
                 if dependency.source not in ids:
                     issues.append(
                         f"TISA instruction '{instruction.tisa_id}' references unknown dependency '{dependency.source}'"
+                    )
+                elif instruction_index[dependency.source] >= instruction_index[instruction.tisa_id]:
+                    issues.append(
+                        f"TISA instruction '{instruction.tisa_id}' dependency '{dependency.source}' "
+                        "must precede it in program order"
                     )
         return tuple(issues)
 
@@ -217,20 +225,95 @@ class BackendArtifact:
     def validate(self) -> tuple[str, ...]:
         issues = list(self.program.validate())
         issues.extend(self.execution_graph.validate())
-        instruction_ids = {instruction.tisa_id for instruction in self.program.instructions}
+        instructions = {
+            instruction.tisa_id: instruction for instruction in self.program.instructions
+        }
+        instruction_ids = set(instructions)
+        task_owners: dict[str, str] = {}
         for tisa_id, task_ids in self.payloads.items():
             if tisa_id not in instruction_ids:
                 issues.append(f"backend payload references unknown TISA instruction '{tisa_id}'")
+                continue
+            if not task_ids:
+                issues.append(f"backend payload for TISA instruction '{tisa_id}' must not be empty")
+                continue
+            payload_resources: set[str] = set()
             for task_id in task_ids:
+                previous_owner = task_owners.get(task_id)
+                if previous_owner is not None:
+                    issues.append(
+                        f"backend task '{task_id}' belongs to both '{previous_owner}' and '{tisa_id}'"
+                    )
+                else:
+                    task_owners[task_id] = tisa_id
                 try:
                     task = self.execution_graph.task(task_id)
                 except KeyError:
                     issues.append(f"backend payload references unknown task '{task_id}'")
                     continue
-                if task.tile_id != next(
-                    instruction.tile_id for instruction in self.program.instructions if instruction.tisa_id == tisa_id
-                ):
+                payload_resources.add(task.resource)
+                if task.tile_id != instructions[tisa_id].tile_id:
                     issues.append(f"backend payload task '{task_id}' is attached to the wrong TISA tile")
+            if len(payload_resources) > 1:
+                issues.append(
+                    f"backend payload for TISA instruction '{tisa_id}' spans multiple resources: "
+                    + ", ".join(sorted(payload_resources))
+                )
+        for instruction in self.program.instructions:
+            if instruction.payload_ref is not None and instruction.tisa_id not in self.payloads:
+                issues.append(
+                    f"TISA instruction '{instruction.tisa_id}' has no backend payload"
+                )
+        for task in self.execution_graph.tasks:
+            if task.task_id not in task_owners:
+                issues.append(f"backend task '{task.task_id}' is not owned by a TISA payload")
+
+        dependency_sources = {
+            instruction.tisa_id: {
+                dependency.source for dependency in instruction.dependencies
+            }
+            for instruction in self.program.instructions
+        }
+
+        # A primitive payload may expose an edge that skips one or more
+        # semantic stages.  Validation checks that the owner-to-owner ordering
+        # is reachable in the TISA dependency DAG, rather than requiring every
+        # backend-internal edge to be repeated as a direct TISA edge.
+        dependency_closure: dict[str, set[str]] = {}
+
+        def ancestors(tisa_id: str, active: set[str] | None = None) -> set[str]:
+            cached = dependency_closure.get(tisa_id)
+            if cached is not None:
+                return set(cached)
+            visiting = set() if active is None else active
+            if tisa_id in visiting:
+                return set()
+            visiting.add(tisa_id)
+            result: set[str] = set()
+            for source in dependency_sources.get(tisa_id, set()):
+                if source not in instructions:
+                    continue
+                result.add(source)
+                result.update(ancestors(source, visiting))
+            visiting.remove(tisa_id)
+            dependency_closure[tisa_id] = set(result)
+            return result
+
+        for tisa_id in instructions:
+            ancestors(tisa_id)
+        for task in self.execution_graph.tasks:
+            owner = task_owners.get(task.task_id)
+            if owner is None:
+                continue
+            for predecessor_id in task.predecessors:
+                predecessor_owner = task_owners.get(predecessor_id)
+                if predecessor_owner is None or predecessor_owner == owner:
+                    continue
+                if predecessor_owner not in dependency_closure.get(owner, set()):
+                    issues.append(
+                        f"backend task edge '{predecessor_id}' -> '{task.task_id}' is not "
+                        f"ordered by TISA dependency '{predecessor_owner}' -> '{owner}'"
+                    )
         return tuple(issues)
 
     def to_dict(self) -> dict[str, Any]:

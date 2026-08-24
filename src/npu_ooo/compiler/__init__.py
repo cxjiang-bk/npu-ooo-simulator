@@ -30,6 +30,13 @@ from .passes import (
     default_pass_manager,
 )
 from .planner import SchedulePlanner, default_schedule_planner
+from .tisa_first import (
+    AnalyticalBackendCodegen,
+    TISAFirstResult,
+    TISASemanticBuilder,
+    TISAStage,
+    compile_tisa_first,
+)
 
 __all__ = [
     "CompilerDiagnostic",
@@ -59,4 +66,9 @@ __all__ = [
     "default_pass_manager",
     "SchedulePlanner",
     "default_schedule_planner",
+    "AnalyticalBackendCodegen",
+    "TISAFirstResult",
+    "TISASemanticBuilder",
+    "TISAStage",
+    "compile_tisa_first",
 ]

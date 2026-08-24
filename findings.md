@@ -271,3 +271,23 @@ ExecuTorch / StableHLO
   对 `[2, 4, 8]` 则先 reshape 为 `[1, 8, 8]`，再以 feature index 1 让每个 outer row
   独立沿 hidden 轴归一化。因此 recovery 必须同时验证 reshape 元素数、hidden 维、
   feature index、单用途链和 reshape-back shape，不能只按 op 名称融合。
+
+## 2026-08-24：TISA scheduler 边界验证
+
+- primitive DAG 合法不代表任意 coarse grouping 后的 TISA DAG 仍合法。同一 Softmax tile
+  中把 `reduce_max/exp/reduce_sum/normalize` 仅按 Vector resource 合并，会让跨 reduction
+  tile barrier 在 group graph 上同时产生双向依赖。第一版必须按 `resource + primitive`
+  建立 TISA instruction；未来只有在证明 group contraction 不产生环时才能做 payload fusion。
+- Static/Dynamic 公平对比现在可以共享完全相同的 `BackendArtifact`：scheduler 只选择
+  `TISAInstruction`，每条指令 issue 后才在绑定 EU 上按本地拓扑顺序运行 payload，primitive
+  不进入全局 ready window。
+- 双层 trace 必须同时保留 instruction 和 payload：TISA lane 用于观察 descriptor issue、
+  dependency/window/ROB 行为，primitive lane 用于解释 instruction duration 和具体 EU 占用；
+  只画其中一层都无法区分 scheduler 决策与 backend timing。
+
+## 2026-08-24：当前 TISA simulator 策略语义
+
+- 阶段 9.9 已将 compiler 顺序改为 `TileGraph -> TISAProgram -> backend capability/payload lowering -> BackendArtifact`。`ExecutionGraph` 只由 analytical payload backend 生成，不能再反向决定 TISA 分组；backend owner edge 只需在 TISA dependency DAG 中可达即可。
+- `simulate_tisa_artifact(policy="static_pipeline")` 的实际语义是 TISA program-order issue：可见窗口只保留最老的一条，遇到依赖、资源、tile window 或地址冲突时不绕过；它不使用 `StaticPipelineConfig`，该配置在 TISA backend 中会被拒绝。它因此是静态/in-order TISA baseline，不是论文完整的 static dual/triple stage reservation。
+- `dynamic_ready_queue` 在 `dependency_window` 和 `ready_queue_depth` 截断后的 waiting window 中收集候选；`critical_path` 选择剩余 payload critical path 最大者，`oldest_first` 按 TISA program order 选择。它可以绕过窗口内阻塞的早期指令，并在不同 EU 空闲时同一 cycle 发射多条 TISA instruction。
+- 当前 TISA payload 先按 primitive DAG 做本地拓扑排序，再将 duration 相加；父指令 issue 后 payload 在一个 EU instance 上 run-to-completion。TISA simulator 尚未使用 `issue_width`、`initiation_interval_cycles`、`pipeline_depth`，也没有真实 dispatch latency、partial-ready condition、memory bank/port 或 runtime command submission。

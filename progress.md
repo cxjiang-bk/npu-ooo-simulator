@@ -465,4 +465,55 @@ git diff --check: passed
 - StableHLO 官方 parser/verifier、reducer region 与真实 torch-xla exporter 已接入；
   通用 tuple/layout/dynamic-shape smoke 尚未完成。
 - 完整 Transformer block、Conv/ResNet 与模型加载 CLI 尚未实现；rank-3 Linear 已支持共享二维 weight/bias 的 batch broadcast，但更复杂的 batch broadcasting 尚未覆盖。
-- SchedulePlanner 仍是确定性 shape-aware heuristic，不是 architecture-aware cost model；simulator 仍消费 backend primitive graph，而不是直接执行 TISA device scheduler。
+- SchedulePlanner 仍是确定性 shape-aware heuristic，不是 architecture-aware cost model；该时点 simulator 仍消费 backend primitive graph，阶段 9.8 已在后续完成 TISA target 接入。
+
+# 2026-08-24：阶段 9.8 TISA Device Scheduler 启动
+
+## 本轮目标
+
+- 将 `TISAProgram` 从编译描述产物提升为 device scheduler 的真实输入。
+- Static 按 TISA program order 发射且不 bypass；Dynamic 在 reception/dependency window 内选择 ready TISA instruction。
+- 一条 TISA instruction issue 后才激活对应 backend primitive payload，禁止 primitive 跨 instruction 进入全局 OOO window。
+- trace 同时记录 TISA ISSUE/COMPLETE 和 primitive START/COMPLETE；`compile-model` 默认使用 TISA target，旧算子命令继续保留 primitive baseline。
+
+## 实施拆分
+
+1. 加强 TISAProgram/BackendArtifact payload 完整性与依赖一致性校验。
+2. 新增 TISA device event simulator 和 Static/Dynamic policy。
+3. 接入 compile-model、summary/manifest 和双层泳道图。
+4. 增加 micro golden case 与完整 attention 回归。
+5. 下一批再重构 `TileGraph -> TISA -> backend primitive` 的 codegen 方向。
+
+## 启动时基线
+
+- 工作区已有上一轮泳道图图例/cycle 轴修改：`src/npu_ooo/trace/export.py`、`tests/test_simulator.py`。
+- Python 3.12 全量回归：90 tests passed。
+- attention project-StableHLO 路径：33 tiles / 112 TISA instructions / 134 primitive tasks / 590 primitive-baseline analytical cycles。
+
+## 遇到的问题
+
+| 问题 | 尝试次数 | 处理 |
+| --- | ---: | --- |
+| 强化 TISA dependency 校验后，Softmax/RMSNorm/LayerNorm 出现 dependency source 位于 consumer 之后 | 1 | 根因是旧 codegen 按 tile/primitive 顺序输出而非 TISA DAG 拓扑顺序；新增稳定拓扑排序，并保留 `source_program_order` provenance |
+## 2026-08-24：阶段 9.8 TISA device scheduler（第一版完成）
+
+- 修复 TISA codegen 的粗粒度分组：由 `resource + compute` 改为 `resource + primitive`，避免 Softmax reduction barrier 在合并后形成伪 TISA cycle；目标前端/仿真测试 42 项通过。
+- 新增独立 TISA scheduler micro-test，覆盖 Static/Dynamic 共用 artifact、critical-path reorder、dependency completion、payload 本地顺序执行、window=1 和非法 payload 契约；5 项通过。
+- `compile-model` 默认调度目标切换为 `tisa`，保留 `--scheduler-target primitive` 兼容 baseline；新增 `tisa_instructions.csv` 和 TISA/primitive 双层泳道输出。
+- 首次 CLI 回归失败：`tisa_instructions.csv` 将 `TaskTiming.task_id` 展开为未声明列；已改为显式映射到 `tisa_id`，避免 CSV schema 混用。
+- 完整 attention official-StableHLO smoke：13 semantic operators / 33 tiles / 120 TISA instructions / 134 primitive tasks；Static=876 cycles，Dynamic critical-path=564 cycles。
+- Static/Dynamic 的 `tisa_program.json` 与 `backend_artifact.json` SHA-256 分别完全一致；两边 `tisa_decision_count=120`，证明策略只改变 issue order。
+- 双层 PNG 已人工检查：TISA/DMA、TISA/MXU、TISA/ARU 与 primitive DMA/MXU/ARU lane 同时可见，图例和 cycle 刻度正常。
+- 目标回归 47 项通过；最终完整回归 `PYTHONPATH=src:. /usr/bin/python3.12 -m unittest discover -s tests -q` 为 95 tests passed。
+- 显式 primitive 兼容 smoke 通过：manifest 为 `scheduler_target=primitive`，instruction timing 为空且不生成 `tisa_instructions.csv`。
+
+## 2026-08-24：阶段 9.9 TISA-first Backend Codegen 完成
+
+- 目标：将 compiler 顺序从 `primitive ExecutionGraph -> TISA` 调整为 `TileGraph -> TISAProgram -> backend payload`，同时保留现有 analytical lowerer 作为第一种 payload backend。
+- 设计边界：`TISASemanticBuilder` 只读取 `OperatorGraph/ScheduleSpec/TileGraph/MachineConfig`，生成 semantic `op_type`、`TISAStage`、logical operands 和 typed dependencies；`AnalyticalBackendCodegen` 再调用现有 lowerer 生成 `ExecutionGraph` 并按稳定 `(tile_id, tisa_stage)` contract 绑定 payload。
+- 第一批覆盖 `matmul/batched_matmul/gemv`、`elementwise/residual_add`、`reduce`、`softmax`、`rmsnorm`、`layernorm`；未覆盖的 primitive 必须在 backend binding 阶段显式失败，不能静默丢 task。
+- 已完成 TISA-first 主路径：`compile_operator_graph()` 先构造并传递唯一 `TileGraph` 给 `TISASemanticBuilder`，再调用 `AnalyticalBackendCodegen`；旧的 `ExecutionGraph -> TISA` helper 已从 pipeline 移除。
+- backend lowerer 通过稳定的 `(tile_id, primitive)` payload contract 绑定任务；`lower_mixed_graph()` 支持复用调用方 TileGraph，避免 backend 阶段重复 tiling。
+- 修正 Softmax 的跨 tile sum barrier 与 LayerNorm 的 variance barrier；验证器改为检查 backend owner edge 在 TISA dependency DAG 中可达，避免绑定到某个 primitive lowerer 的直接边形状。
+- `TISAInstruction.op_type` 现在表示 scheduler-visible stage（如 `load`、`matmul`、`reduce_sum`、`load_transpose`），`attributes.semantic_op_type` 保留 composite semantic operator family，兼顾论文的 stage issue 粒度与前端语义 provenance。
+- 验证：`tests.test_frontend_compiler` + `tests.test_tisa_simulator` 共 38 项通过；`unittest discover -s tests -q` 共 95 项通过；`compileall` 通过。

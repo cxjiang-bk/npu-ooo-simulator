@@ -11,8 +11,9 @@ from npu_ooo.simulator import (
     TimingModel,
     TraceEvent,
     simulate_execution_graph,
+    simulate_tisa_artifact,
 )
-from npu_ooo.ir import ExecutionGraph
+from npu_ooo.ir import BackendArtifact, ExecutionGraph
 from npu_ooo.arch import MachineConfig
 
 
@@ -37,6 +38,26 @@ def schedule_execution_graph(
     normalized_policy = policy.value if isinstance(policy, SchedulerPolicy) else str(policy)
     return simulate_execution_graph(
         graph,
+        machine,
+        normalized_policy,
+        timing_model=timing_model or AnalyticalTimingModel(),
+        config=simulator_config,
+    )
+
+
+def schedule_tisa_program(
+    artifact: BackendArtifact,
+    machine: MachineConfig,
+    policy: SchedulerPolicy | str = SchedulerPolicy.STATIC_PIPELINE,
+    *,
+    timing_model: TimingModel | None = None,
+    simulator_config: SimulatorConfig | None = None,
+) -> ScheduleResult:
+    """Schedule TISA descriptors, activating only their bound payload group."""
+
+    normalized_policy = policy.value if isinstance(policy, SchedulerPolicy) else str(policy)
+    return simulate_tisa_artifact(
+        artifact,
         machine,
         normalized_policy,
         timing_model=timing_model or AnalyticalTimingModel(),

@@ -622,8 +622,8 @@ Import
   -> Liveness / Memory Planning
   -> Tile Planning
   -> Region Dependency Analysis
-  -> Primitive Lowering
-  -> TISAProgram / ExecutionGraph Verify
+  -> TISA semantic builder / TISAProgram Verify
+  -> Backend payload lowering / BackendArtifact Verify
 ```
 
 “统一流程”不意味着所有算子使用同一个 lowerer。Matmul、Reduce、Softmax、Conv2D 仍然需要语义专用 lowering，但由 PassManager 通过 registry 调用；benchmark 只提供输入模型和 case 参数，不再负责 lower 顺序、buffer handoff 或 scheduler 分支。
@@ -777,7 +777,12 @@ static_pipeline
 dynamic_ready_queue
 ```
 
-它应从已进入设备窗口的 `TISAInstruction` 中选择下一条可发射 tile。当前实现从 `ExecutionTask` 选择 task，是兼容 baseline；TISA 对齐后需要增加 `TISAInstruction -> primitive backend expansion`，避免 scheduler 在 primitive 粒度过早做决策。Static/Dynamic 的公平比较必须共用同一 `RuntimeSubmission`、TISA metadata、地址、依赖、timing 和 MachineConfig。
+`compile-model` 默认从已进入设备窗口的 `TISAInstruction` 中选择下一条可发射 tile；
+`--scheduler-target primitive` 保留原来从 `ExecutionTask` 选择 task 的兼容 baseline。
+TISA instruction issue 后，绑定 payload 才在所选 EU instance 上按本地拓扑顺序运行，
+payload primitive 不进入全局 OOO window。Static/Dynamic 共用同一份 `TISAProgram`、
+`BackendArtifact`、地址、依赖、timing 和 MachineConfig；RuntimeSubmission 尚未接入，
+当前等价于一次性提交整个 descriptor stream。
 
 ### 8.3 热插拔 Backend 分层
 
@@ -864,16 +869,16 @@ Simulator 维护：
 ```text
 SchedulerPolicy
   -> baseline: 从 visible ready queue 选择 ExecutionTask
-  -> target: 从 per-unit TISA waiting/issue queue 选择 TISAInstruction
+  -> TISA target: 从 descriptor/WQ visible window 选择 TISAInstruction
 
 TimingModel / EventBackend
   -> baseline: 计算 ExecutionTask issue/start/complete
-  -> target: 将已 issue 的 TISAInstruction 展开为 backend primitive timing
+  -> TISA target: 将已 issue 的 TISAInstruction 展开为 instruction-local backend primitive timing
   -> 维护 unit queue、II、ROB、dependency window、tile window
   -> 在 COMPLETE 时唤醒后继 task
 ```
 
-`AnalyticalTimingModel` 只消费 `ExecutionTask.duration_cycles` 和 `MachineConfig` 的 unit 默认值；它是可替换的 timing provider，不代表真实硬件。`SimulatorConfig` 可以覆盖 instruction queue、ROB、ready queue、dependency window 和 max in-flight tiles。
+`AnalyticalTimingModel` 只消费 `ExecutionTask.duration_cycles` 和 `MachineConfig` 的 unit 默认值；它是可替换的 timing provider，不代表真实硬件。TISA target 把一个 payload 内 primitive duration 按本地拓扑顺序相加，形成该 instruction 的 run-to-completion duration。`SimulatorConfig` 可以覆盖 instruction queue、ROB、ready queue、dependency window 和 max in-flight tiles。
 
 `TimingTableModel` 是第一种外部校准入口：它从 JSON 读取 primitive/resource/task 的 duration 和 initiation interval，未命中的 task 回退到 `AnalyticalTimingModel`。因此 SCALE-Sim、RTL waveform 或硬件 counter 的局部结果可以先转换为 table，再通过同一 scheduler 重放；manifest 的 `backend` 会区分 table 名称和 analytical。
 
@@ -893,7 +898,7 @@ artifact_index.json
 03_tisa/{tisa_program.json,compiled_artifact.json}
 04_backend/{machine.json,backend_artifact.json,execution_graph.json}
 05_runtime/address_dependencies.json
-06_simulation/{summary.json,tasks.csv}
+06_simulation/{summary.json,tasks.csv,tisa_instructions.csv}
 07_trace/{perfetto.json,swimlane.svg,swimlane.png}
 ```
 

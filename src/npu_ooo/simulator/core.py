@@ -339,12 +339,19 @@ class SimulationResult:
     timings: tuple[TaskTiming, ...]
     events: tuple[TraceEvent, ...]
     metrics: Mapping[str, Any] = field(default_factory=dict)
+    instruction_timings: tuple[TaskTiming, ...] = ()
 
     def timing(self, task_id: str) -> TaskTiming:
         for timing in self.timings:
             if timing.task_id == task_id:
                 return timing
         raise KeyError(task_id)
+
+    def instruction_timing(self, tisa_id: str) -> TaskTiming:
+        for timing in self.instruction_timings:
+            if timing.task_id == tisa_id:
+                return timing
+        raise KeyError(tisa_id)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -353,6 +360,9 @@ class SimulationResult:
             "graph_id": self.graph_id,
             "total_cycles": self.total_cycles,
             "timings": [timing.to_dict() for timing in self.timings],
+            "instruction_timings": [
+                timing.to_dict() for timing in self.instruction_timings
+            ],
             "events": [event.to_dict() for event in self.events],
             "metrics": dict(self.metrics),
         }
@@ -360,16 +370,21 @@ class SimulationResult:
     def perfetto_trace(self) -> dict[str, Any]:
         trace_events: list[dict[str, Any]] = []
         for event in self.events:
-            if event.event not in {"START", "COMPLETE"}:
+            if event.event in {"START", "COMPLETE"}:
+                phase = "B" if event.event == "START" else "E"
+                pid = 2 if self.instruction_timings else 1
+            elif event.event in {"TISA_ISSUE", "TISA_COMPLETE"}:
+                phase = "B" if event.event == "TISA_ISSUE" else "E"
+                pid = 1
+            else:
                 continue
-            phase = "B" if event.event == "START" else "E"
             trace_events.append(
                 {
                     "name": event.task_id,
                     "cat": event.resource,
                     "ph": phase,
                     "ts": event.timestamp,
-                    "pid": 1,
+                    "pid": pid,
                     "tid": f"{event.resource}[{event.instance}]",
                     "args": dict(event.details),
                 }

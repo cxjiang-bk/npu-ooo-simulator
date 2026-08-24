@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+import tempfile
 
 from npu_ooo.arch import minimal_machine_config
 from npu_ooo.ir import AccessType, BufferRegion, ExecutionGraph, ExecutionTask
@@ -9,9 +11,53 @@ from npu_ooo.scheduler import (
     schedule_execution_graph,
 )
 from npu_ooo.simulator import TimingTableModel
+from npu_ooo.trace import write_svg
 
 
 class EventSimulatorTest(unittest.TestCase):
+    def test_swimlane_svg_contains_primitive_legend_and_cycle_axis(self) -> None:
+        graph = ExecutionGraph(
+            graph_id="trace_micro",
+            tasks=(
+                ExecutionTask(
+                    "load_a",
+                    "tile0",
+                    "micro",
+                    "load_transpose",
+                    "DMA",
+                    duration_cycles=5,
+                    program_order=0,
+                ),
+                ExecutionTask(
+                    "compute",
+                    "tile0",
+                    "micro",
+                    "matmul",
+                    "MXU",
+                    predecessors=("load_a",),
+                    duration_cycles=12,
+                    program_order=1,
+                ),
+            ),
+        )
+        result = schedule_execution_graph(
+            graph,
+            minimal_machine_config(),
+            SchedulerPolicy.STATIC_PIPELINE,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "swimlane.svg"
+            write_svg(result, output, width=800)
+            svg = (output.parent / "07_trace" / output.name).read_text(encoding="utf-8")
+
+        self.assertIn('id="legend"', svg)
+        self.assertIn(">load_transpose</text>", svg)
+        self.assertIn(">matmul</text>", svg)
+        self.assertIn('id="cycle-axis"', svg)
+        self.assertIn(">Cycle</text>", svg)
+        self.assertIn(">5</text>", svg)
+        self.assertIn("issue=", svg)
+
     def test_timing_table_overrides_primitive_and_keeps_backend_name(self) -> None:
         graph = ExecutionGraph(
             graph_id="timing_table_micro",

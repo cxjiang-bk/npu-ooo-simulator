@@ -6,7 +6,7 @@
 
 ## 当前阶段
 
-阶段 9 实施中：阶段 8 已冻结最小 TISA semantic contract，并搭建从 framework bridge/ExecuTorch 或 JSON graph 到 Canonical OperatorGraph、Schedule/Tiling、TISA/Backend artifact 的前端闭环；当前需要把现有“手写 ModelSpec/benchmark graph”推进为“真实 PyTorch/torch.export -> 自动规范化 -> 自动切分 -> TISA/Backend”的可验证编译链。阶段 4-6 的 analytical primitive-task baseline 已可运行，但尚不能称为论文 TISA tile scheduler 复现；阶段 7 外部 timing/RTL 校准仍作为后续 backend 适配工作。
+阶段 9 实施中：受限的 `PyTorch -> torch.export -> torch-xla -> official StableHLO -> Canonical OperatorGraph -> TileGraph -> TISA/BackendArtifact` 前端闭环已经可运行。阶段 9.8 已把 TISA 从描述性 artifact 提升为 device scheduler 的真实输入：Static/Dynamic 在同一 `TISAProgram` 上按 TISA instruction issue，primitive payload 只能在所属 instruction 发射后执行。阶段 9.9 已完成第一版 TISA-first codegen：先由 `TileGraph` 生成 semantic `TISAProgram`，再由 analytical backend 生成并绑定 primitive payload。阶段 4-6 的 analytical primitive-task baseline 继续保留为兼容对照；RuntimeSubmission 和外部 timing/RTL backend 仍后置。
 
 阶段 9 的前端目标边界：先支持静态 shape、推理场景和小型真实 PyTorch 模型，覆盖 RMSNorm、LayerNorm、Linear/Matmul、ResidualAdd、Softmax 和 attention micrograph；不在第一轮承诺完整 ATen、动态控制流、训练语义或完整 StableHLO/MLIR 工具链。现有手写 benchmark 继续作为 canonical IR/lowering/simulator 回归基线，不能被自动前端重构破坏。
 
@@ -68,6 +68,8 @@
 | 9.5 自动 Schedule/Tiling | 用 op lowering registry 的元数据选择 tile factors、loop order、residency、stage，并生成真实边界 TileInstance | `SchedulePlanner`、`TileGraph`、shape-aware cost hooks | 改变输入 shape/tile size 会自动改变 tile 数、边界和地址；不再为每个 benchmark 写 `default_*_schedule` |
 | 9.6 TISA/Backend codegen | 从 TileGraph/semantic lowering 生成 EU-bound TISA instructions、typed deps、logical address expressions 和 primitive payload | TISA program、backend artifact、payload map、compiler manifest | 每个 semantic tile 的 DMA/Vector/Tensor 分组、依赖和 payload 可验证；生成结果能复用现有 analytical simulator |
 | 9.7 真实前端 CLI 与回归 | 增加 `compile-torch` 或 `compile-model --frontend torch-export`，统一输出 00-07 artifact；保留旧 benchmark 命令作为 baseline | CLI、golden fixtures、前后 IR dump、trace | 一条真实 PyTorch RMSNorm 命令完成 export -> graph -> tile -> TISA -> backend -> simulation，并与手写 baseline 对比周期/泳道 |
+| 9.8 TISA Device Scheduler | 让 device scheduler 消费 TISAProgram，并在 TISA issue 后原子激活绑定 payload | TISA event simulator、Static/Dynamic TISA policy、双层 trace、payload contract tests | scheduler 决策数等于 TISA instruction 数；primitive 不跨 instruction 全局重排；Static/Dynamic 共享同一 program/payload |
+| 9.9 TISA-first Backend Codegen | 调整 compiler 方向，使 TISAProgram 先于 backend primitive payload 生成 | semantic TISA builder、backend payload lowerer、capability verifier | completed：compiler 不从 ExecutionTask 反推 TISA；backend 复用入口 TileGraph；替换 payload backend 不改变 TISAProgram |
 
 ### 阶段 9 的实施顺序
 
@@ -79,6 +81,8 @@
   -> 9.5 自动 schedule/tile
   -> 9.6 TISA/backend codegen
   -> 9.7 真实前端 CLI 与回归
+  -> 9.8 TISA device scheduler
+  -> 9.9 TISA-first backend codegen
 ```
 
 每个子阶段都必须保留 JSON graph、diagnostics 和可复现测试输入；先完成 RMSNorm 单算子闭环，再扩展到 LayerNorm/Linear/attention，最后才接模型 one-block preset。RuntimeSubmission 和 TISA device scheduler 不插入 9.1-9.7 的中间步骤，避免前端问题与后端调度问题混在一起。
@@ -91,8 +95,10 @@
 - 9.3 进行中：`PassManager` 已统一 alias、推导 data edge，并加入 Linear decomposition 与 RHS transpose-to-Matmul fold；pass 前后独立 artifact dump 仍待实现。
 - 9.4 已完成首批模式：RMSNorm composite fusion 支持静态多 outer dimensions；Linear 自动拆为 transposed Matmul + broadcast Add；StableHLO primitive chain 可恢复 Softmax/LayerNorm/RMSNorm；真实 attention micrograph 保留 `QK^T -> Softmax -> PV` 三个 semantic 边界。
 - 9.5 已建立入口：新增 `SchedulePlanner`，当前封装既有确定性 shape-aware heuristic；后续再替换为 architecture-aware cost model。
-- 9.6 已可复用：前端编译 API 会继续生成现有 `TISAProgram`/`BackendArtifact`；TISA device scheduler 尚未接入，当前 simulator 仍消费 primitive payload graph。
+- 9.6 已可复用：前端编译 API 生成 `TISAProgram`/`BackendArtifact`，payload ownership、单资源约束和跨 payload dependency 已纳入 verifier；codegen 方向仍待 9.9 重构。
 - 9.7 基础入口完成：`compile-model` 支持互斥的 canonical JSON、StableHLO file 和 `--torch-module MODULE:FACTORY`，并通过 `--through-stablehlo` 选择论文形态 round-trip；StableHLO 默认 `official` 且不静默回退；均输出完整 staged artifact 和泳道图。标准模型 preset、动态 shape 与复杂输入 binding 尚未完成。
+- 9.8 已完成第一版：`compile-model` 默认使用 TISA target，Static/Dynamic 消费同一 artifact，payload run-to-completion，输出 TISA/primitive 双层 trace；attention 回归为 120 次 TISA decision / 120 instructions。
+- 9.9 已完成第一版：`TISASemanticBuilder` 只消费 graph/schedule/tile/machine，先构造 stage、logical operands 和 typed dependencies；`AnalyticalBackendCodegen` 再复用同一 `TileGraph` 生成并绑定 primitive payload。`BackendArtifact.validate()` 检查 payload ownership、单资源约束、TISA 依赖可达性和未绑定 task；覆盖 matmul/batched_matmul/gemv、elementwise/residual_add、reduce、softmax、rmsnorm、layernorm。前端+TISA 回归 38 项、全量回归 95 项通过。
 
 阶段 4-6 的“completed”表示基线闭环完成，不表示后续功能不再扩展。下一轮工作必须保持这些 baseline 的输入/输出兼容，并以自动前端和 runtime/backend 分层作为增量演进。
 
@@ -176,6 +182,9 @@
 | Transformer block handoff count 测试把 tile/task 数混同 | 1 | 依赖计数按 root-memory 相交的 store/load 边统计，默认 skeleton 为 8 |
 | timing-config 使用文档占位路径导致 FileNotFoundError | 1 | 添加仓库内 smoke table，README 改用真实路径，CLI 捕获 ValueError 输出简洁错误 |
 | 模型 preset sweep 默认维度过大导致事件仿真耗时过长 | 1 | 为 `sweep-workloads` 增加 `--model-tokens/--model-sequence/--model-head-dim/--model-intermediate` 覆盖；大规模 proxy 维度改为按模型分批运行 |
+| TISA resource-only compute grouping 产生 group-level cycle | 1 | 按 `resource + primitive` 分组并稳定拓扑排序；禁止未经 DAG contraction 验证的 payload fusion |
+| TISA CSV 展开 `task_id` 与 `tisa_id` schema 冲突 | 1 | 显式映射 instruction timing 字段，不直接展开 primitive-oriented `TaskTiming.to_dict()` |
+| 文档检索命令中的 Markdown 反引号被 shell 当作命令替换 | 1 | 后续 shell pattern 不使用反引号，改用单引号或去掉该检索项 |
 
 ## 备注
 
@@ -186,7 +195,7 @@
 - StableHLO parser 已支持 rank-2/rank-3 `dot_general`、显式 batching dimensions、rank-N activation 乘共享二维权重的 RHS batch broadcast、末两维转置元数据和 reducer/transpose attributes。
 - 新增 `SoftmaxFusionPass`、`LayerNormFusionPass`；StableHLO primitive chain 会恢复为 semantic Softmax/LayerNorm，RMSNorm 复用既有 fusion pass。
 - `compile-model --through-stablehlo` 输出 `00_frontend/generated.mlir`、`stablehlo_module.json` 和 `source_frontend_import.json`，其余阶段继续使用同一套 graph/tile/TISA/backend/simulator。
-- attention round-trip 已验证：13 semantic operators、33 tiles、112 TISA instructions、134 primitive tasks、590 analytical cycles；直接 TorchExport 与 round-trip 的 tile/instruction/task 数量一致。
+- attention round-trip 初始 primitive baseline 曾验证为 13 semantic operators、33 tiles、112 TISA instructions、134 primitive tasks、590 cycles；修复 composite 分组后当前为 120 TISA instructions/134 primitive tasks，TISA scheduler static=876、dynamic=564 cycles。
 - 当前 round-trip 的 graph metadata/provenance 与 direct path 不逐字节相同，这是预期的 frontend provenance 差异；语义类型、shape、tile count 和 TISA count 已回归。
 - textual emitter/parser 仍不是完整 StableHLO/MLIR compiler，不支持 tuple result、复杂 region、layout、动态 shape 约束和完整 XLA legalization。
 
@@ -200,7 +209,7 @@
   使用 `official`；`auto`/`textual` 为显式选项，manifest 记录 backend、版本、producer、
   verified、fallback 与原因。
 - [x] 官方 attention round-trip 与直接/旧 textual 路径对齐：13 semantic operators、
-  33 tiles、112 TISA instructions、134 primitive tasks、590 analytical cycles。
+  33 tiles；初始分组为 112 TISA/134 primitive，当前合法分组为 120 TISA/134 primitive。
 - [x] 修正 RMSNorm 的官方 StableHLO mean 语义，并让 fusion 支持
   `square -> reduce -> divide -> add -> rsqrt -> multiply`；LayerNorm fusion 调整到 RMSNorm
   之前，避免把 LayerNorm 的 variance 子链误识别为 RMSNorm。

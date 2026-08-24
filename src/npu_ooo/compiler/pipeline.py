@@ -13,26 +13,13 @@ from typing import Any, Mapping, Sequence
 
 from npu_ooo.arch import MachineConfig
 from npu_ooo.frontend import FrontendImport, OfficialStableHLOModule, StableHLOModule
-from npu_ooo.ir import (
-    AccessType,
-    BackendArtifact,
-    BufferRegion,
-    ExecutionGraph,
-    OperatorGraph,
-    ScheduleSpec,
-    TISADependency,
-    TISAInstruction,
-    TISAOperand,
-    TISAProgram,
-    TileGraph,
-    TileMem,
-    UnitMap,
-)
+from npu_ooo.ir import BackendArtifact, OperatorGraph, ScheduleSpec, TISAProgram, TileGraph, build_tile_graph
 from npu_ooo.ir.model import ModelInstance
-from npu_ooo.lowering import LoweringRegistry, default_lowering_registry, lower_mixed_graph
+from npu_ooo.lowering import LoweringRegistry, default_lowering_registry
 
 from .passes import default_pass_manager
 from .planner import default_schedule_planner
+from .tisa_first import compile_tisa_first
 
 
 @dataclass(frozen=True)
@@ -91,202 +78,6 @@ class CompiledArtifact:
         }
 
 
-def _unit_for_operator(op_type: str) -> UnitMap:
-    if op_type in {"matmul", "batched_matmul", "gemv"}:
-        return UnitMap("tensor", affinity="matrix")
-    if op_type in {"softmax", "reduce", "layernorm", "rmsnorm"}:
-        return UnitMap("vector", affinity="reduction")
-    if op_type in {"elementwise", "residual_add"}:
-        return UnitMap("vector", affinity="alu")
-    if op_type in {"reshape", "transpose"}:
-        return UnitMap("dma", affinity="view")
-    return UnitMap("scalar")
-
-
-def _unit_for_resource(resource: str) -> UnitMap:
-    """Map a backend primitive resource to its TISA-visible EU class."""
-
-    normalized = resource.lower()
-    if normalized in {"dma", "de", "copy"}:
-        return UnitMap("dma", affinity="data")
-    if normalized in {"mxu", "me", "tensor", "matrix"}:
-        return UnitMap("tensor", affinity="matrix")
-    if normalized in {"aru", "ve", "vector", "vu"}:
-        return UnitMap("vector", affinity="vector")
-    return UnitMap(normalized)
-
-
-def _semantic_group_type(operator_type: str, tasks: tuple[Any, ...]) -> str:
-    primitives = {str(task.primitive) for task in tasks}
-    if "load_transpose" in primitives:
-        return "load_transpose"
-    if primitives <= {"load", "load_transpose"}:
-        return "load"
-    if primitives <= {"store"}:
-        return "store"
-    return operator_type
-
-
-def _task_group_key(task: Any) -> tuple[str, str]:
-    primitive = str(task.primitive)
-    if primitive in {"load", "load_transpose", "store"}:
-        return str(task.resource), primitive
-    return str(task.resource), "compute"
-
-
-def _region_key(region: BufferRegion) -> tuple[Any, ...]:
-    return (
-        region.tensor,
-        region.memory,
-        region.shape,
-        region.starts,
-        region.dtype,
-        region.normalized_access,
-        region.offset_bytes,
-        region.size_bytes,
-        region.layout,
-    )
-
-
-def _operand_from_region(region: BufferRegion, index: int) -> TISAOperand:
-    return TISAOperand(
-        name=f"{region.tensor}:{region.normalized_access}:{index}",
-        tile_shape=tuple(region.shape),
-        tile_mem=TileMem(
-            base=region.tensor,
-            scope=region.memory,
-            tensor=region.tensor,
-            offset_bytes=region.offset_bytes,
-            size_bytes=region.size_bytes,
-        ),
-        access_type=region.access,
-    )
-
-
-def _dependency_kind(source: Any, target: Any) -> str:
-    source_writes = tuple(source.writes)
-    source_reads = tuple(source.reads)
-    target_writes = tuple(target.writes)
-    target_reads = tuple(target.reads)
-    if source_writes and target_reads:
-        return "RAW"
-    if source_writes and target_writes:
-        return "WAW"
-    if source_reads and target_writes:
-        return "WAR"
-    return "RAW"
-
-
-def _build_tisa_program(
-    graph: OperatorGraph,
-    execution_graph: ExecutionGraph,
-    *,
-    program_id: str,
-) -> tuple[TISAProgram, Mapping[str, tuple[str, ...]]]:
-    operators = {operator.op_id: operator for operator in graph.operators}
-    by_tile: dict[str, list[Any]] = {}
-    tile_order: dict[str, int] = {}
-    for task in execution_graph.tasks:
-        by_tile.setdefault(task.tile_id, []).append(task)
-        tile_order[task.tile_id] = min(tile_order.get(task.tile_id, task.program_order), task.program_order)
-    # A semantic tile may contain a DMA prologue, one compute payload and a
-    # DMA epilogue.  Split these into scheduler-visible instructions whenever
-    # the EU resource changes, while keeping the same tile provenance.
-    groups_by_tile: dict[str, list[tuple[Any, ...]]] = {}
-    task_to_tisa: dict[str, str] = {}
-    for tile_id, tasks in by_tile.items():
-        ordered = sorted(tasks, key=lambda task: task.program_order)
-        groups: list[list[Any]] = []
-        for task in ordered:
-            if not groups or _task_group_key(groups[-1][-1]) != _task_group_key(task):
-                groups.append([task])
-            else:
-                groups[-1].append(task)
-        frozen_groups = [tuple(group) for group in groups]
-        groups_by_tile[tile_id] = frozen_groups
-        for group_index, group in enumerate(frozen_groups):
-            group_id = f"tisa.{tile_id}.u{group_index:02d}"
-            for task in group:
-                task_to_tisa[task.task_id] = group_id
-    instructions: list[TISAInstruction] = []
-    payloads: dict[str, tuple[str, ...]] = {}
-    for tile_id, groups in sorted(groups_by_tile.items(), key=lambda item: tile_order[item[0]]):
-        for group_index, tasks in enumerate(groups):
-            first = tasks[0]
-            operator = operators[first.operator_id]
-            regions: list[BufferRegion] = []
-            for task in tasks:
-                for region in (*task.reads, *task.writes):
-                    if _region_key(region) not in {_region_key(item) for item in regions}:
-                        regions.append(region)
-            dependencies: dict[str, str] = {}
-            for task in tasks:
-                for predecessor_id in task.predecessors:
-                    predecessor = execution_graph.task(predecessor_id)
-                    source_tisa = task_to_tisa[predecessor_id]
-                    tisa_id = f"tisa.{tile_id}.u{group_index:02d}"
-                    if source_tisa == tisa_id:
-                        continue
-                    kind = _dependency_kind(predecessor, task)
-                    previous = dependencies.get(source_tisa)
-                    # RAW is the strongest readiness condition when several
-                    # primitive edges connect the same pair of instructions.
-                    if previous is None or (previous != "RAW" and kind == "RAW"):
-                        dependencies[source_tisa] = kind
-            tisa_id = f"tisa.{tile_id}.u{group_index:02d}"
-            instruction = TISAInstruction(
-                tisa_id=tisa_id,
-                tile_id=tile_id,
-                operator_id=first.operator_id,
-                op_type=_semantic_group_type(operator.normalized_type, tasks),
-                operands=tuple(_operand_from_region(region, index) for index, region in enumerate(regions)),
-                unit_map=_unit_for_resource(first.resource),
-                dependencies=tuple(
-                    TISADependency(source=source, kind=kind)
-                    for source, kind in sorted(dependencies.items())
-                ),
-                attributes={
-                    "program_order": first.program_order,
-                    "primitive_count": len(tasks),
-                    "primitive_resources": sorted({task.resource for task in tasks}),
-                    "semantic_boundary": "tile",
-                    "semantic_tile_id": tile_id,
-                    "tile_group_index": group_index,
-                    **{
-                        key: value
-                        for key, value in (
-                            (
-                                "semantic_family",
-                                operator.attributes.get(
-                                    "semantic_family", operator.normalized_type
-                                ),
-                            ),
-                            ("semantic_op", operator.attributes.get("semantic_op")),
-                            ("stablehlo_op", operator.attributes.get("stablehlo_op")),
-                            ("operand_arity", operator.attributes.get("operand_arity")),
-                            (
-                                "backend_capability_key",
-                                operator.attributes.get("backend_capability_key"),
-                            ),
-                        )
-                        if value not in {None, ""}
-                    },
-                },
-                payload_ref=f"payload:{tisa_id}",
-            )
-            instructions.append(instruction)
-            payloads[tisa_id] = tuple(task.task_id for task in tasks)
-    program = TISAProgram(
-        program_id=program_id,
-        instructions=tuple(instructions),
-        attributes={"source": "canonical-operator-graph", "scheduler_granularity": "tisa_tile"},
-    )
-    issues = program.validate()
-    if issues:
-        raise ValueError("TISA program construction failed: " + "; ".join(issues))
-    return program, payloads
-
-
 def compile_operator_graph(
     graph: OperatorGraph,
     machine: MachineConfig,
@@ -321,25 +112,22 @@ def compile_operator_graph(
         },
     )
     schedule = default_schedule_planner().plan(graph, tile_size=tile_size)
-    lowering = lower_mixed_graph(graph, schedule, machine, registry=registry or default_lowering_registry())
-    program, payloads = _build_tisa_program(
+    tile_graph = build_tile_graph(graph, schedule)
+    tisa_first = compile_tisa_first(
         graph,
-        lowering.execution_graph,
+        schedule,
+        tile_graph,
+        machine,
         program_id=f"{graph.graph_id}.tisa",
+        registry=registry or default_lowering_registry(),
     )
-    artifact = BackendArtifact(
-        artifact_id=f"{graph.graph_id}.analytical",
-        program=program,
-        execution_graph=lowering.execution_graph,
-        payloads=payloads,
-        backend="analytical",
-        attributes={"calibration_status": "analytical", "lowering_statistics": lowering.statistics},
-    )
+    program = tisa_first.program
+    artifact = tisa_first.artifact
     result = CompiledArtifact(
         frontend=frontend,
         graph=graph,
         schedule=schedule,
-        tile_graph=lowering.tile_graph,
+        tile_graph=tile_graph,
         tisa_program=program,
         backend_artifact=artifact,
         diagnostics=(
@@ -357,11 +145,12 @@ def compile_operator_graph(
                 CompilerDiagnostic(item.level, item.pass_name, item.message)
                 for item in pass_result.diagnostics
             ),
-            CompilerDiagnostic("info", "tiling", f"generated {len(lowering.tile_graph.tiles)} tile instances"),
-            CompilerDiagnostic("info", "tisa_codegen", f"generated {len(program.instructions)} TISA instructions"),
+            CompilerDiagnostic("info", "tiling", f"generated {len(tile_graph.tiles)} tile instances"),
+            CompilerDiagnostic("info", "tisa_codegen", f"generated {len(program.instructions)} TISA instructions from TileGraph"),
         ),
         attributes={
             "compiler_pipeline": "frontend->canonical->schedule->tile->tisa->analytical-backend",
+            "codegen_direction": "tilegraph->tisa->analytical-payload",
             "model_id": model_id or graph.graph_id,
         },
     )

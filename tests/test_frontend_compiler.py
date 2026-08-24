@@ -22,6 +22,8 @@ from npu_ooo.compiler import (
     compile_torch_module,
     compile_torch_module_through_stablehlo,
 )
+from npu_ooo.compiler.planner import default_schedule_planner
+from npu_ooo.compiler.tisa_first import TISASemanticBuilder
 from npu_ooo.cli import main
 from npu_ooo.frontend import (
     FrontendImportError,
@@ -33,7 +35,7 @@ from npu_ooo.frontend import (
     official_stablehlo_available,
     torch_xla_available,
 )
-from npu_ooo.ir import DataEdge, OperatorGraph, OperatorSpec, TensorSpec
+from npu_ooo.ir import DataEdge, OperatorGraph, OperatorSpec, TensorSpec, build_tile_graph
 from npu_ooo.simulator import simulate_execution_graph
 
 
@@ -140,6 +142,28 @@ class FrontendCompilerTest(unittest.TestCase):
         self.assertEqual(
             {item.unit_map.unit for item in compiled.tisa_program.instructions},
             {"dma", "tensor"},
+        )
+
+    def test_tisa_semantic_builder_is_independent_of_backend_tasks(self) -> None:
+        model = build_two_matmul_model()
+        instance = model.instantiate(build_two_matmul_case())
+        compiled = compile_frontend_import(
+            import_operator_graph(instance.graph, model_id=model.model_id),
+            minimal_machine_config(),
+            tile_size=32,
+        )
+        schedule = default_schedule_planner().plan(compiled.graph, tile_size=32)
+        tile_graph = build_tile_graph(compiled.graph, schedule)
+        rebuilt = TISASemanticBuilder().build(
+            compiled.graph,
+            schedule,
+            tile_graph,
+            minimal_machine_config(),
+            program_id="independent.tisa",
+        )
+        self.assertEqual(
+            [item.to_dict() for item in rebuilt.instructions],
+            [item.to_dict() for item in compiled.tisa_program.instructions],
         )
 
     def test_compile_frontend_resolves_shape_symbols(self) -> None:
@@ -798,8 +822,46 @@ class FrontendCompilerTest(unittest.TestCase):
             self.assertTrue((output / "00_frontend" / "frontend_import.json").exists())
             self.assertTrue((output / "03_tisa" / "tisa_program.json").exists())
             self.assertTrue((output / "04_backend" / "backend_artifact.json").exists())
+            self.assertTrue((output / "06_simulation" / "tisa_instructions.csv").exists())
             manifest = json.loads((output / "manifest.json").read_text())
             self.assertEqual(manifest["compiler_pipeline"], "frontend->canonical->schedule->tile->tisa->analytical-backend")
+            self.assertEqual(manifest["scheduler_target"], "tisa")
+            self.assertEqual(
+                manifest["tisa_decision_count"], manifest["tisa_instruction_count"]
+            )
+            self.assertEqual(manifest["payload_execution"], "run_to_completion")
+            summary = json.loads(
+                (output / "06_simulation" / "summary.json").read_text()
+            )
+            self.assertEqual(
+                len(summary["instruction_timings"]), manifest["tisa_instruction_count"]
+            )
+            swimlane = (output / "07_trace" / "swimlane.svg").read_text()
+            self.assertIn(">TISA instruction</text>", swimlane)
+            self.assertIn("TISA/", swimlane)
+
+            primitive_output = root / "primitive-out"
+            primitive_exit_code = main(
+                [
+                    "compile-model",
+                    "--graph-json",
+                    str(graph_path),
+                    "--arch",
+                    "minimal",
+                    "--scheduler-target",
+                    "primitive",
+                    "--output-dir",
+                    str(primitive_output),
+                ]
+            )
+            self.assertEqual(primitive_exit_code, 0)
+            primitive_manifest = json.loads(
+                (primitive_output / "manifest.json").read_text()
+            )
+            self.assertEqual(primitive_manifest["scheduler_target"], "primitive")
+            self.assertFalse(
+                (primitive_output / "06_simulation" / "tisa_instructions.csv").exists()
+            )
 
     def test_compile_model_cli_accepts_stablehlo_file(self) -> None:
         text = """

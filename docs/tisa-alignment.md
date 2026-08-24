@@ -65,28 +65,37 @@ per-unit execution ISA / DMA-MXU-Vector micro-events
 |---|---|---|
 | tile computational bounds | `TileInstance.bounds` | 基本对应，但目前只按 operator schedule 展开 |
 | tile index/provenance | `TileInstance.coordinates`, `operator_id` | 已有，需要补 model/layer/template provenance 传递 |
-| `OpType` | `OperatorSpec.normalized_type` | 语义来源已有，但没有复制到独立的 scheduler instruction |
-| `TileShape` | `TileInstance.bounds` + operand shape | 部分对应，尚未按每个 operand 表达 |
-| `TileMem(base, scope)` | `BufferRegion` | 最接近，但当前 base 主要是 offset/starts，scope 与 address expression 不结构化 |
+| `OpType` | `TISAInstruction.op_type` + `semantic_family` | 已进入 scheduler descriptor；reduction composite 当前仍可能按 primitive stage 拆分 |
+| `TileShape` | `TISAOperand.tile_shape` | 已按 operand 表达，尚缺符号 shape/runtime binding |
+| `TileMem(base, scope)` | `TISAOperand.tile_mem` | 已结构化 base/scope/offset/size，尚缺通用 symbolic address expression |
 | `AccessType` | `BufferRegion.access` | 已有 `READ/WRITE/READ_WRITE`，可直接演进 |
-| `Attributes` | `OperatorSpec.attributes` / `ExecutionTask.attributes` | 分散保存，缺少 TISA reorder/sync/partial-ready schema |
-| `UnitMap` | `ExecutionTask.resource` | 不足；只有一个 resource 名称，没有 quantity/affinity/合法 unit class 集合 |
-| typed `Deps` | `TileDependency` / `ExecutionTask.predecessors` | 不足；当前 predecessor 是无类型字符串边 |
-| hardware in-flight semantic table `Fu` | simulator active task/address scoreboard | 部分对应，但当前跟踪的是 primitive task，不是 TISA instruction |
-| per-unit WQ/IQ | simulator ready set/resource state | 行为上部分对应，结构上还没有 TISA reception/WQ/IQ 层 |
+| `Attributes` | `TISAInstruction.attributes` | 已保留 provenance/payload 元数据，partial-ready/reorder schema 仍待冻结 |
+| `UnitMap` | `TISAInstruction.unit_map` | 已有 unit/quantity/affinity；analytical backend 当前只执行 quantity=1 |
+| typed `Deps` | `TISADependency` | 已有 RAW/WAR/WAW 与 condition，当前 condition 主要是 full-region ready |
+| hardware in-flight semantic table `Fu` | TISA simulator active/ROB/tile state | 已在 TISA instruction 粒度跟踪 |
+| per-unit WQ/IQ | descriptor reception queue + resource WQ/visible ready window | 已实现确定性 analytical 行为模型，不宣称 RTL 微结构等价 |
 
 ## 3. 当前设计的真实问题
 
-当前路径是：
+当前存在两条可明确区分的路径：
 
 ```text
+兼容 baseline：
 TileInstance
     -> operator-specific lowering
     -> ExecutionTask
-    -> Static/Dynamic scheduler
+    -> primitive Static/Dynamic scheduler
+
+当前 TISA target：
+TileInstance
+    -> semantic TISA builder
+    -> TISA descriptor
+    -> backend codegen: bound payload
+    -> TISA Static/Dynamic scheduler
+    -> instruction-local primitive timing/events
 ```
 
-论文对齐后的目标路径应为：
+阶段 9.9 已将 compiler codegen 方向切换为 TISA-first。当前 analytical backend 仍使用既有 primitive lowerer 作为 payload materializer，但它只能在 TISAProgram 生成之后运行：
 
 ```text
 TileInstance
@@ -157,27 +166,30 @@ Backend Timing/Event Layer
 
 ## 5. 迁移顺序
 
-不需要推翻当前 Model IR、OperatorGraph、ScheduleSpec、MachineConfig 和 analytical event backend。推荐按以下顺序修正：
+不需要推翻当前 Model IR、OperatorGraph、ScheduleSpec、MachineConfig 和 analytical event backend。当前迁移状态是：
 
 ```text
-1. 冻结 TISAInstruction schema
+1. 已完成第一版 TISAInstruction schema
    OpType, Operand, TileMem, AccessType, Attributes, UnitMap, Deps
 
-2. 为现有 TileInstance 生成 TISAInstruction
-   先覆盖 2mm、elementwise、softmax
+2. 已从自动编译路径生成 TISAInstruction/BackendArtifact
+   已覆盖 Matmul、elementwise、Softmax、Norm 和 attention block
 
-3. 把 typed Deps 从 region overlap 推导出来
+3. 已生成并校验 typed Deps
    保留 RAW/WAR/WAW 和 partial/full readiness
 
-4. 新增 TISA scheduler mode
+4. 已新增 TISA scheduler mode
    scheduler 选择 TISAInstruction，而不是 primitive ExecutionTask
 
-5. 为每个 device backend 实现 TISA -> primitive expansion
+5. 待重构 compiler 方向并扩展 device backend
    codegen 生成 descriptor + execution payload
    analytical、SCALE-Sim、RTL/Verilator 分别实现自己的 expansion/timing
 
-6. 保留 ExecutionTask trace
+6. 已保留 ExecutionTask trace
    同时新增 TISA issue/complete trace，区分 semantic tile 和 primitive lane
 ```
 
-在第 4 步完成前，当前 dynamic 结果只能称为 `primitive-task analytical dynamic scheduling baseline`，不能直接宣称已经复现论文中的 TISA tile scheduler。
+`compile-model` 默认已经使用 analytical TISA scheduler；`--scheduler-target primitive`
+显式选择旧 baseline。当前结果可以称为 TISA instruction-level analytical scheduling
+baseline，但仍不能宣称完成论文硬件复现：dispatch latency、partial-ready、真实 WQ/IQ/Fu
+微结构、memory bank/port 和 RTL timing 仍未校准。

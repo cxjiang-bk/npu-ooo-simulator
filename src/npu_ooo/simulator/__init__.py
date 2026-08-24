@@ -13,6 +13,7 @@ from .core import (
     simulate_execution_graph,
 )
 from .address import AddressConflict, AddressDependency, AddressHazardKind, AddressScoreboard, add_address_dependencies
+from .tisa import simulate_tisa_artifact
 
 __all__ = [
     "AnalyticalTimingModel",
@@ -30,4 +31,5 @@ __all__ = [
     "TraceEvent",
     "add_address_dependencies",
     "simulate_execution_graph",
+    "simulate_tisa_artifact",
 ]

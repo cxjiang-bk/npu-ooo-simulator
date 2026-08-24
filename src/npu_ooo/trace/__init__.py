@@ -1,6 +1,13 @@
 """Trace exporters for schedule results."""
 
-from .export import write_artifact_json, write_csv, write_json, write_png, write_svg
+from .export import (
+    write_artifact_json,
+    write_csv,
+    write_instruction_csv,
+    write_json,
+    write_png,
+    write_svg,
+)
 from .layout import (
     STAGE_DIRECTORIES,
     artifact_path,
@@ -18,6 +25,7 @@ from .graph import (
 __all__ = [
     "write_artifact_json",
     "write_csv",
+    "write_instruction_csv",
     "write_execution_graph_dot",
     "write_json",
     "write_png",

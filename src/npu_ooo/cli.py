@@ -61,11 +61,13 @@ from npu_ooo.scheduler import (
     SimulatorConfig,
     StaticPipelineConfig,
     schedule_execution_graph,
+    schedule_tisa_program,
 )
 from npu_ooo.simulator import TimingTableModel
 from npu_ooo.trace import (
     write_artifact_json,
     write_csv,
+    write_instruction_csv,
     write_execution_graph_dot,
     write_json,
     write_png,
@@ -195,6 +197,12 @@ def build_parser() -> argparse.ArgumentParser:
     compile_model.add_argument("--machine-config", type=Path, help="load a canonical MachineConfig JSON")
     compile_model.add_argument("--timing-config", type=Path, help="load primitive timing overrides from JSON")
     compile_model.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
+    compile_model.add_argument(
+        "--scheduler-target",
+        choices=("tisa", "primitive"),
+        default="tisa",
+        help="schedule TISA instructions (default) or the legacy global primitive graph",
+    )
     compile_model.add_argument("--output-dir", type=Path, default=Path("out/compile-model"))
     compile_model.add_argument("--instruction-queue-depth", type=int)
     compile_model.add_argument("--rob-entries", type=int)
@@ -559,15 +567,27 @@ def run_compile_model(args: argparse.Namespace) -> int:
         address_scoreboard=args.address_scoreboard,
         dynamic_priority=args.dynamic_priority,
     )
-    result = schedule_execution_graph(
-        compiled.backend_artifact.execution_graph,
-        machine,
-        args.policy,
-        timing_model=_timing_model(args.timing_config),
-        simulator_config=simulator_config,
-    )
+    timing_model = _timing_model(args.timing_config)
+    if args.scheduler_target == "tisa":
+        result = schedule_tisa_program(
+            compiled.backend_artifact,
+            machine,
+            args.policy,
+            timing_model=timing_model,
+            simulator_config=simulator_config,
+        )
+    else:
+        result = schedule_execution_graph(
+            compiled.backend_artifact.execution_graph,
+            machine,
+            args.policy,
+            timing_model=timing_model,
+            simulator_config=simulator_config,
+        )
     write_json(result, args.output_dir / "summary.json")
     write_csv(result, args.output_dir / "tasks.csv")
+    if result.instruction_timings:
+        write_instruction_csv(result, args.output_dir / "tisa_instructions.csv")
     write_svg(result, args.output_dir / "swimlane.svg")
     write_png(result, args.output_dir / "swimlane.png")
     write_artifact_json(
@@ -589,9 +609,14 @@ def run_compile_model(args: argparse.Namespace) -> int:
             "model_id": imported.model_id,
             "architecture": args.arch,
             "policy": result.policy,
+            "scheduler_target": result.metrics.get(
+                "scheduler_target", args.scheduler_target
+            ),
             "total_cycles": result.total_cycles,
             "tisa_instruction_count": len(compiled.tisa_program.instructions),
             "primitive_task_count": len(compiled.backend_artifact.execution_graph.tasks),
+            "tisa_decision_count": result.metrics.get("tisa_decision_count"),
+            "payload_execution": result.metrics.get("payload_execution"),
             "calibration_status": result.metrics["calibration_status"],
         },
         args.output_dir / "manifest.json",
@@ -600,6 +625,7 @@ def run_compile_model(args: argparse.Namespace) -> int:
         "frontend": imported.frontend.value if hasattr(imported.frontend, "value") else str(imported.frontend),
         "tisa_instructions": len(compiled.tisa_program.instructions),
         "primitive_tasks": len(compiled.backend_artifact.execution_graph.tasks),
+        "scheduler_target": result.metrics.get("scheduler_target", args.scheduler_target),
         "total_cycles": result.total_cycles,
         "output_dir": str(args.output_dir),
     }, sort_keys=True))

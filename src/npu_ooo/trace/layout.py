@@ -46,6 +46,7 @@ _STAGE_BY_FILENAME: dict[str, str] = {
     "address_dependencies.json": "05_runtime",
     "summary.json": "06_simulation",
     "tasks.csv": "06_simulation",
+    "tisa_instructions.csv": "06_simulation",
     "perfetto.json": "07_trace",
     "swimlane.svg": "07_trace",
     "swimlane.png": "07_trace",

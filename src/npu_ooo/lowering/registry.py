@@ -9,6 +9,7 @@ from npu_ooo.ir import (
     ExecutionGraph,
     OperatorGraph,
     ScheduleSpec,
+    TileGraph,
     build_tile_graph,
 )
 from npu_ooo.ir.model import ModelInstance
@@ -105,6 +106,7 @@ def lower_mixed_graph(
     machine: MachineConfig,
     *,
     registry: LoweringRegistry | None = None,
+    tile_graph: TileGraph | None = None,
 ) -> LoweringResult:
     """Lower a heterogeneous graph and connect explicit root-memory handoffs."""
 
@@ -200,7 +202,11 @@ def lower_mixed_graph(
     issues = execution_graph.validate()
     if issues:
         raise ValueError("; ".join(issues))
-    tile_graph = build_tile_graph(graph, schedule)
+    # TISA-first codegen may already own the semantic TileGraph.  Reusing it
+    # keeps backend payload lowering from silently choosing a second tiling
+    # result; the optional argument preserves the legacy lowering API.
+    if tile_graph is None:
+        tile_graph = build_tile_graph(graph, schedule)
     return LoweringResult(
         tile_graph=tile_graph,
         execution_graph=execution_graph,
