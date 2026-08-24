@@ -51,6 +51,28 @@ def _virtual_region(
     )
 
 
+def _physical_dimensions(
+    iteration: tuple[str, ...],
+    reduction: tuple[str, ...],
+) -> tuple[str, ...]:
+    dimensions = (*iteration, *reduction)
+    if all(name.startswith("d") and name[1:].isdigit() for name in dimensions):
+        return tuple(sorted(dimensions, key=lambda name: int(name[1:])))
+    return dimensions
+
+
+def _tile_region_geometry(
+    tile: TileInstance,
+    physical_dimensions: tuple[str, ...],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    starts = tuple(tile.bound_map[name][0] for name in physical_dimensions)
+    shape = tuple(
+        tile.bound_map[name][1] - tile.bound_map[name][0]
+        for name in physical_dimensions
+    )
+    return starts, shape
+
+
 def lower_softmax_graph(
     graph: OperatorGraph,
     schedule: ScheduleSpec,
@@ -80,8 +102,10 @@ def lower_softmax_graph(
             raise ValueError(f"softmax operator '{operator.op_id}' requires one input and one output")
         iteration = tuple(name for name, _ in operator.iteration_dims)
         reduction = tuple(name for name, _ in operator.reduction_dims)
-        if len(iteration) != 1 or len(reduction) != 1:
-            raise ValueError(f"softmax operator '{operator.op_id}' requires one iteration and one reduction dimension")
+        if not iteration or len(reduction) != 1:
+            raise ValueError(
+                f"softmax operator '{operator.op_id}' requires iteration dimensions and one reduction dimension"
+            )
         input_tensor = tensors[operator.inputs[0]]
         output_tensor = tensors[operator.outputs[0]]
         if tuple(input_tensor.shape) != tuple(output_tensor.shape):
@@ -90,9 +114,10 @@ def lower_softmax_graph(
 
         tiles = enumerate_operator_tiles(operator, schedule.for_operator(operator_id))
         reduction_name = reduction[0]
+        physical_dimensions = _physical_dimensions(iteration, reduction)
         rows: dict[tuple[int, ...], list[TileInstance]] = {}
         for tile in tiles:
-            row_key = (tile.bound_map[iteration[0]][0],)
+            row_key = tuple(tile.bound_map[name][0] for name in iteration)
             rows.setdefault(row_key, []).append(tile)
 
         for row_key, row_tiles in rows.items():
@@ -101,16 +126,27 @@ def lower_softmax_graph(
             sum_final: str | None = None
             load_ids: dict[str, str] = {}
             exp_ids: dict[str, str] = {}
-            max_region = _virtual_region(f"{operator_id}.max", local, (row_tiles[0].extent(iteration[0]),), row_key, AccessType.READ)
-            sum_region = _virtual_region(f"{operator_id}.sum", local, (row_tiles[0].extent(iteration[0]),), row_key, AccessType.READ)
+            iteration_shape = tuple(row_tiles[0].extent(name) for name in iteration)
+            max_region = _virtual_region(
+                f"{operator_id}.max",
+                local,
+                iteration_shape,
+                row_key,
+                AccessType.READ,
+            )
+            sum_region = _virtual_region(
+                f"{operator_id}.sum",
+                local,
+                iteration_shape,
+                row_key,
+                AccessType.READ,
+            )
 
             # Stage 1: load each reduction tile and accumulate row-wise max.
             for tile in row_tiles:
-                bounds = tile.bound_map
-                input_starts = (bounds[iteration[0]][0], bounds[reduction_name][0])
-                input_shape = (
-                    bounds[iteration[0]][1] - bounds[iteration[0]][0],
-                    bounds[reduction_name][1] - bounds[reduction_name][0],
+                input_starts, input_shape = _tile_region_geometry(
+                    tile,
+                    physical_dimensions,
                 )
                 input_global = _region(input_tensor, root, input_starts, input_shape, AccessType.READ)
                 input_local = _region(input_tensor, local, input_starts, input_shape, AccessType.READ)
@@ -174,12 +210,7 @@ def lower_softmax_graph(
 
             # Stage 2: exponentiation, followed by sum reduction over exp tiles.
             for tile in row_tiles:
-                bounds = tile.bound_map
-                shape = (
-                    bounds[iteration[0]][1] - bounds[iteration[0]][0],
-                    bounds[reduction_name][1] - bounds[reduction_name][0],
-                )
-                starts = (bounds[iteration[0]][0], bounds[reduction_name][0])
+                starts, shape = _tile_region_geometry(tile, physical_dimensions)
                 input_local = _region(input_tensor, local, starts, shape, AccessType.READ)
                 exp_region = _virtual_region(f"{operator_id}.exp", local, shape, starts, AccessType.WRITE)
                 exp_id = f"{tile.tile_id}.exp"
@@ -235,12 +266,7 @@ def lower_softmax_graph(
 
             # Stage 3: normalize every tile and write the output.
             for tile in row_tiles:
-                bounds = tile.bound_map
-                shape = (
-                    bounds[iteration[0]][1] - bounds[iteration[0]][0],
-                    bounds[reduction_name][1] - bounds[reduction_name][0],
-                )
-                starts = (bounds[iteration[0]][0], bounds[reduction_name][0])
+                starts, shape = _tile_region_geometry(tile, physical_dimensions)
                 exp_region = _virtual_region(f"{operator_id}.exp", local, shape, starts, AccessType.READ)
                 output_local = _region(output_tensor, local, starts, shape, AccessType.WRITE)
                 output_global = _region(output_tensor, root, starts, shape, AccessType.WRITE)

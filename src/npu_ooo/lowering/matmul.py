@@ -96,9 +96,9 @@ def _transfer_timing(machine: MachineConfig, source: str, target: str, size_byte
     return float(duration), float(unit.initiation_interval_cycles), path.engine
 
 
-def _compute_timing(machine: MachineConfig, output_shape: tuple[int, int], reduction: int) -> tuple[float, float, str]:
+def _compute_timing(machine: MachineConfig, output_shape: tuple[int, ...], reduction: int) -> tuple[float, float, str]:
     unit = _unit_for(machine, "matmul")
-    macs = output_shape[0] * output_shape[1] * reduction
+    macs = math.prod(output_shape) * reduction
     configured_rate = unit.attributes.get("macs_per_cycle")
     if isinstance(configured_rate, (int, float)) and configured_rate > 0:
         macs_per_cycle = float(configured_rate)
@@ -155,22 +155,49 @@ def _regions_overlap(left: BufferRegion, right: BufferRegion) -> bool:
 def _matmul_regions(operator: OperatorSpec, tensors: dict[str, Any], tile: TileInstance):
     if len(operator.inputs) < 2 or len(operator.outputs) != 1:
         raise ValueError(f"matmul operator '{operator.op_id}' must have two inputs and one output")
+    if len(operator.inputs) > 2:
+        raise ValueError(f"matmul operator '{operator.op_id}' must be decomposed to two inputs")
     iteration = tuple(name for name, _ in operator.iteration_dims)
     reduction = tuple(name for name, _ in operator.reduction_dims)
-    if len(iteration) != 2 or len(reduction) != 1:
-        raise ValueError(f"matmul operator '{operator.op_id}' requires two iteration and one reduction dimension")
-    out0, out1 = iteration
+    if len(iteration) < 2 or len(reduction) != 1:
+        raise ValueError(
+            f"matmul operator '{operator.op_id}' requires output iteration dimensions and one reduction dimension"
+        )
+    batch_dimensions = iteration[:-2]
+    out0, out1 = iteration[-2:]
     red = reduction[0]
     bounds = tile.bound_map
-    out_starts = (bounds[out0][0], bounds[out1][0])
-    out_shape = (bounds[out0][1] - bounds[out0][0], bounds[out1][1] - bounds[out1][0])
+    batch_starts = tuple(bounds[name][0] for name in batch_dimensions)
+    batch_shape = tuple(bounds[name][1] - bounds[name][0] for name in batch_dimensions)
+    out_starts = (*batch_starts, bounds[out0][0], bounds[out1][0])
+    out_shape = (
+        *batch_shape,
+        bounds[out0][1] - bounds[out0][0],
+        bounds[out1][1] - bounds[out1][0],
+    )
     red_start, red_stop = bounds[red]
     red_shape = red_stop - red_start
     left = tensors[operator.inputs[0]]
     right = tensors[operator.inputs[1]]
     output = tensors[operator.outputs[0]]
-    left_region = _region(left, "__memory__", (out_starts[0], red_start), (out_shape[0], red_shape), AccessType.READ)
-    right_region = _region(right, "__memory__", (red_start, out_starts[1]), (red_shape, out_shape[1]), AccessType.READ)
+    left_region = _region(
+        left,
+        "__memory__",
+        (*batch_starts, bounds[out0][0], red_start),
+        (*batch_shape, bounds[out0][1] - bounds[out0][0], red_shape),
+        AccessType.READ,
+    )
+    rhs_transposed = bool(operator.attributes.get("rhs_transposed", False))
+    rhs_broadcast_batch = bool(operator.attributes.get("rhs_broadcast_batch", False))
+    right_batch_starts = () if rhs_broadcast_batch else batch_starts
+    right_batch_shape = () if rhs_broadcast_batch else batch_shape
+    if rhs_transposed:
+        right_starts = (*right_batch_starts, bounds[out1][0], red_start)
+        right_shape = (*right_batch_shape, bounds[out1][1] - bounds[out1][0], red_shape)
+    else:
+        right_starts = (*right_batch_starts, red_start, bounds[out1][0])
+        right_shape = (*right_batch_shape, red_shape, bounds[out1][1] - bounds[out1][0])
+    right_region = _region(right, "__memory__", right_starts, right_shape, AccessType.READ)
     output_region = _region(output, "__memory__", out_starts, out_shape, AccessType.READ_WRITE)
     return left_region, right_region, output_region, red_shape
 
@@ -258,7 +285,7 @@ def lower_matmul_graph(
                         task_id=load_b_id,
                         tile_id=tile.tile_id,
                         operator_id=operator_id,
-                        primitive="load",
+                        primitive="load_transpose" if operator.attributes.get("rhs_transposed") else "load",
                         resource=load_b_unit,
                         reads=(right_global,),
                         writes=(right_local,),
@@ -267,7 +294,14 @@ def lower_matmul_graph(
                         initiation_interval_cycles=load_b_ii,
                         stage_id=tile.stage_id,
                         program_order=task_order + 1,
-                        attributes={"operand": "rhs", "iteration": tile.ordinal},
+                        attributes={
+                            "operand": "rhs",
+                            "iteration": tile.ordinal,
+                            "rhs_transposed": bool(operator.attributes.get("rhs_transposed", False)),
+                            "rhs_broadcast_batch": bool(
+                                operator.attributes.get("rhs_broadcast_batch", False)
+                            ),
+                        },
                     ),
                 )
             )
@@ -292,10 +326,15 @@ def lower_matmul_graph(
                     stage_id=tile.stage_id,
                     program_order=task_order,
                     attributes={
-                        "m_tile": output.shape[0],
-                        "n_tile": output.shape[1],
+                        "batch_tile": list(output.shape[:-2]),
+                        "m_tile": output.shape[-2],
+                        "n_tile": output.shape[-1],
                         "k_tile": reduction_shape,
-                        "macs": output.shape[0] * output.shape[1] * reduction_shape,
+                        "macs": math.prod(output.shape) * reduction_shape,
+                        "rhs_transposed": bool(operator.attributes.get("rhs_transposed", False)),
+                        "rhs_broadcast_batch": bool(
+                            operator.attributes.get("rhs_broadcast_batch", False)
+                        ),
                         "iteration": tile.ordinal,
                     },
                 )
@@ -324,7 +363,7 @@ def lower_matmul_graph(
                 )
                 task_order += 1
                 producer_stores.setdefault(output.tensor, []).append((output_global, store_id))
-            total_macs += output.shape[0] * output.shape[1] * reduction_shape
+            total_macs += math.prod(output.shape) * reduction_shape
             total_transfer_bytes += left.size_bytes + right.size_bytes
             if tile.bound_map[reduction_name][1] == dict(operator.reduction_dims)[reduction_name]:
                 total_transfer_bytes += output.size_bytes

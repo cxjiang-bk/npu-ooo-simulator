@@ -5,14 +5,16 @@
 本项目研究的是 NPU 上的 tile-level scheduling，而不是仅做 loop mapping，也不是第一步就复刻某一款 NPU 的 RTL。系统同时区分三个动态层次：编译器生成静态任务描述，runtime 动态完成 buffer 绑定和任务提交，device backend 在已提交任务窗口内执行 TISA-like 静态/动态 issue。
 
 ```text
-PyTorch / ONNX / StableHLO
-          |
-          v
-Frontend Adapter
-  - ExecuTorch / torch.export
-  - ONNX / StableHLO (later)
-          |
-          v
+PyTorch nn.Module
+    -> torch.export.ExportedProgram
+       |-- A. torch-xla exporter -> official StableHLO ---------|
+       |-- B. project legalizer -> verified StableHLO ---------+--> FrontendImport
+       `-- C. direct TorchExportAdapter ------------------------|         |
+                                                                         v
+External StableHLO -> official parser/verifier -> StableHLOAdapter ------+
+Canonical JSON / Model preset -> JsonGraphAdapter / model instantiate ---+
+                                                                         |
+                                                                         v
 Model + Canonical Operator IR
           |
           v
@@ -128,38 +130,174 @@ BenchmarkCase {
 
 ## 2. 编译、运行时与设备 IR
 
-### 2.0 Framework bridge：torchxla、StableHLO 与本项目 frontend
+### 2.0 Framework bridge：torch-xla、StableHLO 与并行 frontend 路线
 
 论文的 frontend 不是直接从 PyTorch kernel 进入 TISA。其层次是：
 
 ```text
 PyTorch/JAX/TF
-    -> torchxla framework bridge
+    -> torch-xla framework bridge
     -> XLA / StableHLO portable graph IR
     -> MLIR Graph Compiler
     -> Fusion Compiler / TISA dialect
     -> TISA generator
 ```
 
-`torchxla` 是导出/连接框架，属于 compiler pipeline 最上游的 framework bridge；
+`torch-xla` 是导出/连接框架，属于 compiler pipeline 最上游的 framework bridge；
 `StableHLO` 是 bridge 之后的可移植 semantic graph IR，位置类似本项目的
 `Canonical OperatorGraph`，但不是最终 TISA 指令。它保留跨框架可识别的算子语义，
 供 Graph Compiler 做 decomposition、fusion、layout、tiling 和 shape analysis。
 
-本项目第一版不强制依赖 XLA/MLIR，而是保留相同的契约：
+前端不是一条互相替代的单链，而是三条并行路线。它们服务于不同研究目的，并在
+`FrontendImport / Canonical OperatorGraph` 边界汇合：
+
+| 路线 | 编译链 | 定位 | 是否经过 StableHLO |
+| --- | --- | --- | --- |
+| A. 论文对齐主路径 | `PyTorch -> torch.export -> torch-xla -> official StableHLO -> importer` | 正式研究 PyTorch 模型和新标准算子 | 是，StableHLO 由 torch-xla 产生 |
+| B. project legalizer 路径 | `PyTorch -> torch.export -> TorchExportAdapter -> project legalizer -> official verifier -> importer` | 小算子、pattern、round-trip 和错误定位 | 是，StableHLO 由项目受控 emitter 产生 |
+| C. direct/debug 路径 | `PyTorch -> torch.export -> TorchExportAdapter`，或 `Canonical JSON -> JsonGraphAdapter` | 无 XLA 依赖基线、单元测试和前后端隔离调试 | 否 |
+
+外部 StableHLO 文件是路线 A/B 之外的标准 IR 入口：必须先经过 official parser/verifier，
+再由同一个 StableHLO importer 汇入 Canonical OperatorGraph。未来 ONNX、ExecuTorch 或
+torch-mlir adapter 也只能增加新的上游入口，不能改变汇合点后的契约。
+
+各组件归属必须明确：
+
+| 组件 | 归属 | 本项目是否维护其算子覆盖 |
+| --- | --- | --- |
+| `torch.export` | PyTorch | 否，只适配其 `ExportedProgram` 契约 |
+| `exported_program_to_stablehlo` | PyTorch/XLA (`torch-xla`) | 否，标准 PyTorch/ATen legalization 由上游负责 |
+| StableHLO dialect/parser/verifier/bytecode | OpenXLA StableHLO 官方仓库 | 否，使用官方 wheel 和兼容性规则 |
+| `OfficialStableHLOGenerator` / `stablehlo_codegen.py` | 本项目 | 是，但仅维护受控 regression 子集 |
+| StableHLO importer / semantic-family recovery | 本项目 | 是，这是前端主要扩展点 |
+| Canonical Graph / TISA / backend lowering | 本项目 | 是，这是硬件能力建模边界 |
+
+#### 路线 A：torch-xla 论文对齐主路径
 
 ```text
-torch.export / ExecuTorch (optional)
-canonical JSON (dependency-light smoke path)
-              -> FrontendImport
-              -> Canonical OperatorGraph
-              -> Compiler pipeline
+PyTorch nn.Module
+    -> torch.export.ExportedProgram
+    -> torch_xla.stablehlo.exported_program_to_stablehlo()
+    -> StableHLO text + bytecode
+    -> OpenXLA StableHLO dialect registration / parse / verify
+    -> StableHLO op import + semantic-family recovery
+    -> Canonical OperatorGraph
 ```
 
-其中 `TorchExportAdapter` 对应论文的 framework bridge，`FrontendImport` 是
-StableHLO/ExecuTorch/JSON 汇合的边界；后续新增 StableHLO adapter 时，下游
-Schedule/Tiling/TISA/Backend 不需要修改。这样可以先验证从 graph 到 TISA/backend
-的结构和依赖，再单独固定 PyTorch/ExecuTorch 版本。
+这是后续支持标准 PyTorch 算子的主方向。PyTorch/ATen 到 StableHLO 的 legalization 由
+torch-xla 负责，本项目不为每个新 PyTorch 算子重复编写 emit 函数。本项目维护的边界是：
+
+```text
+StableHLO operation
+    -> semantic family / composite pattern
+    -> Canonical OperatorSpec
+    -> TISA/backend capability
+```
+
+因此“torch-xla 能导出”不等于“backend 已支持”。例如 `torch.sin` 可以动态导出为通过
+官方 verifier 的 `stablehlo.sine`；如果 semantic-family registry 尚未把它归入 pointwise，
+或者 backend 没有对应 vector/scalar lowering，编译必须在 capability boundary 明确失败，
+不能绕回 source FX graph，也不能静默改用 project legalizer。
+
+当前通过 CLI 使用路线 A 时必须显式指定：
+
+```text
+--through-stablehlo
+--stablehlo-exporter torch-xla
+--stablehlo-backend official
+```
+
+`TorchXLAStableHLOExporter` 保存 human-readable module、bytecode size/hash、exporter version
+和 producer；`OfficialStableHLOAdapter` 再独立执行官方 verifier。manifest 必须记录
+`stablehlo_producer=torch-xla`、版本、verifier 和 `stablehlo_fallback=false`。
+
+#### 路线 B：project legalizer 回归路径
+
+```text
+TorchExportAdapter
+    -> Canonical source graph
+    -> OfficialStableHLOGenerator / StableHLOGenerator
+    -> official verifier 或 textual regression parser
+    -> StableHLO importer
+    -> Canonical OperatorGraph
+```
+
+`OfficialStableHLOGenerator` 和 `stablehlo_codegen.py` 中的固定 emit 函数是项目内
+legalizer，只覆盖当前受控算子集合。它们用于构造确定性 fixture、验证 importer/fusion、
+比较 direct 与 StableHLO round-trip，以及在 torch-xla 输出过于复杂时缩小问题；它们
+不是完整 XLA compiler，也不再作为扩展标准 PyTorch 算子的主入口。
+
+项目 legalizer 的 `official` backend 仍必须输出官方语法，并通过 OpenXLA parser/verifier。
+旧 `StableHLOGenerator/StableHLOAdapter` 的 `textual` backend 只服务无官方依赖的 regression；
+`auto` 的任何回退都必须进入 manifest。当前 CLI 为兼容已有 smoke 仍默认
+`stablehlo_exporter=project`，正式论文实验必须显式选择路线 A；待 importer/backend
+semantic-family 覆盖达到基线后，再单独切换默认值。
+
+#### 路线 C：direct/debug 与外部 IR 路径
+
+Direct TorchExport 路径跳过 StableHLO，用于判断问题发生在 framework export、StableHLO
+import，还是 graph/TISA/backend。Canonical JSON 继续提供完全无 PyTorch/XLA 依赖的
+回归基线。两者都不是论文最终 frontend，但对于分层验证不可删除。
+
+三条路线的公平性比较不能依赖 SSA 名称、参数顺序或完全相同的拓扑序。最低比较项为：
+
+```text
+semantic operator family + tensor shape
+dependency topology
+tile count and tile bounds
+TISA instruction/dependency count
+backend primitive task count
+cycle and trace
+```
+
+只有汇合后的 semantic graph、TISA 和 backend capability 相同，调度策略对比才有意义。
+
+真实 PyTorch 路径当前已验证：
+
+```text
+aten.linear
+  -> Matmul(rhs_transposed) + broadcast Add
+
+K.transpose(-2, -1) -> rank-3 aten.matmul
+  -> batched Matmul(rhs_transposed/load_transpose)
+
+RMSNorm arithmetic chain
+  -> semantic RMSNorm
+```
+
+当前 project legalizer round-trip 为：
+
+```text
+TorchExportAdapter
+    -> OfficialStableHLOGenerator (generated.mlir)
+    -> OpenXLA MLIR parse + StableHLO verify
+    -> OfficialStableHLOAdapter
+    -> Canonicalize/Decompose/Fold/Fusion Passes
+    -> Schedule/Tiling/TISA/Backend
+```
+
+在路线 B 中，Softmax、RMSNorm、LayerNorm 先展开为合法 StableHLO primitive chain，再由
+对应 FusionPass 恢复语义算子。路线 A 则消费 torch-xla 真实产生的 StableHLO pattern。
+官方 bindings 只解决 dialect/grammar/verifier 真实性；动态 shape、layout、复杂 region、
+通用多结果消费仍需要扩展 StableHLO importer 和 semantic-family recovery。两条路径都复用
+`OfficialStableHLOAdapter` 和汇合点后的下游。
+
+路线 A 当前已验证 Matmul、attention micrograph 与包含 `nn.Linear/nn.LayerNorm` 的完整
+attention block。
+Graph Compiler 会恢复 flatten/unflatten Linear，并在直接 row-wise 或
+`[1, prod(outer), hidden]` reshape 的数学等价约束成立时，把多结果
+`batch_norm_training` 加 affine 恢复成 LayerNorm。默认 project exporter 继续承担当前
+宽覆盖 smoke；`--stablehlo-exporter torch-xla` 用于论文同构路径，且不会静默 fallback。
+
+LayerNorm、RMSNorm 和 Softmax lowering 支持多个静态 outer dimensions；Softmax 的
+物理 BufferRegion 顺序按原 tensor axis 恢复，不把非末轴 reduction 错写成末轴访问。
+这些 pass 仍属于本项目的最小 Graph/Fusion Compiler，不等价于论文产业编译器的完整
+layout、memory planning、cost model 或 StableHLO region 处理能力。
+
+`compile-model` 当前有三个互斥入口：`--graph-json`、`--stablehlo-file` 和
+`--torch-module MODULE:FACTORY`。PyTorch CLI 由零参数 factory 构造 `nn.Module`，再按
+重复的 `--input-shape` 生成静态浮点 example inputs；复杂模型输入仍通过
+`compile_torch_module()` API 注入，避免 CLI 猜测 tokenizer、mask 或 cache 语义。
 
 ### 2.1 Model/Benchmark IR
 
@@ -385,19 +523,33 @@ issue width
 
 ## 4. Frontend Adapter 与 Compiler PassManager
 
-### 4.1 ExecuTorch 作为第一前端
+### 4.1 并行 Frontend Adapter 与能力边界
 
-第一版模型导入优先使用：
+当前 PyTorch 主入口是 `torch.export.ExportedProgram`。其后并行进入 torch-xla、project
+legalizer 或 direct adapter，具体路线遵循 2.0 节。ExecuTorch 仍可作为未来的模型交付、
+partition 和 runtime 集成入口，但当前不把它写成已经接入的第一前端，也不让它替代
+StableHLO semantic layer。
+
+Frontend 扩展采用两级 capability registry，而不是继续扩张单个 emitter：
 
 ```text
-PyTorch module
-    -> torch.export()
-    -> ExecuTorch ExportedProgram / Core ATen graph
-    -> FrontendAdapter
-    -> ModelSpec + Canonical OperatorGraph
+StableHLOImportCapability
+  - op name / version / result arity
+  - shape and dtype constraints
+  - semantic family
+  - composite recovery requirements
+
+BackendCapability
+  - semantic family / TISA OpType
+  - supported dtype/layout/rank
+  - required unit and memory behavior
+  - lowering and timing provider
 ```
 
-选择 ExecuTorch 的理由是它已经提供规范化的 PyTorch 图、shape constraints 和 backend partitioner，能够先解决“模型图不应由 benchmark 手写”的问题，而不必立即引入完整 MLIR/IREE C++ toolchain。但 ExecuTorch 不能替代论文中 StableHLO/MLIR 的 semantic layer：FrontendAdapter 必须保留 source module、原始 ATen/高层 operator provenance、composite boundaries 和 shape constraints，不能为了接入 backend 过早把 `attention`、`softmax`、`layernorm` 等语义全部打散成无上下文的 primitive。
+一个新标准 PyTorch 算子的接入流程是：先确认 torch-xla 可以导出且官方 verifier 通过，
+再增加或复用 StableHLO semantic-family 映射，最后检查 TISA/backend capability。只有新的
+复合模式或新的硬件语义族才应新增专用 recovery/lowering；普通 pointwise 算子不应各写
+一套 graph emitter 和 backend pipeline。
 
 FrontendAdapter 只负责输入格式转换和 provenance 保留，不负责 tile mapping 或 scheduler policy。至少要保留：
 
@@ -410,7 +562,9 @@ model/layer/block provenance
 execution phase and persistent state
 ```
 
-ONNX、StableHLO 和 Torch-MLIR 作为后续 adapter，不改变 Canonical OperatorGraph 的下游契约。长期可以让 StableHLO 作为跨框架 semantic canonicalization 层，ExecuTorch 作为 PyTorch 快速入口。
+ONNX、ExecuTorch 和 Torch-MLIR 作为后续 adapter，不改变 Canonical OperatorGraph 的
+下游契约。StableHLO 是当前跨框架 semantic canonicalization 层，torch-xla 是 PyTorch
+标准算子到该层的主 exporter；direct TorchExport 和 Canonical JSON 保留为调试基线。
 
 ### 4.2 统一 Compiler PassManager
 
@@ -689,7 +843,8 @@ TimingModel / EventBackend
 ```text
 manifest.json
 artifact_index.json
-00_frontend/{model_spec,benchmark_case,model_instance}.json
+00_frontend/{model_spec,benchmark_case,model_instance,frontend_import}.json
+00_frontend/{generated.mlir,stablehlo_module.json,source_frontend_import.json}  # round-trip 路径
 01_graph_ir/{operator_graph.json,operator_graph.svg,operator_graph.dot}
 02_schedule_tile/{schedule.json,tile_graph.json,tile_graph.dot}
 03_tisa/{tisa_program.json,compiled_artifact.json}

@@ -204,3 +204,70 @@ ExecuTorch / StableHLO
         -> Backend primitive expansion and timing
         -> Execution trace
 ```
+
+## 2026-08-22：StableHLO adapter 现状
+
+- 本节是 2026-08-22 的历史状态：当时 Python 3.12 有 PyTorch 2.9.1，但没有 StableHLO/MLIR bindings；官方 bindings 已在次日验证接入，`torch_xla` 仍未安装。
+- 已在 frontend boundary 实现 `StableHLOAdapter`：优先接受 module assembly，另提供 textual MLIR/file/payload 入口；其输出直接是 `FrontendImport`，下游不感知 StableHLO node name。
+- 第一版 textual subset 已覆盖 `func.func` 参数、tensor type、constant、单结果 elementwise/reduce/dot/softmax 和 return；StableHLO RMSNorm 算术链可复用同一 RMSNorm fusion、SchedulePlanner、TISA 和 backend。
+- 该 adapter 是论文对齐的输入路径，不等价于完整 StableHLO/MLIR compiler。后续仍需真实 StableHLO object smoke、tuple result/native LayerNorm、layout 和动态 shape constraint 支持。
+
+## 2026-08-22：真实 ATen 图与最小 Graph Compiler 规则
+
+- PyTorch 2.9.1 的 `nn.Linear` 保留为单个 `aten.linear(x, weight[N,K], bias[N])`，不会自动拆成 mm/add；要进入通用 lowering，compiler 必须显式表达 RHS transpose 与 bias broadcast。
+- rank-3 Linear 的 activation 带 batch/sequence 维，weight 仍是共享的二维 `[N,K]`；它不能套用“两侧 batch shape 必须一致”的普通 batched Matmul 校验，TISA/backend operand 必须显式标记 RHS batch broadcast。
+- `nn.LayerNorm` 导出为单结果 `aten.layer_norm`，affine 参数作为 placeholder 输入；适合保留为一条 semantic LayerNorm，再在 backend payload 内展开 mean/variance/affine micro-steps。
+- attention micrograph 导出为 `aten.transpose(K) -> aten.matmul(rank3) -> aten.softmax -> aten.matmul(rank3)`；单用途末两维 RHS transpose 可安全 fold 为 `load_transpose + batched_matmul`，无需物化独立 transpose tensor。
+- rank-3 Matmul 的 batch 维必须进入 tile coordinates 和 BufferRegion；仅使用末两维 M/N 会产生能通过 shape-level验证但地址错误的 graph。
+- Softmax 的 axis 常作为 positional argument；只读取 kwargs 会把 `dim=1` 错当成最后一维。region 构造也必须恢复 tensor 物理轴顺序，不能简单拼接 iteration dims 后再拼 reduction dim。
+- 这些规则说明 Canonical OperatorGraph 之前必须有 framework-specific import，之后仍需要 graph compiler passes；`torch.export` 或 StableHLO 本身都不会直接生成可供 TISA scheduler 使用的 tile program。
+
+## 2026-08-23：StableHLO round-trip 实现结论
+
+- 论文形态的 `TorchExport -> StableHLO -> TISA` 可以先用 dependency-light textual emitter/parser 验证边界，不必在第一步把完整 OpenXLA/MLIR toolchain 嵌入 simulator。
+- StableHLO 的 `dot_general` 维度必须转换为项目的固定矩阵语义：batch dimensions + M + N，K 为唯一 reduction；共享二维权重需要显式 `rhs_broadcast_batch`，否则 lowering 会错误地把权重当成逐 batch tensor。
+- StableHLO primitive 链不是最终 semantic graph。Softmax 的 max/subtract/exp/sum/divide、LayerNorm 的 mean/variance chain 和 RMSNorm 的 square/sum/rsqrt chain必须经过严格 producer/consumer pattern fusion，才能复用已有 semantic lowering。
+- round-trip 的 provenance、op id 和 frontend target 与 direct TorchExport 路径不同是正常现象；公平性应比较 semantic type/shape、tile count、TISA count、primitive task count 和 cycle，而不是要求 JSON hash 完全相同。
+- 输出中应同时保留原始 `FrontendImport` 与 generated StableHLO module，避免把中间模块塞进 provenance 导致 graph JSON 膨胀，也便于定位 emitter/parser 的差异。
+- textual subset 当前不应宣称“使用了完整 StableHLO compiler”：tuple result、复杂 region、layout、动态 shape constraint 和真实 XLA legalization 仍需后续接入标准 toolchain。
+
+## 2026-08-23：官方 StableHLO 接入后的结论
+
+- OpenXLA 官方 StableHLO wheel 的顶层 import 不是 `import stablehlo`，而是
+  `from mlir.ir import Context, Module` 与 `import mlir.dialects.stablehlo`；解析前必须
+  `stablehlo.register_dialect(context)`，验证使用 `module.operation.verify()`。
+- “使用官方 StableHLO”至少包含 dialect registration、官方 parser/printer 和 verifier；
+  仅输出带 `stablehlo.` 前缀的文本不足以证明 IR 合法。旧文本第一次真实验证即暴露出
+  reduce reducer region、transpose syntax 和隐式 broadcast 问题。
+- StableHLO reduce 会移除 reduction axes，PyTorch `keepdim=True` 必须由后续
+  `broadcast_in_dim`/reshape 表达。Graph importer 可以在 fusion 识别阶段折叠这些 shape
+  primitives，但不能在官方 IR 中伪造 keepdim reduce result type。
+- 官方 wheel 负责 IR 基础设施，不负责 `torch.export -> StableHLO`。因此当前架构应明确
+  分成 `PyTorch exporter/legalizer` 与 `OfficialStableHLO backend`；未来切换 torch-xla 或
+  torch-mlir exporter 不应影响 OfficialStableHLOAdapter 后面的 Canonical Graph/TISA。
+- 正式实验不能 silent fallback。`official` 缺依赖/校验失败必须报错；只有显式 `auto`
+  才允许回退，并将 `stablehlo_fallback=true` 和原因写入 manifest。
+
+## 2026-08-23：torch-xla exporter 实测
+
+- `torch-xla==2.9.0` 的稳定 API 是
+  `torch_xla.stablehlo.exported_program_to_stablehlo(ExportedProgram)`；返回对象同时提供
+  `get_stablehlo_text()` 与 `get_stablehlo_bytecode()`。这与论文的 framework bridge
+  形态直接对齐，不需要从 FX graph 手写 StableHLO 文本。
+- 本机 `torch==2.9.1+cu128` 与 torch-xla 2.9.0 的 PJRT CPU backend 实测可用，尽管 patch
+  版本并非完全一致；该组合必须通过 regression 固定，不能泛化为任意 PyTorch 版本兼容。
+- torch-xla 导出的 Matmul 和 attention micrograph 使用官方 `dot_general`、reduce region、
+  broadcast、transpose，可直接通过独立 OpenXLA StableHLO verifier 和当前 importer。
+- torch-xla 会改变函数参数顺序并内联/重排常量，因此公平对比不能依赖 SSA 名称或参数
+  顺序；应继续比较 semantic graph、tile、TISA、primitive task 和 cycle。
+- 完整 attention block 暴露出下一层真实 compiler 工作：Linear 被 flatten 为 rank-2 dot
+  再 reshape 回 rank-3，LayerNorm 变为多结果 `batch_norm_training` 加 affine chain。
+  这证明“有官方 exporter”仍不等于“已经有完整 Graph Compiler”，下一步应实现 pattern
+  recovery，而不是绕过 StableHLO 使用源 TorchExport graph。
+- pattern recovery 实测可在不读取源 FX graph 的前提下恢复完整 attention block：四个
+  flatten/dot/bias/unflatten Linear 恢复为 rank-3 BatchedMatmul 加 broadcast Add；未使用的
+  `batch_norm_training` mean/variance 结果可以投影，但一旦被消费必须显式拒绝。
+- torch-xla 2.9 对输入 `[1, 4, 8]` 的 LayerNorm 直接使用 feature index 1 的 batch norm；
+  对 `[2, 4, 8]` 则先 reshape 为 `[1, 8, 8]`，再以 feature index 1 让每个 outer row
+  独立沿 hidden 轴归一化。因此 recovery 必须同时验证 reshape 元素数、hidden 维、
+  feature index、单用途链和 reshape-back shape，不能只按 op 名称融合。

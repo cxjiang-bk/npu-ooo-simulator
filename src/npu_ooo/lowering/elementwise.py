@@ -47,6 +47,36 @@ def _output_region(operator, tensors: dict[str, Any], tile: TileInstance, memory
     return _region(output, memory, starts, shape, access)
 
 
+def _broadcast_input_region(
+    input_tensor: Any,
+    output_shape: tuple[int, ...],
+    dimensions: tuple[str, ...],
+    tile: TileInstance,
+    memory: str,
+) -> BufferRegion:
+    input_shape = tuple(input_tensor.shape)
+    if len(input_shape) > len(output_shape):
+        raise ValueError(f"input '{input_tensor.name}' rank exceeds elementwise output rank")
+    padded_shape = (1,) * (len(output_shape) - len(input_shape)) + input_shape
+    starts: list[int] = []
+    shape: list[int] = []
+    for axis, (input_extent, output_extent) in enumerate(zip(padded_shape, output_shape)):
+        if input_extent not in {1, output_extent}:
+            raise ValueError(
+                f"input '{input_tensor.name}' shape {input_shape} cannot broadcast to {output_shape}"
+            )
+        if axis < len(output_shape) - len(input_shape):
+            continue
+        if input_extent == 1:
+            starts.append(0)
+            shape.append(1)
+        else:
+            start, stop = tile.bound_map[dimensions[axis]]
+            starts.append(start)
+            shape.append(stop - start)
+    return _region(input_tensor, memory, tuple(starts), tuple(shape), AccessType.READ)
+
+
 def lower_elementwise_graph(
     graph: OperatorGraph,
     schedule: ScheduleSpec,
@@ -81,9 +111,15 @@ def lower_elementwise_graph(
             raise ValueError(f"elementwise operator '{operator.op_id}' requires iteration dimensions only")
         output_shape = tuple(tensors[operator.outputs[0]].shape)
         for input_name in operator.inputs:
-            if tuple(tensors[input_name].shape) != output_shape:
+            input_shape = tuple(tensors[input_name].shape)
+            padded_shape = (1,) * (len(output_shape) - len(input_shape)) + input_shape
+            if len(input_shape) > len(output_shape) or any(
+                input_extent not in {1, output_extent}
+                for input_extent, output_extent in zip(padded_shape, output_shape)
+            ):
                 raise ValueError(
-                    f"elementwise operator '{operator.op_id}' requires matching input/output shapes"
+                    f"elementwise operator '{operator.op_id}' input shape {input_shape} "
+                    f"cannot broadcast to output shape {output_shape}"
                 )
         from npu_ooo.ir.tile import enumerate_operator_tiles
 
@@ -97,11 +133,12 @@ def lower_elementwise_graph(
             load_regions: list[BufferRegion] = []
             for input_index, input_name in enumerate(operator.inputs):
                 input_tensor = tensors[input_name]
-                bounds = tile.bound_map
-                starts = tuple(bounds[name][0] for name in dimensions)
-                shape = tuple(bounds[name][1] - bounds[name][0] for name in dimensions)
-                input_global = _region(input_tensor, root, starts, shape, AccessType.READ)
-                input_local = _region(input_tensor, local, starts, shape, AccessType.READ)
+                input_global = _broadcast_input_region(
+                    input_tensor, output_shape, dimensions, tile, root
+                )
+                input_local = _broadcast_input_region(
+                    input_tensor, output_shape, dimensions, tile, local
+                )
                 load_id = f"{tile.tile_id}.load_{input_index}"
                 predecessors = {
                     store_id

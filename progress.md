@@ -178,6 +178,145 @@ dynamic_ready_queue 17984 cycles
 
 ## 2026-08-21：阶段 8 前端与统一 compiler 第一版
 
+## 2026-08-23：论文形态 StableHLO 前端闭环
+
+### 本轮完成
+
+- 新增 `src/npu_ooo/frontend/stablehlo_codegen.py`：从 canonical frontend graph 生成可检查的 textual StableHLO module，并保留 `source_graph_id`、frontend 和 operator count provenance。
+- `StableHLOAdapter` 扩展为通用常见 dot 维度解析：支持 rank-2、rank-3 batching、隐式 activation leading dimensions、共享二维 RHS batch broadcast、`rhs_transposed` 和 `transpose_dims`。
+- 新增 `SoftmaxFusionPass` 与 `LayerNormFusionPass`，使 generated StableHLO 的 primitive chain 在 graph compiler 中恢复成语义算子；RMSNorm 复用现有 `RMSNormFusionPass`。
+- `CompiledArtifact` 保存 `stablehlo` 和 `source_frontend` 两个可选中间产物；新增 through-StableHLO compiler API。
+- CLI `compile-model --through-stablehlo` 已跑通 attention block，并按 staged output 写入 `00_frontend/generated.mlir`、`stablehlo_module.json` 和 `source_frontend_import.json`。
+- 旧的 rank-3 dot rejection regression 已更新为 batched matmul import regression；新增 TorchExport round-trip 等价性测试。
+
+### 结果
+
+```text
+attention_block (B=1,S=4,H=8,tile=4)
+semantic operators: 13
+tiles:             33
+primitive tasks:   134
+TISA instructions: 112
+analytical cycles: 590
+```
+
+直接 TorchExport 和 StableHLO round-trip 路径的语义算子类型、tile 数、TISA 数和 primitive task 数一致；metadata/provenance 会记录不同 frontend 来源，因此完整 JSON hash 不要求相同。
+
+### 验证
+
+- `PYTHONPATH=src python3 -m unittest discover -s tests -q`：81 tests passed，11 skipped。
+- `python3 -m compileall -q src tests examples`：通过。
+- `git diff --check`：通过。
+- CLI smoke：`compile-model --torch-module examples.torch_models:attention_block --through-stablehlo` 成功生成 staged artifacts 和 swimlane。
+
+### 当时边界（已由下一节的官方 StableHLO 接入取代）
+
+- 这一阶段的 generated StableHLO 仅是 dependency-light textual subset；现已降级为显式 `textual` regression backend。
+
+## 2026-08-23：官方 StableHLO dialect/parser/verifier
+
+### 已完成
+
+- 从 OpenXLA StableHLO 官方 `dev-wheels` 安装并验证
+  `stablehlo-1.12.1.1751868740+6f7b4ab8-cp312-linux_x86_64`；真实导入路径是
+  `mlir.ir` 与 `mlir.dialects.stablehlo`，dialect 需显式注册。
+- 新增 `src/npu_ooo/frontend/stablehlo_official.py`：官方 generator 输出合法
+  StableHLO，adapter 通过官方 MLIR parser/verifier 校验并导回统一 FrontendImport。
+- 修复轻量文本过去不符合官方语义的部分：reduce 使用 reducer region，reduction
+  默认移除轴，keepdim 通过 `broadcast_in_dim` 表达；参数/标量 broadcast 显式化；
+  transpose 使用正式 permutation；RMSNorm 使用 mean 而非未经归一化的 sum。
+- compiler/CLI 增加 `official|auto|textual` backend。正式默认是 `official` 且失败即报错；
+  `auto` 的回退状态和原因进入 manifest，避免实验静默使用 fallback。
+- `--stablehlo-file` 以及 `compile_stablehlo_text/file/module()` 同样默认官方验证，不再
+  只有 `--through-stablehlo` 使用 verifier。
+- 当前机器 Python 3.12 用户 site-packages 已安装官方 wheel；默认 Python 3.14 不兼容
+  cp312 wheel，真实命令使用 `/usr/bin/python3.12`。
+
+### 已验证
+
+```text
+official StableHLO import + parse + verify: passed
+official examples/stablehlo/matmul.mlir compile: passed
+official attention CLI: 13 ops / 33 tiles / 112 TISA / 134 tasks / 590 cycles
+official/textual attention structural counts: identical
+```
+
+### 尚未完成
+
+- 官方 StableHLO wheel 不等于 PyTorch exporter。项目 generator 继续提供当前宽覆盖
+  legalization；真实 torch-xla exporter 已接入 Matmul、attention micrograph 和完整
+  attention block；torch-mlir 尚未接入。
+- 当前 official importer 的支持范围仍是一结果、静态 shape 和本项目算子集合；完整
+  tuple/control-flow/dynamic-shape/layout/quantization 不在本轮完成范围。
+
+### 最终回归
+
+```text
+Python 3.14（无 torch/StableHLO）：86 tests passed，16 skipped
+Python 3.12（torch 2.9.1 + official StableHLO + torch-xla）：86 tests passed
+compileall（Python 3.14/3.12）：passed
+git diff --check：passed
+```
+
+## 2026-08-23：torch-xla 官方 exporter 插件
+
+### 已完成
+
+- 验证 PyPI `torch-xla==2.9.0` 提供 cp312 manylinux wheel，并与本机
+  `torch==2.9.1+cu128` 在 PJRT CPU backend 下兼容。
+- 新增 `TorchXLAStableHLOExporter`，直接调用官方
+  `exported_program_to_stablehlo()`，记录 exporter version、StableHLO bytecode size/hash，
+  并用独立 OpenXLA StableHLO bindings 再做 parse/verify。
+- compiler API 与 CLI 新增 `stablehlo_exporter=project|torch-xla`；torch-xla 强制搭配
+  `stablehlo_backend=official`，任何 export/import unsupported 都直接失败。
+- 增加 `examples.torch_models:attention_micrograph` 三输入 factory 和真实 regression。
+
+### 已验证
+
+```text
+torch-xla Matmul export: passed
+torch-xla attention micrograph: 3 semantic ops / 36 tiles / 104 TISA / 132 tasks
+direct TorchExport 与 torch-xla 路径的 semantic/tile/TISA/task 数：一致
+torch-xla CLI dynamic_ready_queue: 559 analytical cycles
+```
+
+### 后续 importer 工作
+
+- [x] torch-xla `nn.Linear` 的 flatten/dot/bias/unflatten 已恢复为 rank-3 semantic
+  BatchedMatmul 加 broadcast Add，显式 weight transpose 继续 fold 到 Matmul metadata。
+- [x] `[1, 4, 8]` 的直接 row-wise LayerNorm 和 `[2, 4, 8] -> [1, 8, 8]` 的展开形态
+  均已从多结果 `stablehlo.batch_norm_training` 加 affine 恢复；不满足 reshape/feature
+  等价约束时不做错误泛化。
+- [ ] 一般多结果消费、复杂 MLIR region、layout、动态 shape constraint、更广模型导出和
+  TISA device scheduler 仍是后续阶段。
+
+## 2026-08-23：torch-xla 完整 attention block recovery
+
+### 已完成
+
+- 官方投影层保留 `batch_norm_training` 的 `epsilon` 和 `feature_index`，为每个 MLIR result
+  建立独立身份；未使用的 mean/variance 可被安全省略，一旦后续 op 或 return 消费次要
+  result 就显式报错。
+- 新增 `RecoverStableHLOLayerNormPass`：只在直接 row-wise 或
+  `[1, prod(outer), hidden]` reshape 形态、internal scale/offset 为 1/0 且外部 affine
+  shape 匹配时恢复 LayerNorm；batch=2 的完整 block 已加入回归。
+- 新增 `RecoverStableHLOFlattenedLinearPass`：恢复共享 flatten 输入和四组
+  dot/bias/unflatten，重建 rank-3 batch/M/N/K 维度，再由既有 transpose fold、lowering、
+  TISA 和 backend 继续处理。
+- recovery 只消费官方 verifier 通过后的 StableHLO，不读取 source TorchExport graph，
+  不会静默切换 project exporter。
+
+### 验证
+
+```text
+torch-xla attention block: 13 semantic ops / 33 tiles / 112 TISA / 134 tasks
+direct TorchExport 与 torch-xla 的 semantic op 多重集、tile/TISA/task 数：一致
+Python 3.14：86 tests passed，16 skipped
+Python 3.12 + torch/StableHLO/torch-xla：86 tests passed
+compileall（Python 3.14/3.12）：passed
+git diff --check：passed
+```
+
 ### 已完成
 
 - 新增 `ir/tisa.py`：冻结最小 `TileMem`、`TISAOperand`、`UnitMap`、typed `TISADependency`、`TISAInstruction`、`TISAProgram` 和 `BackendArtifact` schema；每条 TISA instruction 绑定一个 semantic tile，payload 通过 `tisa_id -> ExecutionTask tuple` 关联。
@@ -217,3 +356,113 @@ dynamic_ready_queue 17984 cycles
 - 全量 `PYTHONPATH=src python3 -m unittest discover -s tests -q`：62 tests passed。
 - 普通 `two-mm`、`compile-model` 和 `sweep-two-mm` smoke 均生成八个阶段目录；`artifact_index.json` 可列出规范文件，兼容符号链接可正常被旧测试读取。
 - `git diff --check` 通过。
+
+## 2026-08-22：明确前端自动编译推进计划
+
+### 本轮结论
+
+- 当前单算子和模型 block 冒烟仍主要由 `benchmarks/*.py` 手动构造 `ModelSpec/OperatorGraph`，再调用固定的 `default_*_schedule` 和专用/registry lowering；它们是稳定的 backend/simulator baseline，不是从真实 PyTorch 算子自动编译的前端。
+- `compile-model` 已能从 Canonical JSON 经过 `FrontendImport -> Schedule/Tile -> TISA -> BackendArtifact`，但 JSON 本身已经是规范化输入，尚未覆盖真实 `torch.export` 导入和完整 pass pipeline。
+- 阶段 9 拆分为 9.1-9.7：依赖与输入契约、TorchExport/ATen 导入、Canonicalization PassManager、decomposition/fusion、自动 schedule/tile、TISA/backend codegen、真实前端 CLI 与回归。
+- 第一轮前端范围冻结为静态 shape、推理、小型真实 PyTorch 模型，优先 RMSNorm、LayerNorm、Linear/Matmul、ResidualAdd、Softmax 和 attention micrograph；暂不承诺完整 ATen、训练、动态控制流或完整 StableHLO/MLIR 工具链。
+
+### 本轮变更
+
+- 更新 `task_plan.md`，补充阶段 9 前端自动编译子计划、输入输出和验收标准。
+- 本轮未修改实现代码，未改变现有 benchmark、simulator 或输出格式。
+
+## 2026-08-22：前端真实导入与首个 composite pass
+
+### 已完成
+
+- 扩展 `TorchExportAdapter`：支持传入 `model_id`/`variant`/`shape_environment`，保留 `torch.export` 与 GraphModule provenance，并记录 graph inputs/outputs、parameter/activation metadata、frontend target、input occurrences 和 JSON-safe constant args。
+- 扩展 FX/ExportedProgram 导入边界：处理 `placeholder`、`get_attr`、`call_function`、`call_method`、`call_module` 和 `output`；对 matmul、reduce、norm、softmax、elementwise 的基础 target 做语义映射；不再静默丢弃非 `call_function` 节点。
+- 新增 `src/npu_ooo/compiler/passes.py`：`PassManager`、`CanonicalizeGraphPass` 和第一版 `RMSNormFusionPass`。RMSNorm pass 识别显式 `mul -> reduce -> add(epsilon) -> rsqrt -> mul`，生成语义 RMSNorm，并保留 source op/fusion provenance。
+- `compile_operator_graph` 已在 schedule/lowering 前统一执行 PassManager，并把 pass diagnostics 写入 `CompiledArtifact`；新增 `SchedulePlanner` 入口，当前封装既有确定性 heuristic 并标记 `source=automatic-planner`。
+- 新增公开 API：`compile_torch_module` 和 `compile_torch_exported_program`，真实模型无需先手工落成 Canonical JSON 即可进入统一 compiler pipeline。
+- 新增 frontend contract/fusion/compile-to-TISA 测试；全量测试从 62 增至 64，均通过。
+
+### 验证
+
+```text
+PYTHONPATH=src python3 -m unittest discover -s tests -q: 64 tests passed
+python3 -m compileall -q src tests: passed
+git diff --check: passed
+fake ExportedProgram RMSNorm: rmsnorm -> 2 tiles -> 6 TISA instructions -> 10 primitive tasks
+```
+
+### 当前限制
+
+- 当前环境 Python 3.14 未安装 `torch`、`executorch` 或 `stablehlo`，因此还没有运行真实 `torch.nn.Module -> torch.export` API smoke；已用 duck-typed ExportedProgram graph 契约覆盖相同导入逻辑。
+- RMSNorm fusion 当前只覆盖静态二维、显式算术模式；native LayerNorm tuple output、复杂 broadcast、动态 shape 和完整 attention fusion 留待后续 pass。
+- 真实 probe 已确认 `aten.softmax` 可以进入现有 lowering；`aten.linear` 现在能正确识别为 matmul 并保留 bias input，但在 bias decomposition 完成前会显式失败，避免静默丢失 bias；affine `native_layer_norm` 和包含 transpose 的完整 MultiheadAttention 同样暂未宣称支持。
+
+### 真实 PyTorch smoke
+
+- 发现系统 Python 3.12 环境已提供 PyTorch 2.9.1，使用 `PYTHONPATH=src python3.12` 验证真实 `torch.export`。
+- `torch.nn.Module` RMSNorm 展开实际使用 `aten.mean`，补充 `mean -> reduce` 映射；真实 target 使用 `aten::mul`/`aten::rsqrt`，fusion target matching 统一规范化 `::`/`.`。
+- 真实端到端结果：`rmsnorm` semantic op、2 个 tile、6 条 TISA instruction、10 个 primitive payload task，`CompiledArtifact.validate()` 通过。
+- 增加 `test_real_torch_rmsnorm_compiles_to_tisa`；无 torch 环境自动 skip，Python 3.12+torch 环境已实际通过。
+
+### 本轮遇到并修复的错误
+
+| 错误 | 原因 | 修复 |
+|---|---|---|
+| `no registered lowering for operator type 'aten.mean'` | PyTorch 2.9 RMSNorm 导出使用 `aten.mean`，导入器只映射了 `sum` | 将 `aten.mean`/`aten::mean` 归一到 `reduce` |
+| RMSNorm 未触发 fusion，最终 `mul_1` shape mismatch | 真实 FX target 使用 `aten::` 而 fusion matcher 只匹配 `aten.` | matcher 统一把 `::` 转换为 `.` |
+
+## 2026-08-22：StableHLO frontend bridge 第一版
+
+### 已完成
+
+- 新增 `src/npu_ooo/frontend/stablehlo.py` 和公开 `StableHLOAdapter`：支持 `from_text()`、`from_file()`、`from_module()` 以及包含 `mlir/text` 的 payload wrapper。
+- StableHLO adapter 解析第一版 textual MLIR subset：`func.func` 参数、tensor type、constant、单结果 `stablehlo/mhlo` elementwise/reduce/dot/softmax operation 和 return；保留 frontend target、常量参数、graph inputs/outputs、entry point 与 parser provenance。
+- StableHLO 图汇入同一个 `FrontendImport`，因此不需要修改 PassManager、SchedulePlanner、TISA 或 backend；StableHLO `multiply/reduce/add/rsqrt/multiply` 已复用 RMSNorm fusion。
+- 增加 StableHLO textual RMSNorm fixture：导入后能生成 semantic RMSNorm，并通过自动 tiling、TISA/backend artifact validation。
+- 更新 README、`docs/architecture.md` 和 `task_plan.md`，明确 StableHLO adapter 的职责和当前 subset 边界。
+
+### 验证
+
+```text
+PYTHONPATH=src python3 -m unittest discover -s tests -q: 66 tests passed, 1 skip
+PYTHONPATH=src python3.12 -m unittest tests.test_frontend_compiler -q: 10 tests passed
+python3 -m compileall -q src tests: passed
+git diff --check: passed
+```
+
+### 当时限制（历史记录）
+
+- 当时本机没有 StableHLO/MLIR bindings；该限制已在 2026-08-23 的官方 StableHLO 接入中解除，`torch_xla` 仍未安装。
+- StableHLO parser 目前只支持单结果和受控 textual subset；tuple result/native LayerNorm、复杂 region、layout encoding 和动态 shape constraint 仍需后续 adapter pass。
+
+## 2026-08-22：StableHLO CLI 与真实 PyTorch 常用算子闭环
+
+### 已完成
+
+- StableHLO `dot_general` 现在从函数签名的结果侧读取 shape，并解析 compact/canonical contracting 与 batching dimensions；rank-2/rank-3 batched dot、共享二维 RHS broadcast 和可下沉的转置元数据会进入 canonical matmul lowering，真正不支持的维度布局仍在 frontend boundary 显式报错。
+- 新增 `compile_stablehlo_text/file/module` API；`compile-model` 通过互斥的 `--graph-json`/`--stablehlo-file` 支持两种入口，并加入可直接运行的 `examples/stablehlo/matmul.mlir`。
+- PyTorch `graph_signature` 参数分类已接入，parameter/buffer/user input 不再都记为普通 input。
+- 新增 Linear decomposition：`aten.linear(x, W[N,K], bias[N]) -> Matmul(rhs_transposed) -> broadcast Add`；backend payload 对 RHS 使用 `load_transpose`。
+- affine LayerNorm 支持 weight/bias tile load，LayerNorm 与 RMSNorm 支持 `[batch, sequence, hidden]` 多 outer dimensions。
+- Softmax 保留 positional axis，并按物理 tensor axis 构造 region，支持多 outer dimensions 和非末轴 reduction。
+- attention micrograph 的单用途 `K.transpose(-2,-1)` 自动 fold 到 batched Matmul；真实 `QK^T -> Softmax -> PV` 可从 `torch.nn.Module` 编译到 TISA/backend。
+- `compile-model --torch-module MODULE:FACTORY --input-shape ...` 已接入真实 PyTorch CLI；仓库内 pre-norm attention block 示例生成 13 个 canonical operators、33 个 tiles、112 条 TISA instructions（其中 18 条 `load_transpose`）和 134 个 primitive tasks。
+- `pyproject.toml` 新增 `torch` 可选依赖并锁定本轮真实 smoke 使用的 `torch==2.9.1`；未验证的 StableHLO/torch-xla 发行包没有被写成伪依赖。
+- 同一真实 attention block 分别运行 `static_pipeline` 与 `dynamic_ready_queue`：Canonical Graph、TileGraph、TISAProgram 和 ExecutionGraph 的 SHA-256 完全相同；当前 minimal/small-shape 两者均为 590 analytical cycles，说明公平输入已固定，但该 case 本身没有表现出动态调度收益。
+- PyTorch RMSNorm 与 StableHLO RMSNorm 已验证 canonical op、维度、tile 数和 TISA instruction 数一致。
+
+### 验证
+
+```text
+PYTHONPATH=src python3 -m unittest discover -s tests -q: 78 tests passed, 8 skipped
+PYTHONPATH=src:. /usr/bin/python3.12 -m unittest tests.test_frontend_compiler -q: 22 tests passed
+python3 -m compileall -q src tests: passed
+git diff --check: passed
+```
+
+### 仍待完成
+
+- StableHLO 官方 parser/verifier、reducer region 与真实 torch-xla exporter 已接入；
+  通用 tuple/layout/dynamic-shape smoke 尚未完成。
+- 完整 Transformer block、Conv/ResNet 与模型加载 CLI 尚未实现；rank-3 Linear 已支持共享二维 weight/bias 的 batch broadcast，但更复杂的 batch broadcasting 尚未覆盖。
+- SchedulePlanner 仍是确定性 shape-aware heuristic，不是 architecture-aware cost model；simulator 仍消费 backend primitive graph，而不是直接执行 TISA device scheduler。

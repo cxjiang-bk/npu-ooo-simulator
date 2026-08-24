@@ -91,7 +91,9 @@ out/attention-dynamic/
 ├── 00_frontend/             # 输入模型、benchmark case、frontend provenance
 │   ├── model_spec.json
 │   ├── benchmark_case.json
-│   └── model_instance.json
+│   ├── model_instance.json
+│   ├── generated.mlir       # --through-stablehlo 时生成的 StableHLO 文本
+│   └── stablehlo_module.json
 ├── 01_graph_ir/             # Canonical OperatorGraph 和图可视化
 │   ├── operator_graph.json
 │   ├── operator_graph.dot
@@ -145,19 +147,140 @@ out/attention-dynamic/
 StableHLO 上做 fusion、tiling、layout 和 memory planning，Fusion Compiler/TISA
 Generator 再输出语义 tile 指令。
 
-本项目先采用不依赖大型 MLIR 工具链的等价边界：
+本项目现在提供正式的官方 StableHLO 路径，以及仅用于回归测试的轻量路径：
 
 ```text
-torch.export / ExecuTorch       (framework bridge, optional dependency)
-canonical JSON / in-memory IR   (framework-independent bridge for tests)
+torch.export                    (PyTorch capture)
+              -> torch-xla exporter 或 project legalizer
+              -> official StableHLO parser + verifier
               -> Canonical OperatorGraph
               -> compiler pipeline (schedule -> TileGraph -> TISAProgram)
               -> BackendArtifact (descriptor + analytical primitive payload)
 ```
 
 `TorchExportAdapter` 只在被调用时导入 `torch`，所以没有 PyTorch 的环境仍可使用
-JSON/canonical frontend 和后端 simulator。未来的 StableHLO adapter 应汇入同一个
-`FrontendImport`，而不应把 StableHLO node name 直接暴露给 scheduler。
+JSON/canonical frontend 和后端 simulator。正式路径由 `OfficialStableHLOGenerator`
+生成标准 reducer region、`broadcast_in_dim`、`dot_general` 和 transpose 属性，随后由
+`OfficialStableHLOAdapter` 注册官方 dialect，执行 `Module.parse()` 和
+`module.operation.verify()`。验证后的模块再汇入同一个 `FrontendImport`，scheduler
+不会依赖 MLIR node name。旧 `StableHLOGenerator/StableHLOAdapter` 只保留为显式
+`textual` regression backend，不用于正式实验结果。
+
+官方 wheel 的安装与版本说明见 [docs/install-stablehlo.md](docs/install-stablehlo.md)。
+需要注意，官方 StableHLO 包不是 PyTorch exporter。默认 `project` exporter 由本项目
+完成当前宽覆盖的 `torch.export -> StableHLO` legalization；论文同构实验使用已接入的
+`torch-xla==2.9.0` exporter。Matmul、`QK^T -> Softmax -> PV` micrograph 和包含
+LayerNorm/四个 Linear 的完整 attention block 均已走通。两者复用相同官方 verifier 和
+下游 compiler contract，manifest 会明确记录 producer，不能混为同一个实现。
+
+当前真实 PyTorch 模型可以通过 Python API 进入统一编译入口：
+
+项目把已验证版本声明为可选依赖，可在具备对应 PyTorch wheel 的 Python 环境中安装：
+
+```bash
+python3.12 -m pip install -e '.[torch]'
+```
+
+```python
+from npu_ooo.arch import minimal_machine_config
+from npu_ooo.compiler import compile_torch_module
+
+compiled = compile_torch_module(
+    module.eval(),
+    (example_input,),
+    minimal_machine_config(),
+    model_id="my_model",
+)
+```
+
+该 API 执行 `torch.export -> FrontendImport -> PassManager -> Canonical OperatorGraph ->
+SchedulePlanner -> TileGraph -> TISAProgram -> BackendArtifact`。当前 PassManager 已
+包含结构规范化、Linear decomposition、RHS transpose fold 和 RMSNorm pattern fusion；
+真实 PyTorch 2.9.1 已验证 Linear、三维 RMSNorm/LayerNorm、Softmax 和
+`QK^T -> Softmax -> PV` attention micrograph。
+
+StableHLO textual MLIR 可以直接经 CLI 编译并仿真：
+
+```bash
+PYTHONPATH=src:. /usr/bin/python3.12 -m npu_ooo.cli compile-model \
+  --stablehlo-file examples/stablehlo/matmul.mlir \
+  --stablehlo-backend official \
+  --arch minimal \
+  --policy dynamic_ready_queue \
+  --output-dir out/stablehlo-matmul
+```
+
+真实 PyTorch module 也可通过零参数 factory 进入同一命令。默认路径直接使用
+`torch.export -> Canonical OperatorGraph`；加上 `--through-stablehlo` 可以显式走
+论文形态的 StableHLO round-trip：
+
+```bash
+PYTHONPATH=src:. /usr/bin/python3.12 -m npu_ooo.cli compile-model \
+  --torch-module examples.torch_models:attention_block \
+  --input-shape 1,4,8 \
+  --input-dtype float32 \
+  --tile-size 4 \
+  --arch minimal \
+  --policy dynamic_ready_queue \
+  --output-dir out/torch-attention-block
+```
+
+```bash
+PYTHONPATH=src:. /usr/bin/python3.12 -m npu_ooo.cli compile-model \
+  --torch-module examples.torch_models:attention_block \
+  --input-shape 1,4,8 \
+  --tile-size 4 \
+  --arch minimal \
+  --policy dynamic_ready_queue \
+  --through-stablehlo \
+  --stablehlo-backend official \
+  --output-dir out/torch-attention-stablehlo
+```
+
+使用 torch-xla framework bridge 的完整 attention block：
+
+```bash
+PYTHONPATH=src:. PJRT_DEVICE=CPU /usr/bin/python3.12 -m npu_ooo.cli compile-model \
+  --torch-module examples.torch_models:attention_block \
+  --input-shape 1,4,8 \
+  --tile-size 4 \
+  --arch minimal \
+  --policy dynamic_ready_queue \
+  --through-stablehlo \
+  --stablehlo-backend official \
+  --stablehlo-exporter torch-xla \
+  --output-dir out/torch-xla-attention
+```
+
+这条命令真实执行
+`torch.export -> torch_xla.stablehlo.exported_program_to_stablehlo -> official verifier ->
+Canonical Graph -> TISA`。当前完整 block 结果为 13 个 semantic operators、33 tiles、
+112 TISA instructions、134 primitive tasks；与直接 TorchExport 路径的结构计数一致。
+torch-xla 合法地把 V projection 排到 Softmax 之后，因此不要求两条路径的 SSA 名称和
+拓扑序逐项相同。
+
+启用该选项后，`00_frontend/` 会额外生成 `generated.mlir` 和
+`stablehlo_module.json`；`frontend_import.json` 表示 StableHLO 重新导入后的图，
+`source_frontend_import.json` 保留原始 TorchExport 图。编译器会在 StableHLO primitive
+链上执行 Softmax、LayerNorm、RMSNorm fusion，然后继续使用同一套 tile/TISA/backend
+实现。`stablehlo_module.json` 和 `manifest.json` 会记录官方 StableHLO 版本、producer、
+verifier 状态与 fallback 状态；默认 `official` 不会静默回退。
+
+`--input-shape` 可重复指定多个 tensor 输入。当前 CLI 生成静态浮点输入，适合算子和
+小模型编译/性能 smoke；需要 tokenizer、整数输入、KV cache 或自定义样本的模型使用
+`compile_torch_module()` Python API 传入真实 example inputs。
+
+该命令会在 `00_frontend` 到 `07_trace` 中生成 Canonical Graph、TileGraph、
+TISAProgram、backend payload、周期汇总和泳道图。当前官方路径已支持 rank-2、rank-3、
+共享二维 RHS、合法 reducer region、显式 broadcast 和常见 `dot_general`，并能从 primitive
+链恢复 Softmax/LayerNorm/RMSNorm，并恢复 torch-xla 的
+`flatten -> dot_general -> bias -> unflatten` Linear pattern。对
+`batch_norm_training -> affine` 的 LayerNorm 恢复采用严格等价条件：输入必须是直接
+row-wise 形态，或由 reshape 严格变换成 `[1, prod(outer), hidden]`；不满足时显式失败。
+尚未实现的是完整
+torch-xla/XLA legalization、动态 shape、通用 tuple result、复杂 region/layout、完整标准
+模型 one-block preset 和 TISA device scheduler。不能把官方 verifier 和这些受约束的
+recovery pass 等同于完整 XLA Graph Compiler。
 
 ## 第一条闭环
 

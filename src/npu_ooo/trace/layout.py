@@ -25,6 +25,9 @@ STAGE_DIRECTORIES: tuple[tuple[str, str], ...] = (
 
 _STAGE_BY_FILENAME: dict[str, str] = {
     "frontend_import.json": "00_frontend",
+    "source_frontend_import.json": "00_frontend",
+    "stablehlo_module.json": "00_frontend",
+    "generated.mlir": "00_frontend",
     "model_spec.json": "00_frontend",
     "benchmark_case.json": "00_frontend",
     "model_instance.json": "00_frontend",

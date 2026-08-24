@@ -62,8 +62,10 @@ def lower_rmsnorm_graph(
             raise ValueError(f"RMSNorm operator '{operator.op_id}' requires one input and one output")
         iteration = tuple(name for name, _ in operator.iteration_dims)
         reduction = tuple(name for name, _ in operator.reduction_dims)
-        if len(iteration) != 1 or len(reduction) != 1:
-            raise ValueError(f"RMSNorm operator '{operator.op_id}' requires one iteration and one reduction dimension")
+        if not iteration or len(reduction) != 1:
+            raise ValueError(
+                f"RMSNorm operator '{operator.op_id}' requires iteration dimensions and one reduction dimension"
+            )
         input_tensor = tensors[operator.inputs[0]]
         output_tensor = tensors[operator.outputs[0]]
         if tuple(input_tensor.shape) != tuple(output_tensor.shape):
@@ -74,19 +76,32 @@ def lower_rmsnorm_graph(
         reduction_name = reduction[0]
         rows: dict[tuple[int, ...], list[Any]] = {}
         for tile in tiles:
-            rows.setdefault((tile.bound_map[iteration[0]][0],), []).append(tile)
+            rows.setdefault(
+                tuple(tile.bound_map[name][0] for name in iteration),
+                [],
+            ).append(tile)
 
         for row_key, row_tiles in rows.items():
             row_tiles.sort(key=lambda tile: tile.bound_map[reduction_name][0])
             sum_final: str | None = None
-            sum_region = _virtual_region(f"{operator_id}.sumsq", local, (row_tiles[0].extent(iteration[0]),), row_key, AccessType.READ)
+            iteration_shape = tuple(row_tiles[0].extent(name) for name in iteration)
+            sum_region = _virtual_region(
+                f"{operator_id}.sumsq",
+                local,
+                iteration_shape,
+                row_key,
+                AccessType.READ,
+            )
             square_ids: dict[str, str] = {}
             load_ids: dict[str, str] = {}
             for tile in row_tiles:
                 bounds = tile.bound_map
-                starts = (bounds[iteration[0]][0], bounds[reduction_name][0])
+                starts = (
+                    *(bounds[name][0] for name in iteration),
+                    bounds[reduction_name][0],
+                )
                 shape = (
-                    bounds[iteration[0]][1] - bounds[iteration[0]][0],
+                    *(bounds[name][1] - bounds[name][0] for name in iteration),
                     bounds[reduction_name][1] - bounds[reduction_name][0],
                 )
                 input_global = _region(input_tensor, root, starts, shape, AccessType.READ)
@@ -172,9 +187,12 @@ def lower_rmsnorm_graph(
 
             for tile in row_tiles:
                 bounds = tile.bound_map
-                starts = (bounds[iteration[0]][0], bounds[reduction_name][0])
+                starts = (
+                    *(bounds[name][0] for name in iteration),
+                    bounds[reduction_name][0],
+                )
                 shape = (
-                    bounds[iteration[0]][1] - bounds[iteration[0]][0],
+                    *(bounds[name][1] - bounds[name][0] for name in iteration),
                     bounds[reduction_name][1] - bounds[reduction_name][0],
                 )
                 input_local = _region(input_tensor, local, starts, shape, AccessType.READ)

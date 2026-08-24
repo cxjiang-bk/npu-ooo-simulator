@@ -74,45 +74,64 @@ def lower_layernorm_graph(
         operator = next(operator for operator in graph.operators if operator.op_id == operator_id)
         if operator.normalized_type != "layernorm":
             raise NotImplementedError(f"LayerNorm lowering does not support operator type '{operator.normalized_type}'")
-        if len(operator.inputs) != 1 or len(operator.outputs) != 1:
-            raise ValueError(f"LayerNorm operator '{operator.op_id}' requires one input and one output")
+        if len(operator.inputs) not in {1, 3} or len(operator.outputs) != 1:
+            raise ValueError(
+                f"LayerNorm operator '{operator.op_id}' requires x, optional weight/bias, and one output"
+            )
         iteration = tuple(name for name, _ in operator.iteration_dims)
         reduction = tuple(name for name, _ in operator.reduction_dims)
-        if len(iteration) != 1 or len(reduction) != 1:
+        if not iteration or len(reduction) != 1:
             raise ValueError(
-                f"LayerNorm operator '{operator.op_id}' requires one iteration and one reduction dimension"
+                f"LayerNorm operator '{operator.op_id}' requires iteration dimensions and one reduction dimension"
             )
         input_tensor = tensors[operator.inputs[0]]
         output_tensor = tensors[operator.outputs[0]]
         if tuple(input_tensor.shape) != tuple(output_tensor.shape):
             raise ValueError(f"LayerNorm operator '{operator.op_id}' input/output shapes must match")
+        affine = len(operator.inputs) == 3
+        weight_tensor = tensors[operator.inputs[1]] if affine else None
+        bias_tensor = tensors[operator.inputs[2]] if affine else None
+        reduction_extent = dict(operator.reduction_dims)[reduction[0]]
+        if affine and (
+            tuple(weight_tensor.shape) != (reduction_extent,)
+            or tuple(bias_tensor.shape) != (reduction_extent,)
+        ):
+            raise ValueError(
+                f"LayerNorm operator '{operator.op_id}' weight/bias must match reduction extent {reduction_extent}"
+            )
         from npu_ooo.ir.tile import enumerate_operator_tiles
 
         tiles = enumerate_operator_tiles(operator, schedule.for_operator(operator_id))
-        iteration_name = iteration[0]
         reduction_name = reduction[0]
         rows: dict[tuple[int, ...], list[TileInstance]] = {}
         for tile in tiles:
-            rows.setdefault((tile.bound_map[iteration_name][0],), []).append(tile)
+            rows.setdefault(
+                tuple(tile.bound_map[name][0] for name in iteration),
+                [],
+            ).append(tile)
 
         for row_key, row_tiles in rows.items():
             row_tiles.sort(key=lambda tile: tile.bound_map[reduction_name][0])
-            row_extent = row_tiles[0].extent(iteration_name)
+            iteration_shape = tuple(row_tiles[0].extent(name) for name in iteration)
+            row_extent = math.prod(iteration_shape)
             sum_region = _virtual_region(
-                f"{operator_id}.sum", local, (row_extent,), row_key, AccessType.READ
+                f"{operator_id}.sum", local, iteration_shape, row_key, AccessType.READ
             )
             mean_region = _virtual_region(
-                f"{operator_id}.mean", local, (row_extent,), row_key, AccessType.READ
+                f"{operator_id}.mean", local, iteration_shape, row_key, AccessType.READ
             )
             variance_region = _virtual_region(
-                f"{operator_id}.variance", local, (row_extent,), row_key, AccessType.READ
+                f"{operator_id}.variance", local, iteration_shape, row_key, AccessType.READ
             )
             sum_final: str | None = None
             for tile in row_tiles:
                 bounds = tile.bound_map
-                starts = (bounds[iteration_name][0], bounds[reduction_name][0])
+                starts = (
+                    *(bounds[name][0] for name in iteration),
+                    bounds[reduction_name][0],
+                )
                 shape = (
-                    bounds[iteration_name][1] - bounds[iteration_name][0],
+                    *(bounds[name][1] - bounds[name][0] for name in iteration),
                     bounds[reduction_name][1] - bounds[reduction_name][0],
                 )
                 input_global = _region(input_tensor, root, starts, shape, AccessType.READ)
@@ -173,7 +192,8 @@ def lower_layernorm_graph(
                 input_elements += math.prod(shape)
                 transfer_bytes += input_global.size_bytes
 
-            mean_id = f"{operator_id}.r{row_key[0]:04d}.mean"
+            row_label = "_".join(f"{value:04d}" for value in row_key)
+            mean_id = f"{operator_id}.r{row_label}.mean"
             mean_duration, mean_ii, mean_unit = _elementwise_timing(machine, row_extent)
             tasks.append(
                 ExecutionTask(
@@ -199,9 +219,12 @@ def lower_layernorm_graph(
             input_local_by_tile: dict[str, BufferRegion] = {}
             for tile in row_tiles:
                 bounds = tile.bound_map
-                starts = (bounds[iteration_name][0], bounds[reduction_name][0])
+                starts = (
+                    *(bounds[name][0] for name in iteration),
+                    bounds[reduction_name][0],
+                )
                 shape = (
-                    bounds[iteration_name][1] - bounds[iteration_name][0],
+                    *(bounds[name][1] - bounds[name][0] for name in iteration),
                     bounds[reduction_name][1] - bounds[reduction_name][0],
                 )
                 input_local = _region(input_tensor, local, starts, shape, AccessType.READ)
@@ -262,15 +285,80 @@ def lower_layernorm_graph(
             assert variance_final is not None
             for tile in row_tiles:
                 bounds = tile.bound_map
-                starts = (bounds[iteration_name][0], bounds[reduction_name][0])
+                starts = (
+                    *(bounds[name][0] for name in iteration),
+                    bounds[reduction_name][0],
+                )
                 shape = (
-                    bounds[iteration_name][1] - bounds[iteration_name][0],
+                    *(bounds[name][1] - bounds[name][0] for name in iteration),
                     bounds[reduction_name][1] - bounds[reduction_name][0],
                 )
                 output_local = _region(output_tensor, local, starts, shape, AccessType.WRITE)
                 normalize_id = f"{tile.tile_id}.layernorm"
                 normalize_duration, normalize_ii, normalize_unit = _elementwise_timing(machine, math.prod(shape))
                 center_id = f"{tile.tile_id}.center"
+                normalize_reads = [
+                    input_local_by_tile[tile.tile_id],
+                    mean_region,
+                    variance_region,
+                ]
+                normalize_predecessors = {center_id, mean_id, variance_final}
+                if affine:
+                    parameter_start = (bounds[reduction_name][0],)
+                    parameter_shape = (bounds[reduction_name][1] - bounds[reduction_name][0],)
+                    for parameter_name, parameter_tensor in (
+                        ("weight", weight_tensor),
+                        ("bias", bias_tensor),
+                    ):
+                        parameter_global = _region(
+                            parameter_tensor,
+                            root,
+                            parameter_start,
+                            parameter_shape,
+                            AccessType.READ,
+                        )
+                        parameter_local = _region(
+                            parameter_tensor,
+                            local,
+                            parameter_start,
+                            parameter_shape,
+                            AccessType.READ,
+                        )
+                        parameter_load_id = f"{tile.tile_id}.load_{parameter_name}"
+                        parameter_duration, parameter_ii, parameter_unit = _transfer_timing(
+                            machine,
+                            root,
+                            local,
+                            parameter_global.size_bytes,
+                        )
+                        tasks.append(
+                            ExecutionTask(
+                                task_id=parameter_load_id,
+                                tile_id=tile.tile_id,
+                                operator_id=operator_id,
+                                primitive="load",
+                                resource=parameter_unit,
+                                reads=(parameter_global,),
+                                writes=(
+                                    BufferRegion(
+                                        **{**parameter_local.__dict__, "access": AccessType.WRITE}
+                                    ),
+                                ),
+                                duration_cycles=parameter_duration,
+                                initiation_interval_cycles=parameter_ii,
+                                stage_id=tile.stage_id,
+                                program_order=task_order,
+                                attributes={
+                                    "operand": parameter_name,
+                                    "affine": True,
+                                    "iteration": tile.ordinal,
+                                },
+                            )
+                        )
+                        task_order += 1
+                        normalize_reads.append(parameter_local)
+                        normalize_predecessors.add(parameter_load_id)
+                        transfer_bytes += parameter_global.size_bytes
                 tasks.append(
                     ExecutionTask(
                         task_id=normalize_id,
@@ -278,14 +366,18 @@ def lower_layernorm_graph(
                         operator_id=operator_id,
                         primitive="layernorm",
                         resource=normalize_unit,
-                        reads=(input_local_by_tile[tile.tile_id], mean_region, variance_region),
+                        reads=tuple(normalize_reads),
                         writes=(output_local,),
-                        predecessors=(center_id, mean_id, variance_final),
+                        predecessors=tuple(sorted(normalize_predecessors)),
                         duration_cycles=normalize_duration,
                         initiation_interval_cycles=normalize_ii,
                         stage_id=tile.stage_id,
                         program_order=task_order,
-                        attributes={"epsilon": operator.attributes.get("epsilon", 1e-5), "iteration": tile.ordinal},
+                        attributes={
+                            "epsilon": operator.attributes.get("epsilon", 1e-5),
+                            "affine": affine,
+                            "iteration": tile.ordinal,
+                        },
                     )
                 )
                 task_order += 1

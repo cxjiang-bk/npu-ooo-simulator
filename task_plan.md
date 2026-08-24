@@ -6,7 +6,9 @@
 
 ## 当前阶段
 
-阶段 9 实施中：阶段 8 已冻结最小 TISA semantic contract，并搭建从 framework bridge/ExecuTorch 或 JSON graph 到 Canonical OperatorGraph、Schedule/Tiling、TISA/Backend artifact 的前端闭环；当前进入统一 PassManager、TISA target scheduler 和 runtime binding 之前的自动 tile/compiler 收敛。阶段 4-6 的 analytical primitive-task baseline 已可运行，但尚不能称为论文 TISA tile scheduler 复现；阶段 7 外部 timing/RTL 校准仍作为后续 backend 适配工作。
+阶段 9 实施中：阶段 8 已冻结最小 TISA semantic contract，并搭建从 framework bridge/ExecuTorch 或 JSON graph 到 Canonical OperatorGraph、Schedule/Tiling、TISA/Backend artifact 的前端闭环；当前需要把现有“手写 ModelSpec/benchmark graph”推进为“真实 PyTorch/torch.export -> 自动规范化 -> 自动切分 -> TISA/Backend”的可验证编译链。阶段 4-6 的 analytical primitive-task baseline 已可运行，但尚不能称为论文 TISA tile scheduler 复现；阶段 7 外部 timing/RTL 校准仍作为后续 backend 适配工作。
+
+阶段 9 的前端目标边界：先支持静态 shape、推理场景和小型真实 PyTorch 模型，覆盖 RMSNorm、LayerNorm、Linear/Matmul、ResidualAdd、Softmax 和 attention micrograph；不在第一轮承诺完整 ATen、动态控制流、训练语义或完整 StableHLO/MLIR 工具链。现有手写 benchmark 继续作为 canonical IR/lowering/simulator 回归基线，不能被自动前端重构破坏。
 
 ## 阶段状态
 
@@ -54,6 +56,43 @@
 - [x] 为 dual/triple pipeline 编写手算 golden case（dual reservation + drain 已由测试固定；stage_count 支持 triple）。
 
 阶段 0 目前已落地 Model/Operator/MachineConfig、Schedule/Tile/Execution、trace/summary/manifest 基础 schema；核心 dual/triple golden case 已有，完整 normalized schema 版本策略和真实 ISA 契约仍待冻结。
+
+## 阶段 9 前端自动编译子计划
+
+| 子阶段 | 目标 | 主要产物 | 验收标准 |
+|---|---|---|---|
+| 9.1 前端环境与输入契约 | 固定 PyTorch/torch.export（后续再接 ExecuTorch/StableHLO）版本，定义真实模型输入、参数、shape constraint、dtype 和 provenance | frontend dependency lock、`FrontendImport` v1、错误诊断规范 | 一个真实 RMSNorm `torch.nn.Module` 能导出；缺依赖、动态 shape、unsupported op 都有明确错误 |
+| 9.2 TorchExport/ATen 导入 | 将 `ExportedProgram/GraphModule` 的 placeholder、call_function、get_attr、output 映射到 Canonical OperatorGraph | `TorchExportAdapter` 完整实现、tensor/value/constant metadata | RMSNorm、LayerNorm、Linear、ResidualAdd、Softmax、Matmul 的 graph JSON 与手写 canonical graph 结构等价 |
+| 9.3 Canonicalization PassManager | 统一 op name、dtype/shape、广播、常量、别名和数据边；保留 composite provenance；把低级 ATen 序列识别成 semantic operator 或显式 unsupported | pass registry、pass diagnostics、canonical IR verifier | 相同语义的不同 PyTorch 写法得到稳定 graph；每个 pass 可单独 dump 前后 IR |
+| 9.4 Decomposition/Fusion | 建立受控的 ATen decomposition 和 composite pattern（先 RMSNorm/LayerNorm/attention），区分 semantic fusion 与 backend primitive expansion | decomposition registry、fusion groups、source-to-semantic mapping | RMSNorm 不依赖用户手写 graph；attention 能保留 QK/Softmax/PV 的语义边界；unsupported pattern 不静默丢失 |
+| 9.5 自动 Schedule/Tiling | 用 op lowering registry 的元数据选择 tile factors、loop order、residency、stage，并生成真实边界 TileInstance | `SchedulePlanner`、`TileGraph`、shape-aware cost hooks | 改变输入 shape/tile size 会自动改变 tile 数、边界和地址；不再为每个 benchmark 写 `default_*_schedule` |
+| 9.6 TISA/Backend codegen | 从 TileGraph/semantic lowering 生成 EU-bound TISA instructions、typed deps、logical address expressions 和 primitive payload | TISA program、backend artifact、payload map、compiler manifest | 每个 semantic tile 的 DMA/Vector/Tensor 分组、依赖和 payload 可验证；生成结果能复用现有 analytical simulator |
+| 9.7 真实前端 CLI 与回归 | 增加 `compile-torch` 或 `compile-model --frontend torch-export`，统一输出 00-07 artifact；保留旧 benchmark 命令作为 baseline | CLI、golden fixtures、前后 IR dump、trace | 一条真实 PyTorch RMSNorm 命令完成 export -> graph -> tile -> TISA -> backend -> simulation，并与手写 baseline 对比周期/泳道 |
+
+### 阶段 9 的实施顺序
+
+```text
+9.1 环境与契约
+  -> 9.2 TorchExport/ATen 导入
+  -> 9.3 PassManager/Canonicalization
+  -> 9.4 decomposition + semantic fusion
+  -> 9.5 自动 schedule/tile
+  -> 9.6 TISA/backend codegen
+  -> 9.7 真实前端 CLI 与回归
+```
+
+每个子阶段都必须保留 JSON graph、diagnostics 和可复现测试输入；先完成 RMSNorm 单算子闭环，再扩展到 LayerNorm/Linear/attention，最后才接模型 one-block preset。RuntimeSubmission 和 TISA device scheduler 不插入 9.1-9.7 的中间步骤，避免前端问题与后端调度问题混在一起。
+
+### 阶段 9 当前进度
+
+- 9.1 已完成第一版：`FrontendImport` 保留 model/variant/frontend/shape/provenance；Torch adapter 缺依赖时在 frontend boundary 报错；输入输出、parameter/activation metadata 和 constant args 已纳入导入结果。
+- 9.2 已完成第一版并经过真实 PyTorch 2.9.1 验证：支持 placeholder/get_attr/call_function/call_method/call_module/output，使用 graph signature 区分 parameter/buffer/user input；已覆盖 Matmul/BatchedMatmul、Reduce、Elementwise、Norm、Softmax 和 transpose metadata。
+- 9.2 StableHLO 正式分支已接入官方 OpenXLA bindings：`OfficialStableHLOGenerator` 输出合法 region/broadcast/dot/transpose，`OfficialStableHLOAdapter` 执行 dialect registration、MLIR parse/verify 并导回统一 pipeline；`StableHLOAdapter` textual subset 仅保留为显式 regression backend。真实 torch-xla exporter 已接入，torch-mlir、通用 tuple/layout/dynamic-shape 仍待完成。
+- 9.3 进行中：`PassManager` 已统一 alias、推导 data edge，并加入 Linear decomposition 与 RHS transpose-to-Matmul fold；pass 前后独立 artifact dump 仍待实现。
+- 9.4 已完成首批模式：RMSNorm composite fusion 支持静态多 outer dimensions；Linear 自动拆为 transposed Matmul + broadcast Add；StableHLO primitive chain 可恢复 Softmax/LayerNorm/RMSNorm；真实 attention micrograph 保留 `QK^T -> Softmax -> PV` 三个 semantic 边界。
+- 9.5 已建立入口：新增 `SchedulePlanner`，当前封装既有确定性 shape-aware heuristic；后续再替换为 architecture-aware cost model。
+- 9.6 已可复用：前端编译 API 会继续生成现有 `TISAProgram`/`BackendArtifact`；TISA device scheduler 尚未接入，当前 simulator 仍消费 primitive payload graph。
+- 9.7 基础入口完成：`compile-model` 支持互斥的 canonical JSON、StableHLO file 和 `--torch-module MODULE:FACTORY`，并通过 `--through-stablehlo` 选择论文形态 round-trip；StableHLO 默认 `official` 且不静默回退；均输出完整 staged artifact 和泳道图。标准模型 preset、动态 shape 与复杂输入 binding 尚未完成。
 
 阶段 4-6 的“completed”表示基线闭环完成，不表示后续功能不再扩展。下一轮工作必须保持这些 baseline 的输入/输出兼容，并以自动前端和 runtime/backend 分层作为增量演进。
 
@@ -139,6 +178,42 @@
 | 模型 preset sweep 默认维度过大导致事件仿真耗时过长 | 1 | 为 `sweep-workloads` 增加 `--model-tokens/--model-sequence/--model-head-dim/--model-intermediate` 覆盖；大规模 proxy 维度改为按模型分批运行 |
 
 ## 备注
+
+## 2026-08-23：TorchExport -> StableHLO -> TISA round-trip
+
+- 新增 `StableHLOGenerator`/`StableHLOModule`，从 `FrontendImport` 生成依赖轻量的 textual StableHLO primitive module。
+- 新增 `compile_frontend_import_through_stablehlo()`、`compile_torch_exported_program_through_stablehlo()` 和 `compile_torch_module_through_stablehlo()`，明确执行 `TorchExport -> generated StableHLO -> StableHLOAdapter -> PassManager -> TISA`。
+- StableHLO parser 已支持 rank-2/rank-3 `dot_general`、显式 batching dimensions、rank-N activation 乘共享二维权重的 RHS batch broadcast、末两维转置元数据和 reducer/transpose attributes。
+- 新增 `SoftmaxFusionPass`、`LayerNormFusionPass`；StableHLO primitive chain 会恢复为 semantic Softmax/LayerNorm，RMSNorm 复用既有 fusion pass。
+- `compile-model --through-stablehlo` 输出 `00_frontend/generated.mlir`、`stablehlo_module.json` 和 `source_frontend_import.json`，其余阶段继续使用同一套 graph/tile/TISA/backend/simulator。
+- attention round-trip 已验证：13 semantic operators、33 tiles、112 TISA instructions、134 primitive tasks、590 analytical cycles；直接 TorchExport 与 round-trip 的 tile/instruction/task 数量一致。
+- 当前 round-trip 的 graph metadata/provenance 与 direct path 不逐字节相同，这是预期的 frontend provenance 差异；语义类型、shape、tile count 和 TISA count 已回归。
+- textual emitter/parser 仍不是完整 StableHLO/MLIR compiler，不支持 tuple result、复杂 region、layout、动态 shape 约束和完整 XLA legalization。
+
+## 2026-08-23：官方 OpenXLA StableHLO 接入
+
+- [x] 在隔离目录安装并验证 OpenXLA 官方 cp312 Linux wheel，确认真实 API 为
+  `stablehlo.register_dialect(context) -> Module.parse() -> module.operation.verify()`。
+- [x] 新增 `OfficialStableHLOGenerator/OfficialStableHLOAdapter`，生成并验证合法 reducer
+  region、`broadcast_in_dim`、`dot_general` dimension numbers 与 transpose permutation。
+- [x] `compile_*_through_stablehlo()`、`compile_stablehlo_text/file/module()` 和 CLI 默认
+  使用 `official`；`auto`/`textual` 为显式选项，manifest 记录 backend、版本、producer、
+  verified、fallback 与原因。
+- [x] 官方 attention round-trip 与直接/旧 textual 路径对齐：13 semantic operators、
+  33 tiles、112 TISA instructions、134 primitive tasks、590 analytical cycles。
+- [x] 修正 RMSNorm 的官方 StableHLO mean 语义，并让 fusion 支持
+  `square -> reduce -> divide -> add -> rsqrt -> multiply`；LayerNorm fusion 调整到 RMSNorm
+  之前，避免把 LayerNorm 的 variance 子链误识别为 RMSNorm。
+- [x] 添加安装说明 `docs/install-stablehlo.md` 和官方 parser/verifier/attention regression。
+- [x] 接入真实 `torch-xla==2.9.0` exporter 插件；Matmul 和 attention micrograph 已执行
+  `torch.export -> torch-xla -> official StableHLO -> Canonical Graph -> TISA`，并与 direct
+  path 的 tile/TISA/task 计数一致。
+- [x] 扩展 torch-xla importer，恢复完整 block 的 flatten/dot/bias/unflatten Linear，并在
+  直接 row-wise 或 `[1, prod(outer), hidden]` reshape 等价约束成立时，把多结果
+  `batch_norm_training` 加 affine 恢复为 LayerNorm；完整
+  attention block 已与 direct path 的 semantic/tile/TISA/task 计数对齐。
+- [ ] 扩展更多 StableHLO op、一般多结果消费、动态 shape/layout；project exporter 仍是
+  默认宽覆盖路径，torch-xla 不做静默 fallback。
 
 - 开始每个实现阶段前重新检查 `docs/architecture.md` 和本文件；
 - 每完成一个阶段更新状态和 `progress.md`；

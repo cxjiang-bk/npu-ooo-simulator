@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib
 import json
 import sys
 from itertools import product
 from pathlib import Path
 
 from npu_ooo.arch import load_machine_config, lpu_like_machine_config, minimal_machine_config, wide_mxu_machine_config
-from npu_ooo.compiler import compile_frontend_import
+from npu_ooo.compiler import (
+    compile_frontend_import,
+    compile_stablehlo_file,
+    compile_torch_module,
+    compile_torch_module_through_stablehlo,
+)
 from npu_ooo.frontend import JsonGraphAdapter
 from npu_ooo.benchmarks import (
     build_decoder_block_case,
@@ -68,6 +74,7 @@ from npu_ooo.trace import (
     write_svg,
     write_tile_graph_dot,
     ensure_output_layout,
+    write_artifact_index,
 )
 
 
@@ -128,14 +135,54 @@ def build_parser() -> argparse.ArgumentParser:
         "compile-model",
         help="import a canonical graph and compile it through the unified frontend/backend pipeline",
     )
-    compile_model.add_argument(
+    compile_input = compile_model.add_mutually_exclusive_group(required=True)
+    compile_input.add_argument(
         "--graph-json",
         type=Path,
-        required=True,
         help="canonical OperatorGraph JSON (operator_graph.json or a graph wrapper)",
+    )
+    compile_input.add_argument(
+        "--stablehlo-file",
+        type=Path,
+        help="StableHLO textual MLIR input",
+    )
+    compile_input.add_argument(
+        "--torch-module",
+        metavar="MODULE:FACTORY",
+        help="import a zero-argument PyTorch module factory",
+    )
+    compile_model.add_argument(
+        "--input-shape",
+        action="append",
+        default=[],
+        metavar="D0,D1,...",
+        help="generated PyTorch tensor shape; repeat for multiple module inputs",
+    )
+    compile_model.add_argument(
+        "--input-dtype",
+        choices=("float16", "float32", "bfloat16"),
+        default="float32",
+        help="dtype for generated PyTorch inputs",
     )
     compile_model.add_argument("--model-id", default=None)
     compile_model.add_argument("--variant", default="imported-v0")
+    compile_model.add_argument(
+        "--through-stablehlo",
+        action="store_true",
+        help="for a PyTorch module, export StableHLO and re-import it before canonical compilation",
+    )
+    compile_model.add_argument(
+        "--stablehlo-backend",
+        choices=("official", "auto", "textual"),
+        default="official",
+        help="StableHLO implementation for --through-stablehlo (default: official)",
+    )
+    compile_model.add_argument(
+        "--stablehlo-exporter",
+        choices=("project", "torch-xla"),
+        default="project",
+        help="PyTorch-to-StableHLO exporter for --through-stablehlo (default: project)",
+    )
     compile_model.add_argument(
         "--shape",
         action="append",
@@ -394,22 +441,103 @@ def _parse_shape_overrides(values: list[str]) -> dict[str, int]:
 
 
 def run_compile_model(args: argparse.Namespace) -> int:
-    try:
-        payload = json.loads(args.graph_json.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise ValueError(f"graph JSON does not exist: {args.graph_json}") from exc
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid graph JSON '{args.graph_json}': {exc}") from exc
-    imported = JsonGraphAdapter.from_payload(
-        payload,
-        model_id=args.model_id,
-        variant=args.variant,
-        shape_environment=_parse_shape_overrides(args.shape),
-    )
+    shape_environment = _parse_shape_overrides(args.shape)
     machine = _machine(args.arch, args.machine_config)
-    compiled = compile_frontend_import(imported, machine, tile_size=args.tile_size)
+    if args.through_stablehlo and args.torch_module is None:
+        raise ValueError("--through-stablehlo is only valid with --torch-module")
+    if args.stablehlo_exporter != "project" and not args.through_stablehlo:
+        raise ValueError("--stablehlo-exporter is only valid with --through-stablehlo")
+    if args.graph_json is not None:
+        try:
+            payload = json.loads(args.graph_json.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise ValueError(f"graph JSON does not exist: {args.graph_json}") from exc
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid graph JSON '{args.graph_json}': {exc}") from exc
+        imported = JsonGraphAdapter.from_payload(
+            payload,
+            model_id=args.model_id,
+            variant=args.variant,
+            shape_environment=shape_environment,
+        )
+        compiled = compile_frontend_import(imported, machine, tile_size=args.tile_size)
+    elif args.stablehlo_file is not None:
+        compiled = compile_stablehlo_file(
+            args.stablehlo_file,
+            machine,
+            model_id=args.model_id or args.stablehlo_file.stem,
+            variant=args.variant,
+            shape_environment=shape_environment,
+            tile_size=args.tile_size,
+            stablehlo_backend=args.stablehlo_backend,
+        )
+        imported = compiled.frontend
+    else:
+        if not args.input_shape:
+            raise ValueError("--torch-module requires at least one --input-shape")
+        if ":" not in args.torch_module:
+            raise ValueError("--torch-module must use MODULE:FACTORY syntax")
+        module_name, factory_name = args.torch_module.split(":", 1)
+        try:
+            python_module = importlib.import_module(module_name)
+        except (ImportError, ModuleNotFoundError) as exc:
+            raise ValueError(f"cannot import PyTorch module '{module_name}': {exc}") from exc
+        factory: object = python_module
+        try:
+            for attribute in factory_name.split("."):
+                factory = getattr(factory, attribute)
+        except AttributeError as exc:
+            raise ValueError(
+                f"PyTorch module factory '{args.torch_module}' does not exist"
+            ) from exc
+        if not callable(factory):
+            raise ValueError(f"PyTorch module factory '{args.torch_module}' is not callable")
+        try:
+            import torch
+        except ModuleNotFoundError as exc:
+            raise ValueError("--torch-module requires PyTorch") from exc
+        try:
+            module = factory()
+        except Exception as exc:
+            raise ValueError(f"PyTorch module factory '{args.torch_module}' failed: {exc}") from exc
+        if not isinstance(module, torch.nn.Module):
+            raise ValueError(f"PyTorch module factory '{args.torch_module}' did not return nn.Module")
+        dtype = getattr(torch, args.input_dtype)
+        torch.manual_seed(0)
+        input_shapes = tuple(
+            _parse_positive_int_list(value, name="--input-shape")
+            for value in args.input_shape
+        )
+        example_inputs = tuple(torch.randn(*shape, dtype=dtype) for shape in input_shapes)
+        compile_args = {
+            "model_id": args.model_id or factory_name.rsplit(".", 1)[-1],
+            "variant": args.variant,
+            "shape_environment": shape_environment,
+            "tile_size": args.tile_size,
+        }
+        if args.through_stablehlo:
+            compiled = compile_torch_module_through_stablehlo(
+                module.eval(),
+                example_inputs,
+                machine,
+                stablehlo_backend=args.stablehlo_backend,
+                stablehlo_exporter=args.stablehlo_exporter,
+                **compile_args,
+            )
+        else:
+            compiled = compile_torch_module(
+                module.eval(), example_inputs, machine, **compile_args
+            )
+        imported = compiled.frontend
     ensure_output_layout(args.output_dir)
     write_artifact_json(imported, args.output_dir / "frontend_import.json")
+    if compiled.source_frontend is not None:
+        write_artifact_json(compiled.source_frontend, args.output_dir / "source_frontend_import.json")
+    if compiled.stablehlo is not None:
+        write_artifact_json(compiled.stablehlo, args.output_dir / "stablehlo_module.json")
+        stablehlo_target = args.output_dir / "00_frontend" / "generated.mlir"
+        stablehlo_target.write_text(compiled.stablehlo.text, encoding="utf-8")
+        write_artifact_index(args.output_dir)
     write_artifact_json(compiled.graph, args.output_dir / "canonical_graph.json")
     write_artifact_json(compiled.schedule, args.output_dir / "schedule.json")
     write_artifact_json(compiled.tile_graph, args.output_dir / "tile_graph.json")
@@ -447,6 +575,17 @@ def run_compile_model(args: argparse.Namespace) -> int:
             "schema_version": 1,
             "compiler_pipeline": compiled.attributes["compiler_pipeline"],
             "frontend": imported.frontend.value if hasattr(imported.frontend, "value") else str(imported.frontend),
+            "frontend_path": compiled.attributes.get("frontend_path", "direct_canonical"),
+            "stablehlo_variant": compiled.attributes.get("stablehlo_variant"),
+            "stablehlo_backend": compiled.attributes.get("stablehlo_backend"),
+            "stablehlo_exporter": compiled.attributes.get("stablehlo_exporter"),
+            "stablehlo_exporter_version": compiled.attributes.get("stablehlo_exporter_version"),
+            "stablehlo_verified": compiled.attributes.get("stablehlo_verified", False),
+            "stablehlo_producer": compiled.attributes.get("stablehlo_producer"),
+            "stablehlo_verifier": compiled.attributes.get("stablehlo_verifier"),
+            "stablehlo_version": compiled.attributes.get("stablehlo_version"),
+            "stablehlo_fallback": compiled.attributes.get("stablehlo_fallback", False),
+            "stablehlo_fallback_reason": compiled.attributes.get("stablehlo_fallback_reason"),
             "model_id": imported.model_id,
             "architecture": args.arch,
             "policy": result.policy,
