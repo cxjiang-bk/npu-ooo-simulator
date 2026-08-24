@@ -245,9 +245,9 @@ aten.softmax
 - timing source、backend name、calibration status 写入 manifest；
 - backend capability validation，明确支持的 primitive/resource/memory 特性。
 
-当前进度：TimingProvider registry 与 `AnalyticalEventBackend`/EventBackend registry 已接入
-统一 scheduler 和 `compile-model`，现有 analytical 数值保持不变；CodegenBackend registry、
-SystemBackend concrete adapter 和外部 timing source 尚待后续子阶段。
+当前进度：Codegen/Timing/Event registry 均已接入统一编译器、scheduler 和
+`compile-model`；`AnalyticalCodegenBackend` 和 `AnalyticalEventBackend` 保持现有 analytical
+数值不变。SystemBackend concrete adapter 和外部 timing source 尚待后续子阶段。
 
 候选 backend 顺序：
 

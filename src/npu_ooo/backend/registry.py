@@ -8,7 +8,7 @@ from typing import Callable, Mapping
 
 from npu_ooo.simulator.core import AnalyticalTimingModel, TimingModel, TimingTableModel
 
-from .contracts import BackendCapabilities, EventBackend, TimingProvider
+from .contracts import BackendCapabilities, CodegenBackend, EventBackend, TimingProvider
 
 
 _ANALYTICAL_PRIMITIVES = frozenset(
@@ -59,6 +59,7 @@ class TimingProviderAdapter:
 
 TimingFactory = Callable[[Path | None], TimingProvider]
 EventBackendFactory = Callable[[], EventBackend]
+CodegenBackendFactory = Callable[..., CodegenBackend]
 
 
 class TimingProviderRegistry:
@@ -115,6 +116,34 @@ class EventBackendRegistry:
         return tuple(sorted(self._factories))
 
 
+class CodegenBackendRegistry:
+    """Factory registry for TISA-to-payload code generators."""
+
+    def __init__(self, factories: Mapping[str, CodegenBackendFactory] | None = None) -> None:
+        self._factories: dict[str, CodegenBackendFactory] = dict(factories or {})
+
+    def register(self, name: str, factory: CodegenBackendFactory) -> None:
+        if not name or not callable(factory):
+            raise ValueError("codegen backend name and factory must be valid")
+        if name in self._factories:
+            raise ValueError(f"codegen backend '{name}' is already registered")
+        self._factories[name] = factory
+
+    def create(self, name: str, **kwargs) -> CodegenBackend:
+        try:
+            backend = self._factories[name](**kwargs)
+        except KeyError as exc:
+            raise ValueError(
+                f"unknown codegen backend '{name}'; available: {', '.join(sorted(self._factories))}"
+            ) from exc
+        if not hasattr(backend, "capabilities"):
+            raise TypeError(f"codegen backend '{name}' does not expose capabilities")
+        return backend
+
+    def names(self) -> tuple[str, ...]:
+        return tuple(sorted(self._factories))
+
+
 def default_timing_provider_registry() -> TimingProviderRegistry:
     registry = TimingProviderRegistry()
     registry.register(
@@ -145,11 +174,21 @@ def default_event_backend_registry() -> EventBackendRegistry:
     return registry
 
 
+def default_codegen_backend_registry() -> CodegenBackendRegistry:
+    from .codegen import AnalyticalCodegenBackend
+
+    registry = CodegenBackendRegistry()
+    registry.register("analytical", AnalyticalCodegenBackend)
+    return registry
+
+
 __all__ = [
     "TimingProviderAdapter",
+    "CodegenBackendRegistry",
     "EventBackendRegistry",
     "TimingProviderRegistry",
     "analytical_capabilities",
+    "default_codegen_backend_registry",
     "default_event_backend_registry",
     "default_timing_provider_registry",
 ]

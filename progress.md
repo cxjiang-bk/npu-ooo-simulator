@@ -553,3 +553,12 @@ git diff --check: passed
 - analytical event capability 的 resource 范围由 `MachineConfig` 决定，不硬编码 DMA/MXU/ARU 名称；primitive capability 仍显式枚举并在运行前验证。
 - 官方 StableHLO Matmul + policy matrix smoke 保持 3 TISA / 4 primitive / runtime submit 2 / device 52 / synchronization 5 / end-to-end 59 cycles，证明 adapter 迁移未改变数值。
 - 相关 backend/TISA/runtime matrix 测试 16 项通过；下一步补齐 analytical CodegenBackend adapter/registry。
+
+## 2026-08-24：阶段 11.2 Analytical CodegenBackend
+
+- 新增 `AnalyticalCodegenBackend` 和 `CodegenBackendRegistry`，默认注册 `analytical`；adapter 包装现有 `AnalyticalBackendCodegen`，但对外严格实现 `CodegenBackend.lower(...) -> BackendArtifact`。
+- `compile_operator_graph()` 现在固定先以 `TISASemanticBuilder` 构造 backend-independent TISAProgram，再从 codegen registry materialize payload；默认路径生成的 TISAProgram 与 BackendArtifact 和迁移前保持相同。
+- 所有统一编译入口（canonical JSON、StableHLO、torch.export、torch-xla StableHLO、ModelInstance）均支持传入同一个 CodegenBackend；CLI 新增 `--codegen-backend analytical`。
+- compiler attributes、顶层 manifest 与 policy-matrix case manifest 都记录 codegen/runtime/event/timing backend 和相应 capability metadata。
+- 官方 StableHLO Matmul + policy matrix smoke 保持 3 TISA / 4 primitive / runtime submit 2 / device 52 / synchronization 5 / end-to-end 59 cycles；backend/frontend/runtime 目标回归 44 项通过。
+- 下一步：为 matmul 引入可选外部 MXU timing adapter，未覆盖 primitive 必须显式保留 analytical fallback 或失败，并将 calibration source 写入 manifest。

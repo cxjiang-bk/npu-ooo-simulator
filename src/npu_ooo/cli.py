@@ -11,6 +11,7 @@ from pathlib import Path
 
 from npu_ooo.arch import load_machine_config, lpu_like_machine_config, minimal_machine_config, wide_mxu_machine_config
 from npu_ooo.backend import (
+    default_codegen_backend_registry,
     default_event_backend_registry,
     default_timing_provider_registry,
 )
@@ -110,6 +111,10 @@ def _timing_model(path: Path | None, provider: str | None = None):
 
 def _event_backend(name: str):
     return default_event_backend_registry().create(name)
+
+
+def _codegen_backend(name: str):
+    return default_codegen_backend_registry().create(name)
 
 
 def _descriptor_availability(path: Path | None) -> dict[str, float]:
@@ -249,6 +254,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=default_event_backend_registry().names(),
         default="analytical_event",
         help="device event-engine backend for the TISA scheduler",
+    )
+    compile_model.add_argument(
+        "--codegen-backend",
+        choices=default_codegen_backend_registry().names(),
+        default="analytical",
+        help="TISA-to-payload code-generation backend",
     )
     compile_model.add_argument("--policy", choices=tuple(policy.value for policy in SchedulerPolicy), default="static_pipeline")
     compile_model.add_argument(
@@ -552,6 +563,7 @@ def _parse_shape_overrides(values: list[str]) -> dict[str, int]:
 def run_compile_model(args: argparse.Namespace) -> int:
     shape_environment = _parse_shape_overrides(args.shape)
     machine = _machine(args.arch, args.machine_config)
+    codegen_backend = _codegen_backend(args.codegen_backend)
     if args.runtime_device_matrix and args.scheduler_target != "tisa":
         raise ValueError("--runtime-device-matrix requires --scheduler-target tisa")
     if args.through_stablehlo and args.torch_module is None:
@@ -571,7 +583,12 @@ def run_compile_model(args: argparse.Namespace) -> int:
             variant=args.variant,
             shape_environment=shape_environment,
         )
-        compiled = compile_frontend_import(imported, machine, tile_size=args.tile_size)
+        compiled = compile_frontend_import(
+            imported,
+            machine,
+            tile_size=args.tile_size,
+            codegen_backend=codegen_backend,
+        )
     elif args.stablehlo_file is not None:
         compiled = compile_stablehlo_file(
             args.stablehlo_file,
@@ -581,6 +598,7 @@ def run_compile_model(args: argparse.Namespace) -> int:
             shape_environment=shape_environment,
             tile_size=args.tile_size,
             stablehlo_backend=args.stablehlo_backend,
+            codegen_backend=codegen_backend,
         )
         imported = compiled.frontend
     else:
@@ -625,6 +643,7 @@ def run_compile_model(args: argparse.Namespace) -> int:
             "variant": args.variant,
             "shape_environment": shape_environment,
             "tile_size": args.tile_size,
+            "codegen_backend": codegen_backend,
         }
         if args.through_stablehlo:
             compiled = compile_torch_module_through_stablehlo(
@@ -757,7 +776,12 @@ def run_compile_model(args: argparse.Namespace) -> int:
                 if args.scheduler_target == "tisa"
                 else None
             ),
-            "codegen_backend": compiled.backend_artifact.backend,
+            "codegen_backend": compiled.attributes.get(
+                "codegen_backend", compiled.backend_artifact.backend
+            ),
+            "codegen_backend_capabilities": compiled.attributes.get(
+                "codegen_backend_capabilities"
+            ),
             "runtime_backend": "builtin_runtime_submission",
             "model_id": imported.model_id,
             "architecture": args.arch,
@@ -849,6 +873,13 @@ def run_compile_model(args: argparse.Namespace) -> int:
                     "shared_compiled_artifact": "../../03_tisa/compiled_artifact.json",
                     "shared_backend_artifact": "../../04_backend/backend_artifact.json",
                     "machine_hash": machine.stable_hash(),
+                    "codegen_backend": compiled.attributes.get(
+                        "codegen_backend", compiled.backend_artifact.backend
+                    ),
+                    "codegen_backend_capabilities": compiled.attributes.get(
+                        "codegen_backend_capabilities"
+                    ),
+                    "runtime_backend": "builtin_runtime_submission",
                     "event_backend": event_backend.name,
                     "event_backend_capabilities": event_backend.capabilities.to_dict(),
                     "timing_provider": getattr(timing_model, "name", "analytical"),

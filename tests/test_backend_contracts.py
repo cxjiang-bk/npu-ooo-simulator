@@ -4,9 +4,12 @@ from pathlib import Path
 
 from npu_ooo.arch import minimal_machine_config
 from npu_ooo.backend import (
+    AnalyticalCodegenBackend,
     AnalyticalEventBackend,
     BackendCapabilities,
+    CodegenBackendRegistry,
     EventBackendRegistry,
+    default_codegen_backend_registry,
     default_event_backend_registry,
     default_timing_provider_registry,
     validate_backend_capability,
@@ -17,6 +20,21 @@ from npu_ooo.simulator import TimingTableModel
 
 
 class BackendContractTest(unittest.TestCase):
+    def test_default_codegen_registry_exposes_analytical_backend(self) -> None:
+        registry = default_codegen_backend_registry()
+        self.assertEqual(registry.names(), ("analytical",))
+        backend = registry.create("analytical")
+        self.assertIsInstance(backend, AnalyticalCodegenBackend)
+        self.assertEqual(backend.capabilities.calibration_status, "analytical")
+
+    def test_codegen_registry_rejects_duplicates_and_unknown_names(self) -> None:
+        registry = CodegenBackendRegistry()
+        registry.register("analytical", AnalyticalCodegenBackend)
+        with self.assertRaisesRegex(ValueError, "already registered"):
+            registry.register("analytical", AnalyticalCodegenBackend)
+        with self.assertRaisesRegex(ValueError, "unknown codegen backend"):
+            registry.create("missing")
+
     def test_default_event_registry_exposes_analytical_backend(self) -> None:
         registry = default_event_backend_registry()
         self.assertEqual(registry.names(), ("analytical_event",))
@@ -58,6 +76,26 @@ class BackendContractTest(unittest.TestCase):
             capability,
         )
         self.assertTrue(any("elementwise" in issue for issue in issues))
+
+    def test_explicit_codegen_backend_matches_default_artifact(self) -> None:
+        model = build_elementwise_model(rows=8, cols=8)
+        instance = model.instantiate(build_elementwise_case())
+        machine = minimal_machine_config()
+        default = compile_model_instance(instance, machine, tile_size=4)
+        explicit = compile_model_instance(
+            instance,
+            machine,
+            tile_size=4,
+            codegen_backend=AnalyticalCodegenBackend(),
+        )
+
+        self.assertEqual(explicit.tisa_program, default.tisa_program)
+        self.assertEqual(explicit.backend_artifact, default.backend_artifact)
+        self.assertEqual(explicit.attributes["codegen_backend"], "analytical")
+        self.assertEqual(
+            explicit.attributes["codegen_backend_capabilities"]["calibration_status"],
+            "analytical",
+        )
 
     def test_timing_table_provider_preserves_provider_name(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

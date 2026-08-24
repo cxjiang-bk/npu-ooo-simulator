@@ -38,7 +38,7 @@ PyTorch / ONNX / StableHLO
 1. **编译、runtime 与设备调度分离**：Compiler 生成 task，Runtime 负责提交，Device Scheduler 只负责已提交 task 的 issue 决策。
 2. **Static/Dynamic 共用执行模型**：tile、地址、依赖、buffer、资源和 latency 完全一致。
 3. **TISA 语义层独立存在**：TileInstance 描述几何 bounds，TISAInstruction 描述 OpType/Operand/UnitMap/typed Deps，ExecutionTask 只表示 backend primitive。
-4. **Backend 热插拔**：TimingProvider、EventBackend 和可选 SystemBackend 通过统一 compiled/runtime contract 接入。
+4. **Backend 热插拔**：CodegenBackend、TimingProvider、EventBackend 和可选 SystemBackend 通过统一 compiled/runtime contract 接入；当前 analytical codegen/event backend 已可从 registry 选择。
 5. **Mapping 与 timing 分层**：TileFlow/Timeloop 可提供 mapping 与 aggregate cost，但不冒充 per-tile 时间线。
 6. **算子 lowering 可扩展**：scheduler 不依赖 `ProduceQ` 等特定算子或 tensor 名称。
 7. **先可解释、再校准**：第一版是确定性的离散事件模型，不宣称 RTL cycle-accurate。

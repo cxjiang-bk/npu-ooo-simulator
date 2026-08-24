@@ -819,7 +819,7 @@ SystemBackend (optional)
 第一版实现：
 
 ```text
-SimulatorCodegenBackend
+AnalyticalCodegenBackend
     + TISA descriptor / primitive template artifact
     +
 AnalyticalTimingProvider
@@ -829,10 +829,14 @@ AnalyticalTimingProvider
 当前已落地 `src/npu_ooo/backend/` 的第一版 contract：`BackendCapabilities` 统一声明
 primitive/resource/memory 支持范围和 `calibration_status`；`TimingProvider`、
 `EventBackend`、`SystemBackend`、`CodegenBackend` 使用 protocol 保持实现可替换；
-`TimingProviderRegistry` 已注册 analytical 与 timing-table 两个 provider，
+`CodegenBackendRegistry` 已注册 `analytical`，`TimingProviderRegistry` 已注册 analytical
+与 timing-table 两个 provider，
 `EventBackendRegistry` 已注册 `analytical_event`。`schedule_tisa_program()` 通过
 EventBackend 接口进入设备事件引擎，CLI 使用 `--event-backend` 选择；event backend
 仍将 scheduler policy、RuntimeSubmission、TimingProvider 和 SimulatorConfig 作为独立输入。
+编译器先构造 backend-independent `TISAProgram`，再通过 `--codegen-backend` 选择将其
+materialize 为 backend payload 的 CodegenBackend。当前 analytical codegen 仍输出
+ExecutionGraph，但外部 target 不需要改变 TISA scheduler 接口。
 provider
 声明 capability 后，TISA simulator 会在第一次 issue 前验证整个 `BackendArtifact`，
 不支持的 primitive/resource/memory 显式失败，不静默使用未校准数字。当前还没有外部

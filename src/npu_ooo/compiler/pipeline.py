@@ -12,6 +12,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Sequence
 
 from npu_ooo.arch import MachineConfig
+from npu_ooo.backend import CodegenBackend, default_codegen_backend_registry
 from npu_ooo.frontend import FrontendImport, OfficialStableHLOModule, StableHLOModule
 from npu_ooo.ir import BackendArtifact, OperatorGraph, ScheduleSpec, TISAProgram, TileGraph, build_tile_graph
 from npu_ooo.ir.model import ModelInstance
@@ -19,7 +20,7 @@ from npu_ooo.lowering import LoweringRegistry, default_lowering_registry
 
 from .passes import default_pass_manager
 from .planner import default_schedule_planner
-from .tisa_first import compile_tisa_first
+from .tisa_first import TISASemanticBuilder
 
 
 @dataclass(frozen=True)
@@ -87,6 +88,7 @@ def compile_operator_graph(
     frontend: FrontendImport | None = None,
     tile_size: int = 32,
     registry: LoweringRegistry | None = None,
+    codegen_backend: CodegenBackend | None = None,
 ) -> CompiledArtifact:
     """Run normalization, default tiling, semantic lowering and backend codegen."""
 
@@ -113,16 +115,24 @@ def compile_operator_graph(
     )
     schedule = default_schedule_planner().plan(graph, tile_size=tile_size)
     tile_graph = build_tile_graph(graph, schedule)
-    tisa_first = compile_tisa_first(
+    program = TISASemanticBuilder().build(
         graph,
         schedule,
         tile_graph,
         machine,
         program_id=f"{graph.graph_id}.tisa",
-        registry=registry or default_lowering_registry(),
     )
-    program = tisa_first.program
-    artifact = tisa_first.artifact
+    selected_codegen = codegen_backend or default_codegen_backend_registry().create(
+        "analytical",
+        lowering_registry=registry or default_lowering_registry(),
+    )
+    artifact = selected_codegen.lower(
+        graph,
+        schedule,
+        tile_graph,
+        machine,
+        program=program,
+    )
     result = CompiledArtifact(
         frontend=frontend,
         graph=graph,
@@ -149,8 +159,12 @@ def compile_operator_graph(
             CompilerDiagnostic("info", "tisa_codegen", f"generated {len(program.instructions)} TISA instructions from TileGraph"),
         ),
         attributes={
-            "compiler_pipeline": "frontend->canonical->schedule->tile->tisa->analytical-backend",
-            "codegen_direction": "tilegraph->tisa->analytical-payload",
+            "compiler_pipeline": f"frontend->canonical->schedule->tile->tisa->{selected_codegen.name}-backend",
+            "codegen_direction": artifact.attributes.get(
+                "codegen_direction", "tilegraph->tisa->backend-payload"
+            ),
+            "codegen_backend": selected_codegen.name,
+            "codegen_backend_capabilities": selected_codegen.capabilities.to_dict(),
             "model_id": model_id or graph.graph_id,
         },
     )
@@ -166,6 +180,7 @@ def compile_frontend_import(
     *,
     tile_size: int = 32,
     registry: LoweringRegistry | None = None,
+    codegen_backend: CodegenBackend | None = None,
 ) -> CompiledArtifact:
     issues = imported.validate()
     if issues:
@@ -177,6 +192,7 @@ def compile_frontend_import(
         frontend=imported,
         tile_size=tile_size,
         registry=registry,
+        codegen_backend=codegen_backend,
     )
 
 
@@ -186,6 +202,7 @@ def compile_frontend_import_through_stablehlo(
     *,
     tile_size: int = 32,
     registry: LoweringRegistry | None = None,
+    codegen_backend: CodegenBackend | None = None,
     stablehlo_variant: str = "stablehlo-generated-v0",
     stablehlo_backend: str = "official",
 ) -> CompiledArtifact:
@@ -255,6 +272,7 @@ def compile_frontend_import_through_stablehlo(
         machine,
         tile_size=tile_size,
         registry=registry,
+        codegen_backend=codegen_backend,
     )
     return replace(
         compiled,
@@ -286,6 +304,7 @@ def compile_torch_exported_program(
     shape_environment: Mapping[str, int] | None = None,
     tile_size: int = 32,
     registry: LoweringRegistry | None = None,
+    codegen_backend: CodegenBackend | None = None,
 ) -> CompiledArtifact:
     """Compile a ``torch.export`` program without exposing FX downstream."""
 
@@ -302,6 +321,7 @@ def compile_torch_exported_program(
         machine,
         tile_size=tile_size,
         registry=registry,
+        codegen_backend=codegen_backend,
     )
 
 
@@ -314,6 +334,7 @@ def compile_torch_exported_program_through_stablehlo(
     shape_environment: Mapping[str, int] | None = None,
     tile_size: int = 32,
     registry: LoweringRegistry | None = None,
+    codegen_backend: CodegenBackend | None = None,
     stablehlo_variant: str = "stablehlo-generated-v0",
     stablehlo_backend: str = "official",
     stablehlo_exporter: str = "project",
@@ -332,6 +353,7 @@ def compile_torch_exported_program_through_stablehlo(
             machine,
             tile_size=tile_size,
             registry=registry,
+            codegen_backend=codegen_backend,
             stablehlo_variant=stablehlo_variant,
             stablehlo_backend=stablehlo_backend,
         )
@@ -358,6 +380,7 @@ def compile_torch_exported_program_through_stablehlo(
         shape_environment=shape_environment,
         tile_size=tile_size,
         registry=registry,
+        codegen_backend=codegen_backend,
         stablehlo_backend="official",
     )
     stable_frontend = replace(
@@ -406,6 +429,7 @@ def compile_torch_module(
     shape_environment: Mapping[str, int] | None = None,
     tile_size: int = 32,
     registry: LoweringRegistry | None = None,
+    codegen_backend: CodegenBackend | None = None,
 ) -> CompiledArtifact:
     """Capture and compile a real PyTorch module through the frontend boundary."""
 
@@ -425,6 +449,7 @@ def compile_torch_module(
         machine,
         tile_size=tile_size,
         registry=registry,
+        codegen_backend=codegen_backend,
     )
 
 
@@ -440,6 +465,7 @@ def compile_torch_module_through_stablehlo(
     shape_environment: Mapping[str, int] | None = None,
     tile_size: int = 32,
     registry: LoweringRegistry | None = None,
+    codegen_backend: CodegenBackend | None = None,
     stablehlo_variant: str = "stablehlo-generated-v0",
     stablehlo_backend: str = "official",
     stablehlo_exporter: str = "project",
@@ -460,6 +486,7 @@ def compile_torch_module_through_stablehlo(
         shape_environment=shape_environment,
         tile_size=tile_size,
         registry=registry,
+        codegen_backend=codegen_backend,
         stablehlo_variant=stablehlo_variant,
         stablehlo_backend=stablehlo_backend,
         stablehlo_exporter=stablehlo_exporter,
@@ -475,6 +502,7 @@ def compile_stablehlo_text(
     shape_environment: Mapping[str, int] | None = None,
     tile_size: int = 32,
     registry: LoweringRegistry | None = None,
+    codegen_backend: CodegenBackend | None = None,
     stablehlo_backend: str = "official",
 ) -> CompiledArtifact:
     """Compile StableHLO, using official MLIR verification by default."""
@@ -510,6 +538,7 @@ def compile_stablehlo_text(
         machine,
         tile_size=tile_size,
         registry=registry,
+        codegen_backend=codegen_backend,
     )
     return replace(
         compiled,
@@ -539,6 +568,7 @@ def compile_stablehlo_file(
     shape_environment: Mapping[str, int] | None = None,
     tile_size: int = 32,
     registry: LoweringRegistry | None = None,
+    codegen_backend: CodegenBackend | None = None,
     stablehlo_backend: str = "official",
 ) -> CompiledArtifact:
     """Compile a StableHLO MLIR file with the selected binding backend."""
@@ -557,6 +587,7 @@ def compile_stablehlo_file(
         shape_environment=shape_environment,
         tile_size=tile_size,
         registry=registry,
+        codegen_backend=codegen_backend,
         stablehlo_backend=stablehlo_backend,
     )
 
@@ -570,6 +601,7 @@ def compile_stablehlo_module(
     shape_environment: Mapping[str, int] | None = None,
     tile_size: int = 32,
     registry: LoweringRegistry | None = None,
+    codegen_backend: CodegenBackend | None = None,
     stablehlo_backend: str = "official",
 ) -> CompiledArtifact:
     """Compile an MLIR module-like object by reading its assembly."""
@@ -592,6 +624,7 @@ def compile_stablehlo_module(
         shape_environment=shape_environment,
         tile_size=tile_size,
         registry=registry,
+        codegen_backend=codegen_backend,
         stablehlo_backend=stablehlo_backend,
     )
 
@@ -602,6 +635,7 @@ def compile_model_instance(
     *,
     tile_size: int = 32,
     registry: LoweringRegistry | None = None,
+    codegen_backend: CodegenBackend | None = None,
 ) -> CompiledArtifact:
     """Compile an instantiated Model IR through the same frontend boundary."""
 
@@ -630,4 +664,5 @@ def compile_model_instance(
         machine,
         tile_size=tile_size,
         registry=registry,
+        codegen_backend=codegen_backend,
     )
