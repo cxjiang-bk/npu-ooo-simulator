@@ -248,7 +248,8 @@ aten.softmax
 当前进度：Codegen/Timing/Event registry 均已接入统一编译器、scheduler 和
 `compile-model`；`AnalyticalCodegenBackend` 和 `AnalyticalEventBackend` 保持现有 analytical
 数值不变。`systolic_mxu_profile` 可重放外部 MXU tile profile，但尚未直接调用 SCALE-Sim；
-SystemBackend concrete adapter 与 SCALE-Sim exporter 尚待后续子阶段。
+阶段 11.4 已增加 `rtl_completion_trace.v1` JSON/CSV importer，可离线生成同一 profile；
+SystemBackend concrete adapter、真实 trace exporter 和 SCALE-Sim exporter 尚待后续子阶段。
 
 候选 backend 顺序：
 
@@ -261,6 +262,14 @@ analytical event backend
 ```
 
 验收：切换 backend 不需要修改 compiler pass 或 scheduler policy；未覆盖的 primitive 必须显式回退或失败，不能静默混用未标定的数字；同一 trace schema 可以比较不同 backend。
+
+阶段 11.4 交付物：
+
+- versioned RTL completion trace schema，记录 descriptor、compute、PSB completion 边界；
+- compute-only 与 descriptor-to-completion interval 选择；
+- max/median/P95 的显式聚合和 II 推导规则；
+- `import-rtl-trace` JSON/CSV 到 `systolic_mxu_profile.v1` 的离线转换；
+- `docs/rtl-calibration.md` 与 example trace。
 
 ## 阶段 12：模型级自动编译与 TISA 实验矩阵
 

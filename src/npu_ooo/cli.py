@@ -11,9 +11,12 @@ from pathlib import Path
 
 from npu_ooo.arch import load_machine_config, lpu_like_machine_config, minimal_machine_config, wide_mxu_machine_config
 from npu_ooo.backend import (
+    AGGREGATIONS,
+    INTERVALS,
     default_codegen_backend_registry,
     default_event_backend_registry,
     default_timing_provider_registry,
+    import_rtl_completion_trace,
 )
 from npu_ooo.compiler import (
     compile_frontend_import,
@@ -117,6 +120,35 @@ def _codegen_backend(name: str):
     return default_codegen_backend_registry().create(name)
 
 
+def run_import_rtl_trace(args) -> int:
+    """Convert an offline RTL completion trace into an MXU timing profile."""
+
+    profile = import_rtl_completion_trace(
+        args.input,
+        interval=args.interval,
+        aggregation=args.aggregation,
+        unmatched_matmul=args.unmatched_matmul,
+        name=args.name,
+    )
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(profile, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(
+        json.dumps(
+            {
+                "input": str(args.input),
+                "output": str(args.output),
+                "format": profile["format"],
+                "interval": args.interval,
+                "aggregation": args.aggregation,
+                "shape_count": len(profile["matmul_profiles"]),
+                "record_count": profile["metadata"]["record_count"],
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def _descriptor_availability(path: Path | None) -> dict[str, float]:
     if path is None:
         return {}
@@ -180,6 +212,21 @@ def _parse_positive_int_list(value: str, *, name: str) -> tuple[int, ...]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run configurable NPU tile scheduling experiments")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    rtl_trace = subparsers.add_parser(
+        "import-rtl-trace",
+        help="convert a versioned RTL completion trace into an MXU timing profile",
+    )
+    rtl_trace.add_argument("--input", type=Path, required=True, help="RTL completion trace JSON or CSV")
+    rtl_trace.add_argument("--output", type=Path, required=True, help="output systolic MXU profile JSON")
+    rtl_trace.add_argument("--interval", choices=INTERVALS, default=INTERVALS[0])
+    rtl_trace.add_argument("--aggregation", choices=AGGREGATIONS, default="median")
+    rtl_trace.add_argument(
+        "--unmatched-matmul",
+        choices=("error", "analytical"),
+        default="error",
+        help="policy for compiled shapes absent from the generated profile",
+    )
+    rtl_trace.add_argument("--name", default="systolic_mxu_profile")
     compile_model = subparsers.add_parser(
         "compile-model",
         help="import a canonical graph and compile it through the unified frontend/backend pipeline",
@@ -2062,6 +2109,8 @@ def run_sweep_workloads(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "import-rtl-trace":
+        return run_import_rtl_trace(args)
     if args.command == "compile-model":
         return run_compile_model(args)
     if args.command == "two-mm":

@@ -929,6 +929,21 @@ fallback policy 和 calibration status 会写入 manifest/summary，因此 mixed
 `timing_provider_coverage` 按 compiled primitive task 集合统计 exact match、未命中、unknown
 shape 和 non-MXU analytical fallback，不能用 timing query 次数代替 coverage。
 
+阶段 11.4 增加 `src/npu_ooo/backend/rtl_trace.py`，定义
+`npu_ooo.rtl_completion_trace.v1` 输入契约和 `import-rtl-trace` CLI。它接受 RTL 或外部
+仿真器已经整理好的 JSON/CSV completion records，按明确选择的
+`compute_start_to_compute_done` 或 `descriptor_issue_to_done` 区间生成相同的
+`systolic_mxu_profile.v1`。同一 tile shape 的重复观测必须声明 `max`、`median` 或 `p95`
+聚合；II 优先使用输入中的显式值，否则从起始事件间隔推导，单样本回退为 duration。
+生成 profile 的 metadata 保存 trace format、interval、aggregation、source、record/shape
+数量和 calibration status。默认 unmatched Matmul 为 `error`，避免只覆盖少数 shape 时
+静默混入 analytical 数字。
+
+当前 RTL `done_if.out done` 包含 instruction manager、read generation、matrix control 和
+PSB write 链路。因而只有 compute interval 可以直接校准当前 isolated `matmul` payload；
+descriptor interval 必须被视为更大的 backend payload 边界，不能未经说明地复用为阵列
+compute latency。Importer 是离线格式转换器，不读取 VCD/VPD/FSDB，也不绑定某个仿真工具。
+
 `--address-scoreboard` 启用 device-side range scoreboard：根据相同 `tensor/memory` 上的 `BufferRegion` 重叠关系，在 issue 前检查 active task 并产生 RAW/WAR/WAW stall；COMPLETE 后释放范围并继续调度。当前地址来自 canonical `ExecutionTask` metadata，尚不是从真实 TISA binary 动态解析出的硬件 scoreboard。
 
 ## 10. Trace 与结果

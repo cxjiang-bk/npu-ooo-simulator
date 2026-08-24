@@ -19,6 +19,16 @@ from .registry import (
 from .analytical import AnalyticalEventBackend
 from .codegen import AnalyticalCodegenBackend
 from .mxu_profile import SystolicMXUProfileEntry, SystolicMXUProfileTimingProvider
+from .rtl_trace import (
+    AGGREGATIONS,
+    INTERVALS,
+    PROFILE_FORMAT,
+    TRACE_FORMAT,
+    RTLCompletionRecord,
+    build_systolic_mxu_profile,
+    import_rtl_completion_trace,
+    load_rtl_completion_trace,
+)
 
 __all__ = [
     "BackendCapabilities",
@@ -31,6 +41,14 @@ __all__ = [
     "SystemBackend",
     "SystolicMXUProfileEntry",
     "SystolicMXUProfileTimingProvider",
+    "AGGREGATIONS",
+    "INTERVALS",
+    "PROFILE_FORMAT",
+    "TRACE_FORMAT",
+    "RTLCompletionRecord",
+    "build_systolic_mxu_profile",
+    "import_rtl_completion_trace",
+    "load_rtl_completion_trace",
     "TimingProvider",
     "TimingProviderAdapter",
     "TimingProviderRegistry",

@@ -548,6 +548,24 @@ analytical；将 JSON 的 `unmatched_matmul` 设为 `error` 可强制拒绝未�
 `timing_provider_coverage` 还会统计 compiled artifact 中精确命中的 Matmul task、未命中或
 shape 不足的 Matmul task，以及走 analytical fallback 的非 Matmul primitive task 数量。
 
+阶段 11.4 增加了离线 RTL completion trace importer。输入契约、interval 边界、聚合规则和
+当前 MXU RTL `done` 信号的限制见 [`docs/rtl-calibration.md`](docs/rtl-calibration.md)。
+它支持 JSON/CSV，并生成同一份 `npu_ooo.systolic_mxu_profile.v1`，不会在仿真循环中启动
+VCS/Verilator/SCALE-Sim：
+
+```bash
+PYTHONPATH=src python3 -m npu_ooo.cli import-rtl-trace \
+  --input examples/rtl/mxu_completion_trace.json \
+  --output /tmp/mxu-rtl-profile.json \
+  --interval compute_start_to_compute_done \
+  --aggregation median \
+  --unmatched-matmul error
+```
+
+默认的 `compute_start_to_compute_done` 才能映射现有 isolated `matmul` primitive；
+`descriptor_issue_to_done` 是显式的 full descriptor interval，必须结合 profile metadata
+解释，不能直接当作单个 MXU 阵列 latency。
+
 批量比较使用 `sweep-two-mm`。它对每个 architecture/policy/window/ROB 组合重新执行相同的 2mm lowering 和 simulator，并为每个组合写入独立目录：
 
 ```bash

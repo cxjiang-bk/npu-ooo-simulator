@@ -577,3 +577,19 @@ git diff --check: passed
 - 增加 `timing_provider_coverage`：profile provider 按唯一 compiled `ExecutionTask` 集合统计 exact Matmul profile match、unmatched Matmul、unknown-shape Matmul 和 non-Matmul analytical fallback。
 - coverage 不在 `timing()` 内计数，因为 critical-path 分析、候选筛选与实际 issue 会多次查询同一 task；直接计数会错误地把 scheduler 查询放大为执行量。
 - common primitive simulator、TISA simulator、顶层 manifest 与四象限 case manifest 都输出同一 coverage 结构，为后续比较 dynamic/static 时的校准范围提供证据。
+
+## 2026-08-24：阶段 11.4 RTL Completion Trace Importer
+
+- 新增 `src/npu_ooo/backend/rtl_trace.py`，定义 `npu_ooo.rtl_completion_trace.v1` 的
+  JSON/CSV 输入契约，记录 descriptor issue、compute start/done 和 PSB write completion。
+- importer 支持 `compute_start_to_compute_done` 与 `descriptor_issue_to_done` 两种显式
+  interval；默认前者，避免把 MXU instruction manager/PSB write 的端到端周期误当作
+  isolated `matmul` primitive latency。
+- 同一 `(batch,m,n,k)` 的重复样本支持 `max`、`median`、`p95` 聚合；II 优先读取显式
+  值，否则从起始事件间隔推导，单样本回退到 duration。
+- 新增 `import-rtl-trace` CLI、`docs/rtl-calibration.md` 和
+  `examples/rtl/mxu_completion_trace.json`，生成已有 `systolic_mxu_profile.v1`，并在
+  profile metadata 中保留 interval、aggregation、source、record/shape 数量和校准状态。
+- 默认 unmatched Matmul 为 `error`；只有显式选择 analytical fallback 才允许混合 timing。
+- 当前仍未接入 VCD/VPD/FSDB、VCS、Verilator 或 SCALE-Sim exporter；下一阶段是连接真实
+  trace exporter，并校验 RTL signal boundary 与 TISA backend payload boundary。
