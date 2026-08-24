@@ -571,3 +571,9 @@ git diff --check: passed
 - Timing provider 的 calibration status 现在进入 common primitive simulator 和 TISA simulator 的 `timing_calibration_status`/effective `calibration_status`；顶层与 policy matrix manifest 新增 `timing_provider_metadata`。MXU-only profile 的 effective status 显式写成 `mixed:<profile-status>+analytical-fallback`。
 - 新增 `configs/timing/systolic_mxu_matmul_example.json`，其 source 明确标为格式示例而非测量。官方 StableHLO Matmul smoke 命中 `(1,4,12,8)` profile，保持 3 TISA/4 primitive，runtime submit=2、同步=5、总周期从 analytical 的 59 变为 64；profile 标记为 `source-derived-example`，仿真有效状态标为 mixed。
 - 下一步：实现 SCALE-Sim exporter 或真实 RTL trace importer，将外部原始结果转换为此 profile；外部工具仍只校准 timing，不替代 TISA scheduler。
+
+## 2026-08-24：阶段 11.3 Coverage 可解释性补充
+
+- 增加 `timing_provider_coverage`：profile provider 按唯一 compiled `ExecutionTask` 集合统计 exact Matmul profile match、unmatched Matmul、unknown-shape Matmul 和 non-Matmul analytical fallback。
+- coverage 不在 `timing()` 内计数，因为 critical-path 分析、候选筛选与实际 issue 会多次查询同一 task；直接计数会错误地把 scheduler 查询放大为执行量。
+- common primitive simulator、TISA simulator、顶层 manifest 与四象限 case manifest 都输出同一 coverage 结构，为后续比较 dynamic/static 时的校准范围提供证据。

@@ -926,6 +926,8 @@ fallback policy 和 calibration status 会写入 manifest/summary，因此 mixed
 完整 RTL/cycle-accurate 结果。仓库的 `systolic_mxu_matmul_example.json` 仅验证格式和流程，
 不是 SCALE-Sim 或硬件测量数据。effective calibration status 使用
 `mixed:<profile-status>+analytical-fallback`，profile 自身状态另存于 metadata。
+`timing_provider_coverage` 按 compiled primitive task 集合统计 exact match、未命中、unknown
+shape 和 non-MXU analytical fallback，不能用 timing query 次数代替 coverage。
 
 `--address-scoreboard` 启用 device-side range scoreboard：根据相同 `tensor/memory` 上的 `BufferRegion` 重叠关系，在 issue 前检查 active task 并产生 RAW/WAR/WAW stall；COMPLETE 后释放范围并继续调度。当前地址来自 canonical `ExecutionTask` metadata，尚不是从真实 TISA binary 动态解析出的硬件 scoreboard。
 

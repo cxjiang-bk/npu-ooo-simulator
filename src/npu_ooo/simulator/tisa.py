@@ -467,6 +467,11 @@ def simulate_tisa_artifact(
             else machine_calibration_status
         ),
     }
+    coverage = getattr(timing_model, "coverage", None)
+    if callable(coverage):
+        metrics["timing_provider_coverage"] = dict(
+            coverage(artifact.execution_graph.tasks)
+        )
 
     def record_occupancy(event: str) -> None:
         metrics["queue_occupancy_timeline"].append(

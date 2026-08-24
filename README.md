@@ -545,6 +545,8 @@ PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-model \
 analytical；将 JSON 的 `unmatched_matmul` 设为 `error` 可强制拒绝未校准 tile。
 由于 DMA/vector 仍使用 analytical timing，仿真的 effective calibration status 会显式标为
 `mixed:<profile-status>+analytical-fallback`。
+`timing_provider_coverage` 还会统计 compiled artifact 中精确命中的 Matmul task、未命中或
+shape 不足的 Matmul task，以及走 analytical fallback 的非 Matmul primitive task 数量。
 
 批量比较使用 `sweep-two-mm`。它对每个 architecture/policy/window/ROB 组合重新执行相同的 2mm lowering 和 simulator，并为每个组合写入独立目录：
 

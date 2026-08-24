@@ -775,6 +775,9 @@ def run_compile_model(args: argparse.Namespace) -> int:
             "timing_provider_metadata": dict(
                 getattr(timing_model, "metadata", {})
             ),
+            "timing_provider_coverage": result.metrics.get(
+                "timing_provider_coverage"
+            ),
             "event_backend": (
                 event_backend.name if args.scheduler_target == "tisa" else None
             ),
@@ -892,6 +895,9 @@ def run_compile_model(args: argparse.Namespace) -> int:
                     "timing_provider": getattr(timing_model, "name", "analytical"),
                     "timing_provider_metadata": dict(
                         getattr(timing_model, "metadata", {})
+                    ),
+                    "timing_provider_coverage": case.result.metrics.get(
+                        "timing_provider_coverage"
                     ),
                     "calibration_status": case.result.metrics["calibration_status"],
                 },

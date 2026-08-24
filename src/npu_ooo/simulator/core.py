@@ -574,6 +574,9 @@ def simulate_execution_graph(
         "pipeline_drain_cycles": 0.0,
         "queue_occupancy_timeline": [],
     }
+    coverage = getattr(timing_model, "coverage", None)
+    if callable(coverage):
+        metrics["timing_provider_coverage"] = dict(coverage(graph.tasks))
 
     def record_occupancy(timestamp: float, event: str) -> None:
         metrics["queue_occupancy_timeline"].append(

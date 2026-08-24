@@ -94,6 +94,29 @@ class BackendContractTest(unittest.TestCase):
             provider.metadata["profile_calibration_status"],
             "source-derived-example",
         )
+        coverage = provider.coverage(
+            (
+                task,
+                ExecutionTask(
+                    "matmul.unmatched",
+                    "tile.1",
+                    "matmul",
+                    "matmul",
+                    "MXU",
+                    attributes={"m_tile": 4, "n_tile": 8, "k_tile": 8},
+                ),
+                ExecutionTask(
+                    "vector.0",
+                    "tile.2",
+                    "elementwise",
+                    "elementwise",
+                    "ARU",
+                ),
+            )
+        )
+        self.assertEqual(coverage["calibrated_matmul_task_count"], 1)
+        self.assertEqual(coverage["unmatched_matmul_task_count"], 1)
+        self.assertEqual(coverage["non_matmul_analytical_task_count"], 1)
         self.assertEqual(provider.metadata["profile_count"], 1)
 
     def test_systolic_mxu_profile_strictly_rejects_unmatched_matmul(self) -> None:

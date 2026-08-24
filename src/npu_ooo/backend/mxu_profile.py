@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 import json
 import math
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from npu_ooo.arch import MachineConfig
 from npu_ooo.ir import ExecutionTask
@@ -216,6 +216,33 @@ class SystolicMXUProfileTimingProvider:
             f"systolic MXU profile '{self.name}' has no calibrated matmul tile ({shape_text}); "
             "set unmatched_matmul to 'analytical' to allow an explicit fallback"
         )
+
+    def coverage(self, tasks: Iterable[ExecutionTask]) -> Mapping[str, int | str]:
+        """Report calibration coverage over unique compiled primitive tasks."""
+
+        calibrated = 0
+        unmatched = 0
+        unknown_shape = 0
+        non_matmul = 0
+        profile_keys = {entry.key for entry in self.entries}
+        for task in tasks:
+            if task.primitive != "matmul":
+                non_matmul += 1
+                continue
+            shape = self._task_shape(task)
+            if shape is None:
+                unknown_shape += 1
+            elif shape in profile_keys:
+                calibrated += 1
+            else:
+                unmatched += 1
+        return {
+            "calibrated_matmul_task_count": calibrated,
+            "unmatched_matmul_task_count": unmatched,
+            "unknown_shape_matmul_task_count": unknown_shape,
+            "non_matmul_analytical_task_count": non_matmul,
+            "unmatched_matmul_policy": self.unmatched_matmul,
+        }
 
     @staticmethod
     def _task_shape(task: ExecutionTask) -> tuple[int, int, int, int] | None:
