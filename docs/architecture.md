@@ -213,10 +213,13 @@ fusion / reorder attributes
 backend payload recipe
 ```
 
-FC 同时给每条 stage 写入 `readiness_condition`。当前只记录语义，不改变
-analytical scheduler 的 ready 判定：load 使用 `input_region_ready`，计算阶段
-使用 `operand_regions_ready` 或复合算子的 `semantic_tile_ready`，store 使用
-`output_region_ready`。后续 partial-ready 支持可以直接消费这些条件。
+FC 同时给每条 stage 写入 `readiness_condition`。默认编译条件
+`input_region_ready`、`operand_regions_ready`、`semantic_tile_ready` 和
+`output_region_ready` 都在 source TISA 完成时满足，因此不会改变现有 analytical
+cycle baseline。simulator 另外支持显式的 `payload_ready:<task_id>` 条件：它把
+source payload 中指定 task 的完成时间作为依赖 ready 时间，并产生
+`TISA_PARTIAL_READY` trace 事件。该语法用于校准 backend 或 micro-test，当前 GC
+不会自动生成它；payload 仍然是父 TISA 内部执行，不会进入全局 ready queue。
 
 一个 Attention tile 的 FC 输出类似：
 

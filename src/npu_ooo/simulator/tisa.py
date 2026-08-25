@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import heapq
+import math
 from typing import Any
 
 from npu_ooo.arch import ExecutionUnitConfig, MachineConfig
@@ -218,6 +219,29 @@ def _critical_path_lengths(
     return lengths
 
 
+def _payload_readiness_task(condition: str, plan: _PayloadPlan) -> _PayloadStep | None:
+    """Resolve the opt-in partial-ready condition against one TISA payload.
+
+    ``payload_ready:<task_id>`` means that a dependent instruction may use the
+    source after the named backend step finishes.  All compiler-generated
+    conditions remain completion-boundary conditions; this syntax is reserved
+    for calibrated backends and simulator micro-tests.
+    """
+
+    prefix = "payload_ready:"
+    if not condition.startswith(prefix):
+        return None
+    task_id = condition[len(prefix) :]
+    if not task_id:
+        raise ValueError("payload_ready condition must name a backend task")
+    for step in plan.steps:
+        if step.task_id == task_id:
+            return step
+    raise ValueError(
+        f"payload_ready condition references task '{task_id}' outside the source payload"
+    )
+
+
 def simulate_tisa_artifact(
     artifact: BackendArtifact,
     machine: MachineConfig,
@@ -337,12 +361,15 @@ def simulate_tisa_artifact(
         unit.name: [_UnitState(unit, instance) for instance in range(unit.count)]
         for unit in machine.execution_units
     }
-    dependency_sources = {
-        instruction.tisa_id: tuple(
-            dependency.source for dependency in instruction.dependencies
-        )
+    dependency_specs = {
+        instruction.tisa_id: tuple(instruction.dependencies)
         for instruction in instructions
     }
+    readiness_dependencies: dict[str, list[Any]] = {}
+    for instruction in instructions:
+        for dependency in instruction.dependencies:
+            if dependency.condition.startswith("payload_ready:"):
+                readiness_dependencies.setdefault(dependency.source, []).append(dependency)
     runtime_operands_by_tisa: dict[str, tuple[RuntimeOperandBinding, ...]] = {}
     if runtime_submission is not None:
         for instruction in instructions:
@@ -365,6 +392,8 @@ def simulate_tisa_artifact(
     completed: set[str] = set()
     active: dict[str, tuple[str, int]] = {}
     completion_time: dict[str, float] = {}
+    payload_readiness_time: dict[tuple[str, str], float] = {}
+    emitted_payload_readiness: set[tuple[str, str]] = set()
     instruction_timings: dict[str, TaskTiming] = {}
     primitive_timings: dict[str, TaskTiming] = {}
     runtime_timings: list[TaskTiming] = []
@@ -443,6 +472,20 @@ def simulate_tisa_artifact(
         "simulator_config": config.to_dict(),
         "tisa_instruction_count": len(instructions),
         "payload_task_count": len(artifact.execution_graph.tasks),
+        "readiness_interpreter": "completion_boundary+payload_ready",
+        "readiness_conditions": sorted(
+            {
+                dependency.condition
+                for instruction in instructions
+                for dependency in instruction.dependencies
+            }
+        ),
+        "partial_ready_dependency_count": sum(
+            dependency.condition.startswith("payload_ready:")
+            for instruction in instructions
+            for dependency in instruction.dependencies
+        ),
+        "partial_ready_event_count": 0,
         "issued_instruction_count": 0,
         "completed_instruction_count": 0,
         "issued_task_count": 0,
@@ -530,7 +573,29 @@ def simulate_tisa_artifact(
             )
 
     def dependency_ready(tisa_id: str) -> bool:
-        return all(source in completed for source in dependency_sources[tisa_id])
+        for dependency in dependency_specs[tisa_id]:
+            if dependency.source in completed:
+                continue
+            ready_time = payload_readiness_time.get(
+                (dependency.source, dependency.condition)
+            )
+            if ready_time is None or ready_time > now + 1e-9:
+                return False
+        return True
+
+    def dependency_ready_time(tisa_id: str) -> float:
+        times: list[float] = []
+        for dependency in dependency_specs[tisa_id]:
+            partial_time = payload_readiness_time.get(
+                (dependency.source, dependency.condition)
+            )
+            if partial_time is not None:
+                times.append(partial_time)
+            elif dependency.source in completed:
+                times.append(completion_time[dependency.source])
+            else:
+                return math.inf
+        return max(times, default=0.0)
 
     def resource_candidate(tisa_id: str) -> _UnitState | None:
         resource = plans[tisa_id].resource
@@ -592,6 +657,24 @@ def simulate_tisa_artifact(
             metrics["completed_task_count"] += len(artifact.payloads[tisa_id])
             receive_descriptors()
             record_occupancy("TISA_COMPLETE")
+
+        for (source, condition), ready_time in sorted(payload_readiness_time.items()):
+            if ready_time > now + 1e-9 or (source, condition) in emitted_payload_readiness:
+                continue
+            source_resource = plans[source].resource
+            source_instance = active.get(source, (source_resource, 0))[1]
+            events.append(
+                TraceEvent(
+                    now,
+                    "TISA_PARTIAL_READY",
+                    source,
+                    f"TISA/{source_resource}",
+                    source_instance,
+                    details={"condition": condition, "ready_cycle": ready_time},
+                )
+            )
+            emitted_payload_readiness.add((source, condition))
+            metrics["partial_ready_event_count"] += 1
 
         receive_descriptors()
 
@@ -673,9 +756,15 @@ def simulate_tisa_artifact(
             active[tisa_id] = (plan.resource, resource_state.instance)
             rob_occupancy += 1
             inflight_tiles.add(instruction.tile_id)
+            for dependency in readiness_dependencies.get(tisa_id, ()):
+                step = _payload_readiness_task(dependency.condition, plan)
+                if step is not None:
+                    payload_readiness_time[(tisa_id, dependency.condition)] = (
+                        now + step.finish_offset
+                    )
             dependency_ready_cycle = max(
-                (completion_time[source] for source in dependency_sources[tisa_id]),
-                default=0.0,
+                dependency_ready_time(tisa_id),
+                0.0,
             )
             instruction_timings[tisa_id] = TaskTiming(
                 task_id=tisa_id,
@@ -802,6 +891,13 @@ def simulate_tisa_artifact(
                 f"received={len(received)}, issued={len(issued)}, completed={len(completed)}"
             )
         next_time = event_queue[0][0]
+        future_readiness = [
+            ready_time
+            for (source, _condition), ready_time in payload_readiness_time.items()
+            if source in active and ready_time > now + 1e-9
+        ]
+        if future_readiness:
+            next_time = min(next_time, min(future_readiness))
         if next_descriptor_time is not None and next_descriptor_time > now + 1e-9:
             next_time = min(next_time, next_descriptor_time)
         if next_time <= now + 1e-9:
@@ -816,7 +912,8 @@ def simulate_tisa_artifact(
         "ISSUE": 4,
         "START": 5,
         "COMPLETE": 6,
-        "TISA_COMPLETE": 7,
+        "TISA_PARTIAL_READY": 7,
+        "TISA_COMPLETE": 8,
     }
     events.sort(
         key=lambda event: (

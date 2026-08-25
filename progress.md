@@ -16,7 +16,8 @@
 - 首个两头 Attention block 已覆盖 head reshape/permute、scale、additive mask、Softmax、PV、output projection 和 residual；
 - reshape/transpose 已生成 DMA-bound TISA transform，TileGraph 已使用逻辑 tensor region 建边；
 - `compile_statistics.json` 已输出 per-operator tile/TISA/payload、MAC、root traffic 和 dependency 统计；
-- 当前回归为 55 项；一次编译的四组合实验中 device static=2344、dynamic=2119 analytical cycles。
+- 当前回归为 62 项；一次编译的四组合实验中 device static=2344、dynamic=2119 analytical cycles。
+- TISA readiness 已增加 completion-boundary 解释器和显式 `payload_ready:<task_id>` partial-ready 原型；后者可在 source payload 完成前唤醒依赖，并输出 `TISA_PARTIAL_READY` trace 事件。
 
 ## 真实验证
 
@@ -36,6 +37,7 @@ minimal analytical device: static 2344, dynamic 2119 cycles
 - reshape/transpose 仍是 full-tensor transform，symbolic/dynamic shape 与 stride-aware layout 尚未完成；
 - analytical event backend 不是 RTL cycle-accurate；
 - 当前 MXU VCS log 主要提供 descriptor-to-completion 区间；
+- GC 当前只生成 completion-boundary readiness；真实 partial-tile producer 语义仍需由 backend/calibration 端接入；
 - 论文中的完整 ResNet50、BERT、GPT-J、LLaMA2、DeepSeek block 尚未形成可复现实验集。
 
 ## 下一步

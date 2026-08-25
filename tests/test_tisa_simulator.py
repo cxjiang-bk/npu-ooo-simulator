@@ -217,6 +217,75 @@ class TISADeviceSimulatorTest(unittest.TestCase):
             ["softmax", "softmax"],
         )
 
+    def test_payload_ready_condition_wakes_consumer_before_source_completion(self) -> None:
+        source = _instruction("source", "tile_source", "dma")
+        consumer = replace(
+            _instruction("consumer", "tile_consumer", "tensor"),
+            dependencies=(
+                TISADependency(
+                    "source",
+                    kind="RAW",
+                    condition="payload_ready:source.load",
+                ),
+            ),
+        )
+        tasks = (
+            ExecutionTask(
+                "source.load",
+                "tile_source",
+                "micro",
+                "load",
+                "DMA",
+                duration_cycles=4,
+                program_order=0,
+            ),
+            ExecutionTask(
+                "source.finish",
+                "tile_source",
+                "micro",
+                "copy",
+                "DMA",
+                predecessors=("source.load",),
+                duration_cycles=10,
+                program_order=1,
+            ),
+            ExecutionTask(
+                "consumer.compute",
+                "tile_consumer",
+                "micro",
+                "matmul",
+                "MXU",
+                duration_cycles=3,
+                program_order=2,
+            ),
+        )
+        artifact = _artifact(
+            (source, consumer),
+            tasks,
+            {
+                "source": ("source.load", "source.finish"),
+                "consumer": ("consumer.compute",),
+            },
+        )
+
+        result = schedule_tisa_program(
+            artifact,
+            minimal_machine_config(),
+            SchedulerPolicy.DYNAMIC_READY_QUEUE,
+        )
+
+        self.assertEqual(result.instruction_timing("source").issue, 0)
+        self.assertEqual(result.timing("source.finish").finish, 14)
+        self.assertEqual(result.instruction_timing("consumer").issue, 4)
+        self.assertEqual(result.instruction_timing("consumer").dependency_ready, 4)
+        self.assertGreater(result.instruction_timing("source").finish, 4)
+        self.assertEqual(result.metrics["partial_ready_dependency_count"], 1)
+        partial_events = [
+            event for event in result.events if event.event == "TISA_PARTIAL_READY"
+        ]
+        self.assertEqual(len(partial_events), 1)
+        self.assertEqual(partial_events[0].timestamp, 4)
+
     def test_window_one_prevents_dynamic_bypass(self) -> None:
         artifact = self._critical_path_artifact()
         result = schedule_tisa_program(

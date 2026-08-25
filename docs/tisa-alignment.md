@@ -45,7 +45,7 @@ backend execution payload    DMA/MXU/Vector 等单元内部执行
 | `TileShape` | `TISAOperand.tile_shape` | 尚缺通用 symbolic shape binding |
 | `TileMem` | `TISAOperand.tile_mem` | 已有 scope/offset/size，地址表达式仍需扩展 |
 | `AccessType` | operand/buffer access | 已支持 read/write/read-write |
-| `Attributes` | `TISAInstruction.attributes` | 已记录 stage readiness；partial-ready 解释器仍需继续校准 |
+| `Attributes` | `TISAInstruction.attributes` | 已记录 stage readiness；simulator 支持显式 `payload_ready:<task_id>` partial-ready 原型 |
 | `UnitMap` | `TISAInstruction.unit_map` | analytical backend 当前主要验证 quantity=1 |
 | typed `Deps` | `TISADependency` | 已有 RAW/WAR/WAW/STATE/ACCUMULATE 与显式 readiness condition |
 | WQ/IQ/Fu | TISA simulator queue/ROB/in-flight state | 是行为模型，不宣称 RTL 微结构等价 |
@@ -136,8 +136,10 @@ Backend Timing/Event
 尚未完成：
 
 - 论文全部 operation/模型 block 的 semantic coverage；
-- 通用 partial-ready、精确 typed hazard 和 memory bank/port conflict；
+- GC 自动生成的通用 partial-ready、精确 typed hazard 和 memory bank/port conflict；
 - 与论文实现一致的 WQ/IQ/Fu 容量和 dispatch pipeline；
 - 完整 RTL 或真实芯片时序校准。
 
-因此当前结果应称为“TISA instruction-level analytical scheduling baseline”，不能称为论文硬件的 cycle-accurate 复现。
+因此当前结果应称为“TISA instruction-level analytical scheduling baseline”。默认编译
+路径仍是 completion-boundary 语义；`payload_ready:<task_id>` 只作为校准 backend
+和 micro-test 的 partial-ready 原型，不能称为论文硬件的 cycle-accurate 复现。

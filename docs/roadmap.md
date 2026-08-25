@@ -72,7 +72,7 @@ Torch-XLA StableHLO operation
 目标：从 instruction-level analytical baseline 逐步逼近论文硬件调度器。
 
 - 明确 reception queue、per-unit WQ/IQ、ROB/Fu 和 completion feedback；
-- 实现并验证 typed RAW/WAR/WAW、partial-ready 和 address conflict；
+- 实现并验证 typed RAW/WAR/WAW、`payload_ready:<task_id>` partial-ready 原型和 address conflict；
 - 校准 dispatch、wake-up、issue 和 completion 的控制开销；
 - 验证同一 TISA instruction 的 backend payload 只在 instruction 内部执行，不进入全局 OOO window；
 - 为 queue full、dependency wait、resource busy、memory conflict 分别记录 stall 原因。
