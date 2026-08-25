@@ -50,6 +50,11 @@ backend execution payload    DMA/MXU/Vector 等单元内部执行
 | typed `Deps` | `TISADependency` | 已有 RAW/WAR/WAW/STATE/ACCUMULATE 与显式 readiness condition |
 | WQ/IQ/Fu | TISA simulator queue/ROB/in-flight state | 是行为模型，不宣称 RTL 微结构等价 |
 
+可选的 memory bank scoreboard 根据 `MachineConfig.memory_levels` 的 bank 数量、bank
+宽度和读写端口数建立 active reservation。它用于研究 TileMem 访问造成的结构性
+阻塞，默认关闭，且不替代真实 memory timing backend；对应结果应标注为 analytical
+structural-conflict model。
+
 ## 3. 当前唯一编译路径
 
 ```text

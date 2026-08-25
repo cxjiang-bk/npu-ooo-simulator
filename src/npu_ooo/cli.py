@@ -173,6 +173,11 @@ def _add_compile_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--ready-queue-depth", type=int)
     parser.add_argument("--address-scoreboard", action="store_true")
     parser.add_argument(
+        "--memory-bank-scoreboard",
+        action="store_true",
+        help="model configured memory bank and read/write port conflicts",
+    )
+    parser.add_argument(
         "--dynamic-priority",
         choices=("critical_path", "oldest_first"),
         default="critical_path",
@@ -446,6 +451,7 @@ def run_compile_model(args: argparse.Namespace) -> int:
         dependency_window=args.dependency_window,
         ready_queue_depth=args.ready_queue_depth,
         address_scoreboard=args.address_scoreboard,
+        memory_bank_scoreboard=args.memory_bank_scoreboard,
         dynamic_priority=args.dynamic_priority,
     )
     timing_model = _timing_model(args.timing_config, args.timing_provider)

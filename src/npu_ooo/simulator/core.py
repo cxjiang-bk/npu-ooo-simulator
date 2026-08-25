@@ -197,6 +197,7 @@ class SimulatorConfig:
     dependency_window: int | None = None
     ready_queue_depth: int | None = None
     address_scoreboard: bool = False
+    memory_bank_scoreboard: bool = False
     static_pipeline: StaticPipelineConfig | None = None
     dynamic_priority: str = "critical_path"
 
@@ -229,6 +230,7 @@ class SimulatorConfig:
                 )
             ),
             address_scoreboard=self.address_scoreboard,
+            memory_bank_scoreboard=self.memory_bank_scoreboard,
             static_pipeline=self.static_pipeline,
             dynamic_priority=self.dynamic_priority,
         )
@@ -264,6 +266,7 @@ class SimulatorConfig:
             "dependency_window": self.dependency_window,
             "ready_queue_depth": self.ready_queue_depth,
             "address_scoreboard": self.address_scoreboard,
+            "memory_bank_scoreboard": self.memory_bank_scoreboard,
             "static_pipeline": (
                 self.static_pipeline.to_dict() if self.static_pipeline is not None else None
             ),

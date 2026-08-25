@@ -136,6 +136,55 @@ class TISADeviceSimulatorTest(unittest.TestCase):
         self.assertEqual(dynamic.metrics["payload_task_count"], 3)
         self.assertEqual(dynamic.metrics["event_backend"], "analytical_event")
 
+    def test_memory_bank_scoreboard_is_opt_in(self) -> None:
+        instructions = (
+            _instruction("dma", "tile_dma", "dma"),
+            _instruction("tensor", "tile_tensor", "tensor"),
+        )
+        tasks = (
+            ExecutionTask(
+                "dma.load",
+                "tile_dma",
+                "micro",
+                "load",
+                "DMA",
+                duration_cycles=10,
+                program_order=0,
+            ),
+            ExecutionTask(
+                "tensor.matmul",
+                "tile_tensor",
+                "micro",
+                "matmul",
+                "MXU",
+                duration_cycles=10,
+                program_order=1,
+            ),
+        )
+        artifact = _artifact(
+            instructions,
+            tasks,
+            {"dma": ("dma.load",), "tensor": ("tensor.matmul",)},
+        )
+
+        baseline = schedule_tisa_program(
+            artifact, minimal_machine_config(), SchedulerPolicy.DYNAMIC_READY_QUEUE
+        )
+        self.assertEqual(baseline.instruction_timing("dma").issue, 0)
+        self.assertEqual(baseline.instruction_timing("tensor").issue, 0)
+        self.assertFalse(baseline.metrics["memory_bank_scoreboard"])
+
+        constrained = schedule_tisa_program(
+            artifact,
+            minimal_machine_config(),
+            SchedulerPolicy.DYNAMIC_READY_QUEUE,
+            simulator_config=SimulatorConfig(memory_bank_scoreboard=True),
+        )
+        self.assertEqual(constrained.instruction_timing("dma").issue, 0)
+        self.assertEqual(constrained.instruction_timing("tensor").issue, 10)
+        self.assertTrue(constrained.metrics["memory_bank_scoreboard"])
+        self.assertGreater(constrained.metrics["memory_bank_block_events"], 0)
+
     def test_explicit_analytical_event_backend_matches_default_cycles(self) -> None:
         artifact = self._critical_path_artifact()
         machine = minimal_machine_config()

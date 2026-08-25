@@ -52,6 +52,79 @@ class _UnitState:
         return self.busy_until <= now + 1e-9
 
 
+@dataclass(frozen=True)
+class _MemoryAccess:
+    memory: str
+    bank: int
+    mode: str
+
+
+def _memory_accesses(
+    instruction: TISAInstruction,
+    machine: MachineConfig,
+    runtime_operands: tuple[RuntimeOperandBinding, ...] = (),
+) -> tuple[_MemoryAccess, ...]:
+    """Map one TISA instruction's ranges to configured memory bank ports."""
+
+    accesses: set[_MemoryAccess] = set()
+    if runtime_operands:
+        candidates = tuple(
+            # Runtime bindings carry the concrete device address.  Use it for
+            # bank selection so separate buffers with different base addresses
+            # can exercise different banks even when their tile offsets match.
+            (item.physical_scope, item.address, item.size_bytes, item.access_type)
+            for item in runtime_operands
+        )
+    else:
+        candidates = tuple(
+            (
+                operand.tile_mem.scope,
+                operand.tile_mem.offset_bytes or 0,
+                operand.tile_mem.size_bytes or 1,
+                operand.normalized_access,
+            )
+            for operand in instruction.operands
+        )
+    for memory, offset, size, access_type in candidates:
+        try:
+            level = machine.memory(memory)
+        except KeyError:
+            # ``logical`` scopes are resolved by RuntimeSubmission later.
+            continue
+        bank_width = level.bank_width_bytes or 1
+        first_bank = offset // bank_width
+        last_bank = (offset + max(size - 1, 0)) // bank_width
+        modes = (
+            ("read", "write")
+            if access_type == AccessType.READ_WRITE.value
+            else ("read",)
+            if access_type == AccessType.READ.value
+            else ("write",)
+        )
+        for bank in range(first_bank, last_bank + 1):
+            for mode in modes:
+                accesses.add(_MemoryAccess(memory, bank % level.bank_count, mode))
+    return tuple(sorted(accesses, key=lambda item: (item.memory, item.bank, item.mode)))
+
+
+def _memory_port_conflict(
+    active_accesses: dict[str, tuple[_MemoryAccess, ...]],
+    candidate: tuple[_MemoryAccess, ...],
+    machine: MachineConfig,
+) -> tuple[str, int, str] | None:
+    active_counts: dict[tuple[str, int, str], int] = {}
+    for accesses in active_accesses.values():
+        for access in accesses:
+            key = (access.memory, access.bank, access.mode)
+            active_counts[key] = active_counts.get(key, 0) + 1
+    for access in candidate:
+        level = machine.memory(access.memory)
+        limit = level.read_ports if access.mode == "read" else level.write_ports
+        if active_counts.get((access.memory, access.bank, access.mode), 0) >= limit:
+            return access.memory, access.bank, access.mode
+    return None
+
+
 def _payload_plan(
     artifact: BackendArtifact,
     tisa_id: str,
@@ -391,6 +464,7 @@ def simulate_tisa_artifact(
     issued: set[str] = set()
     completed: set[str] = set()
     active: dict[str, tuple[str, int]] = {}
+    active_memory_accesses: dict[str, tuple[_MemoryAccess, ...]] = {}
     completion_time: dict[str, float] = {}
     payload_readiness_time: dict[tuple[str, str], float] = {}
     emitted_payload_readiness: set[tuple[str, str]] = set()
@@ -500,6 +574,8 @@ def simulate_tisa_artifact(
         "rob_block_events": 0,
         "tile_window_block_events": 0,
         "address_scoreboard_block_events": 0,
+        "memory_bank_scoreboard": config.memory_bank_scoreboard,
+        "memory_bank_block_events": 0,
         "resource_busy_cycles": {},
         "queue_occupancy_timeline": [],
         "machine_calibration_status": machine_calibration_status,
@@ -620,6 +696,24 @@ def simulate_tisa_artifact(
                 return active_id, kind
         return None
 
+    memory_accesses_by_tisa = {
+        instruction.tisa_id: _memory_accesses(
+            instruction,
+            machine,
+            runtime_operands_by_tisa.get(instruction.tisa_id, ()),
+        )
+        for instruction in instructions
+    }
+
+    def memory_block(tisa_id: str) -> tuple[str, int, str] | None:
+        if not config.memory_bank_scoreboard:
+            return None
+        return _memory_port_conflict(
+            active_memory_accesses,
+            memory_accesses_by_tisa[tisa_id],
+            machine,
+        )
+
     receive_descriptors()
     record_occupancy("INIT")
 
@@ -630,6 +724,7 @@ def simulate_tisa_artifact(
             completed.add(tisa_id)
             completion_time[tisa_id] = finish
             active.pop(tisa_id)
+            active_memory_accesses.pop(tisa_id, None)
             rob_occupancy -= 1
             tile_completed_count[instruction.tile_id] += 1
             if (
@@ -697,6 +792,7 @@ def simulate_tisa_artifact(
             resource_blocked = False
             tile_blocked = False
             address_blocked = False
+            memory_bank_blocked = False
             for tisa_id in visible:
                 instruction = instruction_by_id[tisa_id]
                 if not dependency_ready(tisa_id):
@@ -711,6 +807,10 @@ def simulate_tisa_artifact(
                 conflict = address_block(tisa_id)
                 if conflict is not None:
                     address_blocked = True
+                    continue
+                memory_conflict = memory_block(tisa_id)
+                if memory_conflict is not None:
+                    memory_bank_blocked = True
                     continue
                 resource = resource_candidate(tisa_id)
                 if resource is None:
@@ -727,6 +827,8 @@ def simulate_tisa_artifact(
                     metrics["tile_window_block_events"] += 1
                 if address_blocked:
                     metrics["address_scoreboard_block_events"] += 1
+                if memory_bank_blocked:
+                    metrics["memory_bank_block_events"] += 1
                 break
 
             if policy == "dynamic_ready_queue":
@@ -754,6 +856,7 @@ def simulate_tisa_artifact(
             waiting.remove(tisa_id)
             issued.add(tisa_id)
             active[tisa_id] = (plan.resource, resource_state.instance)
+            active_memory_accesses[tisa_id] = memory_accesses_by_tisa[tisa_id]
             rob_occupancy += 1
             inflight_tiles.add(instruction.tile_id)
             for dependency in readiness_dependencies.get(tisa_id, ()):

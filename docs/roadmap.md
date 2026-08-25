@@ -73,11 +73,12 @@ Torch-XLA StableHLO operation
 
 - 明确 reception queue、per-unit WQ/IQ、ROB/Fu 和 completion feedback；
 - 实现并验证 typed RAW/WAR/WAW、`payload_ready:<task_id>` partial-ready 原型和 address conflict；
+- 增加可选 memory bank/port conflict model，消费 MachineConfig 的 memory-level 参数并记录独立 stall 计数；
 - 校准 dispatch、wake-up、issue 和 completion 的控制开销；
 - 验证同一 TISA instruction 的 backend payload 只在 instruction 内部执行，不进入全局 OOO window；
 - 为 queue full、dependency wait、resource busy、memory conflict 分别记录 stall 原因。
 
-验收标准：micro-test 能逐 cycle 对账，`window=1` 的退化行为可解释，dynamic 的收益可以从 ready/issue/stall trace 直接定位。
+验收标准：micro-test 能逐 cycle 对账，`window=1` 的退化行为可解释，dynamic 的收益可以从 ready/issue/stall trace 直接定位；memory bank 模型的开启/关闭不改变编译产物。
 
 ## D. 扩展可插拔硬件 backend
 

@@ -50,7 +50,7 @@
 ## 阶段 3：设备调度与后端
 
 - [x] reception availability、queue、ROB/window、资源占用、completion feedback 的 analytical 模型；
-- [ ] 补齐论文语义的 partial-ready、typed hazard 和 memory bank/port conflict；
+- [x] 补齐论文语义的 partial-ready 原型、typed hazard、address conflict 和可选 memory bank/port conflict；
 - [ ] 校准 dispatch/wake-up/issue/completion 控制开销；
 - [ ] 接入 SCALE-Sim 类 MXU timing、memory timing 和 RTL/Verilator 局部时序；
 - [ ] 每个 backend 声明 capability、timing interval 和 calibration status。
@@ -72,7 +72,8 @@ prefill 与 decode 必须是不同 case；analytical、source-derived 和 RTL-ob
 
 ## 当前下一步
 
-下一步细化 FC 的 TISA dialect metadata、strided `TileMem` expression 和 memory bank
-metadata，并补齐 online Softmax 的 rescale、最终 normalization 与 workspace 生命周期语义。
+下一步细化 FC 的 TISA dialect metadata、strided `TileMem` expression，并补齐 online
+Softmax 的 rescale、最终 normalization 与 workspace 生命周期语义。memory bank
+scoreboard 已作为默认关闭的 analytical structural-conflict 模型接入。
 之后继续加入 stride-aware transform、RoPE、KV-cache 和 SwiGLU，形成第一个真实 decoder
 block。scheduler 微结构和外部 timing backend 放在语义契约稳定之后。

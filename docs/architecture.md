@@ -344,6 +344,15 @@ dynamic_ready_queue:
 
 可配置限制包括 instruction queue depth、ROB entries、dependency window、ready queue depth、max inflight tiles、address scoreboard 和 dynamic priority。
 
+当 `SimulatorConfig.memory_bank_scoreboard=true` 时，scheduler 还会消费
+`MachineConfig.memory_levels` 中的 `bank_count`、`bank_width_bytes`、`read_ports`
+和 `write_ports`，对 active TISA instruction 建立 analytical memory-port reservation。
+同一 memory bank 的读/写端口超出配置容量时，候选 instruction 会被阻塞，并在
+`memory_bank_block_events` 中计数。该模型默认关闭；它只表达结构冲突趋势，不是
+SRAM/DRAM 的 cycle-accurate 时序。存在 `RuntimeSubmission` 时优先使用 physical
+operand scope 和 offset；没有 runtime 时仅处理可解析的 concrete scope，`logical`
+scope 会跳过 bank 映射。
+
 ## 10. 可插拔后端
 
 | 接口 | 输入/输出 | 当前实现 |
