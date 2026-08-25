@@ -56,6 +56,13 @@ class PyTorchFrontendTest(unittest.TestCase):
             48,
         )
         self.assertTrue(compiled.tisa_program.instructions)
+        address_expressions = [
+            operand.tile_mem.address_expr
+            for instruction in compiled.tisa_program.instructions
+            for operand in instruction.operands
+        ]
+        self.assertTrue(address_expressions)
+        self.assertTrue(all(expression for expression in address_expressions))
         self.assertIsNotNone(compiled.gc_artifact)
         self.assertIsNotNone(compiled.tisa_dialect)
         self.assertEqual(compiled.validate(), ())

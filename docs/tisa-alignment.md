@@ -43,7 +43,7 @@ backend execution payload    DMA/MXU/Vector 等单元内部执行
 | tile bounds | `TileInstance.bounds` | 已支持静态 resolved shape 与边界 tile |
 | `OpType` | `TISAInstruction.op_type`、`semantic_family` | 复合算子保持 semantic op，按 EU stage 拆分 |
 | `TileShape` | `TISAOperand.tile_shape` | 尚缺通用 symbolic shape binding |
-| `TileMem` | `TISAOperand.tile_mem` | 已有 scope/offset/size，地址表达式仍需扩展 |
+| `TileMem` | `TISAOperand.tile_mem` | 已有 scope、逻辑 `address_expr`、concrete offset/size；strided symbolic expression 仍需扩展 |
 | `AccessType` | operand/buffer access | 已支持 read/write/read-write |
 | `Attributes` | `TISAInstruction.attributes` | 已记录 stage readiness；simulator 支持显式 `payload_ready:<task_id>` partial-ready 原型 |
 | `UnitMap` | `TISAInstruction.unit_map` | analytical backend 当前主要验证 quantity=1 |

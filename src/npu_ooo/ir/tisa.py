@@ -16,13 +16,19 @@ from .execution import AccessType, ExecutionGraph
 
 @dataclass(frozen=True)
 class TileMem:
-    """Logical memory descriptor used by TISA dependency checks."""
+    """Logical memory descriptor used by TISA dependency checks.
+
+    ``address_expr`` keeps the compiler's logical slice visible even when a
+    runtime later binds it to a physical base address.  The concrete byte
+    range remains authoritative for the current analytical scoreboard.
+    """
 
     base: str
     scope: str = "local"
     tensor: str | None = None
     offset_bytes: int | None = None
     size_bytes: int | None = None
+    address_expr: str | None = None
 
     def validate(self) -> tuple[str, ...]:
         issues: list[str] = []
@@ -34,6 +40,8 @@ class TileMem:
             issues.append("TISA TileMem offset_bytes must be non-negative")
         if self.size_bytes is not None and self.size_bytes <= 0:
             issues.append("TISA TileMem size_bytes must be positive")
+        if self.address_expr is not None and not self.address_expr.strip():
+            issues.append("TISA TileMem address_expr must not be blank")
         return tuple(issues)
 
     def to_dict(self) -> dict[str, Any]:
@@ -43,6 +51,7 @@ class TileMem:
             "tensor": self.tensor,
             "offset_bytes": self.offset_bytes,
             "size_bytes": self.size_bytes,
+            "address_expr": self.address_expr,
         }
 
 

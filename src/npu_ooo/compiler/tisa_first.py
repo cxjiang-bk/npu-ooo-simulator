@@ -231,6 +231,21 @@ def _dense_region(
     return offset_elements * _dtype_bytes(tensor.dtype), math.prod(shape) * _dtype_bytes(tensor.dtype)
 
 
+def _address_expression(
+    tensor_name: str,
+    geometry: tuple[tuple[int, ...], tuple[int, ...]] | None,
+) -> str | None:
+    """Render a resolved logical tensor slice for TISA inspection."""
+
+    if geometry is None:
+        return None
+    starts, shape = geometry
+    slices = ", ".join(
+        f"{start}:{start + extent}" for start, extent in zip(starts, shape)
+    )
+    return f"{tensor_name}[{slices}]"
+
+
 def _tile_bounds(tile: TileInstance) -> dict[str, tuple[int, int]]:
     return tile.bound_map
 
@@ -366,6 +381,7 @@ def _stage_operands(
                     tensor=name,
                     offset_bytes=offset_bytes,
                     size_bytes=size_bytes,
+                    address_expr=_address_expression(name, geometry),
                 ),
                 access_type=access,
             )
