@@ -14,7 +14,6 @@ from npu_ooo.ir import (
     TileInstance,
     build_tile_graph,
 )
-from npu_ooo.ir.model import ModelInstance
 
 from .matmul import (
     LoweringResult,
@@ -201,7 +200,3 @@ def lower_reduce_graph(
             "transfer_bytes": transfer_bytes,
         },
     )
-
-
-def lower_reduce(model: ModelInstance, machine: MachineConfig, schedule: ScheduleSpec) -> LoweringResult:
-    return lower_reduce_graph(model.graph, schedule, machine)

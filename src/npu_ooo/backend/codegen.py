@@ -52,7 +52,7 @@ class AnalyticalCodegenBackend:
         # implementation only when this backend is selected.
         from npu_ooo.compiler.tisa_first import AnalyticalBackendCodegen
 
-        result = AnalyticalBackendCodegen().lower(
+        artifact = AnalyticalBackendCodegen().lower(
             graph,
             schedule,
             tile_graph,
@@ -60,12 +60,12 @@ class AnalyticalCodegenBackend:
             program=program,
             registry=self.lowering_registry,
         )
-        issues = validate_backend_capability(result.artifact, machine, self.capabilities)
+        issues = validate_backend_capability(artifact, machine, self.capabilities)
         if issues:
             raise ValueError(
                 "codegen backend capability validation failed: " + "; ".join(issues)
             )
-        return result.artifact
+        return artifact
 
 
 __all__ = ["AnalyticalCodegenBackend"]

@@ -6,16 +6,12 @@ from npu_ooo.arch import minimal_machine_config
 from npu_ooo.backend import (
     AnalyticalCodegenBackend,
     AnalyticalEventBackend,
-    BackendCapabilities,
     CodegenBackendRegistry,
     EventBackendRegistry,
     default_codegen_backend_registry,
     default_event_backend_registry,
     default_timing_provider_registry,
-    validate_backend_capability,
 )
-from npu_ooo.benchmarks import build_elementwise_case, build_elementwise_model
-from npu_ooo.compiler import compile_model_instance
 from npu_ooo.ir import ExecutionTask
 from npu_ooo.simulator import TimingTableModel
 
@@ -174,42 +170,6 @@ class BackendContractTest(unittest.TestCase):
         self.assertFalse(provider.capabilities.attributes["isolated_matmul_compatible"])
         with self.assertRaisesRegex(ValueError, "cannot be applied to the isolated matmul"):
             provider.timing(task, minimal_machine_config())
-
-    def test_capability_validation_rejects_unsupported_payload(self) -> None:
-        model = build_elementwise_model(rows=8, cols=8)
-        instance = model.instantiate(build_elementwise_case())
-        compiled = compile_model_instance(instance, minimal_machine_config(), tile_size=4)
-        capability = BackendCapabilities(
-            backend="mxu-only",
-            supported_primitives=frozenset({"matmul"}),
-            calibration_status="source-derived",
-        )
-        issues = validate_backend_capability(
-            compiled.backend_artifact,
-            minimal_machine_config(),
-            capability,
-        )
-        self.assertTrue(any("elementwise" in issue for issue in issues))
-
-    def test_explicit_codegen_backend_matches_default_artifact(self) -> None:
-        model = build_elementwise_model(rows=8, cols=8)
-        instance = model.instantiate(build_elementwise_case())
-        machine = minimal_machine_config()
-        default = compile_model_instance(instance, machine, tile_size=4)
-        explicit = compile_model_instance(
-            instance,
-            machine,
-            tile_size=4,
-            codegen_backend=AnalyticalCodegenBackend(),
-        )
-
-        self.assertEqual(explicit.tisa_program, default.tisa_program)
-        self.assertEqual(explicit.backend_artifact, default.backend_artifact)
-        self.assertEqual(explicit.attributes["codegen_backend"], "analytical")
-        self.assertEqual(
-            explicit.attributes["codegen_backend_capabilities"]["calibration_status"],
-            "analytical",
-        )
 
     def test_timing_table_provider_preserves_provider_name(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -141,7 +141,7 @@ P1-B: pooling, SwiGLU, optional MoE routing
 P2: quantization and distributed communication
 ```
 
-第一里程碑仍然可以只用 `matmul + copy + elementwise` 跑 2mm；但 Model IR 从现在开始就按上述 taxonomy 设计，避免之后为了支持 ResNet/LLM 重做接口。
+新增算子必须从真实 PyTorch module 经 Torch-XLA 导入；不再为某个 benchmark 添加手写 OperatorGraph builder。semantic taxonomy 保持模型无关，避免为支持 ResNet/LLM 重做 scheduler 接口。
 
 ## 6. 每个算子 backend 的最低契约
 

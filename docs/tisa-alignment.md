@@ -1,195 +1,127 @@
-# TISA 对齐说明
+# TISA 论文语义对齐
 
-本文档记录论文《Dynamic Scheduling for AI Accelerators via TISA》与本项目 IR/调度器的对应关系。结论先行：TISA 与本项目的 `TileInstance` 处于相近的 tile 粒度，但 TISA 不是裸 tile 坐标，也不是最终的 MXU/Vector/DMA 微指令；它是由硬件消费的、带调度语义的 tile-level virtual ISA。TISA descriptor 和 backend execution payload 可以在编译阶段一起生成，但只有 descriptor 进入 TISA scheduler 的可见调度状态。
+TISA 与项目中的 `TileInstance` 处于相近粒度，但两者不是同一个对象。`TileInstance` 描述计算切分；`TISAInstruction` 在此基础上增加硬件调度所需的 operand、地址、访问类型、依赖和 execution-unit 映射。TISA 也不是最底层 DMA/MXU/Vector 微指令。
 
-## 1. 论文中的抽象层次
+## 1. 抽象层次
 
-论文定义：
+论文中的核心字段是：
 
 ```text
 Operand = (TileShape, TileMem, AccessType)
 TileMem = (base, scope)
-
 TISA_Inst = (OpType, Operands, Attributes, UnitMap)
-Deps = (src, type, condition)
-type = RAW | WAR | WAW
+Deps = (src, RAW | WAR | WAW, condition)
 ```
 
-语义含义是：
+对应的编译和执行层次是：
 
 ```text
-TileShape
-    这个 tile 计算哪个逻辑范围，边界 tile 可以是非满 tile
-
-TileMem
-    这个 tile 的 operand 位于哪个地址范围和 memory scope
-
-AccessType
-    对 operand 是读、写还是读写
-
-OpType
-    语义身份，例如 GEMM、SOFTMAX；不是简单的 resource/opcode 字符串
-
-Attributes
-    reorder constraint、同步要求、partial-ready 条件等
-
-UnitMap
-    允许的 unit class、数量和 affinity
-
-Deps
-    typed dependency 以及满足依赖的条件
-```
-
-TISA 的位置可以表示为：
-
-```text
-High-level framework / StableHLO
+PyTorch / StableHLO graph
         |
         v
-Graph + Fusion + Tiling compiler
+graph optimization + tiling
         |
         v
-TISA semantic tile instruction(s)    <-- 论文的调度契约；跨 EU 时按 EU 拆分
+TileInstance
         |
         v
-per-unit execution ISA / DMA-MXU-Vector micro-events
+TISAInstruction              device scheduler 可见
+        |
+        v
+backend execution payload    DMA/MXU/Vector 等单元内部执行
 ```
 
-论文明确描述 compiler 在 tile granularity 截止 lowering；TISA instruction 在 Epoch 上还有 binary encoding，但它补充而不是替代 per-unit execution ISA。
+一个 semantic tile 若跨多个 execution-unit 类型，compiler 会按 unit/stage 边界生成多条 TISA instruction，并用 typed dependency 串联。每条 instruction 只映射到一种主要 `UnitMap`，其 payload 可以包含该 execution unit 内部的多个执行步骤。
 
-论文的 framework bridge 选择 torchxla -> XLA/StableHLO 还有一个重要含义：StableHLO 不只是导入格式，而是用来保持跨框架的 semantic OpType。ExecuTorch 可以作为当前 PyTorch 入口，但 adapter 必须保留高层/composite provenance；如果只输出碎片化 Core ATen primitive，仍然会复现论文所批评的 semantic erosion。长期可以采用 `ExecuTorch -> Canonical OperatorGraph` 或 `ExecuTorch -> StableHLO -> Canonical OperatorGraph` 两条入口，但二者必须汇聚到同一 TISA semantic taxonomy。
+## 2. 当前字段对应
 
-## 2. 与当前 IR 的逐项对照
+| 论文概念 | 当前实现 | 当前边界 |
+| --- | --- | --- |
+| tile bounds | `TileInstance.bounds` | 已支持静态 resolved shape 与边界 tile |
+| `OpType` | `TISAInstruction.op_type`、`semantic_family` | 部分 composite 会按资源 stage 拆分 |
+| `TileShape` | `TISAOperand.tile_shape` | 尚缺通用 symbolic shape binding |
+| `TileMem` | `TISAOperand.tile_mem` | 已有 scope/offset/size，地址表达式仍需扩展 |
+| `AccessType` | operand/buffer access | 已支持 read/write/read-write |
+| `Attributes` | `TISAInstruction.attributes` | partial-ready/reorder 仍需继续校准 |
+| `UnitMap` | `TISAInstruction.unit_map` | analytical backend 当前主要验证 quantity=1 |
+| typed `Deps` | `TISADependency` | 已有 RAW/WAR/WAW 与 readiness condition |
+| WQ/IQ/Fu | TISA simulator queue/ROB/in-flight state | 是行为模型，不宣称 RTL 微结构等价 |
 
-| 论文概念 | 当前项目 | 判断 |
-|---|---|---|
-| tile computational bounds | `TileInstance.bounds` | 基本对应，但目前只按 operator schedule 展开 |
-| tile index/provenance | `TileInstance.coordinates`, `operator_id` | 已有，需要补 model/layer/template provenance 传递 |
-| `OpType` | `TISAInstruction.op_type` + `semantic_family` | 已进入 scheduler descriptor；reduction composite 当前仍可能按 primitive stage 拆分 |
-| `TileShape` | `TISAOperand.tile_shape` | 已按 operand 表达，尚缺符号 shape/runtime binding |
-| `TileMem(base, scope)` | `TISAOperand.tile_mem` | 已结构化 base/scope/offset/size，尚缺通用 symbolic address expression |
-| `AccessType` | `BufferRegion.access` | 已有 `READ/WRITE/READ_WRITE`，可直接演进 |
-| `Attributes` | `TISAInstruction.attributes` | 已保留 provenance/payload 元数据，partial-ready/reorder schema 仍待冻结 |
-| `UnitMap` | `TISAInstruction.unit_map` | 已有 unit/quantity/affinity；analytical backend 当前只执行 quantity=1 |
-| typed `Deps` | `TISADependency` | 已有 RAW/WAR/WAW 与 condition，当前 condition 主要是 full-region ready |
-| hardware in-flight semantic table `Fu` | TISA simulator active/ROB/tile state | 已在 TISA instruction 粒度跟踪 |
-| per-unit WQ/IQ | descriptor reception queue + resource WQ/visible ready window | 已实现确定性 analytical 行为模型，不宣称 RTL 微结构等价 |
-
-## 3. 当前设计的真实问题
-
-当前存在两条可明确区分的路径：
+## 3. 当前唯一编译路径
 
 ```text
-兼容 baseline：
-TileInstance
-    -> operator-specific lowering
-    -> ExecutionTask
-    -> primitive Static/Dynamic scheduler
-
-当前 TISA target：
-TileInstance
-    -> semantic TISA builder
-    -> TISA descriptor
-    -> backend codegen: bound payload
-    -> TISA Static/Dynamic scheduler
-    -> instruction-local primitive timing/events
+PyTorch nn.Module
+  -> torch.export.ExportedProgram
+  -> Torch-XLA StableHLO
+  -> official StableHLO parse/verify
+  -> Canonical OperatorGraph
+  -> ScheduleSpec / TileGraph
+  -> TISAProgram
+  -> CodegenBackend
+  -> BackendArtifact(TISA descriptors + bound payload)
 ```
 
-阶段 9.9 已将 compiler codegen 方向切换为 TISA-first。当前 analytical backend 仍使用既有 primitive lowerer 作为 payload materializer，但它只能在 TISAProgram 生成之后运行：
+Torch-XLA 负责 ATen 到 StableHLO 的 legalization。项目只维护 StableHLO semantic family 到 Canonical/TISA/backend capability 的映射，不接受手写 StableHLO 文件，也不维护另一套项目自有 StableHLO emitter。
+
+Torch-XLA 可能把 Softmax、Norm 等复合算子展开成基础 StableHLO operations。项目的 recovery/fusion pass 根据图结构、shape 和常量恢复调度所需的语义边界，不能按模型名或 factory 名匹配。
+
+## 4. Scheduler 调度什么
+
+全局 static/dynamic scheduler 只调度 `TISAInstruction`，不调度独立的 backend `ExecutionTask`：
 
 ```text
-TileInstance
-    -> TISAInstruction
-    -> backend codegen: descriptor + execution payload
-    -> runtime/loader submission
-    -> TISA device scheduler reads descriptor
-    -> execution unit runs backend payload
-    -> ExecutionTask timing/events
+TISA instruction ready
+  -> device scheduler 检查到达时间、Deps、UnitMap、queue/ROB 和地址冲突
+  -> issue 整条 TISA instruction
+  -> backend 在 instruction 边界内执行绑定 payload
+  -> completion 唤醒后继 instruction
 ```
 
-如果直接在 `ExecutionTask` 粒度做动态 issue，会产生三个偏差：
-
-1. 一个论文 tile 被拆成多个 primitive 后，scheduler 可以在 tile 内部重新排序，违反论文的 run-to-complete、non-preemptive tile boundary 语义；
-2. `SOFTMAX/GEMM/ATTENTION` 的 operator identity、UnitMap 和 typed dependency 在 primitive lowering 时被打散，scheduler 无法按 semantic compatibility 做合法性判断；
-3. `BufferRegion` 的地址重叠只表示一种 hazard 结果，无法区分 compiler typed dependency、TISA condition 和 device-observed conflict。
-
-这并不意味着当前 `ExecutionTask` 没有价值。它应保留为 backend timing/event 层，用来表达：
+例如 Matmul tile 可以形成：
 
 ```text
-TISA GEMM tile
-    -> DMA load A
-    -> DMA load B
-    -> MXU execution
-    -> optional writeback
+TISA load-A -> TISA load-B -> TISA matmul -> TISA store
 ```
 
-真实编译器可以在 runtime 之前生成这些 execution payload，但 scheduler 只能根据与 payload 绑定的 TISA descriptor 发射整个 tile instruction。在 simulator 中可以预先展开 primitive template，但必须以一个不可被跨 tile 重排的 instruction group 执行，不能把 primitive graph 当成 TISA scheduler 的唯一输入。
+其中一条 `TISA matmul` 的 analytical payload 仍可包含 execution-unit 内部 timing task，但这个 task 不会重新进入全局 OOO ready queue。因此不同 tile 的内部步骤不会绕过 TISA dependency 被任意重排。
 
-## 4. 动态调度属于哪一层
+`ExecutionTask` 仍然有价值：它是 backend timing/event 表达，也是泳道图中 DMA、MXU、Vector lane 的来源。它不是论文 scheduler 的输入 ISA。
 
-论文中的 “runtime scheduler” 容易造成误解。原文同时给出：
+## 5. Runtime 与硬件动态调度
 
-```text
-software/runtime interface:
-    binary emits per-tile descriptors
-    descriptors populate waiting/issue queues
-
-AI-core hardware scheduler:
-    reception buffer
-    per-unit WQ/IQ
-    semantic conflict check
-    in-flight table Fu
-    out-of-order issue
-    completion feedback
-```
-
-论文还报告了 7--9 cycle 的 tile dispatch 和 RTL synthesis，并指出控制处理器上的 software runtime 需要 microsecond 级开销，不能承担 tile-level dispatch。因此核心 dynamic reorder/issue 是硬件执行，host runtime 只负责提交带 TISA metadata 的 descriptor stream。
-
-项目中应拆成：
+论文所称 runtime/interface 与核心硬件调度必须分开：
 
 ```text
 Host Runtime
-    选择提交哪个 command chunk
-    绑定物理地址和动态 state
-    处理 launch/event/synchronization
+  绑定物理地址、组织 command chunk、控制 descriptor 到达和同步
 
 TISA Device Scheduler
-    接收 TISAInstruction
-    路由到 per-unit WQ
-    形成 IQ
-    检查 typed deps / TileMem / UnitMap
-    以 tile 为单位 issue 和 complete
+  接收 descriptor、进入 WQ/IQ、检查依赖与资源、OOO issue、处理 completion
 
-Backend Timing/Event Layer
-    将已 issue 的 TISA tile 展开为 DMA/MXU/ARU timing
+Backend Timing/Event
+  模拟已 issue instruction 在执行单元中的时序
 ```
 
-## 5. 迁移顺序
+论文报告 tile dispatch 的 cycle 级开销和 scheduler RTL synthesis，并指出软件控制处理器无法以微秒级开销承担 tile-by-tile reorder。因此论文的关键 OOO 决策属于 device hardware；host runtime 只影响 descriptor 何时可见。
 
-不需要推翻当前 Model IR、OperatorGraph、ScheduleSpec、MachineConfig 和 analytical event backend。当前迁移状态是：
+项目用 `--runtime-policy` 研究第一层，用 `--policy` 研究第二层。`--runtime-device-matrix` 在一次编译后运行四种组合，避免把软件提交收益误算成 TISA device OOO 收益。
 
-```text
-1. 已完成第一版 TISAInstruction schema
-   OpType, Operand, TileMem, AccessType, Attributes, UnitMap, Deps
+## 6. 当前完成度
 
-2. 已从自动编译路径生成 TISAInstruction/BackendArtifact
-   已覆盖 Matmul、elementwise、Softmax、Norm 和 attention block
+已经完成：
 
-3. 已生成并校验 typed Deps
-   保留 RAW/WAR/WAW 和 partial/full readiness
+- PyTorch 到 Torch-XLA/official StableHLO 的唯一前端；
+- TileGraph 到 TISA descriptor 与 BackendArtifact；
+- TISA instruction 粒度的 static/dynamic scheduler；
+- descriptor arrival、queue/ROB/window、资源状态和 completion feedback 的 analytical 模型；
+- instruction 与 payload 两层 trace；
+- analytical、table 和 MXU RTL profile timing source。
 
-4. 已新增 TISA scheduler mode
-   scheduler 选择 TISAInstruction，而不是 primitive ExecutionTask
+尚未完成：
 
-5. 待重构 compiler 方向并扩展 device backend
-   codegen 生成 descriptor + execution payload
-   analytical、SCALE-Sim、RTL/Verilator 分别实现自己的 expansion/timing
+- 论文全部 operation/模型 block 的 semantic coverage；
+- 通用 partial-ready、精确 typed hazard 和 memory bank/port conflict；
+- 与论文实现一致的 WQ/IQ/Fu 容量和 dispatch pipeline；
+- 完整 RTL 或真实芯片时序校准。
 
-6. 已保留 ExecutionTask trace
-   同时新增 TISA issue/complete trace，区分 semantic tile 和 primitive lane
-```
-
-`compile-model` 默认已经使用 analytical TISA scheduler；`--scheduler-target primitive`
-显式选择旧 baseline。当前结果可以称为 TISA instruction-level analytical scheduling
-baseline，但仍不能宣称完成论文硬件复现：dispatch latency、partial-ready、真实 WQ/IQ/Fu
-微结构、memory bank/port 和 RTL timing 仍未校准。
+因此当前结果应称为“TISA instruction-level analytical scheduling baseline”，不能称为论文硬件的 cycle-accurate 复现。

@@ -10,7 +10,7 @@ benchmark-specific ``default_*_schedule`` calls to the frontend path.
 
 from dataclasses import replace
 
-from npu_ooo.ir import OperatorGraph, ScheduleSpec, default_mixed_schedule
+from npu_ooo.ir import OperatorGraph, ScheduleSpec, plan_uniform_tiles
 
 
 class SchedulePlanner:
@@ -19,7 +19,7 @@ class SchedulePlanner:
     name = "heuristic-v1"
 
     def plan(self, graph: OperatorGraph, *, tile_size: int = 32) -> ScheduleSpec:
-        schedule = default_mixed_schedule(graph, tile_size=tile_size)
+        schedule = plan_uniform_tiles(graph, tile_size=tile_size)
         return replace(
             schedule,
             attributes={

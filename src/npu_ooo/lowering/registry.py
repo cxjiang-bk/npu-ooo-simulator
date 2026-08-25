@@ -12,7 +12,6 @@ from npu_ooo.ir import (
     TileGraph,
     build_tile_graph,
 )
-from npu_ooo.ir.model import ModelInstance
 
 from .elementwise import lower_elementwise_graph
 from .layernorm import lower_layernorm_graph
@@ -217,13 +216,3 @@ def lower_mixed_graph(
             **statistics,
         },
     )
-
-
-def lower_mixed_model(
-    model: ModelInstance,
-    machine: MachineConfig,
-    schedule: ScheduleSpec,
-    *,
-    registry: LoweringRegistry | None = None,
-) -> LoweringResult:
-    return lower_mixed_graph(model.graph, schedule, machine, registry=registry)

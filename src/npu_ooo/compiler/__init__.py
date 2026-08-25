@@ -3,17 +3,8 @@
 from .pipeline import (
     CompilerDiagnostic,
     CompiledArtifact,
-    compile_frontend_import,
-    compile_frontend_import_through_stablehlo,
-    compile_model_instance,
     compile_operator_graph,
-    compile_stablehlo_file,
-    compile_stablehlo_module,
-    compile_stablehlo_text,
-    compile_torch_exported_program,
-    compile_torch_exported_program_through_stablehlo,
     compile_torch_module,
-    compile_torch_module_through_stablehlo,
 )
 from .passes import (
     CanonicalizeGraphPass,
@@ -31,27 +22,15 @@ from .passes import (
 )
 from .planner import SchedulePlanner, default_schedule_planner
 from .tisa_first import (
-    AnalyticalBackendCodegen,
-    TISAFirstResult,
     TISASemanticBuilder,
     TISAStage,
-    compile_tisa_first,
 )
 
 __all__ = [
     "CompilerDiagnostic",
     "CompiledArtifact",
-    "compile_frontend_import",
-    "compile_frontend_import_through_stablehlo",
-    "compile_model_instance",
     "compile_operator_graph",
-    "compile_stablehlo_file",
-    "compile_stablehlo_module",
-    "compile_stablehlo_text",
-    "compile_torch_exported_program",
-    "compile_torch_exported_program_through_stablehlo",
     "compile_torch_module",
-    "compile_torch_module_through_stablehlo",
     "CanonicalizeGraphPass",
     "FoldTransposeIntoMatmulPass",
     "LayerNormFusionPass",
@@ -66,9 +45,6 @@ __all__ = [
     "default_pass_manager",
     "SchedulePlanner",
     "default_schedule_planner",
-    "AnalyticalBackendCodegen",
-    "TISAFirstResult",
     "TISASemanticBuilder",
     "TISAStage",
-    "compile_tisa_first",
 ]

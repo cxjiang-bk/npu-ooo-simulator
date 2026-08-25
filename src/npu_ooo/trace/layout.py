@@ -27,9 +27,6 @@ _STAGE_BY_FILENAME: dict[str, str] = {
     "source_frontend_import.json": "00_frontend",
     "stablehlo_module.json": "00_frontend",
     "generated.mlir": "00_frontend",
-    "model_spec.json": "00_frontend",
-    "benchmark_case.json": "00_frontend",
-    "model_instance.json": "00_frontend",
     "canonical_graph.json": "01_graph_ir",
     "operator_graph.json": "01_graph_ir",
     "operator_graph.dot": "01_graph_ir",
@@ -74,10 +71,10 @@ def _root_readme() -> str:
             "`02_schedule_tile` 检查图与切分，接着看 `03_tisa`/`04_backend`，在",
             "`05_runtime` 检查物理地址与 command chunk，最后在 `06_simulation`、",
             "`07_trace` 中比较周期和泳道。",
-            "启用 StableHLO 路径时，可读程序是 `00_frontend/generated.mlir`；",
+            "Torch-XLA 导出的可读程序是 `00_frontend/generated.mlir`；",
             "`stablehlo_module.json` 保存程序文本、producer、版本、验证状态和 provenance。",
-            "旧的 primitive baseline 命令尚未经过 TISA codegen 时，`03_tisa/` 可能为空；",
-            "使用 `compile-model` 或后续 TISA target pipeline 时该目录会出现 descriptor。",
+            "`03_tisa/tisa_program.json` 是 device scheduler 的输入；`04_backend/` 保存",
+            "与每条 TISA instruction 绑定的硬件 payload。",
         ]
     )
     return "\n".join(rows) + "\n"

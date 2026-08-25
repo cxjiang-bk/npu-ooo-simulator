@@ -8,8 +8,6 @@ from .operator import OperatorGraph, OperatorSpec
 
 @dataclass(frozen=True)
 class TensorResidency:
-    """Compile-time placement of a tensor in a named memory level."""
-
     tensor: str
     memory: str
 
@@ -19,7 +17,7 @@ class TensorResidency:
 
 @dataclass(frozen=True)
 class OperatorSchedule:
-    """Tiling and loop-order decisions for one semantic operator."""
+    """Tiling, loop order and residency decisions for one semantic operator."""
 
     operator_id: str
     tile_sizes: tuple[tuple[str, int], ...]
@@ -30,7 +28,7 @@ class OperatorSchedule:
 
     @property
     def tile_size_map(self) -> dict[str, int]:
-        return {name: value for name, value in self.tile_sizes}
+        return dict(self.tile_sizes)
 
     @property
     def residency_map(self) -> dict[str, str]:
@@ -61,19 +59,27 @@ class OperatorSchedule:
                 issues.append(f"schedule '{self.operator_id}' references unknown dimension '{name}'")
             if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
                 issues.append(f"schedule '{self.operator_id}' tile size for '{name}' must be positive")
-            elif name in dimension_extents and isinstance(dimension_extents[name], int) and size > dimension_extents[name]:
+            elif (
+                name in dimension_extents
+                and isinstance(dimension_extents[name], int)
+                and size > dimension_extents[name]
+            ):
                 issues.append(
-                    f"schedule '{self.operator_id}' tile size for '{name}' exceeds extent {dimension_extents[name]}"
+                    f"schedule '{self.operator_id}' tile size for '{name}' exceeds extent "
+                    f"{dimension_extents[name]}"
                 )
         expected_dims = set(dimension_extents)
-        if set(self.tile_size_map) != expected_dims:
-            missing = sorted(expected_dims - set(self.tile_size_map))
-            extra = sorted(set(self.tile_size_map) - expected_dims)
+        actual_dims = set(self.tile_size_map)
+        if actual_dims != expected_dims:
+            missing = sorted(expected_dims - actual_dims)
+            extra = sorted(actual_dims - expected_dims)
             if missing:
                 issues.append(f"schedule '{self.operator_id}' is missing tile dimensions {missing}")
             if extra:
                 issues.append(f"schedule '{self.operator_id}' has extra tile dimensions {extra}")
-        order = self.loop_order or tuple(name for name, _ in operator.iteration_dims + operator.reduction_dims)
+        order = self.loop_order or tuple(
+            name for name, _ in operator.iteration_dims + operator.reduction_dims
+        )
         if len(set(order)) != len(order):
             issues.append(f"schedule '{self.operator_id}' loop_order must be unique")
         if set(order) != expected_dims:
@@ -91,7 +97,7 @@ class OperatorSchedule:
     def to_dict(self) -> dict[str, Any]:
         return {
             "operator_id": self.operator_id,
-            "tile_sizes": {name: value for name, value in self.tile_sizes},
+            "tile_sizes": dict(self.tile_sizes),
             "loop_order": list(self.loop_order),
             "residency": [item.to_dict() for item in self.residency],
             "stage_id": self.stage_id,
@@ -101,7 +107,7 @@ class OperatorSchedule:
 
 @dataclass(frozen=True)
 class ScheduleSpec:
-    """A complete schedule for an OperatorGraph."""
+    """A complete static tiling decision for an OperatorGraph."""
 
     schedule_id: str
     operator_schedules: tuple[OperatorSchedule, ...]
@@ -140,176 +146,44 @@ class ScheduleSpec:
         }
 
 
-def default_two_matmul_schedule(graph: OperatorGraph, *, tile_size: int = 32) -> ScheduleSpec:
-    """Return a small, explicit schedule used by the first end-to-end example."""
+def plan_uniform_tiles(graph: OperatorGraph, *, tile_size: int = 32) -> ScheduleSpec:
+    """Create the current deterministic, shape-aware baseline schedule."""
 
     if isinstance(tile_size, bool) or not isinstance(tile_size, int) or tile_size <= 0:
-        raise ValueError("2mm tile_size must be a positive integer")
-
-    schedules: list[OperatorSchedule] = []
-    for operator in graph.operators:
-        dims = dict((*operator.iteration_dims, *operator.reduction_dims))
-        sizes = {name: min(tile_size, extent) for name, extent in dims.items() if isinstance(extent, int)}
-        if len(sizes) != len(dims):
-            raise ValueError("default 2mm schedule requires a resolved graph")
-        schedules.append(
-            OperatorSchedule(
-                operator_id=operator.op_id,
-                tile_sizes=tuple((name, sizes[name]) for name in dims),
-                loop_order=tuple(name for name, _ in operator.iteration_dims + operator.reduction_dims),
-                stage_id=0 if operator.op_id == graph.topological_order()[0] else 1,
-            )
-        )
-    result = ScheduleSpec("two_matmul_default", tuple(schedules), attributes={"source": "hand-written"})
-    issues = result.validate(graph)
-    if issues:
-        raise ValueError("; ".join(issues))
-    return result
-
-
-def default_elementwise_schedule(graph: OperatorGraph) -> ScheduleSpec:
-    """Return a 32-element tile schedule for elementwise-style operators."""
-
-    schedules: list[OperatorSchedule] = []
-    for operator in graph.operators:
-        if operator.normalized_type not in {"elementwise", "residual_add"}:
-            raise ValueError(
-                f"default elementwise schedule does not support '{operator.normalized_type}'"
-            )
-        dimensions = tuple((*operator.iteration_dims, *operator.reduction_dims))
-        schedules.append(
-            OperatorSchedule(
-                operator_id=operator.op_id,
-                tile_sizes=tuple((name, min(32, int(extent))) for name, extent in dimensions),
-                loop_order=tuple(name for name, _ in dimensions),
-            )
-        )
-    result = ScheduleSpec("elementwise_default", tuple(schedules), attributes={"source": "hand-written"})
-    issues = result.validate(graph)
-    if issues:
-        raise ValueError("; ".join(issues))
-    return result
-
-
-def default_reduce_schedule(graph: OperatorGraph) -> ScheduleSpec:
-    """Return a 32x32 iteration/reduction tile schedule for row reductions."""
-
-    schedules: list[OperatorSchedule] = []
-    for operator in graph.operators:
-        if operator.normalized_type != "reduce":
-            raise ValueError(f"default reduce schedule does not support '{operator.normalized_type}'")
-        dimensions = tuple((*operator.iteration_dims, *operator.reduction_dims))
-        schedules.append(
-            OperatorSchedule(
-                operator_id=operator.op_id,
-                tile_sizes=tuple((name, min(32, int(extent))) for name, extent in dimensions),
-                loop_order=tuple(name for name, _ in dimensions),
-            )
-        )
-    result = ScheduleSpec("reduce_default", tuple(schedules), attributes={"source": "hand-written"})
-    issues = result.validate(graph)
-    if issues:
-        raise ValueError("; ".join(issues))
-    return result
-
-
-def default_softmax_schedule(graph: OperatorGraph) -> ScheduleSpec:
-    """Return a 32x32 iteration/reduction tile schedule for row softmax."""
-
-    schedules: list[OperatorSchedule] = []
-    for operator in graph.operators:
-        if operator.normalized_type != "softmax":
-            raise ValueError(f"default softmax schedule does not support '{operator.normalized_type}'")
-        dimensions = tuple((*operator.iteration_dims, *operator.reduction_dims))
-        schedules.append(
-            OperatorSchedule(
-                operator_id=operator.op_id,
-                tile_sizes=tuple((name, min(32, int(extent))) for name, extent in dimensions),
-                loop_order=tuple(name for name, _ in dimensions),
-            )
-        )
-    result = ScheduleSpec("softmax_default", tuple(schedules), attributes={"source": "hand-written"})
-    issues = result.validate(graph)
-    if issues:
-        raise ValueError("; ".join(issues))
-    return result
-
-
-def default_rmsnorm_schedule(graph: OperatorGraph) -> ScheduleSpec:
-    """Return a 32x32 iteration/reduction tile schedule for RMSNorm."""
-
-    schedules: list[OperatorSchedule] = []
-    for operator in graph.operators:
-        if operator.normalized_type != "rmsnorm":
-            raise ValueError(f"default RMSNorm schedule does not support '{operator.normalized_type}'")
-        dimensions = tuple((*operator.iteration_dims, *operator.reduction_dims))
-        schedules.append(
-            OperatorSchedule(
-                operator_id=operator.op_id,
-                tile_sizes=tuple((name, min(32, int(extent))) for name, extent in dimensions),
-                loop_order=tuple(name for name, _ in dimensions),
-            )
-        )
-    result = ScheduleSpec("rmsnorm_default", tuple(schedules), attributes={"source": "hand-written"})
-    issues = result.validate(graph)
-    if issues:
-        raise ValueError("; ".join(issues))
-    return result
-
-
-def default_layernorm_schedule(graph: OperatorGraph) -> ScheduleSpec:
-    """Return a 32x32 iteration/reduction tile schedule for LayerNorm."""
-
-    schedules: list[OperatorSchedule] = []
-    for operator in graph.operators:
-        if operator.normalized_type != "layernorm":
-            raise ValueError(f"default LayerNorm schedule does not support '{operator.normalized_type}'")
-        dimensions = tuple((*operator.iteration_dims, *operator.reduction_dims))
-        schedules.append(
-            OperatorSchedule(
-                operator_id=operator.op_id,
-                tile_sizes=tuple((name, min(32, int(extent))) for name, extent in dimensions),
-                loop_order=tuple(name for name, _ in dimensions),
-            )
-        )
-    result = ScheduleSpec("layernorm_default", tuple(schedules), attributes={"source": "hand-written"})
-    issues = result.validate(graph)
-    if issues:
-        raise ValueError("; ".join(issues))
-    return result
-
-
-def default_mixed_schedule(graph: OperatorGraph, *, tile_size: int = 32) -> ScheduleSpec:
-    """Build a resolved, topology-staged schedule for heterogeneous operator graphs."""
-
-    if isinstance(tile_size, bool) or not isinstance(tile_size, int) or tile_size <= 0:
-        raise ValueError("mixed schedule tile_size must be a positive integer")
+        raise ValueError("tile_size must be a positive integer")
     stage_by_operator = {
         operator_id: stage_id
         for stage_id, operator_id in enumerate(graph.topological_order())
     }
     schedules: list[OperatorSchedule] = []
     for operator in graph.operators:
-        dimensions = tuple((*operator.iteration_dims, *operator.reduction_dims))
+        dimensions = (*operator.iteration_dims, *operator.reduction_dims)
         if any(not isinstance(extent, int) for _name, extent in dimensions):
-            raise ValueError("default mixed schedule requires a resolved graph")
+            raise ValueError("schedule planning requires a resolved graph")
         schedules.append(
             OperatorSchedule(
                 operator_id=operator.op_id,
                 tile_sizes=tuple(
-                    (name, min(tile_size, int(extent)))
-                    for name, extent in dimensions
+                    (name, min(tile_size, int(extent))) for name, extent in dimensions
                 ),
                 loop_order=tuple(name for name, _extent in dimensions),
                 stage_id=stage_by_operator[operator.op_id],
             )
         )
     result = ScheduleSpec(
-        "mixed_default",
+        "uniform_tiles_v1",
         tuple(schedules),
-        attributes={"source": "hand-written", "tile_size": tile_size},
+        attributes={"source": "automatic-planner", "tile_size": tile_size},
     )
     issues = result.validate(graph)
     if issues:
         raise ValueError("; ".join(issues))
     return result
+
+
+__all__ = [
+    "OperatorSchedule",
+    "ScheduleSpec",
+    "TensorResidency",
+    "plan_uniform_tiles",
+]

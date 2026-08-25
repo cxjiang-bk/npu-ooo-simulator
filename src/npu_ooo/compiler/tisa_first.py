@@ -42,13 +42,6 @@ class TISAStage:
     attributes: Mapping[str, Any]
 
 
-@dataclass(frozen=True)
-class TISAFirstResult:
-    program: TISAProgram
-    artifact: BackendArtifact
-    statistics: Mapping[str, int | float]
-
-
 def _unit_map(primitive: str) -> UnitMap:
     if primitive in {"load", "load_transpose", "store"}:
         return UnitMap("dma", affinity="data")
@@ -584,7 +577,7 @@ class AnalyticalBackendCodegen:
         *,
         program: TISAProgram,
         registry: LoweringRegistry | None = None,
-    ) -> TISAFirstResult:
+    ) -> BackendArtifact:
         lowering = lower_mixed_graph(
             graph,
             schedule,
@@ -629,34 +622,4 @@ class AnalyticalBackendCodegen:
         issues = artifact.validate()
         if issues:
             raise ValueError("TISA-first backend artifact is invalid: " + "; ".join(issues))
-        return TISAFirstResult(
-            program=program,
-            artifact=artifact,
-            statistics=lowering.statistics,
-        )
-
-
-def compile_tisa_first(
-    graph: OperatorGraph,
-    schedule: ScheduleSpec,
-    tile_graph: TileGraph,
-    machine: MachineConfig,
-    *,
-    program_id: str,
-    registry: LoweringRegistry | None = None,
-) -> TISAFirstResult:
-    program = TISASemanticBuilder().build(
-        graph,
-        schedule,
-        tile_graph,
-        machine,
-        program_id=program_id,
-    )
-    return AnalyticalBackendCodegen().lower(
-        graph,
-        schedule,
-        tile_graph,
-        machine,
-        program=program,
-        registry=registry,
-    )
+        return artifact

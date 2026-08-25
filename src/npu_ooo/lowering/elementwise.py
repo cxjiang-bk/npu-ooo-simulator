@@ -15,7 +15,6 @@ from npu_ooo.ir import (
     TileInstance,
     build_tile_graph,
 )
-from npu_ooo.ir.model import ModelInstance
 
 from .matmul import (
     LoweringResult,
@@ -263,7 +262,3 @@ def lower_elementwise_graph(
             "transfer_bytes": transfer_bytes,
         },
     )
-
-
-def lower_elementwise(model: ModelInstance, machine: MachineConfig, schedule: ScheduleSpec) -> LoweringResult:
-    return lower_elementwise_graph(model.graph, schedule, machine)

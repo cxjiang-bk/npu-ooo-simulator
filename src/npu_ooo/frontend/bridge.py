@@ -1,12 +1,6 @@
 from __future__ import annotations
 
-"""Framework bridge implementations.
-
-The compiler consumes ``FrontendImport.graph`` and does not depend on FX,
-StableHLO, or an individual framework after this boundary.  StableHLO input
-will use the same result type in a later adapter; keeping the boundary here
-prevents framework-specific node names from leaking into scheduling code.
-"""
+"""PyTorch export capture and source-graph provenance."""
 
 from dataclasses import dataclass, field
 from enum import Enum
@@ -27,8 +21,6 @@ class FrontendImportError(ValueError):
 
 
 class FrontendKind(str, Enum):
-    CANONICAL = "canonical"
-    JSON = "json"
     TORCH_EXPORT = "torch.export"
     STABLEHLO = "stablehlo"
 
@@ -41,7 +33,7 @@ class FrontendImport:
     model_id: str
     variant: str
     shape_environment: Mapping[str, int] = field(default_factory=dict)
-    frontend: FrontendKind | str = FrontendKind.CANONICAL
+    frontend: FrontendKind | str = FrontendKind.TORCH_EXPORT
     provenance: Mapping[str, Any] = field(default_factory=dict)
     family: ModelFamily | str = ModelFamily.SYNTHETIC
 
@@ -69,90 +61,6 @@ class FrontendImport:
         }
 
 
-def _operator_from_dict(payload: Mapping[str, Any]) -> OperatorSpec:
-    return OperatorSpec(
-        op_id=str(payload["op_id"]),
-        op_type=str(payload["op_type"]),
-        inputs=tuple(str(item) for item in payload.get("inputs", ())),
-        outputs=tuple(str(item) for item in payload.get("outputs", ())),
-        iteration_dims=tuple(
-            (str(item[0]), item[1]) for item in payload.get("iteration_dims", ())
-        ),
-        reduction_dims=tuple(
-            (str(item[0]), item[1]) for item in payload.get("reduction_dims", ())
-        ),
-        attributes=dict(payload.get("attributes", {})),
-        provenance=dict(payload.get("provenance", {})),
-    )
-
-
-def operator_graph_from_dict(payload: Mapping[str, Any]) -> OperatorGraph:
-    """Parse the stable canonical graph JSON format emitted by this project."""
-
-    try:
-        graph = OperatorGraph(
-            graph_id=str(payload["graph_id"]),
-            tensors=tuple(
-                TensorSpec(
-                    name=str(item["name"]),
-                    shape=tuple(item.get("shape", ())),
-                    dtype=str(item.get("dtype", "fp16")),
-                    layout=str(item.get("layout", "dense")),
-                    attributes=dict(item.get("attributes", {})),
-                )
-                for item in payload.get("tensors", ())
-            ),
-            operators=tuple(_operator_from_dict(item) for item in payload.get("operators", ())),
-            edges=tuple(
-                DataEdge(
-                    producer=str(item["producer"]),
-                    consumer=str(item["consumer"]),
-                    tensor=str(item["tensor"]),
-                )
-                for item in payload.get("edges", ())
-            ),
-            attributes=dict(payload.get("attributes", {})),
-        )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise FrontendImportError(f"invalid canonical operator graph JSON: {exc}") from exc
-    issues = graph.validate()
-    if issues:
-        raise FrontendImportError("invalid canonical operator graph: " + "; ".join(issues))
-    return graph
-
-
-class JsonGraphAdapter:
-    """Import an already normalized graph without requiring framework packages."""
-
-    kind = FrontendKind.JSON
-
-    @classmethod
-    def from_payload(
-        cls,
-        payload: Mapping[str, Any],
-        *,
-        model_id: str | None = None,
-        variant: str = "imported-v0",
-        shape_environment: Mapping[str, int] | None = None,
-        family: ModelFamily | str = ModelFamily.SYNTHETIC,
-    ) -> FrontendImport:
-        graph_payload = payload.get("graph", payload)
-        graph = operator_graph_from_dict(graph_payload)
-        result = FrontendImport(
-            graph=graph,
-            model_id=model_id or str(payload.get("model_id", graph.graph_id)),
-            variant=str(payload.get("variant", variant)),
-            shape_environment=dict(shape_environment or payload.get("shape_environment", {})),
-            frontend=cls.kind,
-            provenance={"source": "canonical-json"},
-            family=family,
-        )
-        issues = result.validate()
-        if issues:
-            raise FrontendImportError("invalid frontend import: " + "; ".join(issues))
-        return result
-
-
 class TorchExportAdapter:
     """Bridge a ``torch.export`` ExportedProgram to canonical OperatorGraph.
 
@@ -164,31 +72,6 @@ class TorchExportAdapter:
     """
 
     kind = FrontendKind.TORCH_EXPORT
-
-    @classmethod
-    def export_module(
-        cls,
-        module: Any,
-        args: Sequence[Any] = (),
-        *,
-        kwargs: Mapping[str, Any] | None = None,
-        dynamic_shapes: Mapping[str, Any] | None = None,
-        model_id: str = "torch_export_model",
-        variant: str = "torch-export-v0",
-        shape_environment: Mapping[str, int] | None = None,
-    ) -> FrontendImport:
-        exported = cls.capture_module(
-            module,
-            args,
-            kwargs=kwargs,
-            dynamic_shapes=dynamic_shapes,
-        )
-        return cls.from_exported_program(
-            exported,
-            model_id=model_id,
-            variant=variant,
-            shape_environment=shape_environment,
-        )
 
     @classmethod
     def capture_module(
@@ -691,18 +574,3 @@ def _operator_graph_from_fx_graph(
     if issues:
         raise FrontendImportError("torch.export graph normalization failed: " + "; ".join(issues))
     return graph
-
-
-def import_operator_graph(graph: OperatorGraph, *, model_id: str | None = None, variant: str = "canonical-v0") -> FrontendImport:
-    """Wrap an existing canonical graph so all frontends share one result type."""
-
-    issues = graph.validate()
-    if issues:
-        raise FrontendImportError("invalid canonical graph: " + "; ".join(issues))
-    return FrontendImport(
-        graph=graph,
-        model_id=model_id or graph.graph_id,
-        variant=variant,
-        frontend=FrontendKind.CANONICAL,
-        provenance={"source": "canonical-operator-graph"},
-    )

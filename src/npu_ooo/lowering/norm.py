@@ -13,7 +13,6 @@ from npu_ooo.ir import (
     ScheduleSpec,
     build_tile_graph,
 )
-from npu_ooo.ir.model import ModelInstance
 
 from .elementwise import _elementwise_timing
 from .matmul import LoweringResult, _local_memory, _region, _regions_overlap, _root_memory, _transfer_timing
@@ -261,7 +260,3 @@ def lower_rmsnorm_graph(
             "composite_stage_count": 3,
         },
     )
-
-
-def lower_rmsnorm(model: ModelInstance, machine: MachineConfig, schedule: ScheduleSpec) -> LoweringResult:
-    return lower_rmsnorm_graph(model.graph, schedule, machine)

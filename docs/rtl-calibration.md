@@ -103,7 +103,11 @@ PYTHONPATH=src:. python3 -m npu_ooo.cli import-rtl-trace \
 
 ```bash
 PYTHONPATH=src:. python3 -m npu_ooo.cli compile-model \
-  --stablehlo-file examples/stablehlo/matmul.mlir \
+  --torch-module examples.torch_models:TwoMatmul \
+  --input-shape 8,8 \
+  --input-shape 8,8 \
+  --input-shape 8,8 \
+  --tile-size 4 \
   --timing-provider systolic_mxu_profile \
   --timing-config /tmp/mxu-rtl-profile.json \
   --output-dir out/matmul-rtl-profile

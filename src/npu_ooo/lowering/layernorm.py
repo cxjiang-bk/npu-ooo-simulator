@@ -15,7 +15,6 @@ from npu_ooo.ir import (
     TileInstance,
     build_tile_graph,
 )
-from npu_ooo.ir.model import ModelInstance
 
 from .matmul import (
     LoweringResult,
@@ -425,11 +424,3 @@ def lower_layernorm_graph(
             "composite_stage_count": 6,
         },
     )
-
-
-def lower_layernorm(
-    model: ModelInstance,
-    machine: MachineConfig,
-    schedule: ScheduleSpec,
-) -> LoweringResult:
-    return lower_layernorm_graph(model.graph, schedule, machine)

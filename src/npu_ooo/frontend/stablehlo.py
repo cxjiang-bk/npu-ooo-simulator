@@ -1,18 +1,14 @@
 from __future__ import annotations
 
-"""StableHLO frontend bridge.
+"""Internal semantic parser for verified StableHLO projections.
 
-The project does not require the MLIR Python bindings for its canonical IR.
-When those bindings are available, callers can pass a module-like object and
-the adapter reads its textual assembly.  A small, explicit textual subset is
-also supported for dependency-light tests and for inspecting compiler output:
-function arguments, one-result StableHLO operations, tensor types, constants,
-and ``return``.  Unsupported MLIR constructs fail at this boundary instead of
-being silently dropped.
+The official adapter owns external MLIR parsing and verification.  This module
+only turns the verified, project-supported operation projection into the
+Canonical OperatorGraph. Unsupported constructs fail at this boundary instead
+of being silently dropped.
 """
 
 import re
-from pathlib import Path
 from typing import Any, Mapping
 
 from npu_ooo.ir import (
@@ -520,7 +516,7 @@ def _graph_from_text(text: str, *, graph_id: str) -> OperatorGraph:
 
 
 class StableHLOAdapter:
-    """Import StableHLO text or a module-like object into ``FrontendImport``."""
+    """Import the official adapter's verified StableHLO projection."""
 
     kind = FrontendKind.STABLEHLO
 
@@ -549,54 +545,5 @@ class StableHLOAdapter:
         if issues:
             raise FrontendImportError("invalid StableHLO import: " + "; ".join(issues))
         return imported
-
-    @classmethod
-    def from_file(cls, path: str | Path, **kwargs: Any) -> FrontendImport:
-        file_path = Path(path)
-        try:
-            text = file_path.read_text(encoding="utf-8")
-        except FileNotFoundError as exc:
-            raise FrontendImportError(f"StableHLO file does not exist: {file_path}") from exc
-        return cls.from_text(text, **kwargs)
-
-    @classmethod
-    def from_module(cls, module: Any, **kwargs: Any) -> FrontendImport:
-        if isinstance(module, str):
-            return cls.from_text(module, **kwargs)
-        if isinstance(module, Mapping):
-            return cls.from_payload(module, **kwargs)
-        operation = getattr(module, "operation", module)
-        for method_name in ("get_asm", "to_string", "as_text"):
-            method = getattr(operation, method_name, None)
-            if callable(method):
-                try:
-                    return cls.from_text(str(method()), **kwargs)
-                except Exception as exc:
-                    raise FrontendImportError(f"failed to read StableHLO module assembly: {exc}") from exc
-        raise FrontendImportError(
-            "StableHLO adapter expected textual MLIR or a module with operation.get_asm()/to_string()"
-        )
-
-    @classmethod
-    def from_payload(
-        cls,
-        payload: Mapping[str, Any],
-        *,
-        model_id: str = "stablehlo_model",
-        variant: str = "stablehlo-v0",
-        shape_environment: Mapping[str, int] | None = None,
-    ) -> FrontendImport:
-        """Accept a JSON wrapper containing StableHLO textual MLIR."""
-
-        text = payload.get("mlir", payload.get("text"))
-        if not isinstance(text, str):
-            raise FrontendImportError("StableHLO payload must contain an 'mlir' or 'text' string")
-        return cls.from_text(
-            text,
-            model_id=model_id,
-            variant=variant,
-            shape_environment=shape_environment,
-        )
-
 
 __all__ = ["StableHLOAdapter"]

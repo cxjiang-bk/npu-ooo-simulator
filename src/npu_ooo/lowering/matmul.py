@@ -16,9 +16,7 @@ from npu_ooo.ir import (
     TileGraph,
     TileInstance,
     build_tile_graph,
-    default_two_matmul_schedule,
 )
-from npu_ooo.ir.model import ModelInstance
 
 
 _DTYPE_BYTES = {
@@ -387,8 +385,3 @@ def lower_matmul_graph(
             "transfer_bytes": total_transfer_bytes,
         },
     )
-
-
-def lower_two_matmul(model: ModelInstance, machine: MachineConfig, schedule: ScheduleSpec | None = None) -> LoweringResult:
-    schedule = schedule or default_two_matmul_schedule(model.graph)
-    return lower_matmul_graph(model.graph, schedule, machine)

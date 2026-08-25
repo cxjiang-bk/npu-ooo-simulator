@@ -2,7 +2,6 @@
 
 __all__ = [
     "arch",
-    "benchmarks",
     "compiler",
     "frontend",
     "ir",

@@ -1,15 +1,6 @@
 """Semantic and compilation IRs."""
 
-from .model import (
-    BenchmarkCase,
-    EvaluationScope,
-    ExecutionPhase,
-    GraphTemplate,
-    ModelFamily,
-    ModelInstance,
-    ModelSpec,
-    PersistentStateSpec,
-)
+from .model import ModelFamily
 from .operator import (
     DataEdge,
     OperatorGraph,
@@ -21,13 +12,7 @@ from .schedule import (
     OperatorSchedule,
     ScheduleSpec,
     TensorResidency,
-    default_elementwise_schedule,
-    default_layernorm_schedule,
-    default_mixed_schedule,
-    default_reduce_schedule,
-    default_softmax_schedule,
-    default_rmsnorm_schedule,
-    default_two_matmul_schedule,
+    plan_uniform_tiles,
 )
 from .tile import TileDependency, TileGraph, TileInstance, build_tile_graph, enumerate_operator_tiles
 from .execution import AccessType, BufferRegion, ExecutionGraph, ExecutionTask
@@ -52,15 +37,8 @@ from .runtime import (
 )
 
 __all__ = [
-    "BenchmarkCase",
     "DataEdge",
-    "EvaluationScope",
-    "ExecutionPhase",
-    "GraphTemplate",
     "ModelFamily",
-    "ModelInstance",
-    "ModelSpec",
-    "PersistentStateSpec",
     "DataEdge",
     "OperatorGraph",
     "OperatorSpec",
@@ -92,12 +70,6 @@ __all__ = [
     "TileGraph",
     "TileInstance",
     "build_tile_graph",
-    "default_two_matmul_schedule",
-    "default_elementwise_schedule",
-    "default_layernorm_schedule",
-    "default_mixed_schedule",
-    "default_reduce_schedule",
-    "default_softmax_schedule",
-    "default_rmsnorm_schedule",
+    "plan_uniform_tiles",
     "enumerate_operator_tiles",
 ]

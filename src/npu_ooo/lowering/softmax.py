@@ -14,7 +14,6 @@ from npu_ooo.ir import (
     TileInstance,
     build_tile_graph,
 )
-from npu_ooo.ir.model import ModelInstance
 
 from .elementwise import _elementwise_timing
 from .matmul import (
@@ -333,7 +332,3 @@ def lower_softmax_graph(
             "composite_stage_count": 4,
         },
     )
-
-
-def lower_softmax(model: ModelInstance, machine: MachineConfig, schedule: ScheduleSpec) -> LoweringResult:
-    return lower_softmax_graph(model.graph, schedule, machine)
