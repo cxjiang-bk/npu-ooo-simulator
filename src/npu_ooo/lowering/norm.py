@@ -57,8 +57,10 @@ def lower_rmsnorm_graph(
         operator = next(operator for operator in graph.operators if operator.op_id == operator_id)
         if operator.normalized_type != "rmsnorm":
             raise NotImplementedError(f"RMSNorm lowering does not support '{operator.normalized_type}'")
-        if len(operator.inputs) != 1 or len(operator.outputs) != 1:
-            raise ValueError(f"RMSNorm operator '{operator.op_id}' requires one input and one output")
+        if len(operator.inputs) not in {1, 2} or len(operator.outputs) != 1:
+            raise ValueError(
+                f"RMSNorm operator '{operator.op_id}' requires one input, an optional affine weight, and one output"
+            )
         iteration = tuple(name for name, _ in operator.iteration_dims)
         reduction = tuple(name for name, _ in operator.reduction_dims)
         if not iteration or len(reduction) != 1:
@@ -67,8 +69,13 @@ def lower_rmsnorm_graph(
             )
         input_tensor = tensors[operator.inputs[0]]
         output_tensor = tensors[operator.outputs[0]]
+        weight_tensor = tensors[operator.inputs[1]] if len(operator.inputs) == 2 else None
         if tuple(input_tensor.shape) != tuple(output_tensor.shape):
             raise ValueError(f"RMSNorm operator '{operator.op_id}' input/output shapes must match")
+        if weight_tensor is not None and tuple(weight_tensor.shape) != (operator.reduction_dims[0][1],):
+            raise ValueError(
+                f"RMSNorm operator '{operator.op_id}' affine weight must match the reduction extent"
+            )
         from npu_ooo.ir.tile import enumerate_operator_tiles
 
         tiles = enumerate_operator_tiles(operator, schedule.for_operator(operator_id))
@@ -196,6 +203,17 @@ def lower_rmsnorm_graph(
                 )
                 input_local = _region(input_tensor, local, starts, shape, AccessType.READ)
                 output_local = _region(output_tensor, local, starts, shape, AccessType.WRITE)
+                weight_region = (
+                    _region(
+                        weight_tensor,
+                        root,
+                        (bounds[reduction_name][0],),
+                        (bounds[reduction_name][1] - bounds[reduction_name][0],),
+                        AccessType.READ,
+                    )
+                    if weight_tensor is not None
+                    else None
+                )
                 normalize_id = f"{tile.tile_id}.rmsnorm"
                 normalize_duration, normalize_ii, normalize_unit = _elementwise_timing(machine, math.prod(shape))
                 tasks.append(
@@ -205,7 +223,11 @@ def lower_rmsnorm_graph(
                         operator_id=operator_id,
                         primitive="rmsnorm",
                         resource=normalize_unit,
-                        reads=(input_local, sum_region),
+                        reads=tuple(
+                            item
+                            for item in (input_local, sum_region, weight_region)
+                            if item is not None
+                        ),
                         writes=(output_local,),
                         predecessors=(load_ids[tile.tile_id], sum_final),
                         duration_cycles=normalize_duration,

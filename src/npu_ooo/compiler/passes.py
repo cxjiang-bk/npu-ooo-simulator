@@ -489,6 +489,47 @@ def _constant_scalar(operator: OperatorSpec) -> float | int | None:
     return None
 
 
+def _constant_tensor(tensor: str, tensors: dict[str, TensorSpec]) -> bool:
+    spec = tensors.get(tensor)
+    return bool(spec is not None and spec.attributes.get("source_kind") == "constant")
+
+
+def _unwrap_reshape(
+    tensor: str,
+    producer: dict[str, OperatorSpec],
+) -> tuple[str, tuple[OperatorSpec, ...]]:
+    """Remove a chain of single-input reshapes while retaining its operators."""
+
+    current = tensor
+    reshapes: list[OperatorSpec] = []
+    while True:
+        operation = producer.get(current)
+        if operation is None or operation.normalized_type != "reshape" or len(operation.inputs) != 1:
+            return current, tuple(reshapes)
+        reshapes.append(operation)
+        current = operation.inputs[0]
+
+
+def _is_rmsnorm_square(
+    operation: OperatorSpec,
+    tensors: dict[str, TensorSpec],
+) -> str | None:
+    """Return the squared input for multiply/power square expressions."""
+
+    if operation.normalized_type != "elementwise":
+        return None
+    nonconstant = [
+        tensor for tensor in operation.inputs if not _constant_tensor(tensor, tensors)
+    ]
+    target = _frontend_target(operation)
+    if any(token in target for token in ("stablehlo.multiply", "stablehlo.mul", "aten.mul")):
+        return nonconstant[0] if len(nonconstant) == 2 and nonconstant[0] == nonconstant[1] else None
+    if any(token in target for token in ("stablehlo.power", "aten.pow")):
+        exponent = _constant_scalar(operation)
+        return nonconstant[0] if len(nonconstant) == 1 and exponent == 2 else None
+    return None
+
+
 def _is_elementwise(operator: OperatorSpec, *names: str) -> bool:
     if operator.normalized_type != "elementwise":
         return False
@@ -943,6 +984,165 @@ class RMSNormFusionPass:
     """Recognize ``x*x -> sum -> add(eps) -> rsqrt -> x*scale``."""
 
     name = "fuse_rmsnorm"
+    repeat_until_stable = True
+
+    def _try_general_pattern(
+        self,
+        graph: OperatorGraph,
+        operators: list[OperatorSpec],
+        tensors: dict[str, TensorSpec],
+        producer: dict[str, OperatorSpec],
+        consumers: dict[str, list[OperatorSpec]],
+    ) -> PassResult | None:
+        """Fuse Torch-XLA's power/reduction RMSNorm form when proven safe."""
+
+        for final in operators:
+            if not _is_elementwise_mul(final) or len(_input_occurrences(final)) != 2:
+                continue
+            final_inputs = _input_occurrences(final)
+            for normalized_tensor in final_inputs:
+                normalized = producer.get(normalized_tensor)
+                if normalized is None or not _is_elementwise_mul(normalized):
+                    continue
+                normalized_inputs = _input_occurrences(normalized)
+                if len(normalized_inputs) != 2:
+                    continue
+                source_tensor: str | None = None
+                inverse_tensor: str | None = None
+                inverse_op: OperatorSpec | None = None
+                for candidate in normalized_inputs:
+                    base, _reshapes = _unwrap_reshape(candidate, producer)
+                    operation = producer.get(base)
+                    if operation is not None and _is_elementwise(operation, "stablehlo.rsqrt"):
+                        inverse_tensor, inverse_op = candidate, operation
+                    else:
+                        source_tensor = candidate
+                if source_tensor is None or inverse_tensor is None or inverse_op is None:
+                    continue
+                weight_tensor = next(
+                    (tensor for tensor in final_inputs if tensor != normalized_tensor), None
+                )
+                if weight_tensor is None:
+                    continue
+
+                inverse_base, inverse_reshapes = _unwrap_reshape(inverse_tensor, producer)
+                rsqrt = producer.get(inverse_base)
+                if rsqrt is None or not _is_elementwise(rsqrt, "stablehlo.rsqrt"):
+                    continue
+                rsqrt_inputs = _input_occurrences(rsqrt)
+                if len(rsqrt_inputs) != 1:
+                    continue
+                add = producer.get(rsqrt_inputs[0])
+                if add is None or not _is_elementwise_add(add):
+                    continue
+                variance_input = next(
+                    (tensor for tensor in _input_occurrences(add)
+                     if not _constant_tensor(tensor, tensors)),
+                    None,
+                )
+                if variance_input is None:
+                    continue
+                variance_base, variance_reshapes = _unwrap_reshape(variance_input, producer)
+                variance_operation = producer.get(variance_base)
+                scale_operation: OperatorSpec | None = None
+                reduce_tensor: str | None = None
+                if variance_operation is not None and variance_operation.normalized_type == "reduce":
+                    reduce_tensor = variance_base
+                elif variance_operation is not None and _is_elementwise_mul(variance_operation):
+                    scale_operation = variance_operation
+                    reduce_tensor = next(
+                        (tensor for tensor in _input_occurrences(variance_operation)
+                         if not _constant_tensor(tensor, tensors)),
+                        None,
+                    )
+                if reduce_tensor is None:
+                    continue
+                reduce = producer.get(reduce_tensor)
+                if reduce is None or reduce.normalized_type != "reduce" or len(reduce.inputs) != 1:
+                    continue
+                square = producer.get(reduce.inputs[0])
+                if square is None:
+                    continue
+                squared_source = _is_rmsnorm_square(square, tensors)
+                if squared_source is None:
+                    continue
+                source_base, source_reshapes = _unwrap_reshape(source_tensor, producer)
+                if squared_source != source_base:
+                    continue
+                source_spec = tensors.get(source_base)
+                output_tensor = _single_output(final)
+                output_spec = tensors.get(output_tensor)
+                if source_spec is None or output_spec is None or source_spec.shape != output_spec.shape:
+                    continue
+                if not reduce.iteration_dims or len(reduce.reduction_dims) != 1:
+                    continue
+                if consumers.get(normalized_tensor, ()) != [final]:
+                    continue
+                if consumers.get(square.outputs[0], ()) != [reduce]:
+                    continue
+                if source_reshapes:
+                    # A source-side view transform needs an explicit layout
+                    # proof before it can be removed by semantic fusion.
+                    continue
+                bridge_operations = (
+                    *source_reshapes,
+                    square,
+                    reduce,
+                    *(tuple([scale_operation]) if scale_operation is not None else ()),
+                    *variance_reshapes,
+                    add,
+                    rsqrt,
+                    *inverse_reshapes,
+                    normalized,
+                    final,
+                )
+                matched_ids = {operation.op_id for operation in bridge_operations}
+                if len(matched_ids) != len(bridge_operations):
+                    continue
+                source_ops = [operation.op_id for operation in bridge_operations]
+                fused = OperatorSpec(
+                    op_id=f"{final.op_id}.rmsnorm",
+                    op_type="rmsnorm",
+                    inputs=(source_base, weight_tensor),
+                    outputs=(output_tensor,),
+                    iteration_dims=reduce.iteration_dims,
+                    reduction_dims=reduce.reduction_dims,
+                    attributes={
+                        "axis": reduce.reduction_dims[0][0],
+                        "epsilon": (
+                            _constant_scalar(add)
+                            if _constant_scalar(add) is not None
+                            else 1e-5
+                        ),
+                        "affine": True,
+                        "fusion": "rmsnorm",
+                        "source_ops": source_ops,
+                    },
+                    provenance={
+                        "compiler_pass": self.name,
+                        "source_graph": graph.graph_id,
+                        "source_ops": source_ops,
+                    },
+                )
+                result = _rebuild_graph(
+                    graph,
+                    operators,
+                    matched_ids,
+                    fused,
+                    min(operators.index(operation) for operation in bridge_operations),
+                    fusion_kind=self.name,
+                )
+                return PassResult(
+                    result,
+                    (
+                        PassDiagnostic(
+                            "info",
+                            self.name,
+                            f"fused {len(source_ops)} frontend nodes into '{fused.op_id}'",
+                        ),
+                    ),
+                )
+        return None
 
     def run(self, graph: OperatorGraph) -> PassResult:
         operators = list(graph.operators)
@@ -956,6 +1156,16 @@ class RMSNormFusionPass:
         for operator in operators:
             for tensor in operator.inputs:
                 consumers.setdefault(tensor, []).append(operator)
+
+        general = self._try_general_pattern(
+            graph,
+            operators,
+            tensors,
+            producer_by_tensor,
+            consumers,
+        )
+        if general is not None:
+            return general
 
         for final in operators:
             if not _is_elementwise_mul(final):

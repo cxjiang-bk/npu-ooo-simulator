@@ -38,6 +38,7 @@
 - [x] 第一版 region-aware tile dependency，无法证明映射时显式保守回退；
 - [x] 保存每个 GC pass 的输入/输出图与诊断 dump；
 - [x] LayerNorm recovery 对多实例图执行 fixed-point，避免第二个规范化节点残留到 FC；
+- [x] RMSNorm recovery 支持 Torch-XLA power/reshape/affine 链，并将 weight 作为 semantic operand 传入 payload；
 - [x] 生成 capacity-aware residency 和多 tile ping-pong intent metadata；
 - [x] 为 FC stage 和 typed dependency 写入显式 readiness condition；
 - [x] Softmax 提供默认 materialized 与显式 analytical online state-chain 两种 payload 语义；

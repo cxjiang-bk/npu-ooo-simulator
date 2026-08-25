@@ -382,7 +382,7 @@ RuntimeSubmission（除非实验变量就是 runtime）
 
 ## 12. 当前限制
 
-- StableHLO semantic importer 只覆盖已注册 operation；LayerNorm recovery pass 对同一图中的多个 Torch-XLA `batch_norm_training` 形式按 fixed-point 重复执行，直到不再产生新 canonical LayerNorm；
+- StableHLO semantic importer 只覆盖已注册 operation；LayerNorm recovery pass 对同一图中的多个 Torch-XLA `batch_norm_training` 形式按 fixed-point 重复执行，直到不再产生新 canonical LayerNorm；RMSNorm recovery 已覆盖带 power、reshape 和 affine weight 的 Torch-XLA 链，但仍要求静态 shape 和可证明的 row-wise reduction；
 - Torch-XLA 复合模式恢复仍需扩大真实模型覆盖；
 - tile planner 是统一启发式 baseline，尚无 cost model 或 auto-tuning；
 - reshape/transpose 当前是 full-tensor DMA transform，尚未支持 stride-aware tile transform；

@@ -150,6 +150,33 @@ class PyTorchFrontendTest(unittest.TestCase):
         )
         self.assertEqual(compiled.validate(), ())
 
+    def test_rmsnorm_power_chain_with_affine_weight_is_recovered(self) -> None:
+        import torch
+
+        class RMSNormModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.norm = torch.nn.RMSNorm(8)
+
+            def forward(self, value):
+                return self.norm(value)
+
+        compiled = compile_torch_module(
+            RMSNormModule(),
+            (torch.randn(1, 4, 8),),
+            minimal_machine_config(),
+            model_id="rmsnorm-affine",
+            tile_size=4,
+        )
+
+        rmsnorms = [
+            operator for operator in compiled.graph.operators
+            if operator.normalized_type == "rmsnorm"
+        ]
+        self.assertEqual(len(rmsnorms), 1)
+        self.assertEqual(len(rmsnorms[0].inputs), 2)
+        self.assertEqual(compiled.validate(), ())
+
     def test_attention_online_configuration_survives_softmax_recovery(self) -> None:
         import torch
 
