@@ -69,8 +69,29 @@ class GraphCompiler:
         if graph_issues or machine_issues:
             raise ValueError("; ".join((*graph_issues, *machine_issues)))
 
+        softmax_algorithm = machine.attributes.get("softmax_algorithm")
+        if softmax_algorithm is not None and softmax_algorithm not in {"materialized", "online"}:
+            raise ValueError(
+                "machine attribute 'softmax_algorithm' must be 'materialized' or 'online'"
+            )
         pass_result = default_pass_manager().run(graph)
         canonical_graph = pass_result.graph
+        if softmax_algorithm is not None:
+            canonical_graph = replace(
+                canonical_graph,
+                operators=tuple(
+                    replace(
+                        operator,
+                        attributes={
+                            **dict(operator.attributes),
+                            "softmax_algorithm": softmax_algorithm,
+                        },
+                    )
+                    if operator.normalized_type == "softmax"
+                    else operator
+                    for operator in canonical_graph.operators
+                ),
+            )
         schedule = default_schedule_planner().plan(
             canonical_graph,
             tile_size=tile_size,

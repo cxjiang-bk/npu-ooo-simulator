@@ -5,6 +5,7 @@ from npu_ooo.arch import minimal_machine_config
 from npu_ooo.compiler import compile_operator_graph
 from npu_ooo.frontend import FrontendImport, OfficialStableHLOModule
 from npu_ooo.ir import OperatorGraph, OperatorSpec, TensorSpec
+from npu_ooo.scheduler import SchedulerPolicy, schedule_tisa_program
 
 
 def _stable_frontend(graph: OperatorGraph) -> tuple[FrontendImport, OfficialStableHLOModule]:
@@ -158,6 +159,72 @@ class CompilerStageContractTest(unittest.TestCase):
         }
         self.assertIn("semantic_tile_ready", dependency_conditions)
         self.assertEqual(compiled.backend_artifact.validate(), ())
+
+    def test_online_softmax_uses_forward_state_payload(self) -> None:
+        graph = OperatorGraph(
+            graph_id="online-softmax-stage-test",
+            tensors=(TensorSpec("x", (4, 8)), TensorSpec("y", (4, 8))),
+            operators=(
+                OperatorSpec(
+                    op_id="softmax",
+                    op_type="softmax",
+                    inputs=("x",),
+                    outputs=("y",),
+                    iteration_dims=(("row", 4),),
+                    reduction_dims=(("col", 8),),
+                ),
+            ),
+        )
+        frontend, stablehlo = _stable_frontend(graph)
+        machine = replace(
+            minimal_machine_config(),
+            attributes={"softmax_algorithm": "online", "calibration_status": "analytical"},
+        )
+        compiled = compile_operator_graph(
+            graph,
+            machine,
+            frontend=frontend,
+            source_frontend=frontend,
+            stablehlo=stablehlo,
+            tile_size=4,
+        )
+
+        compute = [
+            instruction
+            for instruction in compiled.tisa_program.instructions
+            if instruction.op_type == "softmax"
+        ]
+        self.assertEqual(len(compute), 2)
+        self.assertTrue(
+            all(
+                instruction.attributes["softmax_algorithm"] == "online"
+                for instruction in compute
+            )
+        )
+        self.assertTrue(
+            all(
+                instruction.attributes["payload_primitives"] == ["online_update"]
+                for instruction in compute
+            )
+        )
+        self.assertEqual(
+            compute[1].dependencies[0].kind,
+            "STATE",
+        )
+        payload_primitives = {
+            task.primitive for task in compiled.backend_artifact.execution_graph.tasks
+        }
+        self.assertIn("online_update", payload_primitives)
+        self.assertNotIn("reduce_max", payload_primitives)
+        self.assertEqual(compiled.validate(), ())
+
+        result = schedule_tisa_program(
+            compiled.backend_artifact,
+            machine,
+            SchedulerPolicy.DYNAMIC_READY_QUEUE,
+        )
+        self.assertGreater(result.total_cycles, 0)
+        self.assertEqual(result.metrics["calibration_status"], "analytical")
 
 
 if __name__ == "__main__":

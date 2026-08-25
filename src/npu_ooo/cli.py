@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from dataclasses import replace
 import importlib
 import json
 import math
@@ -132,6 +133,15 @@ def _add_compile_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--model-id")
     parser.add_argument("--tile-size", type=int, default=32)
+    parser.add_argument(
+        "--softmax-algorithm",
+        choices=("materialized", "online"),
+        default=None,
+        help=(
+            "Softmax payload strategy: materialized row-wise reductions or the "
+            "analytical online state chain"
+        ),
+    )
     parser.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
     parser.add_argument("--machine-config", type=Path)
     parser.add_argument("--timing-config", type=Path)
@@ -351,6 +361,14 @@ def run_compile_model(args: argparse.Namespace) -> int:
         args.input_dtype,
     )
     machine = _machine(args.arch, args.machine_config)
+    if args.softmax_algorithm is not None:
+        machine = replace(
+            machine,
+            attributes={
+                **dict(machine.attributes),
+                "softmax_algorithm": args.softmax_algorithm,
+            },
+        )
     codegen_backend = default_codegen_backend_registry().create(args.codegen_backend)
     compiled = compile_torch_module(
         module,
@@ -465,6 +483,7 @@ def run_compile_model(args: argparse.Namespace) -> int:
         "stablehlo_verified": True,
         "stablehlo_version": compiled.attributes["stablehlo_version"],
         "architecture": args.arch,
+        "softmax_algorithm": machine.attributes.get("softmax_algorithm", "materialized"),
         "machine_hash": machine.stable_hash(),
         "codegen_backend": compiled.attributes["codegen_backend"],
         "timing_provider": getattr(timing_model, "name", "analytical"),

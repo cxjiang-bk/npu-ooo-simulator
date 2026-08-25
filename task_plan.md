@@ -39,9 +39,10 @@
 - [x] 保存每个 GC pass 的输入/输出图与诊断 dump；
 - [x] 生成 capacity-aware residency 和多 tile ping-pong intent metadata；
 - [x] 为 FC stage 和 typed dependency 写入显式 readiness condition；
+- [x] Softmax 提供默认 materialized 与显式 analytical online state-chain 两种 payload 语义；
 - [ ] 完善 symbolic/dynamic shape、layout、broadcast 和边界 tile；
 - [x] 输出 per-operator tile、TISA、MAC、root traffic 和 dependency statistics；
-- [ ] 输出每个 pass 前后的独立 graph dump；
+- [x] 输出每个 pass 前后的独立 graph dump；
 - [ ] 为多种 tile candidate 增加可解释 cost model。
 
 验收：相同 module、shape、tile size、MachineConfig 和 backend 产生稳定 compiled artifact；static/dynamic 只改变 policy。
@@ -71,4 +72,7 @@ prefill 与 decode 必须是不同 case；analytical、source-derived 和 RTL-ob
 
 ## 当前下一步
 
-下一步实现 Attention 的 online Softmax backend lowering 与对应的 GC state dependency；同时细化 FC 的 TISA dialect metadata、`TileMem` 地址表达式和 partial-ready 条件。之后继续加入 stride-aware transform、RoPE、KV-cache 和 SwiGLU，形成第一个真实 decoder block。scheduler 微结构和外部 timing backend 放在语义契约稳定之后。
+下一步细化 FC 的 TISA dialect metadata、`TileMem` 地址表达式和 partial-ready 条件，
+并补齐 online Softmax 的 rescale、最终 normalization 与 workspace 生命周期语义。
+之后继续加入 stride-aware transform、RoPE、KV-cache 和 SwiGLU，形成第一个真实 decoder
+block。scheduler 微结构和外部 timing backend 放在语义契约稳定之后。

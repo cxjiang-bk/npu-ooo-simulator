@@ -363,10 +363,12 @@ def build_tile_graph(graph: OperatorGraph, schedule: ScheduleSpec) -> TileGraph:
                 tuple(tile.bound_map[name][0] for name in iteration_names),
                 [],
             ).append(tile)
-        if operator.normalized_type == "softmax":
-            # The current backend uses materialized row-wise softmax.  Its
-            # max/sum finalization is encoded by FC below; an online state
-            # chain will be emitted once the online lowering is enabled.
+        if (
+            operator.normalized_type == "softmax"
+            and operator.attributes.get("softmax_algorithm", "materialized") != "online"
+        ):
+            # Materialized row-wise Softmax finalizes max/sum inside its
+            # composite payload. Online mode instead keeps this GC state chain.
             continue
         kind = (
             "accumulate"

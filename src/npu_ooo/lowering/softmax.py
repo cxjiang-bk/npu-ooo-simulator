@@ -72,7 +72,7 @@ def _tile_region_geometry(
     return starts, shape
 
 
-def lower_softmax_graph(
+def _lower_materialized_softmax_graph(
     graph: OperatorGraph,
     schedule: ScheduleSpec,
     machine: MachineConfig,
@@ -332,3 +332,225 @@ def lower_softmax_graph(
             "composite_stage_count": 4,
         },
     )
+
+
+def _lower_online_softmax_graph(
+    graph: OperatorGraph,
+    schedule: ScheduleSpec,
+    machine: MachineConfig,
+) -> LoweringResult:
+    """Lower row-wise Softmax as a sequential online state update.
+
+    This analytical lowering models the scheduler-visible contract: every
+    reduction tile consumes the previous tile's ``(max, sum)`` state and
+    produces a tile output after updating that state.  It does not execute
+    numerical tensor values; a calibrated backend may refine the payload's
+    rescale/normalization micro-steps without changing the TISA boundary.
+    """
+
+    graph_issues = graph.validate()
+    schedule_issues = schedule.validate(graph)
+    machine_issues = machine.validate()
+    if graph_issues or schedule_issues or machine_issues:
+        raise ValueError("; ".join((*graph_issues, *schedule_issues, *machine_issues)))
+    tensors = {tensor.name: tensor for tensor in graph.tensors}
+    root = _root_memory(machine)
+    local = _local_memory(machine, root)
+    tasks: list[ExecutionTask] = []
+    producer_stores: dict[str, list[tuple[BufferRegion, str]]] = {}
+    task_order = 0
+    input_elements = 0
+    transfer_bytes = 0
+
+    for operator_id in graph.topological_order():
+        operator = next(operator for operator in graph.operators if operator.op_id == operator_id)
+        if operator.normalized_type != "softmax":
+            raise NotImplementedError(f"online softmax lowering does not support '{operator.normalized_type}'")
+        if len(operator.inputs) != 1 or len(operator.outputs) != 1:
+            raise ValueError(f"softmax operator '{operator.op_id}' requires one input and one output")
+        iteration = tuple(name for name, _ in operator.iteration_dims)
+        reduction = tuple(name for name, _ in operator.reduction_dims)
+        if not iteration or len(reduction) != 1:
+            raise ValueError(
+                f"softmax operator '{operator.op_id}' requires iteration dimensions and one reduction dimension"
+            )
+        input_tensor = tensors[operator.inputs[0]]
+        output_tensor = tensors[operator.outputs[0]]
+        if tuple(input_tensor.shape) != tuple(output_tensor.shape):
+            raise ValueError(f"softmax operator '{operator.op_id}' input/output shapes must match")
+        from npu_ooo.ir.tile import enumerate_operator_tiles
+
+        tiles = enumerate_operator_tiles(operator, schedule.for_operator(operator_id))
+        reduction_name = reduction[0]
+        physical_dimensions = _physical_dimensions(iteration, reduction)
+        rows: dict[tuple[int, ...], list[TileInstance]] = {}
+        for tile in tiles:
+            rows.setdefault(
+                tuple(tile.bound_map[name][0] for name in iteration),
+                [],
+            ).append(tile)
+
+        for row_key, row_tiles in rows.items():
+            row_tiles.sort(key=lambda tile: tile.bound_map[reduction_name][0])
+            iteration_shape = tuple(row_tiles[0].extent(name) for name in iteration)
+            state_max = _virtual_region(
+                f"{operator_id}.online_max",
+                local,
+                iteration_shape,
+                row_key,
+                AccessType.READ_WRITE,
+                dtype=input_tensor.dtype,
+            )
+            state_sum = _virtual_region(
+                f"{operator_id}.online_sum",
+                local,
+                iteration_shape,
+                row_key,
+                AccessType.READ_WRITE,
+                dtype=input_tensor.dtype,
+            )
+            previous_update: str | None = None
+            for tile in row_tiles:
+                starts, shape = _tile_region_geometry(tile, physical_dimensions)
+                input_global = _region(input_tensor, root, starts, shape, AccessType.READ)
+                input_local = _region(input_tensor, local, starts, shape, AccessType.READ)
+                load_id = f"{tile.tile_id}.load"
+                predecessors = {
+                    store_id
+                    for region, store_id in producer_stores.get(operator.inputs[0], [])
+                    if _regions_overlap(region, input_global)
+                }
+                load_duration, load_ii, load_unit = _transfer_timing(
+                    machine, root, local, input_global.size_bytes
+                )
+                tasks.append(
+                    ExecutionTask(
+                        task_id=load_id,
+                        tile_id=tile.tile_id,
+                        operator_id=operator_id,
+                        primitive="load",
+                        resource=load_unit,
+                        reads=(input_global,),
+                        writes=(BufferRegion(**{**input_local.__dict__, "access": AccessType.WRITE}),),
+                        predecessors=tuple(sorted(predecessors)),
+                        duration_cycles=load_duration,
+                        initiation_interval_cycles=load_ii,
+                        stage_id=tile.stage_id,
+                        program_order=task_order,
+                        attributes={"iteration": tile.ordinal, "softmax_algorithm": "online"},
+                    )
+                )
+                task_order += 1
+                input_elements += math.prod(shape)
+                transfer_bytes += input_global.size_bytes
+
+                update_id = f"{tile.tile_id}.online_update"
+                update_duration, update_ii, update_unit = _reduce_timing(machine, math.prod(shape))
+                update_predecessors = {load_id}
+                if previous_update is not None:
+                    update_predecessors.add(previous_update)
+                output_local = _region(output_tensor, local, starts, shape, AccessType.WRITE)
+                tasks.append(
+                    ExecutionTask(
+                        task_id=update_id,
+                        tile_id=tile.tile_id,
+                        operator_id=operator_id,
+                        primitive="online_update",
+                        resource=update_unit,
+                        reads=(input_local, state_max, state_sum),
+                        writes=(
+                            BufferRegion(**{**state_max.__dict__, "access": AccessType.READ_WRITE}),
+                            BufferRegion(**{**state_sum.__dict__, "access": AccessType.READ_WRITE}),
+                            output_local,
+                        ),
+                        predecessors=tuple(sorted(update_predecessors)),
+                        duration_cycles=update_duration,
+                        initiation_interval_cycles=update_ii,
+                        stage_id=tile.stage_id,
+                        program_order=task_order,
+                        attributes={
+                            "reduction": "online_max_sum",
+                            "iteration": tile.ordinal,
+                            "softmax_algorithm": "online",
+                        },
+                    )
+                )
+                task_order += 1
+                previous_update = update_id
+
+                output_global = _region(output_tensor, root, starts, shape, AccessType.WRITE)
+                store_id = f"{tile.tile_id}.store"
+                store_duration, store_ii, store_unit = _transfer_timing(
+                    machine, local, root, output_global.size_bytes
+                )
+                tasks.append(
+                    ExecutionTask(
+                        task_id=store_id,
+                        tile_id=tile.tile_id,
+                        operator_id=operator_id,
+                        primitive="store",
+                        resource=store_unit,
+                        reads=(BufferRegion(**{**output_local.__dict__, "access": AccessType.READ}),),
+                        writes=(output_global,),
+                        predecessors=(update_id,),
+                        duration_cycles=store_duration,
+                        initiation_interval_cycles=store_ii,
+                        stage_id=tile.stage_id,
+                        program_order=task_order,
+                        attributes={"iteration": tile.ordinal, "softmax_algorithm": "online"},
+                    )
+                )
+                task_order += 1
+                transfer_bytes += output_global.size_bytes
+                producer_stores.setdefault(output_tensor.name, []).append((output_global, store_id))
+
+    execution = ExecutionGraph(
+        graph_id=f"{graph.graph_id}.execution",
+        tasks=tuple(tasks),
+        attributes={
+            "source": "softmax-online-lowering",
+            "root_memory": root,
+            "local_memory": local,
+            "softmax_algorithm": "online",
+        },
+    )
+    issues = execution.validate()
+    if issues:
+        raise ValueError("; ".join(issues))
+    tile_graph = build_tile_graph(graph, schedule)
+    return LoweringResult(
+        tile_graph=tile_graph,
+        execution_graph=execution,
+        statistics={
+            "tile_count": len(tile_graph.tiles),
+            "task_count": len(execution.tasks),
+            "input_elements": input_elements,
+            "transfer_bytes": transfer_bytes,
+            "composite_stage_count": 1,
+            "softmax_algorithm": "online",
+        },
+    )
+
+
+def lower_softmax_graph(
+    graph: OperatorGraph,
+    schedule: ScheduleSpec,
+    machine: MachineConfig,
+) -> LoweringResult:
+    """Select the configured materialized or online Softmax payload."""
+
+    operator = next(
+        (item for item in graph.operators if item.normalized_type == "softmax"),
+        None,
+    )
+    configured = machine.attributes.get("softmax_algorithm", "materialized")
+    algorithm = str(
+        operator.attributes.get("softmax_algorithm", configured)
+        if operator is not None
+        else configured
+    )
+    if algorithm == "online":
+        return _lower_online_softmax_graph(graph, schedule, machine)
+    if algorithm != "materialized":
+        raise ValueError("softmax_algorithm must be 'materialized' or 'online'")
+    return _lower_materialized_softmax_graph(graph, schedule, machine)

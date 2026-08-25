@@ -119,7 +119,11 @@ def _stages_for_tile(operator: Any, tile: TileInstance) -> tuple[TISAStage, ...]
             f"FC semantic builder does not support operator '{op_type}'"
         )
     composite_payloads = {
-        "softmax": ("reduce_max", "exp", "reduce_sum", "normalize"),
+        "softmax": (
+            ("online_update",)
+            if operator.attributes.get("softmax_algorithm", "materialized") == "online"
+            else ("reduce_max", "exp", "reduce_sum", "normalize")
+        ),
         "rmsnorm": ("square", "reduce_sum_square", "rmsnorm"),
         "layernorm": (
             "reduce_sum",
@@ -148,6 +152,15 @@ def _stages_for_tile(operator: Any, tile: TileInstance) -> tuple[TISAStage, ...]
                 "primitive": primitive,
                 "semantic_op": op_type,
                 "payload_primitives": list(payload_for_stage(key, primitive)),
+                **(
+                    {
+                        "softmax_algorithm": operator.attributes.get(
+                            "softmax_algorithm", "materialized"
+                        )
+                    }
+                    if op_type == "softmax"
+                    else {}
+                ),
             },
             payload_primitives=payload_for_stage(key, primitive),
         )
@@ -527,18 +540,24 @@ class TISASemanticBuilder:
                             "ACCUMULATE" if op_type in {"matmul", "batched_matmul", "gemv"} else "STATE",
                         )
                 if op_type == "softmax" and reduction:
-                    # Materialized softmax computes the final row max/sum
-                    # before all exp/normalize payloads.  The semantic FC op
-                    # therefore depends on the final reduction tile; an
-                    # online-softmax lowering will replace this with a
-                    # forward state chain.
-                    final = ordered[-1]
-                    for tile in ordered[:-1]:
-                        add_dependency(
-                            instruction_id(tile.tile_id, "compute"),
-                            instruction_id(final.tile_id, "compute"),
-                            "STATE",
-                        )
+                    if operator.attributes.get("softmax_algorithm", "materialized") == "online":
+                        for previous, current in zip(ordered, ordered[1:]):
+                            add_dependency(
+                                instruction_id(current.tile_id, "compute"),
+                                instruction_id(previous.tile_id, "compute"),
+                                "STATE",
+                            )
+                    else:
+                        # Materialized softmax computes the final row max/sum
+                        # before all exp/normalize payloads.  The semantic FC
+                        # op therefore depends on the final reduction tile.
+                        final = ordered[-1]
+                        for tile in ordered[:-1]:
+                            add_dependency(
+                                instruction_id(tile.tile_id, "compute"),
+                                instruction_id(final.tile_id, "compute"),
+                                "STATE",
+                            )
 
         # Stable topological order is part of the descriptor contract.
         successors = {tisa_id: [] for tisa_id in by_id}

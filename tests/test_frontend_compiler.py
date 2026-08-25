@@ -1,3 +1,5 @@
+from collections import Counter
+from dataclasses import replace
 import importlib.util
 import unittest
 
@@ -42,7 +44,13 @@ class PyTorchFrontendTest(unittest.TestCase):
         self.assertEqual(compiled.stablehlo.producer, "torch-xla")
         self.assertTrue(compiled.stablehlo.verified)
         self.assertEqual([operator.op_type for operator in compiled.graph.operators], ["matmul", "matmul"])
-        self.assertEqual(len(compiled.tile_graph.dependencies), 16)
+        dependency_counts = Counter(
+            dependency.kind for dependency in compiled.tile_graph.dependencies
+        )
+        self.assertEqual(
+            dependency_counts,
+            {"region_data": 16, "accumulate": 8},
+        )
         self.assertEqual(
             compiled.tile_graph.attributes["avoided_all_to_all_dependencies"],
             48,
@@ -79,6 +87,42 @@ class PyTorchFrontendTest(unittest.TestCase):
         self.assertTrue(
             {"reduce_max", "exp", "reduce_sum", "normalize"}.issubset(payload_primitives)
         )
+
+    def test_attention_online_configuration_survives_softmax_recovery(self) -> None:
+        import torch
+
+        from examples.torch_models import AttentionMicrograph
+
+        shape = (1, 4, 8)
+        machine = replace(
+            minimal_machine_config(),
+            attributes={"softmax_algorithm": "online", "calibration_status": "analytical"},
+        )
+        compiled = compile_torch_module(
+            AttentionMicrograph(),
+            tuple(torch.randn(*shape) for _ in range(3)),
+            machine,
+            model_id="attention-online",
+            tile_size=4,
+        )
+
+        softmax = [
+            instruction
+            for instruction in compiled.tisa_program.instructions
+            if instruction.op_type == "softmax"
+        ]
+        self.assertTrue(softmax)
+        self.assertTrue(
+            all(item.attributes["softmax_algorithm"] == "online" for item in softmax)
+        )
+        self.assertTrue(
+            all(item.attributes["payload_primitives"] == ["online_update"] for item in softmax)
+        )
+        self.assertIn(
+            "online_update",
+            {task.primitive for task in compiled.backend_artifact.execution_graph.tasks},
+        )
+        self.assertEqual(compiled.validate(), ())
 
     def test_multi_head_attention_compiles_transforms_and_shares_static_dynamic_artifact(self) -> None:
         import torch

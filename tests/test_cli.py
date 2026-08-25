@@ -32,6 +32,20 @@ class CliSurfaceTest(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             build_parser().parse_args(["attention"])
 
+    def test_compile_model_accepts_online_softmax_configuration(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "compile-model",
+                "--torch-module",
+                "examples.torch_models:AttentionMicrograph",
+                "--input-shape",
+                "1,4,8",
+                "--softmax-algorithm",
+                "online",
+            ]
+        )
+        self.assertEqual(args.softmax_algorithm, "online")
+
 
 @unittest.skipUnless(FRONTEND_AVAILABLE, "requires PyTorch, Torch-XLA and official StableHLO")
 class CompileModelCliTest(unittest.TestCase):

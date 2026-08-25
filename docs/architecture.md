@@ -247,14 +247,18 @@ load -> optional load_transpose -> matmul -> optional store
 
 ```text
 load -> softmax -> store
-backend payload: reduce_max -> exp -> reduce_sum -> normalize
+默认 backend payload: reduce_max -> exp -> reduce_sum -> normalize
 ```
 
 这里的 `softmax` 是 scheduler-visible 的语义指令。当前 analytical backend
-仍使用 materialized 的 row-wise `max/sum` lowering；这些 primitive 只在该
-payload 内执行，不代表已经实现论文目标的 online Softmax state update。
-后续切换到 online lowering 时，保持同一个 TISA 语义边界，只替换 payload
-和对应的 GC state dependency。
+默认使用 materialized 的 row-wise `max/sum` lowering；这些 primitive 只在该
+payload 内执行，不代表已经实现论文目标的 online Softmax state update。通过
+`MachineConfig.attributes["softmax_algorithm"] = "online"` 或 CLI 的
+`--softmax-algorithm online` 可切换到分析版 online lowering。该模式保持同一个
+TISA 语义边界，只替换 payload 为 `online_update`，并由 GC/FC 为同一 reduction
+row 的相邻 tile 添加 `STATE` 依赖。它目前只建模 scheduler-visible 的 `(max, sum)`
+状态传递，不执行完整数值算法所需的 rescale、最终 normalization 和 workspace，
+因此不能称为论文硬件的 cycle-accurate 或数值正确 online Softmax 实现。
 
 每条 `TISAInstruction` 包含：
 
@@ -372,6 +376,7 @@ RuntimeSubmission（除非实验变量就是 runtime）
 - reshape/transpose 当前是 full-tensor DMA transform，尚未支持 stride-aware tile transform；
 - analytical backend 不是 cycle-accurate RTL；
 - 当前 MXU VCS 日志只有 descriptor-to-done 区间，不能直接作为 isolated Matmul compute latency；
+- online Softmax 目前是 scheduler-level analytical state-chain 模型，尚未覆盖完整的数值 rescale、最终 normalization 和 workspace 生命周期；
 - 真实 ResNet50、BERT、GPT-J、LLaMA2、DeepSeek block 尚未形成可复现实验集。
 
 下一阶段见 [roadmap.md](roadmap.md)。

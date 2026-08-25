@@ -180,7 +180,26 @@ out/<run>/
 
 推荐按目录编号依次检查。`generated.mlir` 是确认 Torch-XLA 输出的第一现场；`01_gc/pass_dumps/` 按顺序展示每个 GC pass 的输入图、输出图和诊断，`01_gc/gc_artifact.json` 展示最终融合、切分、初始顺序和依赖；`02_fc/tisa_dialect.json` 展示 FC 生成的语义 TISA op；`03_tisa/tisa_program.json` 是 device scheduler 的输入；`backend_artifact.json` 记录每条 TISA instruction 对应的后端 payload。复合算子的 reduce/exp 等内部步骤只在 backend payload 中出现。
 
-当前 Softmax 的语义 TISA 已按 tile 粒度生成 `load -> softmax -> store`，但 analytical backend 仍使用 materialized row-wise lowering；online Softmax state update 尚未接入，不能把当前结果称为论文硬件的 online 实现。
+当前 Softmax 的语义 TISA 已按 tile 粒度生成 `load -> softmax -> store`，默认使用
+materialized row-wise lowering。可以通过 `--softmax-algorithm online` 启用分析版
+online state payload：它保留同一个 `softmax` TISA 边界，将相邻 reduction tile 串成
+`(max, sum)` 状态依赖链，便于比较调度周期。该实现不执行完整数值 online Softmax 的
+rescale、最终归一化和输出 workspace，因此只能用于 scheduler/cycle 研究，不能称为
+论文硬件或数值正确的 FlashAttention online 实现。
+
+例如，使用 online 分析模型运行 Attention：
+
+```bash
+PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-model \
+  --torch-module examples.torch_models:MultiHeadAttentionBlock \
+  --input-shape 1,4,8 --input-shape 1,1,4,4 \
+  --tile-size 4 --softmax-algorithm online \
+  --policy dynamic_ready_queue \
+  --output-dir out/attention-online
+```
+
+运行产物的 `manifest.json` 会记录实际采用的 Softmax 算法；不指定参数时记录为
+`materialized`。
 
 ## 调度边界
 

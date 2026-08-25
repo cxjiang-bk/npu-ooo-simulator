@@ -91,10 +91,13 @@ TISA load-A -> TISA load-B -> TISA matmul -> TISA store
 
 其中一条 `TISA matmul` 或 `TISA softmax` 的 analytical payload 仍可包含 execution-unit 内部 timing task，但这些 task 不会重新进入全局 OOO ready queue。因此不同 tile 的内部步骤不会绕过 TISA dependency 被任意重排。
 
-实现边界需要特别区分：当前 analytical Softmax payload 是 materialized
+实现边界需要特别区分：默认 analytical Softmax payload 是 materialized
 row-wise `max/sum -> exp -> normalize`，并非论文式 online state update。
-跨 tile 的 primitive 边只用于 payload timing，不能反向推导成全局 TISA
-依赖；online lowering 将作为后续 backend capability 单独接入。
+显式配置 `softmax_algorithm=online` 时，项目提供一个 scheduler-level analytical
+state-chain payload：每个 reduction tile 的 `online_update` 读取并更新前一 tile
+的 `(max, sum)` 状态。它用于观察状态依赖对 OOO 调度的影响，不执行完整数值算法的
+rescale、最终 normalization 和 workspace 管理；跨 tile 的 primitive 边仍只属于
+backend payload，只有 GC/FC 生成的 TISA `STATE` 边进入全局 scheduler。
 
 `ExecutionTask` 仍然有价值：它是 backend timing/event 表达，也是泳道图中 DMA、MXU、Vector lane 的来源。它不是论文 scheduler 的输入 ISA。
 

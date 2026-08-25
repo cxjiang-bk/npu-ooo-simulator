@@ -32,6 +32,7 @@ _ANALYTICAL_PRIMITIVES = frozenset(
         "rmsnorm",
         "layernorm_mean",
         "layernorm",
+        "online_update",
     }
 )
 
