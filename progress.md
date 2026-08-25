@@ -21,6 +21,7 @@
 - 已接入可选 memory bank/port scoreboard：依据 `MachineConfig.memory_levels` 的 bank 和读写端口容量记录结构冲突；默认关闭，不改变既有 baseline。
 - GC 的 LayerNorm recovery 已改为 fixed-point pass，可完整处理同一 module 中多个 Torch-XLA `batch_norm_training` 规范化节点。
 - RMSNorm recovery 已支持 Torch-XLA 的 `power -> reduce -> rsqrt -> affine` 形式及中间 reshape，并在 backend payload 中建模 affine weight read。
+- 首个真实 PyTorch pre-norm decoder block 已编译并完成 static/dynamic device 仿真，覆盖 RMSNorm、multi-head attention、masked Softmax、residual 和 SwiGLU/MLP；RoPE 与 KV-cache 尚未加入。
 
 ## 真实验证
 

@@ -24,7 +24,8 @@
 - [x] Matmul、elementwise、reduce、Softmax、RMSNorm、LayerNorm 基础路径；
 - [x] attention micrograph 的 `QK^T -> Softmax -> PV`；
 - [x] 首个静态 shape multi-head attention：scale、additive mask、head reshape、output projection；
-- [ ] decoder block：RoPE、KV-cache、SwiGLU/MLP、residual；
+- [x] 首个静态 shape pre-norm decoder block：RMSNorm、attention、residual、SwiGLU/MLP；
+- [ ] decoder block extensions：RoPE、KV-cache；
 - [ ] ResNet bottleneck：Conv2D、BatchNorm inference、ReLU、pooling；
 - [ ] BERT/GPT-J/LLaMA2/DeepSeek 的真实 one-block module。
 

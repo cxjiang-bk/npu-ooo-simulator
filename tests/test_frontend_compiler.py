@@ -177,6 +177,36 @@ class PyTorchFrontendTest(unittest.TestCase):
         self.assertEqual(len(rmsnorms[0].inputs), 2)
         self.assertEqual(compiled.validate(), ())
 
+    def test_prenorm_decoder_block_compiles_and_runs_both_device_policies(self) -> None:
+        import torch
+
+        from examples.torch_models import PreNormDecoderBlock
+
+        compiled = compile_torch_module(
+            PreNormDecoderBlock(),
+            (torch.randn(1, 4, 8), torch.zeros(1, 1, 4, 4)),
+            minimal_machine_config(),
+            model_id="prenorm-decoder-block",
+            tile_size=4,
+        )
+        operator_types = {operator.normalized_type for operator in compiled.graph.operators}
+        self.assertTrue(
+            {"rmsnorm", "batched_matmul", "softmax", "elementwise"}.issubset(operator_types)
+        )
+        static = schedule_tisa_program(
+            compiled.backend_artifact,
+            minimal_machine_config(),
+            SchedulerPolicy.STATIC_PIPELINE,
+        )
+        dynamic = schedule_tisa_program(
+            compiled.backend_artifact,
+            minimal_machine_config(),
+            SchedulerPolicy.DYNAMIC_READY_QUEUE,
+        )
+        self.assertGreater(static.total_cycles, 0)
+        self.assertGreater(dynamic.total_cycles, 0)
+        self.assertEqual(compiled.validate(), ())
+
     def test_attention_online_configuration_survives_softmax_recovery(self) -> None:
         import torch
 
