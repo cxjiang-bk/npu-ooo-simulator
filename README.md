@@ -43,6 +43,7 @@ PyTorch nn.Module
 - 使用 OpenXLA 官方 StableHLO bindings 执行 MLIR parse 和 verify；
 - 将支持的 StableHLO semantic family 导入统一 OperatorGraph；
 - 以论文 GC/FC 为边界执行图 canonicalization、复合算子恢复、切 tile、依赖构造和 TISA dialect 生成；
+- 保存每个 GC pass 的输入/输出图，生成可解释的 residency 与 ping-pong intent；
 - 支持多头 Attention 所需的 reshape、permute、scale、additive mask 和 batched Matmul；
 - 使用逻辑 tensor region 生成跨算子 tile dependency，并输出 MAC/traffic/依赖统计；
 - Static 和 Dynamic device policy 共享同一份 `TISAProgram/BackendArtifact`；
@@ -150,6 +151,7 @@ out/<run>/
 ├── 01_gc/
 │   ├── canonical_graph.json       # GC 规范化后的算子图
 │   ├── gc_artifact.json            # GC 完整阶段产物
+│   ├── pass_dumps/                 # 每个 GC pass 的输入/输出图
 │   ├── schedule.json               # 初始软件 schedule
 │   ├── compile_statistics.json
 │   ├── tile_graph.{json,dot}
@@ -176,7 +178,7 @@ out/<run>/
     └── perfetto.json
 ```
 
-推荐按目录编号依次检查。`generated.mlir` 是确认 Torch-XLA 输出的第一现场；`01_gc/gc_artifact.json` 展示 GC 的融合、切分、初始顺序和依赖；`02_fc/tisa_dialect.json` 展示 FC 生成的语义 TISA op；`03_tisa/tisa_program.json` 是 device scheduler 的输入；`backend_artifact.json` 记录每条 TISA instruction 对应的后端 payload。复合算子的 reduce/exp 等内部步骤只在 backend payload 中出现。
+推荐按目录编号依次检查。`generated.mlir` 是确认 Torch-XLA 输出的第一现场；`01_gc/pass_dumps/` 按顺序展示每个 GC pass 的输入图、输出图和诊断，`01_gc/gc_artifact.json` 展示最终融合、切分、初始顺序和依赖；`02_fc/tisa_dialect.json` 展示 FC 生成的语义 TISA op；`03_tisa/tisa_program.json` 是 device scheduler 的输入；`backend_artifact.json` 记录每条 TISA instruction 对应的后端 payload。复合算子的 reduce/exp 等内部步骤只在 backend payload 中出现。
 
 当前 Softmax 的语义 TISA 已按 tile 粒度生成 `load -> softmax -> store`，但 analytical backend 仍使用 materialized row-wise lowering；online Softmax state update 尚未接入，不能把当前结果称为论文硬件的 online 实现。
 

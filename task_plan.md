@@ -36,6 +36,8 @@
 - [x] 明确 GCArtifact、TISADialectProgram、TISAProgram 三个编译阶段契约；
 - [x] 复合 Softmax/Norm 保持 semantic TISA op，内部 primitive 退回 backend payload；
 - [x] 第一版 region-aware tile dependency，无法证明映射时显式保守回退；
+- [x] 保存每个 GC pass 的输入/输出图与诊断 dump；
+- [x] 生成 capacity-aware residency 和多 tile ping-pong intent metadata；
 - [ ] 完善 symbolic/dynamic shape、layout、broadcast 和边界 tile；
 - [x] 输出 per-operator tile、TISA、MAC、root traffic 和 dependency statistics；
 - [ ] 输出每个 pass 前后的独立 graph dump；
@@ -68,4 +70,4 @@ prefill 与 decode 必须是不同 case；analytical、source-derived 和 RTL-ob
 
 ## 当前下一步
 
-先补齐 GC 的独立 pass dump、residency/ping-pong 规划和 Attention 的在线 Softmax 状态依赖；再把 FC 的 TISA dialect metadata 与 `TileMem`/partial-ready 条件细化。之后继续加入 stride-aware transform、RoPE、KV-cache 和 SwiGLU，形成第一个真实 decoder block。scheduler 微结构和外部 timing backend 放在语义契约稳定之后。
+下一步实现 Attention 的 online Softmax backend lowering 与对应的 GC state dependency；同时细化 FC 的 TISA dialect metadata、`TileMem` 地址表达式和 partial-ready 条件。之后继续加入 stride-aware transform、RoPE、KV-cache 和 SwiGLU，形成第一个真实 decoder block。scheduler 微结构和外部 timing backend 放在语义契约稳定之后。

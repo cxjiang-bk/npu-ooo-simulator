@@ -372,6 +372,10 @@ def run_compile_model(args: argparse.Namespace) -> int:
     write_artifact_json(compiled.graph, args.output_dir / "canonical_graph.json")
     if compiled.gc_artifact is not None:
         write_artifact_json(compiled.gc_artifact, args.output_dir / "gc_artifact.json")
+        pass_dump_dir = args.output_dir / "01_gc" / "pass_dumps"
+        for snapshot in compiled.gc_artifact.pass_dumps:
+            filename = f"{snapshot.pass_index:02d}_{snapshot.pass_name}.json"
+            write_artifact_json(snapshot, pass_dump_dir / filename)
     write_artifact_json(compiled.schedule, args.output_dir / "schedule.json")
     write_artifact_json(
         compiled.attributes["compile_statistics"],

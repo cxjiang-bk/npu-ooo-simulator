@@ -76,7 +76,7 @@ def _root_readme() -> str:
         [
             "",
             "典型查看顺序：先看 `00_frontend` 确认输入，再看 `01_gc` 检查图、切分",
-            "与依赖，接着看 `02_fc` 的 TISA dialect 和 `03_tisa` 的虚拟指令，之后看",
+            "与依赖；`01_gc/pass_dumps/` 可逐个查看 pass 前后的图变化；接着看 `02_fc` 的 TISA dialect 和 `03_tisa` 的虚拟指令，之后看",
             "`04_backend`，在",
             "`05_runtime` 检查物理地址与 command chunk，最后在 `06_simulation`、",
             "`07_trace` 中比较周期和泳道。",
@@ -175,7 +175,7 @@ def write_artifact_index(root: str | Path) -> None:
     for directory, _description in STAGE_DIRECTORIES:
         files = sorted(
             str(path.relative_to(root_path))
-            for path in (root_path / directory).iterdir()
+            for path in (root_path / directory).rglob("*")
             if path.is_file()
         )
         if files:

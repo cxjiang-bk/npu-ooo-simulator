@@ -13,7 +13,7 @@ from typing import Any, Mapping
 from npu_ooo.arch import MachineConfig
 from npu_ooo.ir import OperatorGraph, ScheduleSpec, TileGraph, build_tile_graph
 
-from .passes import PassDiagnostic, default_pass_manager
+from .passes import PassDiagnostic, PassSnapshot, default_pass_manager
 from .planner import default_schedule_planner
 
 
@@ -25,6 +25,7 @@ class GCArtifact:
     schedule: ScheduleSpec
     tile_graph: TileGraph
     diagnostics: tuple[PassDiagnostic, ...] = ()
+    pass_dumps: tuple[PassSnapshot, ...] = ()
     attributes: Mapping[str, Any] = field(default_factory=dict)
 
     def validate(self, machine: MachineConfig | None = None) -> tuple[str, ...]:
@@ -46,6 +47,7 @@ class GCArtifact:
                 {"level": item.level, "pass": item.pass_name, "message": item.message}
                 for item in self.diagnostics
             ],
+            "pass_dumps": [item.to_dict() for item in self.pass_dumps],
             "attributes": dict(self.attributes),
         }
 
@@ -72,6 +74,7 @@ class GraphCompiler:
         schedule = default_schedule_planner().plan(
             canonical_graph,
             tile_size=tile_size,
+            machine=machine,
         )
         tile_graph = build_tile_graph(canonical_graph, schedule)
         schedule = replace(
@@ -91,7 +94,7 @@ class GraphCompiler:
                 "dependency_kinds": ["region_data", "state", "accumulate", "buffer_reuse"],
                 "initial_order": "tile_graph_topological_order",
                 "residency_plan": "schedule.residency",
-                "ping_pong_plan": "compiler_attributes_or_backend_default",
+                "ping_pong_plan": "schedule.operator_schedules[].attributes.ping_pong",
                 "tile_to_core_assignment": "compiler_attributes_or_machine_default",
             },
         )
@@ -100,6 +103,7 @@ class GraphCompiler:
             schedule=schedule,
             tile_graph=tile_graph,
             diagnostics=pass_result.diagnostics,
+            pass_dumps=pass_result.snapshots,
             attributes={
                 "paper_stage": "GC",
                 "implementation": "python-semantic-proxy",
@@ -110,6 +114,7 @@ class GraphCompiler:
                 "tiling": "automatic shape-aware baseline",
                 "locality": "schedule residency metadata",
                 "dependency_model": tile_graph.attributes.get("dependency_model"),
+                "pass_count": len(pass_result.snapshots),
             },
         )
         issues = artifact.validate(machine)

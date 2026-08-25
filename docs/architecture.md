@@ -165,9 +165,14 @@ Semantic TileGraph
 fusion / residency / locality metadata
 typed tile dependencies
 initial software order
+per-pass input/output graph snapshots
 ```
 
 `GCArtifact` 的 Python dataclass 是论文 MLIR GC dialect 的语义代理，不声称复刻论文内部 pass 实现。
+
+每个 GC pass 都保留独立的输入图、输出图和诊断，CLI 将它们写入
+`01_gc/pass_dumps/<index>_<pass>.json`。这些 dump 用于解释图恢复和融合
+发生在哪一个 pass，不参与后续调度。
 
 ### 4.1 Tiling、locality 与依赖
 
@@ -178,6 +183,14 @@ tile_size(dim) = min(CLI tile_size, resolved extent)
 loop_order = iteration dims + reduction dims
 stage_id = operator topological order
 ```
+
+在 `MachineConfig` 可用时，planner 还生成 capacity-aware 的 residency intent：
+优先将当前 operator 的输入/输出放入 root 的第一级 local memory，超出容量的
+tensor 保留在 root memory。多 tile operator 会附带 `ping_pong` 计划，描述两个
+local tile slot 的交替意图；它是 GC metadata，不是 runtime 的实际 buffer 分配。
+
+每个 pass 的图快照和上述 memory intent 都是分析产物。它们不会改变
+`TISAProgram` 的指令顺序，也不会替 device scheduler 做 issue 决策。
 
 这是 GC 的初始软件 schedule，不是 static device scheduler。它决定 tile decomposition、初始 loop order 和可记录的 residency；最终 issue 顺序仍由 device scheduler 决定。
 

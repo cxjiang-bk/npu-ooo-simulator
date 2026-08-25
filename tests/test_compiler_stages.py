@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 
 from npu_ooo.arch import minimal_machine_config
 from npu_ooo.compiler import compile_operator_graph
@@ -22,6 +23,55 @@ def _stable_frontend(graph: OperatorGraph) -> tuple[FrontendImport, OfficialStab
 
 
 class CompilerStageContractTest(unittest.TestCase):
+    def test_gc_keeps_pass_snapshots_and_memory_plan_metadata(self) -> None:
+        graph = OperatorGraph(
+            graph_id="gc-metadata-test",
+            tensors=(TensorSpec("x", (4, 8)), TensorSpec("y", (4, 8))),
+            operators=(
+                OperatorSpec(
+                    op_id="softmax",
+                    op_type="softmax",
+                    inputs=("x",),
+                    outputs=("y",),
+                    iteration_dims=(("row", 4),),
+                    reduction_dims=(("col", 8),),
+                ),
+            ),
+        )
+        frontend, stablehlo = _stable_frontend(graph)
+        machine = minimal_machine_config()
+        machine = replace(
+            machine,
+            memory_levels=tuple(
+                replace(level, capacity_bytes=16) if level.name == "SRAM" else level
+                for level in machine.memory_levels
+            ),
+        )
+        compiled = compile_operator_graph(
+            graph,
+            machine,
+            frontend=frontend,
+            source_frontend=frontend,
+            stablehlo=stablehlo,
+            tile_size=4,
+        )
+
+        snapshots = compiled.gc_artifact.pass_dumps
+        self.assertTrue(snapshots)
+        self.assertEqual(
+            [snapshot.pass_index for snapshot in snapshots],
+            list(range(len(snapshots))),
+        )
+        self.assertEqual(snapshots[0].input_graph.to_dict(), graph.to_dict())
+        self.assertEqual(snapshots[-1].output_graph.to_dict(), compiled.gc_artifact.graph.to_dict())
+        self.assertEqual(compiled.gc_artifact.attributes["pass_count"], len(snapshots))
+
+        operator_schedule = compiled.schedule.for_operator("softmax")
+        ping_pong = operator_schedule.attributes["ping_pong"]
+        self.assertTrue(ping_pong["enabled"])
+        self.assertEqual(ping_pong["buffer_count"], 2)
+        self.assertEqual(operator_schedule.attributes["residency_overflow_tensors"], ["x", "y"])
+
     def test_gc_fc_and_tisa_generator_have_distinct_contracts(self) -> None:
         graph = OperatorGraph(
             graph_id="stage-test",

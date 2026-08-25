@@ -23,9 +23,38 @@ class PassDiagnostic:
 
 
 @dataclass(frozen=True)
+class PassSnapshot:
+    """Input/output graphs for one GC pass invocation."""
+
+    pass_index: int
+    pass_name: str
+    input_graph: OperatorGraph
+    output_graph: OperatorGraph
+    diagnostics: tuple[PassDiagnostic, ...] = ()
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "paper_stage": "GC",
+            "pass_index": self.pass_index,
+            "pass_name": self.pass_name,
+            "input_graph": self.input_graph.to_dict(),
+            "output_graph": self.output_graph.to_dict(),
+            "diagnostics": [
+                {
+                    "level": item.level,
+                    "pass": item.pass_name,
+                    "message": item.message,
+                }
+                for item in self.diagnostics
+            ],
+        }
+
+
+@dataclass(frozen=True)
 class PassResult:
     graph: OperatorGraph
     diagnostics: tuple[PassDiagnostic, ...] = ()
+    snapshots: tuple[PassSnapshot, ...] = ()
 
 
 class GraphPass(Protocol):
@@ -1304,11 +1333,22 @@ class PassManager:
     def run(self, graph: OperatorGraph) -> PassResult:
         current = graph
         diagnostics: list[PassDiagnostic] = []
-        for graph_pass in self.passes:
+        snapshots: list[PassSnapshot] = []
+        for pass_index, graph_pass in enumerate(self.passes):
+            input_graph = current
             result = graph_pass.run(current)
             current = result.graph
             diagnostics.extend(result.diagnostics)
-        return PassResult(current, tuple(diagnostics))
+            snapshots.append(
+                PassSnapshot(
+                    pass_index=pass_index,
+                    pass_name=graph_pass.name,
+                    input_graph=input_graph,
+                    output_graph=current,
+                    diagnostics=result.diagnostics,
+                )
+            )
+        return PassResult(current, tuple(diagnostics), tuple(snapshots))
 
 
 def default_pass_manager() -> PassManager:
@@ -1320,6 +1360,7 @@ __all__ = [
     "GraphPass",
     "PassDiagnostic",
     "PassManager",
+    "PassSnapshot",
     "PassResult",
     "RecoverStableHLOFlattenedLinearPass",
     "RecoverStableHLOLayerNormPass",
