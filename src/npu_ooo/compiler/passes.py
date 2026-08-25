@@ -512,6 +512,7 @@ class RecoverStableHLOLayerNormPass:
     """Recover the constrained batch-norm form torch-xla uses for LayerNorm."""
 
     name = "recover_stablehlo_layernorm"
+    repeat_until_stable = True
 
     def run(self, graph: OperatorGraph) -> PassResult:
         operators = list(graph.operators)
@@ -1334,20 +1335,28 @@ class PassManager:
         current = graph
         diagnostics: list[PassDiagnostic] = []
         snapshots: list[PassSnapshot] = []
-        for pass_index, graph_pass in enumerate(self.passes):
-            input_graph = current
-            result = graph_pass.run(current)
-            current = result.graph
-            diagnostics.extend(result.diagnostics)
-            snapshots.append(
-                PassSnapshot(
-                    pass_index=pass_index,
-                    pass_name=graph_pass.name,
-                    input_graph=input_graph,
-                    output_graph=current,
-                    diagnostics=result.diagnostics,
+        pass_index = 0
+        for graph_pass in self.passes:
+            repeat_limit = len(current.operators) + 1
+            for _iteration in range(repeat_limit):
+                input_graph = current
+                result = graph_pass.run(current)
+                current = result.graph
+                diagnostics.extend(result.diagnostics)
+                snapshots.append(
+                    PassSnapshot(
+                        pass_index=pass_index,
+                        pass_name=graph_pass.name,
+                        input_graph=input_graph,
+                        output_graph=current,
+                        diagnostics=result.diagnostics,
+                    )
                 )
-            )
+                pass_index += 1
+                if not getattr(graph_pass, "repeat_until_stable", False):
+                    break
+                if current.to_dict() == input_graph.to_dict():
+                    break
         return PassResult(current, tuple(diagnostics), tuple(snapshots))
 
 

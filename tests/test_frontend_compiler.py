@@ -124,6 +124,32 @@ class PyTorchFrontendTest(unittest.TestCase):
         )
         self.assertEqual(compiled.validate(), ())
 
+    def test_multiple_layernorms_are_recovered_until_gc_is_stable(self) -> None:
+        import torch
+
+        class TwoLayerNorm(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.first = torch.nn.LayerNorm(8)
+                self.second = torch.nn.LayerNorm(8)
+
+            def forward(self, value):
+                return self.second(self.first(value))
+
+        compiled = compile_torch_module(
+            TwoLayerNorm(),
+            (torch.randn(1, 4, 8),),
+            minimal_machine_config(),
+            model_id="two-layernorm",
+            tile_size=4,
+        )
+
+        self.assertEqual(
+            [operator.normalized_type for operator in compiled.graph.operators],
+            ["layernorm", "layernorm"],
+        )
+        self.assertEqual(compiled.validate(), ())
+
     def test_attention_online_configuration_survives_softmax_recovery(self) -> None:
         import torch
 
