@@ -101,6 +101,21 @@ PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-model \
 
 它在一次编译后运行 runtime static/dynamic 与 device static/dynamic 的四种组合。
 
+当前也提供一个包含两次 RMSNorm、masked multi-head attention、residual 和 SwiGLU
+MLP 的真实 PyTorch pre-norm decoder block：
+
+```bash
+PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-model \
+  --torch-module examples.torch_models:PreNormDecoderBlock \
+  --input-shape 1,4,8 --input-shape 1,1,4,4 \
+  --tile-size 4 \
+  --policy dynamic_ready_queue \
+  --output-dir out/decoder-dynamic
+```
+
+该示例暂不包含 RoPE 和 KV-cache；它们需要额外的 state/stride 语义，不应被普通
+decoder block 的结果隐式代替。
+
 ## 添加 PyTorch 算子或模型
 
 在任意可导入 Python 模块中定义真实的 `torch.nn.Module`。无参数构造的 module class 可以直接作为 CLI 入口：
