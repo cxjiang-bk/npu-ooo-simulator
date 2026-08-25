@@ -63,6 +63,14 @@ class PyTorchFrontendTest(unittest.TestCase):
         ]
         self.assertTrue(address_expressions)
         self.assertTrue(all(expression for expression in address_expressions))
+        stride_metadata = [
+            operand.tile_mem
+            for instruction in compiled.tisa_program.instructions
+            for operand in instruction.operands
+        ]
+        self.assertTrue(all(item.strides_bytes for item in stride_metadata))
+        self.assertTrue(all(item.stride_expr for item in stride_metadata))
+        self.assertTrue(all(item.layout == "dense" for item in stride_metadata))
         self.assertIsNotNone(compiled.gc_artifact)
         self.assertIsNotNone(compiled.tisa_dialect)
         self.assertEqual(compiled.validate(), ())

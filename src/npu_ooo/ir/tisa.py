@@ -29,6 +29,9 @@ class TileMem:
     offset_bytes: int | None = None
     size_bytes: int | None = None
     address_expr: str | None = None
+    strides_bytes: tuple[int, ...] | None = None
+    stride_expr: str | None = None
+    layout: str = "dense"
 
     def validate(self) -> tuple[str, ...]:
         issues: list[str] = []
@@ -42,6 +45,20 @@ class TileMem:
             issues.append("TISA TileMem size_bytes must be positive")
         if self.address_expr is not None and not self.address_expr.strip():
             issues.append("TISA TileMem address_expr must not be blank")
+        if not self.layout or not self.layout.strip():
+            issues.append("TISA TileMem layout must not be blank")
+        if self.strides_bytes is not None:
+            if not self.strides_bytes:
+                issues.append("TISA TileMem strides_bytes must not be empty")
+            elif any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                for value in self.strides_bytes
+            ):
+                issues.append("TISA TileMem strides_bytes must contain non-negative integers")
+        if self.stride_expr is not None and not self.stride_expr.strip():
+            issues.append("TISA TileMem stride_expr must not be blank")
         return tuple(issues)
 
     def to_dict(self) -> dict[str, Any]:
@@ -52,6 +69,9 @@ class TileMem:
             "offset_bytes": self.offset_bytes,
             "size_bytes": self.size_bytes,
             "address_expr": self.address_expr,
+            "strides_bytes": list(self.strides_bytes) if self.strides_bytes is not None else None,
+            "stride_expr": self.stride_expr,
+            "layout": self.layout,
         }
 
 

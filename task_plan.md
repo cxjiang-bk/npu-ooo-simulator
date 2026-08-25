@@ -41,6 +41,7 @@
 - [x] 为 FC stage 和 typed dependency 写入显式 readiness condition；
 - [x] Softmax 提供默认 materialized 与显式 analytical online state-chain 两种 payload 语义；
 - [ ] 完善 symbolic/dynamic shape、layout、broadcast 和边界 tile；
+- [x] 为 FC/TISA `TileMem` 增加 concrete stride、stride expression 和 layout metadata；
 - [x] 输出 per-operator tile、TISA、MAC、root traffic 和 dependency statistics；
 - [x] 输出每个 pass 前后的独立 graph dump；
 - [ ] 为多种 tile candidate 增加可解释 cost model。
@@ -72,7 +73,7 @@ prefill 与 decode 必须是不同 case；analytical、source-derived 和 RTL-ob
 
 ## 当前下一步
 
-下一步细化 FC 的 TISA dialect metadata、strided `TileMem` expression，并补齐 online
+下一步细化 FC 的 TISA dialect metadata、strided `TileMem` interval，并补齐 online
 Softmax 的 rescale、最终 normalization 与 workspace 生命周期语义。memory bank
 scoreboard 已作为默认关闭的 analytical structural-conflict 模型接入。
 之后继续加入 stride-aware transform、RoPE、KV-cache 和 SwiGLU，形成第一个真实 decoder

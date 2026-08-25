@@ -246,6 +246,41 @@ def _address_expression(
     return f"{tensor_name}[{slices}]"
 
 
+def _tensor_strides_bytes(tensor: Any) -> tuple[int, ...] | None:
+    """Return concrete byte strides, preserving an explicit tensor layout."""
+
+    full_shape = _resolved_tensor_shape(tensor)
+    if full_shape is None:
+        return None
+    attributes = getattr(tensor, "attributes", {})
+    explicit = attributes.get("strides_bytes") if isinstance(attributes, Mapping) else None
+    if explicit is not None:
+        try:
+            strides = tuple(int(value) for value in explicit)
+        except (TypeError, ValueError):
+            strides = ()
+        if len(strides) == len(full_shape) and all(value >= 0 for value in strides):
+            return strides
+    strides: list[int] = []
+    stride = _dtype_bytes(tensor.dtype)
+    for extent in reversed(full_shape):
+        strides.append(stride)
+        stride *= extent
+    strides.reverse()
+    return tuple(strides)
+
+
+def _stride_expression(strides_bytes: tuple[int, ...] | None) -> str | None:
+    if strides_bytes is None:
+        return None
+    terms = [
+        f"i{index}*{stride}"
+        for index, stride in enumerate(strides_bytes)
+        if stride
+    ]
+    return " + ".join(terms) if terms else "0"
+
+
 def _tile_bounds(tile: TileInstance) -> dict[str, tuple[int, int]]:
     return tile.bound_map
 
@@ -371,6 +406,7 @@ def _stage_operands(
         dense_region = _dense_region(tensor, *geometry) if geometry is not None else None
         offset_bytes = dense_region[0] if dense_region is not None else None
         size_bytes = dense_region[1] if dense_region is not None else None
+        strides_bytes = _tensor_strides_bytes(tensor)
         operands.append(
             TISAOperand(
                 name=f"{name}:{access.value}:{index}",
@@ -382,6 +418,9 @@ def _stage_operands(
                     offset_bytes=offset_bytes,
                     size_bytes=size_bytes,
                     address_expr=_address_expression(name, geometry),
+                    strides_bytes=strides_bytes,
+                    stride_expr=_stride_expression(strides_bytes),
+                    layout=str(getattr(tensor, "layout", "dense")),
                 ),
                 access_type=access,
             )
