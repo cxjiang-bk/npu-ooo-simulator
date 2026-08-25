@@ -4,27 +4,13 @@
 
 ```mermaid
 flowchart LR
-    A[PyTorch nn.Module] --> B[torch.export\nExportedProgram]
-    B --> C[Torch-XLA\nATen -> StableHLO]
-    C --> D[官方 StableHLO\nparse / verify]
-    D --> E[Canonical\nOperatorGraph]
-    E --> F[Graph passes\nsemantic recovery]
-    F --> G[ScheduleSpec\nTileGraph]
-    G --> H[TISAProgram]
-    H --> I[BackendArtifact\nTISA + payload]
-
-    I --> J[RuntimeSubmission\n地址 / chunk / arrival]
-    J --> K[Device scheduler]
-    K --> L{调度策略}
-    L --> M[Static\nprogram order]
-    L --> N[Dynamic\nready queue / OOO]
-    M --> O[Backend event + timing]
-    N --> O
-    O --> P[周期 / stall / utilization]
-    O --> Q[泳道图 / Perfetto trace]
-
-    I -. 同一份 compiled artifact .-> M
-    I -. 同一份 compiled artifact .-> N
+    A[PyTorch nn.Module] --> B[PyTorch 前端\ntorch.export + Torch-XLA + StableHLO]
+    B --> C[编译器\nOperatorGraph -> TileGraph -> TISA]
+    C --> D[BackendArtifact]
+    D --> E[Runtime\n地址绑定与提交]
+    E --> F[Device scheduler\nStatic / Dynamic OOO]
+    F --> G[Backend 仿真\n周期与执行事件]
+    G --> H[周期、stall、泳道图、Perfetto]
 ```
 
 这是一个用于研究 TISA 风格 NPU 动态调度的编译与仿真框架。项目当前只有一条生产前端路线：
