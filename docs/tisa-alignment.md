@@ -45,9 +45,9 @@ backend execution payload    DMA/MXU/Vector 等单元内部执行
 | `TileShape` | `TISAOperand.tile_shape` | 尚缺通用 symbolic shape binding |
 | `TileMem` | `TISAOperand.tile_mem` | 已有 scope/offset/size，地址表达式仍需扩展 |
 | `AccessType` | operand/buffer access | 已支持 read/write/read-write |
-| `Attributes` | `TISAInstruction.attributes` | partial-ready/reorder 仍需继续校准 |
+| `Attributes` | `TISAInstruction.attributes` | 已记录 stage readiness；partial-ready 解释器仍需继续校准 |
 | `UnitMap` | `TISAInstruction.unit_map` | analytical backend 当前主要验证 quantity=1 |
-| typed `Deps` | `TISADependency` | 已有 RAW/WAR/WAW/STATE/ACCUMULATE 与 readiness condition |
+| typed `Deps` | `TISADependency` | 已有 RAW/WAR/WAW/STATE/ACCUMULATE 与显式 readiness condition |
 | WQ/IQ/Fu | TISA simulator queue/ROB/in-flight state | 是行为模型，不宣称 RTL 微结构等价 |
 
 ## 3. 当前唯一编译路径

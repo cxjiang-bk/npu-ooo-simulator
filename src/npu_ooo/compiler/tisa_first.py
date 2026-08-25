@@ -155,6 +155,22 @@ def _stages_for_tile(operator: Any, tile: TileInstance) -> tuple[TISAStage, ...]
     )
 
 
+def _readiness_condition(stage: TISAStage) -> str:
+    """Name the semantic event that makes a stage eligible to issue."""
+
+    if stage.key == "load":
+        return "input_region_ready"
+    if stage.key == "store":
+        return "output_region_ready"
+    if stage.key == "transform":
+        return "full_region_ready"
+    if stage.primitive in {"matmul", "batched_matmul", "gemv"}:
+        return "operand_regions_ready"
+    if stage.primitive in {"softmax", "rmsnorm", "layernorm", "reduce"}:
+        return "semantic_tile_ready"
+    return "operand_regions_ready"
+
+
 def _dtype_bytes(dtype: str) -> int:
     normalized = str(dtype).lower().replace("torch.", "")
     return {
@@ -397,6 +413,7 @@ class TISASemanticBuilder:
                             "semantic_op_type": operator.normalized_type,
                             "paper_stage": "FC",
                             "scheduler_visible": True,
+                            "readiness_condition": _readiness_condition(stage),
                             "source_program_order": source_order[tisa_id],
                         },
                         payload_ref=f"payload:{tisa_id}",
@@ -404,14 +421,18 @@ class TISASemanticBuilder:
                 )
 
         by_id = {instruction.tisa_id: instruction for instruction in instructions}
-        dependencies: dict[str, dict[str, str]] = {tisa_id: {} for tisa_id in by_id}
+        dependencies: dict[str, dict[str, tuple[str, str]]] = {tisa_id: {} for tisa_id in by_id}
 
         def add_dependency(target: str, source: str, kind: str = "RAW") -> None:
             if target == source:
                 return
             current = dependencies[target].get(source)
-            if current is None or (current != "RAW" and kind == "RAW"):
-                dependencies[target][source] = kind
+            condition = str(
+                by_id[target].attributes.get("readiness_condition", "full_region_ready")
+            )
+            candidate = (kind, condition)
+            if current is None or (current[0] != "RAW" and kind == "RAW"):
+                dependencies[target][source] = candidate
 
         def instruction_id(tile_id: str, key: str) -> str:
             try:
@@ -538,8 +559,8 @@ class TISASemanticBuilder:
                 replace(
                     instruction,
                     dependencies=tuple(
-                        TISADependency(source=source, kind=kind)
-                        for source, kind in sorted(dependencies[current].items())
+                        TISADependency(source=source, kind=kind, condition=condition)
+                        for source, (kind, condition) in sorted(dependencies[current].items())
                     ),
                     attributes={
                         **dict(instruction.attributes),

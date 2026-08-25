@@ -138,6 +138,25 @@ class CompilerStageContractTest(unittest.TestCase):
         self.assertIn("softmax", visible_ops)
         self.assertNotIn("reduce_max", visible_ops)
         self.assertTrue({"reduce_max", "exp", "reduce_sum", "normalize"}.issubset(payload_ops))
+        readiness = {
+            instruction.op_type: instruction.attributes["readiness_condition"]
+            for instruction in compiled.tisa_program.instructions
+            if instruction.tile_id == "softmax.t0000"
+        }
+        self.assertEqual(
+            readiness,
+            {
+                "load": "input_region_ready",
+                "softmax": "semantic_tile_ready",
+                "store": "output_region_ready",
+            },
+        )
+        dependency_conditions = {
+            dependency.condition
+            for instruction in compiled.tisa_program.instructions
+            for dependency in instruction.dependencies
+        }
+        self.assertIn("semantic_tile_ready", dependency_conditions)
         self.assertEqual(compiled.backend_artifact.validate(), ())
 
 

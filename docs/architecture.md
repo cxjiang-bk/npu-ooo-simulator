@@ -213,6 +213,11 @@ fusion / reorder attributes
 backend payload recipe
 ```
 
+FC 同时给每条 stage 写入 `readiness_condition`。当前只记录语义，不改变
+analytical scheduler 的 ready 判定：load 使用 `input_region_ready`，计算阶段
+使用 `operand_regions_ready` 或复合算子的 `semantic_tile_ready`，store 使用
+`output_region_ready`。后续 partial-ready 支持可以直接消费这些条件。
+
 一个 Attention tile 的 FC 输出类似：
 
 ```text

@@ -38,6 +38,7 @@
 - [x] 第一版 region-aware tile dependency，无法证明映射时显式保守回退；
 - [x] 保存每个 GC pass 的输入/输出图与诊断 dump；
 - [x] 生成 capacity-aware residency 和多 tile ping-pong intent metadata；
+- [x] 为 FC stage 和 typed dependency 写入显式 readiness condition；
 - [ ] 完善 symbolic/dynamic shape、layout、broadcast 和边界 tile；
 - [x] 输出 per-operator tile、TISA、MAC、root traffic 和 dependency statistics；
 - [ ] 输出每个 pass 前后的独立 graph dump；
