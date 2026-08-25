@@ -103,6 +103,27 @@ class PyTorchFrontendTest(unittest.TestCase):
             {"reduce_max", "exp", "reduce_sum", "normalize"}.issubset(payload_primitives)
         )
 
+    def test_silu_uses_stablehlo_logistic_capability(self) -> None:
+        import torch
+
+        class SiLU(torch.nn.Module):
+            def forward(self, value):
+                return torch.nn.functional.silu(value)
+
+        compiled = compile_torch_module(
+            SiLU(),
+            (torch.randn(1, 4, 8),),
+            minimal_machine_config(),
+            model_id="silu",
+            tile_size=4,
+        )
+
+        self.assertIn(
+            "stablehlo.logistic",
+            {operator.attributes.get("frontend_target") for operator in compiled.graph.operators},
+        )
+        self.assertEqual(compiled.validate(), ())
+
     def test_attention_online_configuration_survives_softmax_recovery(self) -> None:
         import torch
 

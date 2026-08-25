@@ -46,6 +46,7 @@ _CAPABILITIES = {
                 "cosine",
                 "exponential",
                 "log",
+                "logistic",
                 "negate",
                 "rsqrt",
                 "sine",
