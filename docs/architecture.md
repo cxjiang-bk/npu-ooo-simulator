@@ -1,5 +1,52 @@
 # 整体架构
 
+## 总体流程图
+
+```mermaid
+flowchart TB
+    subgraph Frontend[前端：真实 PyTorch 输入]
+        A[PyTorch nn.Module] --> B[torch.export\nExportedProgram]
+        B --> C[Torch-XLA\nATen -> StableHLO]
+        C --> D[官方 StableHLO\nMLIR parse / verify]
+    end
+
+    subgraph Compiler[编译器：生成 scheduler-visible TISA]
+        D --> E[Canonical\nOperatorGraph]
+        E --> F[PassManager\ncanonicalize / recover / fuse]
+        F --> G[ScheduleSpec + TileGraph]
+        G --> H[TISAProgram]
+        H --> I[CodegenBackend]
+        I --> J[BackendArtifact\nTISA descriptor + payload]
+    end
+
+    subgraph Runtime[Runtime：提交与地址绑定]
+        J --> K[RuntimeSubmission]
+        K --> K1[physical address\ncommand chunk\ndescriptor arrival]
+    end
+
+    subgraph Device[Device：TISA 指令调度]
+        K1 --> L[reception / WQ / IQ / ROB]
+        L --> M{Device policy}
+        M --> N[Static\n按 program order issue]
+        M --> O[Dynamic\nready queue + OOO issue]
+    end
+
+    subgraph Backend[Backend：执行时序与事件]
+        N --> P[EventBackend + TimingProvider]
+        O --> P
+        P --> Q[Execution-unit payload\nDMA / MXU / Vector]
+        Q --> R[completion feedback]
+        R -. 唤醒后继 TISA .-> L
+    end
+
+    P --> S[cycles / stalls / utilization]
+    P --> T[swimlane SVG/PNG\nPerfetto JSON]
+    J -. 同一份 compiled artifact .-> N
+    J -. 同一份 compiled artifact .-> O
+```
+
+图中 `Static` 和 `Dynamic` 共享同一份 `BackendArtifact`；`RuntimeSubmission` 的提交策略与 device scheduler policy 是两个独立实验维度。
+
 ## 1. 设计约束
 
 当前架构遵守五条约束：
