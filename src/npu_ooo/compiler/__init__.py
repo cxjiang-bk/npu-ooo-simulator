@@ -21,6 +21,7 @@ from .passes import (
     default_pass_manager,
 )
 from .planner import SchedulePlanner, default_schedule_planner
+from .statistics import build_compile_statistics
 from .tisa_first import (
     TISASemanticBuilder,
     TISAStage,
@@ -45,6 +46,7 @@ __all__ = [
     "default_pass_manager",
     "SchedulePlanner",
     "default_schedule_planner",
+    "build_compile_statistics",
     "TISASemanticBuilder",
     "TISAStage",
 ]

@@ -169,6 +169,10 @@ stage_id = operator topological order
 
 `build_tile_graph()` 根据 schedule 枚举 `TileInstance`，包含 tile id、operator id、coordinates、每个维度的 `[start, stop)` bounds 和 semantic metadata，并从 operator data edge 建立 tile dependency。
 
+跨算子依赖使用 `logical_tensor_region_v1`：compiler 将 producer/consumer tile 投影到共享 tensor 的逻辑 region，只为重叠 region 建边。Matmul 的 M/N/K、broadcast elementwise、reduce/norm 和 full-tensor transform 都有显式映射；无法证明映射时才对该 operator edge 保守回退 all-to-all。`compile_statistics.json` 会记录回退边数和避免的无效依赖数。
+
+当前 reshape/transpose 采用保守的 full-tensor schedule。reshape 映射为 DMA copy，transpose 映射为 DMA transpose；它们都有明确 TISA instruction 和 backend payload，不会被静默当成零成本 alias。后续 stride-aware region planner 可以将其细化为 tile transform。
+
 ## 6. TISAProgram
 
 `TISASemanticBuilder` 从 OperatorGraph、ScheduleSpec、TileGraph 和 MachineConfig 生成 scheduler-visible descriptors。
@@ -222,6 +226,7 @@ reduce
 softmax
 rmsnorm
 layernorm
+reshape / transpose
 ```
 
 新硬件 backend 应实现同一 `CodegenBackend` contract，而不是在 CLI 中增加新分支。
@@ -290,14 +295,14 @@ TimingProvider
 RuntimeSubmission（除非实验变量就是 runtime）
 ```
 
-`manifest.json` 记录 frontend path、工具版本、machine hash、backend、policy、TISA instruction count、cycle 和 calibration status。
+`compile_statistics.json` 记录 per-operator tile/TISA/payload 数量、MAC、root-memory traffic 和依赖统计。`manifest.json` 记录 frontend path、工具版本、machine hash、backend、policy、TISA instruction count、cycle 和 calibration status。
 
 ## 12. 当前限制
 
 - StableHLO semantic importer 只覆盖已注册 operation；
 - Torch-XLA 复合模式恢复仍需扩大真实模型覆盖；
 - tile planner 是统一启发式 baseline，尚无 cost model 或 auto-tuning；
-- TileGraph 跨算子依赖仍偏保守；
+- reshape/transpose 当前是 full-tensor DMA transform，尚未支持 stride-aware tile transform；
 - analytical backend 不是 cycle-accurate RTL；
 - 当前 MXU VCS 日志只有 descriptor-to-done 区间，不能直接作为 isolated Matmul compute latency；
 - 真实 ResNet50、BERT、GPT-J、LLaMA2、DeepSeek block 尚未形成可复现实验集。

@@ -43,7 +43,7 @@ class TISAStage:
 
 
 def _unit_map(primitive: str) -> UnitMap:
-    if primitive in {"load", "load_transpose", "store"}:
+    if primitive in {"load", "load_transpose", "store", "copy", "transpose"}:
         return UnitMap("dma", affinity="data")
     if primitive in {"matmul"}:
         return UnitMap("tensor", affinity="matrix")
@@ -132,6 +132,9 @@ def _stages_for_tile(operator: Any, tile: TileInstance) -> tuple[TISAStage, ...]
                 ("store", "store"),
             ]
         )
+    elif op_type in {"reshape", "transpose"}:
+        primitive = "copy" if op_type == "reshape" else "transpose"
+        stages = [("transform", primitive)]
     else:
         raise NotImplementedError(
             f"TISA-first semantic builder does not support operator '{op_type}'"
@@ -268,6 +271,12 @@ def _operand_geometry(
                 starts.append(output_starts[output_axis])
                 shape.append(output_shape[output_axis])
         return tuple(starts), tuple(shape)
+
+    if op_type in {"reshape", "transpose"}:
+        full_shape = _resolved_tensor_shape(tensor)
+        if full_shape is None:
+            return None
+        return (0,) * len(full_shape), full_shape
 
     all_dimensions = (*iteration, *reduction)
     if name in operator.outputs and op_type == "reduce":

@@ -20,6 +20,8 @@ _PRIMITIVE_PALETTE = {
     "tisa_instruction": "#263238",
     "load": "#377eb8",
     "load_transpose": "#00a6a6",
+    "copy": "#4c78a8",
+    "transpose": "#17a2a4",
     "store": "#4daf4a",
     "matmul": "#ff7f00",
     "elementwise": "#984ea3",

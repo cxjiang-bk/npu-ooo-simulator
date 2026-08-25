@@ -499,13 +499,36 @@ def _operator_graph_from_fx_graph(
         elif op_type == SemanticOpType.SOFTMAX.value:
             semantic_attributes["axes"] = list(_dim_argument(node, len(input_shapes[0])))
         elif op_type == SemanticOpType.TRANSPOSE.value:
-            if len(node_args) < 3 or not all(isinstance(item, int) for item in node_args[1:3]):
-                raise FrontendImportError(f"transpose node '{name}' requires constant dimensions")
-            transpose_dims = tuple(
-                item if item >= 0 else len(input_shapes[0]) + item
-                for item in node_args[1:3]
-            )
-            semantic_attributes["transpose_dims"] = list(transpose_dims)
+            normalized_target = target_name.lower().replace("::", ".")
+            if "permute" in normalized_target:
+                permutation = node_args[1] if len(node_args) > 1 else None
+                if not isinstance(permutation, (tuple, list)) or not all(
+                    isinstance(item, int) for item in permutation
+                ):
+                    raise FrontendImportError(
+                        f"permute node '{name}' requires a constant permutation"
+                    )
+                normalized = tuple(
+                    item if item >= 0 else len(input_shapes[0]) + item
+                    for item in permutation
+                )
+                if sorted(normalized) != list(range(len(input_shapes[0]))):
+                    raise FrontendImportError(
+                        f"permute node '{name}' has invalid permutation {normalized}"
+                    )
+                semantic_attributes["transpose_dims"] = list(normalized)
+            else:
+                if len(node_args) < 3 or not all(
+                    isinstance(item, int) for item in node_args[1:3]
+                ):
+                    raise FrontendImportError(
+                        f"transpose node '{name}' requires constant dimensions"
+                    )
+                transpose_dims = tuple(
+                    item if item >= 0 else len(input_shapes[0]) + item
+                    for item in node_args[1:3]
+                )
+                semantic_attributes["transpose_dims"] = list(transpose_dims)
         operators.append(
             OperatorSpec(
                 op_id=name,

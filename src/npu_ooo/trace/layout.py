@@ -32,6 +32,7 @@ _STAGE_BY_FILENAME: dict[str, str] = {
     "operator_graph.dot": "01_graph_ir",
     "operator_graph.svg": "01_graph_ir",
     "schedule.json": "02_schedule_tile",
+    "compile_statistics.json": "02_schedule_tile",
     "tile_graph.json": "02_schedule_tile",
     "tile_graph.dot": "02_schedule_tile",
     "tisa_program.json": "03_tisa",
@@ -73,6 +74,8 @@ def _root_readme() -> str:
             "`07_trace` 中比较周期和泳道。",
             "Torch-XLA 导出的可读程序是 `00_frontend/generated.mlir`；",
             "`stablehlo_module.json` 保存程序文本、producer、版本、验证状态和 provenance。",
+            "`02_schedule_tile/compile_statistics.json` 汇总各算子的 tile、TISA、MAC、",
+            "root-memory traffic 和 region dependency 数量。",
             "`03_tisa/tisa_program.json` 是 device scheduler 的输入；`04_backend/` 保存",
             "与每条 TISA instruction 绑定的硬件 payload。",
         ]

@@ -77,7 +77,7 @@ class RuntimeSubmissionTest(unittest.TestCase):
                 operand_offsets={(instruction.tisa_id, operand.name): 10**9},
             )
 
-    def test_lifetime_allocator_reuses_only_dependency_ordered_tensors(self) -> None:
+    def test_lifetime_allocator_does_not_infer_whole_buffer_order_from_tile_order(self) -> None:
         lifetimes = derive_tensor_lifetimes(self.compiled.tisa_program)
         reuse_pairs = derive_tensor_reuse_pairs(self.compiled.tisa_program)
         bindings = allocate_buffer_bindings(
@@ -87,10 +87,8 @@ class RuntimeSubmissionTest(unittest.TestCase):
             reuse_pairs=reuse_pairs,
         )
         reused = [binding for binding in bindings if binding.attributes.get("reused_from")]
-        self.assertTrue(reused)
-        self.assertTrue(
-            all((binding.attributes["reused_from"], binding.tensor) in reuse_pairs for binding in reused)
-        )
+        self.assertEqual(reuse_pairs, frozenset())
+        self.assertFalse(reused)
         submission = create_runtime_submission(self.compiled.backend_artifact, bindings)
         self.assertEqual(submission.validate(self.compiled.tisa_program), ())
 

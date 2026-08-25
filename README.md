@@ -38,6 +38,8 @@ PyTorch nn.Module
 - 使用 OpenXLA 官方 StableHLO bindings 执行 MLIR parse 和 verify；
 - 将支持的 StableHLO semantic family 导入统一 OperatorGraph；
 - 自动执行图 canonicalization、复合算子恢复、静态切 tile 和 TISA 生成；
+- 支持多头 Attention 所需的 reshape、permute、scale、additive mask 和 batched Matmul；
+- 使用逻辑 tensor region 生成跨算子 tile dependency，并输出 MAC/traffic/依赖统计；
 - Static 和 Dynamic device policy 共享同一份 `TISAProgram/BackendArtifact`；
 - runtime 单独负责物理地址、command chunk、descriptor availability 和提交开销；
 - backend codegen、event engine、timing provider 均可替换；
@@ -60,16 +62,15 @@ OpenXLA StableHLO wheel
 
 ## 快速运行
 
-编译并动态调度一个 PyTorch attention micrograph：
+编译并动态调度一个真实的两头 PyTorch Attention block：
 
 ```bash
 cd /home/lora/OpenTPU/npu-ooo-simulator
 
 PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-model \
-  --torch-module examples.torch_models:AttentionMicrograph \
+  --torch-module examples.torch_models:MultiHeadAttentionBlock \
   --input-shape 1,4,8 \
-  --input-shape 1,4,8 \
-  --input-shape 1,4,8 \
+  --input-shape 1,1,4,4 \
   --tile-size 4 \
   --policy dynamic_ready_queue \
   --output-dir out/attention-dynamic
@@ -79,8 +80,8 @@ PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-model \
 
 ```bash
 PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-model \
-  --torch-module examples.torch_models:AttentionMicrograph \
-  --input-shape 1,4,8 --input-shape 1,4,8 --input-shape 1,4,8 \
+  --torch-module examples.torch_models:MultiHeadAttentionBlock \
+  --input-shape 1,4,8 --input-shape 1,1,4,4 \
   --tile-size 4 \
   --policy static_pipeline \
   --output-dir out/attention-static
@@ -146,6 +147,7 @@ out/<run>/
 │   └── operator_graph.{dot,svg}
 ├── 02_schedule_tile/
 │   ├── schedule.json
+│   ├── compile_statistics.json
 │   └── tile_graph.{json,dot}
 ├── 03_tisa/
 │   ├── tisa_program.json
@@ -166,7 +168,7 @@ out/<run>/
     └── perfetto.json
 ```
 
-推荐按目录编号依次检查。`generated.mlir` 是确认 Torch-XLA 输出的第一现场，`tisa_program.json` 是 device scheduler 的输入，`backend_artifact.json` 记录每条 TISA instruction 对应的后端 payload。
+推荐按目录编号依次检查。`generated.mlir` 是确认 Torch-XLA 输出的第一现场；`compile_statistics.json` 汇总每个算子的 tile、TISA、MAC、root-memory traffic 和依赖；`tisa_program.json` 是 device scheduler 的输入；`backend_artifact.json` 记录每条 TISA instruction 对应的后端 payload。
 
 ## 调度边界
 

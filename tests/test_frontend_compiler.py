@@ -4,6 +4,7 @@ import unittest
 from npu_ooo.arch import minimal_machine_config
 from npu_ooo.compiler import compile_torch_module
 from npu_ooo.frontend import official_stablehlo_available, torch_xla_available
+from npu_ooo.scheduler import SchedulerPolicy, schedule_tisa_program
 
 
 FRONTEND_AVAILABLE = bool(
@@ -37,6 +38,11 @@ class PyTorchFrontendTest(unittest.TestCase):
         self.assertEqual(compiled.stablehlo.producer, "torch-xla")
         self.assertTrue(compiled.stablehlo.verified)
         self.assertEqual([operator.op_type for operator in compiled.graph.operators], ["matmul", "matmul"])
+        self.assertEqual(len(compiled.tile_graph.dependencies), 16)
+        self.assertEqual(
+            compiled.tile_graph.attributes["avoided_all_to_all_dependencies"],
+            48,
+        )
         self.assertTrue(compiled.tisa_program.instructions)
         self.assertEqual(compiled.validate(), ())
 
@@ -59,6 +65,52 @@ class PyTorchFrontendTest(unittest.TestCase):
         self.assertTrue(any(instruction.dependencies for instruction in compiled.tisa_program.instructions))
         primitives = {instruction.op_type for instruction in compiled.tisa_program.instructions}
         self.assertTrue({"matmul", "reduce_max", "exp", "normalize"}.issubset(primitives))
+
+    def test_multi_head_attention_compiles_transforms_and_shares_static_dynamic_artifact(self) -> None:
+        import torch
+
+        from examples.torch_models import MultiHeadAttentionBlock
+
+        compiled = compile_torch_module(
+            MultiHeadAttentionBlock(),
+            (torch.randn(1, 4, 8), torch.zeros(1, 1, 4, 4)),
+            minimal_machine_config(),
+            model_id="multi-head-attention",
+            tile_size=4,
+        )
+
+        operator_types = {operator.op_type for operator in compiled.graph.operators}
+        self.assertTrue(
+            {"reshape", "transpose", "batched_matmul", "softmax"}.issubset(operator_types)
+        )
+        primitives = {task.primitive for task in compiled.backend_artifact.execution_graph.tasks}
+        self.assertTrue({"copy", "transpose"}.issubset(primitives))
+        self.assertEqual(
+            compiled.tile_graph.attributes["dependency_model"],
+            "logical_tensor_region_v1",
+        )
+        self.assertGreater(
+            compiled.tile_graph.attributes["avoided_all_to_all_dependencies"],
+            0,
+        )
+        statistics = compiled.attributes["compile_statistics"]
+        self.assertEqual(statistics["summary"]["tile_count"], len(compiled.tile_graph.tiles))
+        self.assertGreater(statistics["summary"]["macs"], 0)
+
+        artifact_before = compiled.backend_artifact.to_dict()
+        static_result = schedule_tisa_program(
+            compiled.backend_artifact,
+            minimal_machine_config(),
+            SchedulerPolicy.STATIC_PIPELINE,
+        )
+        dynamic_result = schedule_tisa_program(
+            compiled.backend_artifact,
+            minimal_machine_config(),
+            SchedulerPolicy.DYNAMIC_READY_QUEUE,
+        )
+        self.assertEqual(compiled.backend_artifact.to_dict(), artifact_before)
+        self.assertGreater(static_result.total_cycles, 0)
+        self.assertGreater(dynamic_result.total_cycles, 0)
 
     def test_public_compiler_api_has_no_legacy_frontend_wrappers(self) -> None:
         import npu_ooo.compiler as compiler

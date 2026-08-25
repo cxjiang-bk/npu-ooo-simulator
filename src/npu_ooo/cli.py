@@ -371,6 +371,10 @@ def run_compile_model(args: argparse.Namespace) -> int:
     write_artifact_json(compiled.frontend, args.output_dir / "frontend_import.json")
     write_artifact_json(compiled.graph, args.output_dir / "canonical_graph.json")
     write_artifact_json(compiled.schedule, args.output_dir / "schedule.json")
+    write_artifact_json(
+        compiled.attributes["compile_statistics"],
+        args.output_dir / "compile_statistics.json",
+    )
     write_artifact_json(compiled.tile_graph, args.output_dir / "tile_graph.json")
     write_artifact_json(compiled.tisa_program, args.output_dir / "tisa_program.json")
     write_artifact_json(compiled, args.output_dir / "compiled_artifact.json")

@@ -36,7 +36,7 @@ PyTorch nn.Module
 优先顺序：
 
 1. 完成 Linear、batched Matmul、reshape/transpose、bias、activation 的组合覆盖；
-2. 支持完整 multi-head attention，包括 scale、mask、head reshape 和 output projection；
+2. 支持完整 multi-head attention，包括 scale、mask、head reshape 和 output projection（首个静态 shape 两头 Attention 已完成）；
 3. 支持 decoder block 的 RoPE、KV-cache、SwiGLU/MLP 和 residual；
 4. 支持 ResNet bottleneck 所需的 Conv2D、BatchNorm inference、ReLU 和 pooling；
 5. 接入 BERT、GPT-J、LLaMA2、DeepSeek 的一个真实 block，最后再扩展 full model。
@@ -58,7 +58,7 @@ Torch-XLA StableHLO operation
 
 目标：在扩大模型覆盖之前，使 tile 数量、依赖和内存流量都可核对。
 
-- 将跨算子的保守依赖细化为基于 tile region 的依赖；
+- 将跨算子的保守依赖细化为基于 tile region 的依赖（第一版 logical region 映射已完成）；
 - 完善 symbolic/dynamic shape 与边界 tile；
 - 为 layout、transpose、broadcast、reduction barrier 建立显式规则；
 - 给 TISA operand 增加可绑定的地址表达式和 memory scope；

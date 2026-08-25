@@ -26,6 +26,8 @@ _ANALYTICAL_PRIMITIVES = frozenset(
         "normalize",
         "square",
         "center",
+        "copy",
+        "transpose",
         "rmsnorm",
         "layernorm_mean",
         "layernorm",

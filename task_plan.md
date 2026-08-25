@@ -22,7 +22,7 @@
 
 - [x] Matmul、elementwise、reduce、Softmax、RMSNorm、LayerNorm 基础路径；
 - [x] attention micrograph 的 `QK^T -> Softmax -> PV`；
-- [ ] 完整 multi-head attention：scale、mask、reshape、output projection；
+- [x] 首个静态 shape multi-head attention：scale、additive mask、head reshape、output projection；
 - [ ] decoder block：RoPE、KV-cache、SwiGLU/MLP、residual；
 - [ ] ResNet bottleneck：Conv2D、BatchNorm inference、ReLU、pooling；
 - [ ] BERT/GPT-J/LLaMA2/DeepSeek 的真实 one-block module。
@@ -32,9 +32,10 @@
 ## 阶段 2：编译与 TISA 正确性
 
 - [x] PassManager、统一 tile planner、TISA descriptor 和 backend payload ownership；
-- [ ] 细化 region-aware tile dependency，减少不必要的 all-to-all 等待；
+- [x] 第一版 region-aware tile dependency，无法证明映射时显式保守回退；
 - [ ] 完善 symbolic/dynamic shape、layout、broadcast 和边界 tile；
-- [ ] 输出 pass 前后 graph、tile 数、MAC、traffic 和 dependency diagnostics；
+- [x] 输出 per-operator tile、TISA、MAC、root traffic 和 dependency statistics；
+- [ ] 输出每个 pass 前后的独立 graph dump；
 - [ ] 为多种 tile candidate 增加可解释 cost model。
 
 验收：相同 module、shape、tile size、MachineConfig 和 backend 产生稳定 compiled artifact；static/dynamic 只改变 policy。
@@ -64,4 +65,4 @@ prefill 与 decode 必须是不同 case；analytical、source-derived 和 RTL-ob
 
 ## 当前下一步
 
-优先完成一个真实 multi-head attention 或 decoder block，并同时细化 tile region dependency。前端语义稳定后再增加 scheduler 微结构和外部 timing backend，避免用不完整的图去校准硬件时序。
+下一步把当前 full-tensor reshape/transpose 细化为 stride-aware tile transform，并在同一生产路径加入 pre-norm、RoPE、KV-cache 和 SwiGLU，形成第一个真实 decoder block。随后再增加 scheduler 微结构和外部 timing backend。

@@ -19,6 +19,7 @@ from .matmul import LoweringResult, _regions_overlap, _root_memory, lower_matmul
 from .norm import lower_rmsnorm_graph
 from .reduce import lower_reduce_graph
 from .softmax import lower_softmax_graph
+from .transform import lower_transform_graph
 
 
 GraphLowerer = Callable[[OperatorGraph, ScheduleSpec, MachineConfig], LoweringResult]
@@ -59,6 +60,7 @@ def default_lowering_registry() -> LoweringRegistry:
     registry.register(("softmax",), lower_softmax_graph)
     registry.register(("rmsnorm",), lower_rmsnorm_graph)
     registry.register(("layernorm",), lower_layernorm_graph)
+    registry.register(("reshape", "transpose"), lower_transform_graph)
     return registry
 
 

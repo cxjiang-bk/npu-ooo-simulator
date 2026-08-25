@@ -29,6 +29,7 @@ from npu_ooo.lowering import LoweringRegistry, default_lowering_registry
 
 from .passes import default_pass_manager
 from .planner import default_schedule_planner
+from .statistics import build_compile_statistics
 from .tisa_first import TISASemanticBuilder
 
 
@@ -138,6 +139,13 @@ def compile_operator_graph(
         machine,
         program=program,
     )
+    compile_statistics = build_compile_statistics(
+        graph,
+        tile_graph,
+        program,
+        backend_artifact,
+        machine,
+    )
 
     result = CompiledArtifact(
         frontend=frontend,
@@ -174,6 +182,7 @@ def compile_operator_graph(
             "codegen_backend": selected_codegen.name,
             "codegen_backend_capabilities": selected_codegen.capabilities.to_dict(),
             "model_id": source_frontend.model_id,
+            "compile_statistics": compile_statistics,
         },
     )
     issues = result.validate()
