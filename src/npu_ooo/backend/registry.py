@@ -24,6 +24,7 @@ _ANALYTICAL_PRIMITIVES = frozenset(
         "reduce_sum_square",
         "exp",
         "normalize",
+        "softmax",
         "square",
         "center",
         "copy",

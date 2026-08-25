@@ -5,8 +5,10 @@
 ```mermaid
 flowchart LR
     A[PyTorch nn.Module] --> B[PyTorch 前端\ntorch.export + Torch-XLA + StableHLO]
-    B --> C[编译器\nOperatorGraph -> TileGraph -> TISA]
-    C --> D[BackendArtifact]
+    B --> C[GC\nStableHLO -> Semantic TileGraph]
+    C --> C2[FC\nTileGraph -> TISA Dialect]
+    C2 --> C3[TISA Generator\nDialect -> TISAProgram]
+    C3 --> D[BackendArtifact]
     D --> E[Runtime\n地址绑定与提交]
     E --> F[Device scheduler\nStatic / Dynamic OOO]
     F --> G[Backend 仿真\n周期与执行事件]
@@ -20,8 +22,11 @@ PyTorch nn.Module
   -> torch.export.ExportedProgram
   -> Torch-XLA
   -> 官方 StableHLO
-  -> Canonical OperatorGraph
-  -> ScheduleSpec / TileGraph
+  -> Graph Compiler (GC)
+  -> software-scheduled Semantic TileGraph
+  -> Fusion Compiler (FC)
+  -> TISA Dialect
+  -> TISA Generator
   -> TISAProgram
   -> BackendArtifact
   -> RuntimeSubmission
@@ -37,7 +42,7 @@ PyTorch nn.Module
 - 使用 Torch-XLA 完成 ATen 到 StableHLO 的 legalization；
 - 使用 OpenXLA 官方 StableHLO bindings 执行 MLIR parse 和 verify；
 - 将支持的 StableHLO semantic family 导入统一 OperatorGraph；
-- 自动执行图 canonicalization、复合算子恢复、静态切 tile 和 TISA 生成；
+- 以论文 GC/FC 为边界执行图 canonicalization、复合算子恢复、切 tile、依赖构造和 TISA dialect 生成；
 - 支持多头 Attention 所需的 reshape、permute、scale、additive mask 和 batched Matmul；
 - 使用逻辑 tensor region 生成跨算子 tile dependency，并输出 MAC/traffic/依赖统计；
 - Static 和 Dynamic device policy 共享同一份 `TISAProgram/BackendArtifact`；
@@ -142,13 +147,16 @@ out/<run>/
 │   ├── generated.mlir                # Torch-XLA StableHLO
 │   ├── stablehlo_module.json         # verifier、版本和 provenance
 │   └── frontend_import.json          # StableHLO 导入结果
-├── 01_graph_ir/
-│   ├── canonical_graph.json
-│   └── operator_graph.{dot,svg}
-├── 02_schedule_tile/
-│   ├── schedule.json
+├── 01_gc/
+│   ├── canonical_graph.json       # GC 规范化后的算子图
+│   ├── gc_artifact.json            # GC 完整阶段产物
+│   ├── schedule.json               # 初始软件 schedule
 │   ├── compile_statistics.json
-│   └── tile_graph.{json,dot}
+│   ├── tile_graph.{json,dot}
+│   └── operator_graph.{dot,svg}
+├── 02_fc/
+│   ├── tisa_dialect.json           # FC 输出的 TISA semantic ops
+│   └── fc_diagnostics.json
 ├── 03_tisa/
 │   ├── tisa_program.json
 │   └── compiled_artifact.json
@@ -168,7 +176,9 @@ out/<run>/
     └── perfetto.json
 ```
 
-推荐按目录编号依次检查。`generated.mlir` 是确认 Torch-XLA 输出的第一现场；`compile_statistics.json` 汇总每个算子的 tile、TISA、MAC、root-memory traffic 和依赖；`tisa_program.json` 是 device scheduler 的输入；`backend_artifact.json` 记录每条 TISA instruction 对应的后端 payload。
+推荐按目录编号依次检查。`generated.mlir` 是确认 Torch-XLA 输出的第一现场；`01_gc/gc_artifact.json` 展示 GC 的融合、切分、初始顺序和依赖；`02_fc/tisa_dialect.json` 展示 FC 生成的语义 TISA op；`03_tisa/tisa_program.json` 是 device scheduler 的输入；`backend_artifact.json` 记录每条 TISA instruction 对应的后端 payload。复合算子的 reduce/exp 等内部步骤只在 backend payload 中出现。
+
+当前 Softmax 的语义 TISA 已按 tile 粒度生成 `load -> softmax -> store`，但 analytical backend 仍使用 materialized row-wise lowering；online Softmax state update 尚未接入，不能把当前结果称为论文硬件的 online 实现。
 
 ## 调度边界
 
@@ -202,9 +212,10 @@ src/npu_ooo/compiler/pipeline.py         线性 PyTorch-to-TISA 主流程
 src/npu_ooo/frontend/bridge.py           torch.export 捕获与源图 provenance
 src/npu_ooo/frontend/torch_xla_export.py Torch-XLA StableHLO 导出
 src/npu_ooo/frontend/stablehlo_official.py 官方 verifier 和导入边界
-src/npu_ooo/compiler/passes.py           Canonical graph passes
-src/npu_ooo/compiler/planner.py          自动 tile planner
-src/npu_ooo/compiler/tisa_first.py       TileGraph 到 TISA descriptors
+src/npu_ooo/compiler/graph_compiler.py   论文 GC：图优化、切 tile、依赖
+src/npu_ooo/compiler/fusion_compiler.py  论文 FC：TileGraph 到 TISA dialect
+src/npu_ooo/compiler/tisa_generator.py   TISA dialect 到 virtual TISAProgram
+src/npu_ooo/compiler/tisa_first.py       TISA stage/metadata 构造
 src/npu_ooo/backend/                     可替换 backend 与 timing provider
 src/npu_ooo/simulator/tisa.py            TISA device scheduler simulator
 ```

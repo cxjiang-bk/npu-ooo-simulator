@@ -10,7 +10,7 @@ TISA 与项目中的 `TileInstance` 处于相近粒度，但两者不是同一�
 Operand = (TileShape, TileMem, AccessType)
 TileMem = (base, scope)
 TISA_Inst = (OpType, Operands, Attributes, UnitMap)
-Deps = (src, RAW | WAR | WAW, condition)
+Deps = (src, RAW | WAR | WAW | STATE | ACCUMULATE, condition)
 ```
 
 对应的编译和执行层次是：
@@ -19,10 +19,13 @@ Deps = (src, RAW | WAR | WAW, condition)
 PyTorch / StableHLO graph
         |
         v
-graph optimization + tiling
+Graph Compiler (GC): graph optimization + tiling + typed tile dependencies
         |
         v
-TileInstance
+software-scheduled TileGraph
+        |
+        v
+Fusion Compiler (FC): TISA dialect
         |
         v
 TISAInstruction              device scheduler 可见
@@ -38,13 +41,13 @@ backend execution payload    DMA/MXU/Vector 等单元内部执行
 | 论文概念 | 当前实现 | 当前边界 |
 | --- | --- | --- |
 | tile bounds | `TileInstance.bounds` | 已支持静态 resolved shape 与边界 tile |
-| `OpType` | `TISAInstruction.op_type`、`semantic_family` | 部分 composite 会按资源 stage 拆分 |
+| `OpType` | `TISAInstruction.op_type`、`semantic_family` | 复合算子保持 semantic op，按 EU stage 拆分 |
 | `TileShape` | `TISAOperand.tile_shape` | 尚缺通用 symbolic shape binding |
 | `TileMem` | `TISAOperand.tile_mem` | 已有 scope/offset/size，地址表达式仍需扩展 |
 | `AccessType` | operand/buffer access | 已支持 read/write/read-write |
 | `Attributes` | `TISAInstruction.attributes` | partial-ready/reorder 仍需继续校准 |
 | `UnitMap` | `TISAInstruction.unit_map` | analytical backend 当前主要验证 quantity=1 |
-| typed `Deps` | `TISADependency` | 已有 RAW/WAR/WAW 与 readiness condition |
+| typed `Deps` | `TISADependency` | 已有 RAW/WAR/WAW/STATE/ACCUMULATE 与 readiness condition |
 | WQ/IQ/Fu | TISA simulator queue/ROB/in-flight state | 是行为模型，不宣称 RTL 微结构等价 |
 
 ## 3. 当前唯一编译路径
@@ -54,8 +57,11 @@ PyTorch nn.Module
   -> torch.export.ExportedProgram
   -> Torch-XLA StableHLO
   -> official StableHLO parse/verify
-  -> Canonical OperatorGraph
-  -> ScheduleSpec / TileGraph
+  -> Graph Compiler (GC)
+  -> GCArtifact / software-scheduled TileGraph
+  -> Fusion Compiler (FC)
+  -> TISADialectProgram
+  -> TISA Generator
   -> TISAProgram
   -> CodegenBackend
   -> BackendArtifact(TISA descriptors + bound payload)
@@ -67,7 +73,7 @@ Torch-XLA 可能把 Softmax、Norm 等复合算子展开成基础 StableHLO oper
 
 ## 4. Scheduler 调度什么
 
-全局 static/dynamic scheduler 只调度 `TISAInstruction`，不调度独立的 backend `ExecutionTask`：
+全局 static/dynamic scheduler 只调度 `TISAInstruction`，不调度独立的 backend `ExecutionTask`。FC 对 Softmax、RMSNorm、LayerNorm 等复合算子只生成语义 TISA operation；`reduce_max/exp/reduce_sum/normalize` 等步骤属于该 instruction 的 backend-local payload：
 
 ```text
 TISA instruction ready
@@ -83,7 +89,12 @@ TISA instruction ready
 TISA load-A -> TISA load-B -> TISA matmul -> TISA store
 ```
 
-其中一条 `TISA matmul` 的 analytical payload 仍可包含 execution-unit 内部 timing task，但这个 task 不会重新进入全局 OOO ready queue。因此不同 tile 的内部步骤不会绕过 TISA dependency 被任意重排。
+其中一条 `TISA matmul` 或 `TISA softmax` 的 analytical payload 仍可包含 execution-unit 内部 timing task，但这些 task 不会重新进入全局 OOO ready queue。因此不同 tile 的内部步骤不会绕过 TISA dependency 被任意重排。
+
+实现边界需要特别区分：当前 analytical Softmax payload 是 materialized
+row-wise `max/sum -> exp -> normalize`，并非论文式 online state update。
+跨 tile 的 primitive 边只用于 payload timing，不能反向推导成全局 TISA
+依赖；online lowering 将作为后续 backend capability 单独接入。
 
 `ExecutionTask` 仍然有价值：它是 backend timing/event 表达，也是泳道图中 DMA、MXU、Vector lane 的来源。它不是论文 scheduler 的输入 ISA。
 
@@ -112,6 +123,8 @@ Backend Timing/Event
 
 - PyTorch 到 Torch-XLA/official StableHLO 的唯一前端；
 - TileGraph 到 TISA descriptor 与 BackendArtifact；
+- 论文 GC、FC、TISA Generator 的显式 Python 语义边界与阶段产物；
+- 复合 Softmax/Norm 的 semantic TISA instruction 与 backend-local primitive payload 分离；
 - TISA instruction 粒度的 static/dynamic scheduler；
 - descriptor arrival、queue/ROB/window、资源状态和 completion feedback 的 analytical 模型；
 - instruction 与 payload 两层 trace；

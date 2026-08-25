@@ -61,8 +61,8 @@ class CompileModelCliTest(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             expected_root = {
                 "00_frontend",
-                "01_graph_ir",
-                "02_schedule_tile",
+                "01_gc",
+                "02_fc",
                 "03_tisa",
                 "04_backend",
                 "05_runtime",
@@ -74,8 +74,10 @@ class CompileModelCliTest(unittest.TestCase):
             }
             self.assertEqual({path.name for path in output.iterdir()}, expected_root)
             self.assertTrue((output / "00_frontend" / "generated.mlir").exists())
-            self.assertTrue((output / "01_graph_ir" / "operator_graph.svg").exists())
-            self.assertTrue((output / "02_schedule_tile" / "compile_statistics.json").exists())
+            self.assertTrue((output / "01_gc" / "operator_graph.svg").exists())
+            self.assertTrue((output / "01_gc" / "gc_artifact.json").exists())
+            self.assertTrue((output / "01_gc" / "compile_statistics.json").exists())
+            self.assertTrue((output / "02_fc" / "tisa_dialect.json").exists())
             self.assertTrue((output / "03_tisa" / "tisa_program.json").exists())
             self.assertTrue((output / "07_trace" / "swimlane.svg").exists())
 

@@ -6,13 +6,14 @@
 
 ## 当前状态
 
-当前已完成阶段 1-3：
+当前已完成阶段 1-3，并完成论文 GC/FC 阶段对齐的第一版：
 
 1. `torch.export -> Torch-XLA -> official StableHLO -> Canonical OperatorGraph` 唯一前端；
-2. Canonical graph passes、统一 tile planner、TISA-first codegen；
-3. RuntimeSubmission、物理地址绑定、TISA instruction 粒度的 static/dynamic simulator；
-4. 可配置 MachineConfig，以及 codegen、timing、event backend registry；
-5. 分阶段 artifact、泳道图、Perfetto trace 和 RTL completion profile importer。
+2. Graph Compiler（GC）：Canonical graph passes、统一 tile planner、region/state tile dependency；
+3. Fusion Compiler（FC）与 TISA Generator：TISA dialect proxy、semantic descriptor 和 backend payload ownership；
+4. RuntimeSubmission、物理地址绑定、TISA instruction 粒度的 static/dynamic simulator；
+5. 可配置 MachineConfig，以及 codegen、timing、event backend registry；
+6. 分阶段 artifact、泳道图、Perfetto trace 和 RTL completion profile importer。
 
 已经删除的生产路径：手写 `src/npu_ooo/benchmarks`、直接 JSON/StableHLO 输入、项目自有 StableHLO emitter、算子专用 CLI 和 primitive scheduler 入口。
 
@@ -32,6 +33,8 @@
 ## 阶段 2：编译与 TISA 正确性
 
 - [x] PassManager、统一 tile planner、TISA descriptor 和 backend payload ownership；
+- [x] 明确 GCArtifact、TISADialectProgram、TISAProgram 三个编译阶段契约；
+- [x] 复合 Softmax/Norm 保持 semantic TISA op，内部 primitive 退回 backend payload；
 - [x] 第一版 region-aware tile dependency，无法证明映射时显式保守回退；
 - [ ] 完善 symbolic/dynamic shape、layout、broadcast 和边界 tile；
 - [x] 输出 per-operator tile、TISA、MAC、root traffic 和 dependency statistics；
@@ -65,4 +68,4 @@ prefill 与 decode 必须是不同 case；analytical、source-derived 和 RTL-ob
 
 ## 当前下一步
 
-下一步把当前 full-tensor reshape/transpose 细化为 stride-aware tile transform，并在同一生产路径加入 pre-norm、RoPE、KV-cache 和 SwiGLU，形成第一个真实 decoder block。随后再增加 scheduler 微结构和外部 timing backend。
+先补齐 GC 的独立 pass dump、residency/ping-pong 规划和 Attention 的在线 Softmax 状态依赖；再把 FC 的 TISA dialect metadata 与 `TileMem`/partial-ready 条件细化。之后继续加入 stride-aware transform、RoPE、KV-cache 和 SwiGLU，形成第一个真实 decoder block。scheduler 微结构和外部 timing backend 放在语义契约稳定之后。

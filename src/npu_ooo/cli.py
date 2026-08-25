@@ -370,12 +370,20 @@ def run_compile_model(args: argparse.Namespace) -> int:
     )
     write_artifact_json(compiled.frontend, args.output_dir / "frontend_import.json")
     write_artifact_json(compiled.graph, args.output_dir / "canonical_graph.json")
+    if compiled.gc_artifact is not None:
+        write_artifact_json(compiled.gc_artifact, args.output_dir / "gc_artifact.json")
     write_artifact_json(compiled.schedule, args.output_dir / "schedule.json")
     write_artifact_json(
         compiled.attributes["compile_statistics"],
         args.output_dir / "compile_statistics.json",
     )
     write_artifact_json(compiled.tile_graph, args.output_dir / "tile_graph.json")
+    if compiled.tisa_dialect is not None:
+        write_artifact_json(compiled.tisa_dialect, args.output_dir / "tisa_dialect.json")
+        write_artifact_json(
+            compiled.tisa_dialect.attributes,
+            args.output_dir / "fc_diagnostics.json",
+        )
     write_artifact_json(compiled.tisa_program, args.output_dir / "tisa_program.json")
     write_artifact_json(compiled, args.output_dir / "compiled_artifact.json")
     write_artifact_json(compiled.backend_artifact, args.output_dir / "backend_artifact.json")

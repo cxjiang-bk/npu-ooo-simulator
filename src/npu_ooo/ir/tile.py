@@ -347,6 +347,46 @@ def build_tile_graph(graph: OperatorGraph, schedule: ScheduleSpec) -> TileGraph:
             TileDependency(producer.tile_id, consumer.tile_id, edge.tensor, "region_data")
             for producer, consumer in selected
         )
+
+    # GC owns reduction/state ordering.  Keeping these edges in the
+    # TileGraph makes the software-scheduled output complete before FC lowers
+    # it to TISA dependencies.  Independent rows remain free to overlap.
+    for operator in graph.operators:
+        if not operator.reduction_dims:
+            continue
+        operator_tiles = by_operator[operator.op_id]
+        reduction_names = tuple(name for name, _ in operator.reduction_dims)
+        iteration_names = tuple(name for name, _ in operator.iteration_dims)
+        rows: dict[tuple[int, ...], list[TileInstance]] = {}
+        for tile in operator_tiles:
+            rows.setdefault(
+                tuple(tile.bound_map[name][0] for name in iteration_names),
+                [],
+            ).append(tile)
+        if operator.normalized_type == "softmax":
+            # The current backend uses materialized row-wise softmax.  Its
+            # max/sum finalization is encoded by FC below; an online state
+            # chain will be emitted once the online lowering is enabled.
+            continue
+        kind = (
+            "accumulate"
+            if operator.normalized_type in {"matmul", "batched_matmul", "gemv"}
+            else "state"
+        )
+        for row_tiles in rows.values():
+            ordered = sorted(
+                row_tiles,
+                key=lambda tile: tuple(tile.bound_map[name][0] for name in reduction_names),
+            )
+            dependencies.extend(
+                TileDependency(
+                    producer.tile_id,
+                    consumer.tile_id,
+                    None,
+                    kind,
+                )
+                for producer, consumer in zip(ordered, ordered[1:])
+            )
     result = TileGraph(
         graph.graph_id,
         tuple(tiles),

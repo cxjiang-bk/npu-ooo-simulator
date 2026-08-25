@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""TISA-first compiler and analytical payload backend.
+"""FC stage builder and analytical payload backend.
 
 The semantic builder in this module deliberately does not inspect
 ``ExecutionTask``.  It derives scheduler-visible stages from the canonical
@@ -17,6 +17,7 @@ from npu_ooo.arch import MachineConfig
 from npu_ooo.ir import (
     AccessType,
     BackendArtifact,
+    ExecutionTask,
     OperatorGraph,
     ScheduleSpec,
     TISADependency,
@@ -40,6 +41,7 @@ class TISAStage:
     unit_map: UnitMap
     ordinal: int
     attributes: Mapping[str, Any]
+    payload_primitives: tuple[str, ...] = ()
 
 
 def _unit_map(primitive: str) -> UnitMap:
@@ -104,48 +106,50 @@ def _stages_for_tile(operator: Any, tile: TileInstance) -> tuple[TISAStage, ...]
         if _is_last_reduction_tile(tile, operator):
             stages.append(("store", "store"))
     elif op_type == "softmax":
-        stages = [
-            ("load", "load"),
-            ("max", "reduce_max"),
-            ("exp", "exp"),
-            ("sum", "reduce_sum"),
-            ("normalize", "normalize"),
-            ("store", "store"),
-        ]
+        stages = [("load", "load"), ("compute", "softmax"), ("store", "store")]
     elif op_type == "rmsnorm":
-        stages = [
-            ("load", "load"),
-            ("square", "square"),
-            ("sum_square", "reduce_sum_square"),
-            ("normalize", "rmsnorm"),
-            ("store", "store"),
-        ]
+        stages = [("load", "load"), ("compute", "rmsnorm"), ("store", "store")]
     elif op_type == "layernorm":
-        stages = [("load", "load"), ("sum", "reduce_sum")]
-        if _is_first_reduction_tile(tile, operator):
-            stages.append(("mean", "layernorm_mean"))
-        stages.extend(
-            [
-                ("center", "center"),
-                ("variance", "reduce_sum_square"),
-                ("normalize", "layernorm"),
-                ("store", "store"),
-            ]
-        )
+        stages = [("load", "load"), ("compute", "layernorm"), ("store", "store")]
     elif op_type in {"reshape", "transpose"}:
         primitive = "copy" if op_type == "reshape" else "transpose"
         stages = [("transform", primitive)]
     else:
         raise NotImplementedError(
-            f"TISA-first semantic builder does not support operator '{op_type}'"
+            f"FC semantic builder does not support operator '{op_type}'"
         )
+    composite_payloads = {
+        "softmax": ("reduce_max", "exp", "reduce_sum", "normalize"),
+        "rmsnorm": ("square", "reduce_sum_square", "rmsnorm"),
+        "layernorm": (
+            "reduce_sum",
+            "layernorm_mean",
+            "center",
+            "reduce_sum_square",
+            "layernorm",
+        ),
+    }
+
+    def payload_for_stage(key: str, primitive: str) -> tuple[str, ...]:
+        if key == "load":
+            return ("load", "load_transpose", "copy", "transpose")
+        if key == "store":
+            return ("store",)
+        return composite_payloads.get(op_type, (primitive,))
+
     return tuple(
         TISAStage(
             key=key,
             primitive=primitive,
             unit_map=_unit_map(primitive),
             ordinal=index,
-            attributes={"tisa_stage": key, "primitive": primitive},
+            attributes={
+                "tisa_stage": key,
+                "primitive": primitive,
+                "semantic_op": op_type,
+                "payload_primitives": list(payload_for_stage(key, primitive)),
+            },
+            payload_primitives=payload_for_stage(key, primitive),
         )
         for index, (key, primitive) in enumerate(stages)
     )
@@ -391,6 +395,8 @@ class TISASemanticBuilder:
                             "semantic_boundary": "tile",
                             "semantic_tile_id": tile_id,
                             "semantic_op_type": operator.normalized_type,
+                            "paper_stage": "FC",
+                            "scheduler_visible": True,
                             "source_program_order": source_order[tisa_id],
                         },
                         payload_ref=f"payload:{tisa_id}",
@@ -430,9 +436,29 @@ class TISASemanticBuilder:
             consumer = tiles[dependency.consumer]
             producer_stages = _stages_for_tile(operators[producer.operator_id], producer)
             consumer_stages = _stages_for_tile(operators[consumer.operator_id], consumer)
+            if dependency.kind in {"state", "accumulate"}:
+                producer_stage = next(
+                    (stage for stage in producer_stages if stage.key == "compute"),
+                    producer_stages[-1],
+                )
+                consumer_stage = next(
+                    (stage for stage in consumer_stages if stage.key == "compute"),
+                    consumer_stages[0],
+                )
+            elif dependency.kind == "buffer_reuse":
+                producer_stage = producer_stages[-1]
+                consumer_stage = consumer_stages[0]
+            else:
+                producer_stage = producer_stages[-1]
+                consumer_stage = consumer_stages[0]
             add_dependency(
-                instruction_id(consumer.tile_id, consumer_stages[0].key),
-                instruction_id(producer.tile_id, producer_stages[-1].key),
+                instruction_id(consumer.tile_id, consumer_stage.key),
+                instruction_id(producer.tile_id, producer_stage.key),
+                {
+                    "state": "STATE",
+                    "accumulate": "ACCUMULATE",
+                    "buffer_reuse": "BUFFER_REUSE",
+                }.get(dependency.kind, "RAW"),
             )
 
         # Reduction barriers and matrix partial accumulation are semantic
@@ -465,64 +491,33 @@ class TISASemanticBuilder:
                             add_dependency(
                                 instruction_id(current.tile_id, "compute"),
                                 instruction_id(previous.tile_id, "compute"),
+                                "ACCUMULATE",
                             )
                 barrier_stage = {
                     "reduce": "compute",
-                    "softmax": "max",
-                    "rmsnorm": "sum_square",
-                    "layernorm": "sum",
+                    "rmsnorm": "compute",
+                    "layernorm": "compute",
                 }.get(op_type)
                 if barrier_stage and reduction:
                     for previous, current in zip(ordered, ordered[1:]):
                         add_dependency(
                             instruction_id(current.tile_id, barrier_stage),
                             instruction_id(previous.tile_id, barrier_stage),
+                            "ACCUMULATE" if op_type in {"matmul", "batched_matmul", "gemv"} else "STATE",
                         )
                 if op_type == "softmax" and reduction:
-                    for previous, current in zip(ordered, ordered[1:]):
-                        add_dependency(
-                            instruction_id(current.tile_id, "sum"),
-                            instruction_id(previous.tile_id, "sum"),
-                        )
-                # LayerNorm has two row-wise reductions.  The variance pass
-                # must observe the same tile ordering as the mean pass so the
-                # backend's reduce_sum_square edge has a semantic owner edge.
-                if op_type == "layernorm" and reduction:
-                    for previous, current in zip(ordered, ordered[1:]):
-                        add_dependency(
-                            instruction_id(current.tile_id, "variance"),
-                            instruction_id(previous.tile_id, "variance"),
-                        )
-
-                if op_type == "softmax":
+                    # Materialized softmax computes the final row max/sum
+                    # before all exp/normalize payloads.  The semantic FC op
+                    # therefore depends on the final reduction tile; an
+                    # online-softmax lowering will replace this with a
+                    # forward state chain.
                     final = ordered[-1]
-                    for tile in ordered:
+                    for tile in ordered[:-1]:
                         add_dependency(
-                            instruction_id(tile.tile_id, "exp"),
-                            instruction_id(final.tile_id, "max"),
+                            instruction_id(tile.tile_id, "compute"),
+                            instruction_id(final.tile_id, "compute"),
+                            "STATE",
                         )
-                        add_dependency(
-                            instruction_id(tile.tile_id, "normalize"),
-                            instruction_id(final.tile_id, "sum"),
-                        )
-                elif op_type == "rmsnorm":
-                    final = ordered[-1]
-                    for tile in ordered:
-                        add_dependency(
-                            instruction_id(tile.tile_id, "normalize"),
-                            instruction_id(final.tile_id, "sum_square"),
-                        )
-                elif op_type == "layernorm":
-                    first = ordered[0]
-                    final = ordered[-1]
-                    mean_id = instruction_id(first.tile_id, "mean")
-                    for tile in ordered:
-                        add_dependency(instruction_id(tile.tile_id, "center"), mean_id)
-                        add_dependency(
-                            instruction_id(tile.tile_id, "normalize"),
-                            instruction_id(final.tile_id, "variance"),
-                        )
-                    add_dependency(mean_id, instruction_id(final.tile_id, "sum"))
 
         # Stable topological order is part of the descriptor contract.
         successors = {tisa_id: [] for tisa_id in by_id}
@@ -558,7 +553,7 @@ class TISASemanticBuilder:
                     ready.append(successor)
                     ready.sort(key=lambda tisa_id: (source_order[tisa_id], tisa_id))
         if len(ordered) != len(instructions):
-            raise ValueError("TISA-first semantic dependency graph contains a cycle")
+            raise ValueError("FC semantic dependency graph contains a cycle")
         program = TISAProgram(
             program_id=program_id,
             instructions=tuple(ordered),
@@ -570,7 +565,7 @@ class TISASemanticBuilder:
         )
         issues = program.validate()
         if issues:
-            raise ValueError("TISA-first program construction failed: " + "; ".join(issues))
+            raise ValueError("FC program construction failed: " + "; ".join(issues))
         return program
 
 
@@ -594,32 +589,75 @@ class AnalyticalBackendCodegen:
             registry=registry or default_lowering_registry(),
             tile_graph=tile_graph,
         )
-        tasks_by_stage: dict[tuple[str, str], list[str]] = {}
+        tasks_by_stage: dict[tuple[str, str], list[ExecutionTask]] = {}
         for task in lowering.execution_graph.tasks:
-            tasks_by_stage.setdefault((task.tile_id, task.primitive), []).append(task.task_id)
+            tasks_by_stage.setdefault((task.tile_id, task.primitive), []).append(task)
         payloads: dict[str, tuple[str, ...]] = {}
         consumed: set[str] = set()
+        original_tasks = {task.task_id: task for task in lowering.execution_graph.tasks}
+
+        composite_ops = {"softmax", "rmsnorm", "layernorm"}
         for instruction in program.instructions:
-            stage = str(instruction.attributes.get("primitive", ""))
-            task_ids = tuple(tasks_by_stage.get((instruction.tile_id, stage), ()))
-            if not task_ids:
+            stage = str(instruction.attributes.get("tisa_stage", ""))
+            semantic_op = str(instruction.attributes.get("semantic_op_type", ""))
+            if semantic_op in composite_ops:
+                if stage == "load":
+                    primitive_names = {"load", "load_transpose", "copy", "transpose"}
+                elif stage == "store":
+                    primitive_names = {"store"}
+                else:
+                    primitive_names = set(
+                        instruction.attributes.get("payload_primitives", ())
+                    )
+                candidates = tuple(
+                    task
+                    for task in lowering.execution_graph.tasks
+                    if task.tile_id == instruction.tile_id
+                    and task.primitive in primitive_names
+                    and task.task_id not in consumed
+                )
+                if not candidates:
+                    raise ValueError(
+                        f"analytical backend has no composite payload for TISA instruction "
+                        f"'{instruction.tisa_id}' stage '{stage}'"
+                    )
+                resources = {task.resource for task in candidates}
+                if len(resources) != 1:
+                    raise ValueError(
+                        f"composite TISA payload '{instruction.tisa_id}' spans resources: "
+                        + ", ".join(sorted(resources))
+                    )
+                # Keep the detailed primitive DAG in BackendArtifact.  It is
+                # expanded only after the semantic TISA instruction issues;
+                # the primitive tasks never enter the global ready queue.
+                payloads[instruction.tisa_id] = tuple(task.task_id for task in candidates)
+                consumed.update(task.task_id for task in candidates)
+                continue
+
+            primitive = str(instruction.attributes.get("primitive", ""))
+            candidates = tuple(tasks_by_stage.get((instruction.tile_id, primitive), ()))
+            if not candidates:
                 raise ValueError(
                     f"analytical backend has no payload for TISA instruction '{instruction.tisa_id}' "
-                    f"stage '{stage}' on tile '{instruction.tile_id}'"
+                    f"stage '{primitive}' on tile '{instruction.tile_id}'"
                 )
+            task_ids = tuple(task.task_id for task in candidates)
             payloads[instruction.tisa_id] = task_ids
             consumed.update(task_ids)
-        all_tasks = {task.task_id for task in lowering.execution_graph.tasks}
+
+        all_tasks = set(original_tasks)
         unbound = sorted(all_tasks - consumed)
         if unbound:
             raise ValueError(
                 "analytical backend generated primitive tasks without TISA ownership: "
                 + ", ".join(unbound[:8])
             )
+
+        execution_graph = lowering.execution_graph
         artifact = BackendArtifact(
             artifact_id=f"{graph.graph_id}.analytical-tisa-first",
             program=program,
-            execution_graph=lowering.execution_graph,
+            execution_graph=execution_graph,
             payloads=payloads,
             backend="analytical",
             attributes={
@@ -630,5 +668,5 @@ class AnalyticalBackendCodegen:
         )
         issues = artifact.validate()
         if issues:
-            raise ValueError("TISA-first backend artifact is invalid: " + "; ".join(issues))
+            raise ValueError("FC backend artifact is invalid: " + "; ".join(issues))
         return artifact

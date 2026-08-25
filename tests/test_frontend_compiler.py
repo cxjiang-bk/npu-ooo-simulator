@@ -33,6 +33,10 @@ class PyTorchFrontendTest(unittest.TestCase):
             compiled.attributes["frontend_path"],
             "torch_export->torch_xla->official_stablehlo->canonical",
         )
+        self.assertEqual(
+            compiled.attributes["compiler_stages"],
+            ["framework_bridge", "graph_compiler", "fusion_compiler", "tisa_generator", "backend"],
+        )
         self.assertEqual(compiled.source_frontend.frontend.value, "torch.export")
         self.assertEqual(compiled.frontend.frontend.value, "stablehlo")
         self.assertEqual(compiled.stablehlo.producer, "torch-xla")
@@ -44,6 +48,8 @@ class PyTorchFrontendTest(unittest.TestCase):
             48,
         )
         self.assertTrue(compiled.tisa_program.instructions)
+        self.assertIsNotNone(compiled.gc_artifact)
+        self.assertIsNotNone(compiled.tisa_dialect)
         self.assertEqual(compiled.validate(), ())
 
     def test_attention_preserves_stablehlo_and_tisa_dependencies(self) -> None:
@@ -64,7 +70,15 @@ class PyTorchFrontendTest(unittest.TestCase):
         self.assertIn("stablehlo.reduce", compiled.stablehlo.text)
         self.assertTrue(any(instruction.dependencies for instruction in compiled.tisa_program.instructions))
         primitives = {instruction.op_type for instruction in compiled.tisa_program.instructions}
-        self.assertTrue({"matmul", "reduce_max", "exp", "normalize"}.issubset(primitives))
+        self.assertTrue({"matmul", "softmax"}.issubset(primitives))
+        payload_primitives = {
+            primitive
+            for instruction in compiled.tisa_program.instructions
+            for primitive in instruction.attributes.get("payload_primitives", ())
+        }
+        self.assertTrue(
+            {"reduce_max", "exp", "reduce_sum", "normalize"}.issubset(payload_primitives)
+        )
 
     def test_multi_head_attention_compiles_transforms_and_shares_static_dynamic_artifact(self) -> None:
         import torch

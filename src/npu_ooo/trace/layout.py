@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 
 
 STAGE_DIRECTORIES: tuple[tuple[str, str], ...] = (
     ("00_frontend", "前端导入与模型输入"),
-    ("01_graph_ir", "规范化算子图与图可视化"),
-    ("02_schedule_tile", "调度规划与 tile 实例"),
+    ("01_gc", "Graph Compiler：规范化、融合、切 tile 与依赖"),
+    ("02_fc", "Fusion Compiler：TISA dialect 与融合指令"),
     ("03_tisa", "TISA 语义指令与编译产物"),
     ("04_backend", "后端执行图、机器配置与 payload"),
     ("05_runtime", "runtime 地址绑定与依赖观察"),
@@ -27,14 +28,18 @@ _STAGE_BY_FILENAME: dict[str, str] = {
     "source_frontend_import.json": "00_frontend",
     "stablehlo_module.json": "00_frontend",
     "generated.mlir": "00_frontend",
-    "canonical_graph.json": "01_graph_ir",
-    "operator_graph.json": "01_graph_ir",
-    "operator_graph.dot": "01_graph_ir",
-    "operator_graph.svg": "01_graph_ir",
-    "schedule.json": "02_schedule_tile",
-    "compile_statistics.json": "02_schedule_tile",
-    "tile_graph.json": "02_schedule_tile",
-    "tile_graph.dot": "02_schedule_tile",
+    "canonical_graph.json": "01_gc",
+    "operator_graph.json": "01_gc",
+    "operator_graph.dot": "01_gc",
+    "operator_graph.svg": "01_gc",
+    "gc_artifact.json": "01_gc",
+    "gc_statistics.json": "01_gc",
+    "schedule.json": "01_gc",
+    "compile_statistics.json": "01_gc",
+    "tile_graph.json": "01_gc",
+    "tile_graph.dot": "01_gc",
+    "tisa_dialect.json": "02_fc",
+    "fc_diagnostics.json": "02_fc",
     "tisa_program.json": "03_tisa",
     "compiled_artifact.json": "03_tisa",
     "backend_artifact.json": "04_backend",
@@ -50,6 +55,8 @@ _STAGE_BY_FILENAME: dict[str, str] = {
     "swimlane.svg": "07_trace",
     "swimlane.png": "07_trace",
 }
+
+_LEGACY_STAGE_DIRECTORIES = ("01_graph_ir", "02_schedule_tile")
 
 
 def _root_readme() -> str:
@@ -68,15 +75,16 @@ def _root_readme() -> str:
     rows.extend(
         [
             "",
-            "典型查看顺序：先看 `00_frontend` 确认输入，再看 `01_graph_ir` 和",
-            "`02_schedule_tile` 检查图与切分，接着看 `03_tisa`/`04_backend`，在",
+            "典型查看顺序：先看 `00_frontend` 确认输入，再看 `01_gc` 检查图、切分",
+            "与依赖，接着看 `02_fc` 的 TISA dialect 和 `03_tisa` 的虚拟指令，之后看",
+            "`04_backend`，在",
             "`05_runtime` 检查物理地址与 command chunk，最后在 `06_simulation`、",
             "`07_trace` 中比较周期和泳道。",
             "Torch-XLA 导出的可读程序是 `00_frontend/generated.mlir`；",
             "`stablehlo_module.json` 保存程序文本、producer、版本、验证状态和 provenance。",
-            "`02_schedule_tile/compile_statistics.json` 汇总各算子的 tile、TISA、MAC、",
+            "`01_gc/compile_statistics.json` 汇总各算子的 tile、TISA、MAC、",
             "root-memory traffic 和 region dependency 数量。",
-            "`03_tisa/tisa_program.json` 是 device scheduler 的输入；`04_backend/` 保存",
+            "`02_fc/tisa_dialect.json` 是 FC 输出；`03_tisa/tisa_program.json` 是 device scheduler 的输入；`04_backend/` 保存",
             "与每条 TISA instruction 绑定的硬件 payload。",
         ]
     )
@@ -92,12 +100,37 @@ def _remove_legacy_flat_artifacts(root: Path) -> None:
             candidate.unlink()
 
 
+def _migrate_legacy_stage_directories(root: Path) -> None:
+    """Move artifacts from the pre-GC/FC layout when reusing an output path."""
+
+    for legacy_name in _LEGACY_STAGE_DIRECTORIES:
+        legacy = root / legacy_name
+        if not legacy.is_dir():
+            continue
+        for source in tuple(legacy.iterdir()):
+            target_stage = _STAGE_BY_FILENAME.get(source.name)
+            if target_stage is None:
+                continue
+            target = root / target_stage / source.name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                shutil.move(str(source), str(target))
+            elif source.is_file() or source.is_symlink():
+                source.unlink()
+        try:
+            legacy.rmdir()
+        except OSError:
+            # Preserve unknown user files rather than deleting them.
+            pass
+
+
 def ensure_output_layout(root: str | Path) -> Path:
     root_path = Path(root)
     root_path.mkdir(parents=True, exist_ok=True)
     _remove_legacy_flat_artifacts(root_path)
     for directory, _description in STAGE_DIRECTORIES:
         (root_path / directory).mkdir(parents=True, exist_ok=True)
+    _migrate_legacy_stage_directories(root_path)
     readme = root_path / "README.md"
     readme.write_text(_root_readme(), encoding="utf-8")
     return root_path

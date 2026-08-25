@@ -34,6 +34,7 @@ _PRIMITIVE_PALETTE = {
     "layernorm_mean": "#a65628",
     "exp": "#f781bf",
     "normalize": "#1b9e77",
+    "softmax": "#2f7f8f",
     "rmsnorm": "#00876c",
     "layernorm": "#2a9d8f",
 }

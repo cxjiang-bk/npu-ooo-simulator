@@ -23,14 +23,13 @@ from npu_ooo.ir import (
     ScheduleSpec,
     TISAProgram,
     TileGraph,
-    build_tile_graph,
 )
 from npu_ooo.lowering import LoweringRegistry, default_lowering_registry
 
-from .passes import default_pass_manager
-from .planner import default_schedule_planner
+from .fusion_compiler import TISADialectProgram, default_fusion_compiler
+from .graph_compiler import GCArtifact, default_graph_compiler
 from .statistics import build_compile_statistics
-from .tisa_first import TISASemanticBuilder
+from .tisa_generator import default_tisa_generator
 
 
 @dataclass(frozen=True)
@@ -57,6 +56,8 @@ class CompiledArtifact:
     backend_artifact: BackendArtifact
     stablehlo: OfficialStableHLOModule
     source_frontend: FrontendImport
+    gc_artifact: GCArtifact | None = None
+    tisa_dialect: TISADialectProgram | None = None
     diagnostics: tuple[CompilerDiagnostic, ...] = ()
     attributes: Mapping[str, Any] = field(default_factory=dict)
 
@@ -70,6 +71,10 @@ class CompiledArtifact:
         issues.extend(self.tile_graph.validate())
         issues.extend(self.tisa_program.validate())
         issues.extend(self.backend_artifact.validate())
+        if self.gc_artifact is not None:
+            issues.extend(self.gc_artifact.validate())
+        if self.tisa_dialect is not None:
+            issues.extend(self.tisa_dialect.validate())
         return tuple(issues)
 
     def to_dict(self) -> dict[str, Any]:
@@ -82,6 +87,8 @@ class CompiledArtifact:
             "tile_graph": self.tile_graph.to_dict(),
             "tisa_program": self.tisa_program.to_dict(),
             "backend_artifact": self.backend_artifact.to_dict(),
+            "gc_artifact": self.gc_artifact.to_dict() if self.gc_artifact else None,
+            "tisa_dialect": self.tisa_dialect.to_dict() if self.tisa_dialect else None,
             "diagnostics": [item.to_dict() for item in self.diagnostics],
             "attributes": dict(self.attributes),
         }
@@ -107,26 +114,26 @@ def compile_operator_graph(
     if machine_issues:
         raise ValueError("compiler machine is invalid: " + "; ".join(machine_issues))
 
-    pass_result = default_pass_manager().run(graph)
-    graph = pass_result.graph
+    gc_artifact = default_graph_compiler().compile(
+        graph,
+        machine,
+        tile_size=tile_size,
+    )
+    graph = gc_artifact.graph
     frontend = replace(
         frontend,
         graph=graph,
         provenance={
             **dict(frontend.provenance),
-            "compiler_passes": [item.pass_name for item in pass_result.diagnostics],
+            "compiler_passes": [item.pass_name for item in gc_artifact.diagnostics],
+            "graph_compiler": gc_artifact.attributes.get("compiler"),
         },
     )
 
-    schedule = default_schedule_planner().plan(graph, tile_size=tile_size)
-    tile_graph = build_tile_graph(graph, schedule)
-    program = TISASemanticBuilder().build(
-        graph,
-        schedule,
-        tile_graph,
-        machine,
-        program_id=f"{graph.graph_id}.tisa",
-    )
+    schedule = gc_artifact.schedule
+    tile_graph = gc_artifact.tile_graph
+    tisa_dialect = default_fusion_compiler().compile(gc_artifact, machine)
+    program = default_tisa_generator().generate(tisa_dialect)
 
     selected_codegen = codegen_backend or default_codegen_backend_registry().create(
         "analytical",
@@ -156,15 +163,24 @@ def compile_operator_graph(
         tile_graph=tile_graph,
         tisa_program=program,
         backend_artifact=backend_artifact,
+        gc_artifact=gc_artifact,
+        tisa_dialect=tisa_dialect,
         diagnostics=(
             CompilerDiagnostic("info", "torch.export", "captured PyTorch module"),
             CompilerDiagnostic("info", "torch-xla", "exported official StableHLO"),
-            *(CompilerDiagnostic(item.level, item.pass_name, item.message) for item in pass_result.diagnostics),
+            *(CompilerDiagnostic(item.level, item.pass_name, item.message) for item in gc_artifact.diagnostics),
             CompilerDiagnostic("info", "tiling", f"generated {len(tile_graph.tiles)} tile instances"),
             CompilerDiagnostic("info", "tisa", f"generated {len(program.instructions)} TISA instructions"),
         ),
         attributes={
-            "compiler_pipeline": "pytorch->torch.export->torch-xla->stablehlo->canonical->tile->tisa->backend",
+            "compiler_pipeline": "pytorch->torch.export->torch-xla->stablehlo->GC->FC->tisa-generator->backend",
+            "compiler_stages": [
+                "framework_bridge",
+                "graph_compiler",
+                "fusion_compiler",
+                "tisa_generator",
+                "backend",
+            ],
             "frontend_path": "torch_export->torch_xla->official_stablehlo->canonical",
             "stablehlo_variant": stablehlo.variant,
             "stablehlo_backend": "official",

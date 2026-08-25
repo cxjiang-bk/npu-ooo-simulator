@@ -203,7 +203,7 @@ def lower_mixed_graph(
     issues = execution_graph.validate()
     if issues:
         raise ValueError("; ".join(issues))
-    # TISA-first codegen may already own the semantic TileGraph.  Reusing it
+    # GC already owns the semantic TileGraph.  Reusing it
     # keeps backend payload lowering from silently choosing a second tiling
     # result; the optional argument preserves the legacy lowering API.
     if tile_graph is None:

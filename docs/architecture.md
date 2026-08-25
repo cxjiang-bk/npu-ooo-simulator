@@ -10,11 +10,11 @@ flowchart TB
         C --> D[官方 StableHLO\nMLIR parse / verify]
     end
 
-    subgraph Compiler[编译器：生成 scheduler-visible TISA]
-        D --> E[Canonical\nOperatorGraph]
-        E --> F[PassManager\ncanonicalize / recover / fuse]
-        F --> G[ScheduleSpec + TileGraph]
-        G --> H[TISAProgram]
+    subgraph Compiler[编译器：论文 GC / FC / TISA Generator]
+        D --> E[GC\nGraph Compiler]
+        E --> F[Software-scheduled\nSemantic TileGraph]
+        F --> G[FC\nTISA Dialect]
+        G --> H[TISA Generator\nTISAProgram]
         H --> I[CodegenBackend]
         I --> J[BackendArtifact\nTISA descriptor + payload]
     end
@@ -64,10 +64,11 @@ PyTorch nn.Module
   -> torch.export.ExportedProgram
   -> Torch-XLA StableHLO
   -> official StableHLO parse/verify
-  -> Canonical OperatorGraph
-  -> graph passes
-  -> ScheduleSpec
-  -> TileGraph
+  -> Graph Compiler (GC)
+  -> software-scheduled Semantic TileGraph
+  -> Fusion Compiler (FC)
+  -> TISA dialect
+  -> TISA Generator
   -> TISAProgram
   -> BackendArtifact
   -> RuntimeSubmission
@@ -86,7 +87,7 @@ npu_ooo.cli.main
   -> compile_torch_module
 ```
 
-`compile_torch_module()` 在一个函数中按执行顺序展示完整前端，位于 `src/npu_ooo/compiler/pipeline.py`。内部仅保留一个需要复用的分界函数 `compile_operator_graph()`，表示 StableHLO 已导入后的 Canonical IR 编译阶段。原先只做参数转发的 wrapper 已删除。
+`compile_torch_module()` 位于 `src/npu_ooo/compiler/pipeline.py`，按顺序调用 Framework Bridge、GC、FC、TISA Generator 和 Backend。`compile_operator_graph()` 是 StableHLO 已导入后的公共入口，便于隔离测试各编译阶段。
 
 ## 3. 前端
 
@@ -129,9 +130,9 @@ StableHLO semantic family
 
 当前 importer 仍有明确限制：官方 MLIR object 先投影到项目支持的可读 operation 子集，再由 semantic importer 建图。未注册 operation 会在 capability boundary 失败，不会静默降级。
 
-## 4. Canonical OperatorGraph
+## 4. Graph Compiler（GC）
 
-从 StableHLO 恢复的信息包括：
+GC 的输入是已经由官方 MLIR bindings 验证的 StableHLO projection；其第一步导入 Canonical OperatorGraph。恢复的信息包括：
 
 ```text
 TensorSpec: shape、dtype、source kind
@@ -140,7 +141,7 @@ DataEdge: producer、consumer、tensor
 StableHLO provenance: source op、operand arity、capability key
 ```
 
-PassManager 当前顺序：
+当前 GC pass 顺序：
 
 ```text
 CanonicalizeGraphPass
@@ -153,11 +154,24 @@ RMSNormFusionPass
 SoftmaxFusionPass
 ```
 
-Torch-XLA 可能把复合算子展开为 primitive 子图，recovery/fusion pass 尝试恢复 scheduler 需要的语义边界。恢复必须依赖图结构、shape 和常量约束，不能按模型名匹配。
+Torch-XLA 可能把复合算子展开为 primitive 子图，recovery/fusion pass 依据图结构、shape 和常量恢复 GC 所需的语义边界，不能按模型名匹配。
 
-## 5. Schedule 与 TileGraph
+GC 的最终产物是 `GCArtifact`，由以下内容组成：
 
-`SchedulePlanner` 调用统一的 `plan_uniform_tiles()` baseline：
+```text
+OperatorGraph
+ScheduleSpec
+Semantic TileGraph
+fusion / residency / locality metadata
+typed tile dependencies
+initial software order
+```
+
+`GCArtifact` 的 Python dataclass 是论文 MLIR GC dialect 的语义代理，不声称复刻论文内部 pass 实现。
+
+### 4.1 Tiling、locality 与依赖
+
+`SchedulePlanner` 当前调用统一的 `plan_uniform_tiles()` baseline：
 
 ```text
 tile_size(dim) = min(CLI tile_size, resolved extent)
@@ -165,29 +179,64 @@ loop_order = iteration dims + reduction dims
 stage_id = operator topological order
 ```
 
-这是编译期静态 tile 规划，不是 static device scheduler。
+这是 GC 的初始软件 schedule，不是 static device scheduler。它决定 tile decomposition、初始 loop order 和可记录的 residency；最终 issue 顺序仍由 device scheduler 决定。
 
-`build_tile_graph()` 根据 schedule 枚举 `TileInstance`，包含 tile id、operator id、coordinates、每个维度的 `[start, stop)` bounds 和 semantic metadata，并从 operator data edge 建立 tile dependency。
+`build_tile_graph()` 根据 schedule 枚举 `TileInstance`，并保留 tile id、operator id、coordinates、边界和 semantic metadata。除跨算子 region edge 外，GC 还生成 reduction/state/accumulate 边，使软件 TileGraph 在进入 FC 前已经完整表达 tile 级合法性。
 
 跨算子依赖使用 `logical_tensor_region_v1`：compiler 将 producer/consumer tile 投影到共享 tensor 的逻辑 region，只为重叠 region 建边。Matmul 的 M/N/K、broadcast elementwise、reduce/norm 和 full-tensor transform 都有显式映射；无法证明映射时才对该 operator edge 保守回退 all-to-all。`compile_statistics.json` 会记录回退边数和避免的无效依赖数。
 
-当前 reshape/transpose 采用保守的 full-tensor schedule。reshape 映射为 DMA copy，transpose 映射为 DMA transpose；它们都有明确 TISA instruction 和 backend payload，不会被静默当成零成本 alias。后续 stride-aware region planner 可以将其细化为 tile transform。
+当前 reshape/transpose 采用保守的 full-tensor schedule。reshape 映射为 DMA copy，transpose 映射为 DMA transpose；后续 stride-aware region planner 可以将其细化为 tile transform。
 
-## 6. TISAProgram
+## 5. Fusion Compiler（FC）
 
-`TISASemanticBuilder` 从 OperatorGraph、ScheduleSpec、TileGraph 和 MachineConfig 生成 scheduler-visible descriptors。
+FC 接收 `GCArtifact`，不再直接从普通 `OperatorGraph` 重新推导 tile。它将融合区域和 tile stage 专化为 TISA dialect operations，并为每条 scheduler-visible operation 附加：
 
-当前实现中，一个 semantic tile 会按资源阶段生成多条 TISA instruction。例如 Matmul：
+```text
+OpType / semantic operator
+Operands: TileShape + TileMem + AccessType
+typed Deps and readiness condition
+UnitMap
+fusion / reorder attributes
+backend payload recipe
+```
+
+一个 Attention tile 的 FC 输出类似：
+
+```text
+tisa.load           <de>
+tisa.load_transpose <de>
+tisa.matmul         <me>
+tisa.softmax        <ve>
+tisa.matmul         <me>
+tisa.store          <de>
+```
+
+每条 TISA operation 只绑定一种主要 EU。Softmax 的 `reduce_max/exp/reduce_sum/normalize` 属于 VE 内部 payload recipe，不再作为全局 scheduler 的独立 TISA instruction。
+
+`TISADialectProgram` 是 FC 的 Python 语义代理，明确标注 `paper_stage=FC` 和 `dialect=tisa`。
+
+## 6. TISA Generator 与 TISAProgram
+
+`TISAGenerator` 将 `TISADialectProgram` 序列化为 `TISAProgram`。它不再做新的 tiling、fusion 或 backend primitive 推导，只保留 FC 已经确定的 descriptor 语义。
+
+当前一个 semantic tile 的 TISA 结构为：
 
 ```text
 load -> optional load_transpose -> matmul -> optional store
 ```
 
-Softmax：
+复合算子：
 
 ```text
-load -> reduce_max -> exp -> reduce_sum -> normalize -> store
+load -> softmax -> store
+backend payload: reduce_max -> exp -> reduce_sum -> normalize
 ```
+
+这里的 `softmax` 是 scheduler-visible 的语义指令。当前 analytical backend
+仍使用 materialized 的 row-wise `max/sum` lowering；这些 primitive 只在该
+payload 内执行，不代表已经实现论文目标的 online Softmax state update。
+后续切换到 online lowering 时，保持同一个 TISA 语义边界，只替换 payload
+和对应的 GC state dependency。
 
 每条 `TISAInstruction` 包含：
 
@@ -196,12 +245,12 @@ tisa_id / tile_id / operator_id
 op_type
 TISAOperand(tile shape, TileMem, access type)
 UnitMap
-RAW dependency
+typed dependency（RAW/WAR/WAW/STATE/ACCUMULATE）
 semantic metadata
 payload_ref
 ```
 
-Builder 负责同 tile stage 顺序、跨算子依赖、Matmul K 累加和 reduction barrier。它不查看 backend `ExecutionTask`，因此 TISA 契约独立于具体硬件 payload。
+TISA Generator 不查看 backend `ExecutionTask`，因此 TISA 契约独立于具体硬件 payload。`TISAInstruction` 的依赖 kind 允许 `RAW/WAR/WAW/STATE/ACCUMULATE/BUFFER_REUSE`，scheduler 当前统一按 source readiness 执行。
 
 ## 7. BackendArtifact
 

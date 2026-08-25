@@ -111,7 +111,15 @@ class TISADependency:
         issues: list[str] = []
         if not self.source:
             issues.append("TISA dependency source must not be empty")
-        if self.kind not in {"RAW", "WAR", "WAW"}:
+        if self.kind not in {
+            "RAW",
+            "WAR",
+            "WAW",
+            "STATE",
+            "ACCUMULATE",
+            "BUFFER_REUSE",
+            "CONTROL",
+        }:
             issues.append(f"TISA dependency kind '{self.kind}' is unsupported")
         if not self.condition:
             issues.append("TISA dependency condition must not be empty")
@@ -274,6 +282,8 @@ class BackendArtifact:
             }
             for instruction in self.program.instructions
         }
+        task_by_id = {task.task_id: task for task in self.execution_graph.tasks}
+        composite_types = {"softmax", "rmsnorm", "layernorm"}
 
         # A primitive payload may expose an edge that skips one or more
         # semantic stages.  Validation checks that the owner-to-owner ordering
@@ -308,6 +318,31 @@ class BackendArtifact:
             for predecessor_id in task.predecessors:
                 predecessor_owner = task_owners.get(predecessor_id)
                 if predecessor_owner is None or predecessor_owner == owner:
+                    continue
+
+                # Composite lowering may keep a materialized primitive DAG
+                # across tiles (for example, row-wise softmax's max and sum
+                # finalization).  Those edges are implementation details of
+                # the payload and are intentionally not promoted to global
+                # TISA dependencies.  The semantic instruction is still
+                # ordered at the tile boundary; cross-operator edges remain
+                # subject to the strict check below.
+                predecessor_task = task_by_id.get(predecessor_id)
+                owner_instruction = instructions[owner]
+                predecessor_instruction = instructions[predecessor_owner]
+                same_operator = (
+                    predecessor_task is not None
+                    and predecessor_task.operator_id == task.operator_id
+                    and task.operator_id == owner_instruction.operator_id
+                )
+                same_composite_operator = (
+                    owner_instruction.attributes.get("semantic_op_type")
+                    in composite_types
+                    and predecessor_instruction.attributes.get("semantic_op_type")
+                    == owner_instruction.attributes.get("semantic_op_type")
+                    and same_operator
+                )
+                if same_composite_operator:
                     continue
                 if predecessor_owner not in dependency_closure.get(owner, set()):
                     issues.append(
