@@ -48,9 +48,9 @@ class AnalyticalCodegenBackend:
         *,
         program: TISAProgram,
     ) -> BackendArtifact:
-        # Keep the adapter outside compiler internals and load the legacy
-        # implementation only when this backend is selected.
-        from npu_ooo.compiler.tisa_first import AnalyticalBackendCodegen
+        # Keep the adapter outside compiler internals and load the analytical
+        # payload binder only when this backend is selected.
+        from npu_ooo.compiler.tisa_dialect import AnalyticalBackendCodegen
 
         artifact = AnalyticalBackendCodegen().lower(
             graph,

@@ -9,7 +9,7 @@ from npu_ooo.arch import MachineConfig
 from npu_ooo.ir import TISAProgram
 
 from .graph_compiler import GCArtifact
-from .tisa_first import TISASemanticBuilder
+from .tisa_dialect import TISASemanticBuilder
 
 
 @dataclass(frozen=True)

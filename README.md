@@ -251,7 +251,7 @@ src/npu_ooo/frontend/stablehlo_official.py 官方 verifier 和导入边界
 src/npu_ooo/compiler/graph_compiler.py   论文 GC：图优化、切 tile、依赖
 src/npu_ooo/compiler/fusion_compiler.py  论文 FC：TileGraph 到 TISA dialect
 src/npu_ooo/compiler/tisa_generator.py   TISA dialect 到 virtual TISAProgram
-src/npu_ooo/compiler/tisa_first.py       TISA stage/metadata 构造
+src/npu_ooo/compiler/tisa_dialect.py     TISA 方言 stage/metadata 构造与语义 payload 绑定
 src/npu_ooo/backend/                     可替换 backend 与 timing provider
 src/npu_ooo/simulator/tisa.py            TISA device scheduler simulator
 ```

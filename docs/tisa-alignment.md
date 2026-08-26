@@ -76,6 +76,11 @@ Torch-XLA 负责 ATen 到 StableHLO 的 legalization。项目只维护 StableHLO
 
 Torch-XLA 可能把 Softmax、Norm 等复合算子展开成基础 StableHLO operations。项目的 recovery/fusion pass 根据图结构、shape 和常量恢复调度所需的语义边界，不能按模型名或 factory 名匹配。
 
+GC 的 `softmax_algorithm` 只是 Softmax lowering 的算法属性：`materialized` 对应完整
+中间结果 materialization，`online` 对应跨 reduction tile 的状态链。它与 device
+侧 `static_pipeline`/`dynamic_ready_queue` 是两条独立配置轴；同一 Softmax algorithm
+可以分别用两种 scheduler 比较。
+
 ## 4. Scheduler 调度什么
 
 全局 static/dynamic scheduler 只调度 `TISAInstruction`，不调度独立的 backend `ExecutionTask`。FC 对 Softmax、RMSNorm、LayerNorm 等复合算子只生成语义 TISA operation；`reduce_max/exp/reduce_sum/normalize` 等步骤属于该 instruction 的 backend-local payload：

@@ -156,6 +156,14 @@ SoftmaxFusionPass
 
 Torch-XLA 可能把复合算子展开为 primitive 子图，recovery/fusion pass 依据图结构、shape 和常量恢复 GC 所需的语义边界，不能按模型名匹配。
 
+`softmax_algorithm` 的传播路径是：CLI 或 `MachineConfig.attributes` 给出
+`materialized`/`online` 选择；GC 首先校验取值，然后把它写入 canonical Softmax
+operator 的 attributes，再交给 planner 和 `TileGraph`。它只选择 Softmax 的实现
+语义，不选择 static/dynamic scheduler，也不改变 tile size。之后 FC 读取同一个
+attribute：materialized 生成 `reduce_max/exp/reduce_sum/normalize` payload recipe，
+online 生成 `online_update` recipe，并为同一 reduction row 的相邻 tile 写入
+`STATE` dependency。backend lowering 最后使用该属性生成对应的 primitive task graph。
+
 GC 的最终产物是 `GCArtifact`，由以下内容组成：
 
 ```text
@@ -212,6 +220,30 @@ UnitMap
 fusion / reorder attributes
 backend payload recipe
 ```
+
+当前 Python 语义代理位于 `compiler/tisa_dialect.py`，核心过程是：
+
+1. `FusionCompiler.compile()` 先验证 `GCArtifact`，只消费其中的
+   `OperatorGraph`、`ScheduleSpec` 和 `TileGraph`。
+2. `TISASemanticBuilder` 按 TileGraph 的拓扑顺序访问每个 `TileInstance`，依据
+   operator family 选择 stage，例如 Matmul 是 `load -> matmul -> store`，
+   Softmax 是 `load -> softmax -> store`，transpose 是一个 DMA transform stage。
+3. `_stage_operands()` 将 tile 的 bounds 投影到每个输入/输出 tensor，生成
+   `TileShape + TileMem + AccessType`；`TileMem` 同时保存逻辑 slice、concrete
+   offset/size 和 stride metadata。
+4. builder 为每个 stage 创建临时 `TISAInstruction`，填充 `UnitMap`、semantic
+   family、readiness condition、payload primitive recipe 和 FC metadata。
+5. builder 将 TileGraph 的 region/state/accumulate/buffer-reuse 边投影为 typed
+   TISA dependencies，再补充同一 tile 的 stage 顺序、reduction barrier 和
+   Matmul partial-accumulate 边。
+6. 最后对依赖图做稳定拓扑排序，写入 `program_order`，验证依赖 source 必须先于
+   target，并包装为 `TISADialectProgram`。此阶段不读取 `ExecutionTask`，也不做
+   backend-specific primitive scheduling。
+
+随后 `TISAGenerator` 只把这个 dialect proxy 规范化为 `TISAProgram`，
+`AnalyticalBackendCodegen` 才调用 lowering registry，将每条 TISA instruction 绑定
+到同一 tile 的 backend-local payload。这样 FC 的 TISA 方言和具体硬件 payload
+保持解耦。
 
 FC 同时给每条 stage 写入 `readiness_condition`。默认编译条件
 `input_region_ready`、`operand_regions_ready`、`semantic_tile_ready` 和

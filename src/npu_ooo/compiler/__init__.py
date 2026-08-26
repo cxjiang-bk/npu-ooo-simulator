@@ -26,7 +26,7 @@ from .statistics import build_compile_statistics
 from .fusion_compiler import FusionCompiler, TISADialectProgram, default_fusion_compiler
 from .graph_compiler import GCArtifact, GraphCompiler, default_graph_compiler
 from .tisa_generator import TISAGenerator, default_tisa_generator
-from .tisa_first import (
+from .tisa_dialect import (
     TISASemanticBuilder,
     TISAStage,
 )

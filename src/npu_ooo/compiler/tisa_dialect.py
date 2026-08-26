@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""FC stage builder and analytical payload backend.
+"""TISA dialect construction and analytical payload binding.
 
 The semantic builder in this module deliberately does not inspect
 ``ExecutionTask``.  It derives scheduler-visible stages from the canonical
