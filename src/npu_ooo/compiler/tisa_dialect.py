@@ -750,7 +750,7 @@ class AnalyticalBackendCodegen:
 
         execution_graph = lowering.execution_graph
         artifact = BackendArtifact(
-            artifact_id=f"{graph.graph_id}.analytical-tisa-first",
+            artifact_id=f"{graph.graph_id}.analytical-tisa-dialect",
             program=program,
             execution_graph=execution_graph,
             payloads=payloads,

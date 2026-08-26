@@ -5,7 +5,7 @@
 - 唯一生产入口：`compile-model --torch-module MODULE:CLASS_OR_FACTORY`；
 - 完整前端链路：`PyTorch -> torch.export -> Torch-XLA -> official StableHLO -> Canonical IR`；
 - StableHLO 官方 parse/verify 与 semantic capability boundary；
-- 自动 graph pass、tile planner、TISA-first builder 和 analytical backend payload；
+- 自动 graph pass、tile planner、TISA dialect semantic builder 和 analytical backend payload；
 - TISA instruction 粒度 static/dynamic device scheduler；
 - runtime 地址分配、command chunk、descriptor availability 和 runtime/device 四组合矩阵；
 - 可配置 MachineConfig、codegen/timing/event registry；
