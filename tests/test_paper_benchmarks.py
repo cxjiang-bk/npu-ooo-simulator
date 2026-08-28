@@ -53,11 +53,55 @@ class PaperBenchmarkFrontendTest(unittest.TestCase):
                 tile_size=4,
             )
             self.assertTrue(compiled.tisa_program.instructions)
-            regions = compiled.graph.attributes.get("semantic_regions", ())
+            regions = [
+                region
+                for region in compiled.graph.attributes.get("semantic_regions", ())
+                if region.get("semantic_family") == "attention"
+            ]
             self.assertEqual(len(regions), 1)
             self.assertEqual(regions[0]["semantic_family"], "attention")
             self.assertFalse(regions[0]["opaque"])
             if case_id == "llama2-13b-oneblk":
+                rotary_regions = [
+                    region
+                    for region in compiled.graph.attributes.get("semantic_regions", ())
+                    if region.get("semantic_family") == "rotary_embedding"
+                ]
+                self.assertEqual(len(rotary_regions), 1)
+                rotary_region = rotary_regions[0]
+                self.assertFalse(rotary_region["opaque"])
+                self.assertEqual(set(rotary_region["roles"]), {
+                    "query",
+                    "key",
+                    "cosine",
+                    "sine",
+                    "rotation_matrix",
+                })
+                self.assertEqual(rotary_region["algorithm"], "rotate_half")
+                rotary_ops = [
+                    operator
+                    for operator in compiled.graph.operators
+                    if operator.attributes.get("semantic_region_family")
+                    == "rotary_embedding"
+                ]
+                self.assertTrue(rotary_ops)
+                self.assertIn(
+                    "rotate_half",
+                    {operator.attributes["semantic_region_role"] for operator in rotary_ops},
+                )
+                rotary_tisa = [
+                    instruction
+                    for instruction in compiled.tisa_program.instructions
+                    if instruction.attributes.get("semantic_region_family")
+                    == "rotary_embedding"
+                ]
+                self.assertTrue(rotary_tisa)
+                self.assertTrue(
+                    all(
+                        instruction.attributes.get("rotary_algorithm") == "rotate_half"
+                        for instruction in rotary_tisa
+                    )
+                )
                 swiglu = [
                     operator
                     for operator in compiled.graph.operators

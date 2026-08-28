@@ -160,6 +160,8 @@ def enumerate_operator_tiles(operator: OperatorSpec, schedule: OperatorSchedule)
                     "semantic_region_opaque",
                     operator.attributes.get("semantic_region_opaque"),
                 ),
+                ("rotary_algorithm", operator.attributes.get("rotary_algorithm")),
+                ("rotary_embedding", operator.attributes.get("rotary_embedding")),
             )
             if value not in {None, ""}
         }

@@ -37,7 +37,7 @@ PyTorch nn.Module
 
 1. 完成 Linear、batched Matmul、reshape/transpose、bias、activation 的组合覆盖；
 2. 支持完整 multi-head attention，包括 scale、mask、head reshape 和 output projection（首个静态 shape 两头 Attention 已完成）；
-3. 支持 decoder block 的 RoPE、KV-cache；首个静态 shape pre-norm decoder（RMSNorm、attention、residual、SwiGLU/MLP）已完成；
+3. 支持 decoder block 的 RoPE、KV-cache；首个静态 shape pre-norm decoder（RMSNorm、attention、residual、SwiGLU/MLP）已完成，LLaMA2 one-block 的显式 RoPE region 已完成；KV-cache 仍待实现；
 4. 支持 ResNet bottleneck 所需的 Conv2D、BatchNorm inference、ReLU 和 pooling；
 5. 接入 BERT、GPT-J、LLaMA2、DeepSeek 的一个真实 block，最后再扩展 full model。
 

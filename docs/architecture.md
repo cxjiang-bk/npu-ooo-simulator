@@ -151,8 +151,9 @@ RecoverStableHLOFlattenedLinearPass
 FoldTransposeIntoMatmulPass
 LayerNormFusionPass
 RMSNormFusionPass
-SoftmaxFusionPass
-AttentionRegionPass
+    SoftmaxFusionPass
+    RotaryEmbeddingRegionPass
+    AttentionRegionPass
 SwiGLUFusionPass
 ```
 
@@ -168,15 +169,18 @@ SemanticFusionPatternRegistry
   多节点 Canonical 子图 -> 已证明等价的 semantic operator / region
 ```
 
-默认 semantic pattern registry 当前注册 LayerNorm recovery、LayerNorm、RMSNorm 和
-Softmax，并以稳定 priority 与 canonical/linear/transpose 等结构 pass 合并成上述
-pipeline。未知 StableHLO operation 必须先在 importer capability boundary 显式失败；
+默认 semantic pattern registry 当前注册 LayerNorm recovery、LayerNorm、RMSNorm、
+Softmax、RoPE region recovery、Attention region recovery 和 SwiGLU，并以稳定 priority
+与 canonical/linear/transpose 等结构 pass 合并成上述 pipeline。未知 StableHLO operation
+必须先在 importer capability boundary 显式失败；
 fusion registry 不能作为绕过未支持 operation 的 fallback。后续 Attention 应保留
 `QK^T Matmul -> Softmax -> PV Matmul` 的 region 内部结构，SwiGLU 也应在证明完整子图、
 shape 和单消费者条件后再注册，不能仅凭模型名折叠。
 
-当前实现中，Attention pattern 只添加非 opaque region metadata，并保留 QK、Softmax、
-PV 及中间 reshape/scale/mask 节点的独立 TISA；SwiGLU pattern 则将已证明等价的
+当前实现中，RoPE pattern 识别 `value * cos + rotate_half(value) * sin`，将共享的
+cos/sin/rotation matrix 和 Q/K 两条路径记录为非 opaque `rotary_embedding` region，
+保留每个底层成员的独立 TISA。Attention pattern 只添加非 opaque region metadata，并
+保留 QK、Softmax、PV 及中间 reshape/scale/mask 节点的独立 TISA；SwiGLU pattern 则将已证明等价的
 vector primitive chain 收敛为一个 `swiglu` TISA 边界，内部步骤留在该指令的 backend
 payload 中。输入图若包含 dtype round-trip，转换步骤也会作为 payload primitive 保留。
 
@@ -445,6 +449,8 @@ RuntimeSubmission（除非实验变量就是 runtime）
 - analytical backend 不是 cycle-accurate RTL；
 - 当前 MXU VCS 日志只有 descriptor-to-done 区间，不能直接作为 isolated Matmul compute latency；
 - online Softmax 目前是 scheduler-level analytical state-chain 模型，尚未覆盖完整的数值 rescale、最终 normalization 和 workspace 生命周期；
-- 真实 ResNet50、BERT、GPT-J、LLaMA2、DeepSeek block 尚未形成可复现实验集。
+- 真实 ResNet50、DeepSeek block 尚未形成可复现实验集；BERT/GPT-J/LLaMA2 当前已有
+  one-block PyTorch micro workload，LLaMA2 的 RoPE 已接入，但 KV-cache 和 full depth
+  仍未实现。
 
 下一阶段见 [roadmap.md](roadmap.md)。

@@ -20,13 +20,22 @@ class SemanticFusionPatternRegistryTest(unittest.TestCase):
                 "fuse_layernorm",
                 "fuse_rmsnorm",
                 "fuse_softmax",
+                "recover_rotary_embedding",
                 "recover_attention_region",
                 "fuse_swiglu",
             ],
         )
         self.assertEqual(
             [pattern.semantic_family for pattern in patterns],
-            ["layernorm", "layernorm", "rmsnorm", "softmax", "attention", "swiglu"],
+            [
+                "layernorm",
+                "layernorm",
+                "rmsnorm",
+                "softmax",
+                "rotary_embedding",
+                "attention",
+                "swiglu",
+            ],
         )
         self.assertEqual(
             [graph_pass.name for graph_pass in default_semantic_fusion_registry().create_passes()],
@@ -83,6 +92,7 @@ class SemanticFusionPatternRegistryTest(unittest.TestCase):
                 "fuse_layernorm",
                 "fuse_rmsnorm",
                 "fuse_softmax",
+                "recover_rotary_embedding",
                 "recover_attention_region",
                 "fuse_swiglu",
             ],

@@ -5,6 +5,39 @@ from npu_ooo.frontend.stablehlo import StableHLOAdapter
 
 
 class StableHLOCapabilityBoundaryTest(unittest.TestCase):
+    def test_broadcast_in_dim_preserves_shape_and_dimension_mapping(self) -> None:
+        imported = StableHLOAdapter.from_text(
+            """
+            module {
+              func.func @main(%arg0: tensor<8xf32>) -> tensor<1x4x8xf32> {
+                %0 = stablehlo.broadcast_in_dim %arg0, dims = [2] : (tensor<8xf32>) -> tensor<1x4x8xf32>
+                return %0 : tensor<1x4x8xf32>
+              }
+            }
+            """
+        )
+
+        operator = imported.graph.operators[0]
+        tensors = {tensor.name: tensor for tensor in imported.graph.tensors}
+        self.assertEqual(operator.normalized_type, "reshape")
+        self.assertEqual(tensors[operator.inputs[0]].shape, (8,))
+        self.assertEqual(tensors[operator.outputs[0]].shape, (1, 4, 8))
+        self.assertTrue(operator.attributes["broadcast"])
+        self.assertEqual(operator.attributes["broadcast_dimensions"], [2])
+
+    def test_broadcast_in_dim_rejects_incompatible_extent(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cannot broadcast"):
+            StableHLOAdapter.from_text(
+                """
+                module {
+                  func.func @main(%arg0: tensor<7xf32>) -> tensor<1x4x8xf32> {
+                    %0 = stablehlo.broadcast_in_dim %arg0, dims = [2] : (tensor<7xf32>) -> tensor<1x4x8xf32>
+                    return %0 : tensor<1x4x8xf32>
+                  }
+                }
+                """
+            )
+
     def test_convert_is_imported_with_dtype_semantics(self) -> None:
         imported = StableHLOAdapter.from_text(
             """

@@ -10,13 +10,13 @@ from .types import PaperBenchmarkSpec, PaperBenchmarkWorkload
 
 class LLaMA2OneBlock(PaperTransformerBlock):
     def __init__(self) -> None:
-        super().__init__(norm="rmsnorm", activation="silu", gated=True)
+        super().__init__(norm="rmsnorm", activation="silu", gated=True, rotary=True)
 
 
 SPEC = PaperBenchmarkSpec(
     "llama2-13b-oneblk", "LLaMA2-13B", "decoder_transformer", "prefill", "float16", 1, 512, None,
     5120, 40, 13824, 54.0, 77.1, 1.43, "transformer_one_block",
-    ("token_embedding", "rotary_embedding", "kv_cache", "full_model_depth"),
+    ("token_embedding", "kv_cache", "full_model_depth"),
 )
 
 

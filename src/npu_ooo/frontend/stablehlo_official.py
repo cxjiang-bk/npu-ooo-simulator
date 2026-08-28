@@ -157,7 +157,16 @@ def _project_module(module: Any) -> str:
         result_type = str(result.type)
 
         if name == "stablehlo.broadcast_in_dim":
-            value_names[result] = value_names[operation.operands[0]]
+            dimensions_text = str(operation.attributes["broadcast_dimensions"])
+            dimensions_match = re.search(r"array<i64:\s*([^>]*)>", dimensions_text)
+            dimensions = _ints(
+                dimensions_match.group(1) if dimensions_match else dimensions_text
+            )
+            lines.append(
+                f"    %{result_name} = stablehlo.broadcast_in_dim %{operands[0]}, "
+                f"dims = [{', '.join(map(str, dimensions))}] : "
+                f"({', '.join(operand_types)}) -> {result_type}"
+            )
             continue
         if name == "stablehlo.constant":
             dense = str(operation.attributes["value"]).split(":", 1)[0].strip()

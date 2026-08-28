@@ -49,13 +49,40 @@ def lower_transform_graph(
             )
         input_tensor = tensors[operator.inputs[0]]
         output_tensor = tensors[operator.outputs[0]]
+        is_broadcast = bool(
+            operator.attributes.get("broadcast")
+            or operator.attributes.get("stablehlo_op") == "stablehlo.broadcast_in_dim"
+        )
         input_elements = math.prod(input_tensor.shape)
         output_elements = math.prod(output_tensor.shape)
-        if input_elements != output_elements:
+        if not is_broadcast and input_elements != output_elements:
             raise ValueError(
                 f"transform operator '{operator.op_id}' changes element count "
                 f"from {input_elements} to {output_elements}"
             )
+        if is_broadcast:
+            dimensions = operator.attributes.get("broadcast_dimensions")
+            if not isinstance(dimensions, (tuple, list)):
+                raise ValueError(
+                    f"broadcast operator '{operator.op_id}' is missing broadcast_dimensions"
+                )
+            if len(dimensions) != len(input_tensor.shape) or len(set(dimensions)) != len(dimensions):
+                raise ValueError(
+                    f"broadcast operator '{operator.op_id}' has invalid broadcast_dimensions "
+                    f"{dimensions}"
+                )
+            for source_axis, result_axis in enumerate(dimensions):
+                if not isinstance(result_axis, int) or result_axis < 0 or result_axis >= len(output_tensor.shape):
+                    raise ValueError(
+                        f"broadcast operator '{operator.op_id}' has an out-of-range result dimension"
+                    )
+                source_extent = input_tensor.shape[source_axis]
+                result_extent = output_tensor.shape[result_axis]
+                if source_extent != 1 and source_extent != result_extent:
+                    raise ValueError(
+                        f"broadcast operator '{operator.op_id}' cannot map input dimension "
+                        f"{source_axis}={source_extent} to output dimension {result_axis}={result_extent}"
+                    )
 
         operator_tiles = tuple(
             tile for tile in tile_graph.tiles if tile.operator_id == operator_id
@@ -65,7 +92,11 @@ def lower_transform_graph(
                 f"transform operator '{operator.op_id}' requires a full-tensor schedule"
             )
         tile = operator_tiles[0]
-        primitive = "copy" if operator.normalized_type == "reshape" else "transpose"
+        primitive = (
+            "copy"
+            if operator.normalized_type == "reshape"
+            else "transpose"
+        )
         unit = _unit_for(machine, primitive)
         input_region = _region(
             input_tensor,
@@ -109,6 +140,8 @@ def lower_transform_graph(
                     "semantic_family": operator.normalized_type,
                     "frontend_target": operator.attributes.get("frontend_target", ""),
                     "transpose_dims": operator.attributes.get("transpose_dims"),
+                    "broadcast": is_broadcast,
+                    "broadcast_dimensions": operator.attributes.get("broadcast_dimensions"),
                     "full_tensor_transform": True,
                 },
             )

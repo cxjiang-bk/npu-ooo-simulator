@@ -413,7 +413,10 @@ def _operator_graph_from_fx_graph(
             if len(input_shapes[0]) < 2 or len(input_shapes[1]) < 2:
                 raise FrontendImportError(f"matmul node '{name}' requires rank >= 2 operands")
             if op_type == SemanticOpType.BATCHED_MATMUL.value:
-                if input_shapes[0][:-2] != input_shapes[1][:-2]:
+                rhs_broadcast_batch = (
+                    len(input_shapes[1]) == 2 and len(input_shapes[0]) > 2
+                )
+                if not rhs_broadcast_batch and input_shapes[0][:-2] != input_shapes[1][:-2]:
                     raise FrontendImportError(
                         f"batched matmul node '{name}' uses broadcast batch dimensions; "
                         "batch broadcasting is not implemented"
@@ -495,6 +498,10 @@ def _operator_graph_from_fx_graph(
                     "epsilon": float(epsilon),
                     "affine": len(input_names) == 3,
                 }
+            )
+        elif op_type == SemanticOpType.BATCHED_MATMUL.value:
+            semantic_attributes["rhs_broadcast_batch"] = (
+                len(input_shapes[1]) == 2 and len(input_shapes[0]) > 2
             )
         elif op_type == SemanticOpType.SOFTMAX.value:
             semantic_attributes["axes"] = list(_dim_argument(node, len(input_shapes[0])))

@@ -113,8 +113,10 @@ PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-model \
   --output-dir out/decoder-dynamic
 ```
 
-该示例暂不包含 RoPE 和 KV-cache；它们需要额外的 state/stride 语义，不应被普通
-decoder block 的结果隐式代替。
+该通用示例暂不包含 RoPE 和 KV-cache；它们需要额外的 state/stride 语义，不应被普通
+decoder block 的结果隐式代替。论文 benchmark 中的 `llama2-13b-oneblk` 另有显式
+`rope_cos`/`rope_sin` 输入，当前已能恢复为非 opaque `rotary_embedding` region，并
+将 Q/K 旋转路径的底层成员继续暴露给 TISA。KV-cache 仍未实现。
 
 ## 添加 PyTorch 算子或模型
 

@@ -439,6 +439,43 @@ def _graph_from_text(text: str, *, graph_id: str) -> OperatorGraph:
                 for axis in range(len(input_shapes[0]))
                 if axis not in axes
             )
+        elif op_type == SemanticOpType.RESHAPE.value:
+            iteration_dims = tuple((f"d{axis}", value) for axis, value in enumerate(result_shape))
+            reduction_dims = ()
+            if normalized_target == "stablehlo.broadcast_in_dim":
+                dimensions = _dimension_list(body, "dims")
+                source_shape = input_shapes[0]
+                if dimensions is None:
+                    raise FrontendImportError(
+                        f"StableHLO broadcast_in_dim '{result_name}' is missing broadcast dimensions"
+                    )
+                if len(dimensions) != len(source_shape):
+                    raise FrontendImportError(
+                        f"StableHLO broadcast_in_dim '{result_name}' maps {len(source_shape)} "
+                        f"operand dimensions using {len(dimensions)} entries"
+                    )
+                if len(set(dimensions)) != len(dimensions) or any(
+                    axis < 0 or axis >= len(result_shape) for axis in dimensions
+                ):
+                    raise FrontendImportError(
+                        f"StableHLO broadcast_in_dim '{result_name}' has invalid dimensions "
+                        f"{dimensions} for result rank {len(result_shape)}"
+                    )
+                for source_axis, result_axis in enumerate(dimensions):
+                    source_extent = source_shape[source_axis]
+                    result_extent = result_shape[result_axis]
+                    if source_extent != 1 and source_extent != result_extent:
+                        raise FrontendImportError(
+                            f"StableHLO broadcast_in_dim '{result_name}' cannot broadcast "
+                            f"operand dimension {source_axis}={source_extent} to "
+                            f"result dimension {result_axis}={result_extent}"
+                        )
+                operation_attributes.update(
+                    {
+                        "broadcast": True,
+                        "broadcast_dimensions": list(dimensions),
+                    }
+                )
         elif op_type == SemanticOpType.TRANSPOSE.value:
             iteration_dims = tuple((f"d{axis}", value) for axis, value in enumerate(result_shape))
             reduction_dims = ()

@@ -501,13 +501,23 @@ def _unwrap_reshape(
     tensor: str,
     producer: dict[str, OperatorSpec],
 ) -> tuple[str, tuple[OperatorSpec, ...]]:
-    """Remove a chain of single-input reshapes while retaining its operators."""
+    """Remove shape-only bridges while retaining their operators.
+
+    StableHLO represents a broadcasted affine vector as
+    ``broadcast_in_dim``.  It is canonicalized to the same transform family
+    as reshape, so semantic norm recovery must be able to look through both
+    spellings while still retaining the bridge in provenance.
+    """
 
     current = tensor
     reshapes: list[OperatorSpec] = []
     while True:
         operation = producer.get(current)
-        if operation is None or operation.normalized_type != "reshape" or len(operation.inputs) != 1:
+        if (
+            operation is None
+            or operation.normalized_type != "reshape"
+            or len(operation.inputs) != 1
+        ):
             return current, tuple(reshapes)
         reshapes.append(operation)
         current = operation.inputs[0]
@@ -649,10 +659,12 @@ class RecoverStableHLOLayerNormPass:
             if not _is_elementwise(shifted, "stablehlo.add") or len(shifted.inputs) != 2:
                 continue
             bias = next((item for item in shifted.inputs if item != scaled.outputs[0]), None)
+            weight_base, weight_bridges = _unwrap_reshape(weight, producer)
+            bias_base, bias_bridges = _unwrap_reshape(bias, producer) if bias is not None else (None, ())
             output = _single_output(shifted)
             output_spec = tensors.get(output)
-            weight_spec = tensors.get(weight) if weight else None
-            bias_spec = tensors.get(bias) if bias else None
+            weight_spec = tensors.get(weight_base) if weight_base else None
+            bias_spec = tensors.get(bias_base) if bias_base else None
             pre_reshape = producer.get(norm_source)
             if pre_reshape is not None and pre_reshape.normalized_type != "reshape":
                 pre_reshape = None
@@ -693,12 +705,14 @@ class RecoverStableHLOLayerNormPass:
                 *((post_reshape,) if post_reshape is not None else ()),
                 scaled,
                 shifted,
+                *weight_bridges,
+                *bias_bridges,
             )
             matched_ids = {item.op_id for item in chain}
             fused = OperatorSpec(
                 op_id=output,
                 op_type="layernorm",
-                inputs=(source, weight, bias),
+                inputs=(source, weight_base, bias_base),
                 outputs=(output,),
                 iteration_dims=tuple(
                     (f"d{axis}", extent)
@@ -1053,6 +1067,7 @@ class RMSNormFusionPass:
                 )
                 if weight_tensor is None:
                     continue
+                weight_base, weight_reshapes = _unwrap_reshape(weight_tensor, producer)
 
                 inverse_base, inverse_reshapes = _unwrap_reshape(inverse_tensor, producer)
                 rsqrt = producer.get(inverse_base)
@@ -1101,7 +1116,10 @@ class RMSNormFusionPass:
                 source_spec = tensors.get(source_base)
                 output_tensor = _single_output(final)
                 output_spec = tensors.get(output_tensor)
+                weight_spec = tensors.get(weight_base)
                 if source_spec is None or output_spec is None or source_spec.shape != output_spec.shape:
+                    continue
+                if weight_spec is None or weight_spec.shape != (reduce.reduction_dims[0][1],):
                     continue
                 if not reduce.iteration_dims or len(reduce.reduction_dims) != 1:
                     continue
@@ -1124,6 +1142,7 @@ class RMSNormFusionPass:
                     *inverse_reshapes,
                     normalized,
                     final,
+                    *weight_reshapes,
                 )
                 matched_ids = {operation.op_id for operation in bridge_operations}
                 if len(matched_ids) != len(bridge_operations):
@@ -1132,7 +1151,7 @@ class RMSNormFusionPass:
                 fused = OperatorSpec(
                     op_id=f"{final.op_id}.rmsnorm",
                     op_type="rmsnorm",
-                    inputs=(source_base, weight_tensor),
+                    inputs=(source_base, weight_base),
                     outputs=(output_tensor,),
                     iteration_dims=reduce.iteration_dims,
                     reduction_dims=reduce.reduction_dims,
@@ -1357,7 +1376,8 @@ class SoftmaxFusionPass:
             if not _is_elementwise(final, "stablehlo.divide") or len(final.inputs) != 2:
                 continue
             exp = producer.get(final.inputs[0])
-            total = producer.get(final.inputs[1])
+            total_tensor, total_reshapes = _unwrap_reshape(final.inputs[1], producer)
+            total = producer.get(total_tensor)
             if exp is None or total is None or not _is_elementwise(exp, "stablehlo.exponential"):
                 continue
             if total.normalized_type != "reduce" or total.attributes.get("reducer") != "add":
@@ -1368,7 +1388,8 @@ class SoftmaxFusionPass:
             if shifted is None or not _is_elementwise(shifted, "stablehlo.subtract") or len(shifted.inputs) != 2:
                 continue
             source = shifted.inputs[0]
-            maximum = producer.get(shifted.inputs[1])
+            maximum_tensor, maximum_reshapes = _unwrap_reshape(shifted.inputs[1], producer)
+            maximum = producer.get(maximum_tensor)
             if maximum is None or maximum.normalized_type != "reduce":
                 continue
             if maximum.attributes.get("reducer") != "maximum" or maximum.inputs != (source,):
@@ -1380,15 +1401,45 @@ class SoftmaxFusionPass:
             output_spec = tensors.get(output)
             if source_spec is None or output_spec is None or source_spec.shape != output_spec.shape:
                 continue
-            chain = (maximum, shifted, exp, total, final)
+            maximum_bridge = tuple(reversed(maximum_reshapes))
+            total_bridge = tuple(reversed(total_reshapes))
+            chain = (
+                maximum,
+                *maximum_bridge,
+                shifted,
+                exp,
+                total,
+                *total_bridge,
+                final,
+            )
             chain_ids = {item.op_id for item in chain}
+            maximum_user = maximum_reshapes[-1] if maximum_reshapes else shifted
+            total_user = total_reshapes[-1] if total_reshapes else final
+            if consumers.get(_single_output(maximum), ()) != [maximum_user]:
+                continue
             if any(
-                consumers.get(_single_output(item), ()) != [next_item]
-                for item, next_item in ((maximum, shifted), (shifted, exp), (total, final))
+                consumers.get(_single_output(current), ()) != [next_item]
+                for current, next_item in zip(
+                    maximum_bridge,
+                    (*maximum_bridge[1:], shifted),
+                )
+            ):
+                continue
+            if consumers.get(_single_output(shifted), ()) != [exp]:
+                continue
+            if consumers.get(_single_output(total), ()) != [total_user]:
+                continue
+            if any(
+                consumers.get(_single_output(current), ()) != [next_item]
+                for current, next_item in zip(
+                    total_bridge,
+                    (*total_bridge[1:], final),
+                )
             ):
                 continue
             exp_consumers = consumers.get(_single_output(exp), ())
-            if len(exp_consumers) != 2 or total not in exp_consumers or final not in exp_consumers:
+            final_exp_user = final
+            if len(exp_consumers) != 2 or total not in exp_consumers or final_exp_user not in exp_consumers:
                 continue
             axes = [int(name[1:]) for name, _ in maximum.reduction_dims if name.startswith("d") and name[1:].isdigit()]
             fused = OperatorSpec(
@@ -1562,6 +1613,421 @@ def _tensor_elements(tensor: TensorSpec | None) -> int | None:
     ):
         return None
     return math.prod(tensor.shape)
+
+
+@dataclass(frozen=True)
+class _RotaryMatch:
+    """One ``value * cos + rotate(value) * sin`` graph match."""
+
+    output: str
+    input_tensor: str
+    cosine_tensor: str
+    sine_tensor: str
+    rotation_matrix_tensor: str
+    rotation_matmul: OperatorSpec
+    role_operations: dict[str, tuple[OperatorSpec, ...]]
+    members: tuple[OperatorSpec, ...]
+
+
+def _unique_operations(*groups: tuple[OperatorSpec, ...]) -> tuple[OperatorSpec, ...]:
+    """Deduplicate operation objects by id while preserving graph order."""
+
+    seen: set[str] = set()
+    result: list[OperatorSpec] = []
+    for group in groups:
+        for operation in group:
+            if operation.op_id in seen:
+                continue
+            seen.add(operation.op_id)
+            result.append(operation)
+    return tuple(result)
+
+
+def _broadcast_shapes_compatible(
+    source: tuple[object, ...], target: tuple[object, ...]
+) -> bool:
+    """Check NumPy/StableHLO-style broadcast compatibility for static shapes."""
+
+    if len(source) > len(target):
+        return False
+    padded = (1,) * (len(target) - len(source)) + source
+    return all(left == 1 or left == right for left, right in zip(padded, target))
+
+
+class RotaryEmbeddingRegionPass:
+    """Recover RoPE metadata without hiding its primitive execution members.
+
+    Torch-XLA lowers the common rotary form to two pointwise branches and a
+    small matrix multiply implementing ``rotate_half``::
+
+        value * cos + matmul(value, rotation_matrix) * sin
+
+    The pass annotates the original operations and records one region for the
+    shared Q/K cos/sin inputs.  It deliberately does not replace the graph
+    with an opaque ``rope`` operator, so each load/compute/store remains
+    visible to FC and the scheduler.
+    """
+
+    name = "recover_rotary_embedding"
+
+    @staticmethod
+    def _is_transform(operation: OperatorSpec) -> bool:
+        return (
+            operation.normalized_type in {"reshape", "transpose"}
+            or _is_elementwise(operation, "stablehlo.convert")
+        ) and len(operation.inputs) == 1 and len(operation.outputs) == 1
+
+    @classmethod
+    def _trace_transforms(
+        cls,
+        tensor: str,
+        producer: dict[str, OperatorSpec],
+    ) -> tuple[str, tuple[OperatorSpec, ...]]:
+        """Return the first non-view tensor and the view chain above it."""
+
+        current = tensor
+        chain: list[OperatorSpec] = []
+        while True:
+            operation = producer.get(current)
+            if operation is None or not cls._is_transform(operation):
+                return current, tuple(chain)
+            chain.append(operation)
+            current = operation.inputs[0]
+
+    @classmethod
+    def _matmul_candidates(
+        cls,
+        tensor: str,
+        producer: dict[str, OperatorSpec],
+    ) -> tuple[tuple[OperatorSpec, tuple[OperatorSpec, ...]], ...]:
+        """Find matmuls reachable from a value while retaining downstream paths."""
+
+        candidates: list[tuple[OperatorSpec, tuple[OperatorSpec, ...]]] = []
+
+        def visit(current: str, path: tuple[OperatorSpec, ...], active: frozenset[str]) -> None:
+            operation = producer.get(current)
+            if operation is None or operation.op_id in active:
+                return
+            if operation.normalized_type in {"matmul", "batched_matmul", "gemv"}:
+                candidates.append((operation, path))
+            for input_tensor in operation.inputs:
+                visit(input_tensor, (*path, operation), active | {operation.op_id})
+
+        visit(tensor, (), frozenset())
+        return tuple(candidates)
+
+    @classmethod
+    def _match_add(
+        cls,
+        add: OperatorSpec,
+        producer: dict[str, OperatorSpec],
+        consumers: dict[str, list[OperatorSpec]],
+        tensors: dict[str, TensorSpec],
+    ) -> _RotaryMatch | None:
+        if not _is_elementwise(add, "stablehlo.add") or len(add.inputs) != 2:
+            return None
+        multiply_branches = tuple(
+            (producer.get(root), bridges)
+            for tensor in add.inputs
+            for root, bridges in (cls._trace_transforms(tensor, producer),)
+            if producer.get(root) is not None and _is_elementwise_mul(producer[root])
+        )
+        if len(multiply_branches) != 2 or any(
+            operation is None for operation, _bridges in multiply_branches
+        ):
+            return None
+        def branch_reaches_add(
+            operation: OperatorSpec,
+            bridges: tuple[OperatorSpec, ...],
+        ) -> bool:
+            if not bridges:
+                return consumers.get(_single_output(operation), ()) == [add]
+            return (
+                consumers.get(_single_output(operation), ()) == [bridges[-1]]
+                and consumers.get(_single_output(bridges[0]), ()) == [add]
+            )
+
+        for direct_index, rotated_index in ((0, 1), (1, 0)):
+            direct_mul, direct_tail = multiply_branches[direct_index]
+            rotated_mul, rotated_tail = multiply_branches[rotated_index]
+            if direct_mul is None or rotated_mul is None:
+                continue
+            if direct_mul.op_id == rotated_mul.op_id or not all(
+                branch_reaches_add(operation, bridges)
+                for operation, bridges in (
+                    (direct_mul, direct_tail),
+                    (rotated_mul, rotated_tail),
+                )
+            ):
+                continue
+            for rotated_value in rotated_mul.inputs:
+                for rotation, _downstream_path in cls._matmul_candidates(rotated_value, producer):
+                    if len(rotation.inputs) != 2 or len(rotation.outputs) != 1:
+                        continue
+                    rotation_rhs, rhs_bridges = cls._trace_transforms(rotation.inputs[1], producer)
+                    rhs_spec = tensors.get(rotation_rhs)
+                    if (
+                        rhs_spec is None
+                        or len(rhs_spec.shape) != 2
+                        or rhs_spec.shape[0] != rhs_spec.shape[1]
+                        or not any(
+                            _frontend_target(operation) == "stablehlo.broadcast_in_dim"
+                            for operation in rhs_bridges
+                        )
+                    ):
+                        continue
+                    rotation_value_root, rotation_value_bridges = cls._trace_transforms(
+                        rotated_value, producer
+                    )
+                    if rotation_value_root != rotation.outputs[0]:
+                        continue
+                    rotation_input_spec = tensors.get(rotation.inputs[0])
+                    rotation_output_spec = tensors.get(rotation.outputs[0])
+                    if (
+                        rotation_input_spec is None
+                        or rotation_output_spec is None
+                        or rotation_input_spec.shape != rotation_output_spec.shape
+                        or not rotation_input_spec.shape
+                        or rotation_input_spec.shape[-1] != rhs_spec.shape[0]
+                    ):
+                        continue
+                    input_root, input_bridges = cls._trace_transforms(rotation.inputs[0], producer)
+
+                    direct_value = next(
+                        (
+                            tensor
+                            for tensor in direct_mul.inputs
+                            if cls._trace_transforms(tensor, producer)[0] == input_root
+                        ),
+                        None,
+                    )
+                    if direct_value is None:
+                        continue
+                    direct_coefficient = next(
+                        (tensor for tensor in direct_mul.inputs if tensor != direct_value),
+                        None,
+                    )
+                    rotated_coefficient = next(
+                        (tensor for tensor in rotated_mul.inputs if tensor != rotated_value),
+                        None,
+                    )
+                    if direct_coefficient is None or rotated_coefficient is None:
+                        continue
+                    cosine_tensor, cosine_bridges = cls._trace_transforms(
+                        direct_coefficient, producer
+                    )
+                    sine_tensor, sine_bridges = cls._trace_transforms(
+                        rotated_coefficient, producer
+                    )
+                    if cosine_tensor in {input_root, rotation_rhs} or sine_tensor in {
+                        input_root,
+                        rotation_rhs,
+                    }:
+                        continue
+                    output_spec = tensors.get(_single_output(add))
+                    direct_spec = tensors.get(_single_output(direct_mul))
+                    rotated_spec = tensors.get(_single_output(rotated_mul))
+                    cosine_spec = tensors.get(cosine_tensor)
+                    sine_spec = tensors.get(sine_tensor)
+                    if any(
+                        spec is None
+                        for spec in (output_spec, direct_spec, rotated_spec, cosine_spec, sine_spec)
+                    ):
+                        continue
+                    if (
+                        direct_spec.shape != output_spec.shape
+                        or rotated_spec.shape != output_spec.shape
+                        or not _broadcast_shapes_compatible(cosine_spec.shape, direct_spec.shape)
+                        or not _broadcast_shapes_compatible(sine_spec.shape, rotated_spec.shape)
+                    ):
+                        continue
+                    role_operations = {
+                        "input_transform": _unique_operations(
+                            input_bridges,
+                            cls._trace_transforms(direct_value, producer)[1],
+                        ),
+                        "rotated_transform": rotation_value_bridges,
+                        "rotate_half": (rotation,),
+                        "rotation_matrix": rhs_bridges,
+                        "cosine_operand": cosine_bridges,
+                        "sine_operand": sine_bridges,
+                        "cosine_scale": (direct_mul,),
+                        "sine_scale": (rotated_mul,),
+                        "branch_transform": _unique_operations(direct_tail, rotated_tail),
+                        "combine": (add,),
+                    }
+                    members = _unique_operations(*role_operations.values())
+                    return _RotaryMatch(
+                        output=_single_output(add),
+                        input_tensor=input_root,
+                        cosine_tensor=cosine_tensor,
+                        sine_tensor=sine_tensor,
+                        rotation_matrix_tensor=rotation_rhs,
+                        rotation_matmul=rotation,
+                        role_operations=role_operations,
+                        members=members,
+                    )
+        return None
+
+    @staticmethod
+    def _downstream_matmul_role(
+        tensor: str,
+        consumers: dict[str, list[OperatorSpec]],
+    ) -> str:
+        """Infer query/key from the first downstream batched matmul operand."""
+
+        visited: set[str] = set()
+
+        def visit(current: str) -> str | None:
+            if current in visited:
+                return None
+            visited.add(current)
+            for operation in consumers.get(current, ()):
+                if operation.normalized_type in {"matmul", "batched_matmul"}:
+                    try:
+                        return "query" if operation.inputs.index(current) == 0 else "key"
+                    except ValueError:
+                        continue
+                if RotaryEmbeddingRegionPass._is_transform(operation):
+                    result = visit(operation.outputs[0])
+                    if result is not None:
+                        return result
+            return None
+
+        return visit(tensor) or "operand"
+
+    def run(self, graph: OperatorGraph) -> PassResult:
+        operators = list(graph.operators)
+        tensors = {tensor.name: tensor for tensor in graph.tensors}
+        producer = _producer_map(operators)
+        consumers = _consumer_map(operators)
+        matches = tuple(
+            match
+            for operation in operators
+            if (match := self._match_add(operation, producer, consumers, tensors)) is not None
+        )
+        if not matches:
+            return PassResult(
+                graph,
+                (PassDiagnostic("info", self.name, "no supported rotary embedding region found"),),
+            )
+
+        grouped: dict[tuple[str, str, str], list[_RotaryMatch]] = {}
+        for match in matches:
+            grouped.setdefault(
+                (match.cosine_tensor, match.sine_tensor, match.rotation_matrix_tensor),
+                [],
+            ).append(match)
+
+        roles_by_operator: dict[str, tuple[str, str]] = {}
+        regions: list[dict[str, object]] = []
+        assigned: set[str] = set()
+        for group_matches in grouped.values():
+            region_members = {
+                operation.op_id
+                for match in group_matches
+                for operation in match.members
+            }
+            if assigned.intersection(region_members):
+                continue
+            region_id = f"rotary_embedding_region_{len(regions):04d}"
+            role_records: dict[str, dict[str, object]] = {}
+            for match in group_matches:
+                role = self._downstream_matmul_role(match.output, consumers)
+                role_records[role] = {
+                    "output": match.output,
+                    "input": match.input_tensor,
+                    "cosine_scale": next(
+                        operation.op_id for operation in match.role_operations["cosine_scale"]
+                    ),
+                    "sine_scale": next(
+                        operation.op_id for operation in match.role_operations["sine_scale"]
+                    ),
+                    "rotate_half": match.rotation_matmul.op_id,
+                }
+                for semantic_role, role_operations in match.role_operations.items():
+                    for operation in role_operations:
+                        roles_by_operator.setdefault(operation.op_id, (region_id, semantic_role))
+                assigned.update(operation.op_id for operation in match.members)
+            members = [
+                operation
+                for operation in operators
+                if operation.op_id in region_members
+            ]
+            regions.append(
+                {
+                    "region_id": region_id,
+                    "semantic_family": "rotary_embedding",
+                    "algorithm": "rotate_half",
+                    "members": [operation.op_id for operation in members],
+                    "roles": {
+                        **role_records,
+                        "cosine": group_matches[0].cosine_tensor,
+                        "sine": group_matches[0].sine_tensor,
+                        "rotation_matrix": group_matches[0].rotation_matrix_tensor,
+                    },
+                    "inputs": list(
+                        dict.fromkeys(
+                            tensor
+                            for operation in members
+                            for tensor in operation.inputs
+                            if producer.get(tensor) is None
+                            or producer[tensor].op_id not in region_members
+                        )
+                    ),
+                    "outputs": [match.output for match in group_matches],
+                    "scheduler_visibility": "member_tisa_instructions",
+                    "opaque": False,
+                }
+            )
+
+        annotated = tuple(
+            replace(
+                operation,
+                attributes={
+                    **dict(operation.attributes),
+                    "semantic_region_id": roles_by_operator[operation.op_id][0],
+                    "semantic_region_family": "rotary_embedding",
+                    "semantic_region_role": roles_by_operator[operation.op_id][1],
+                    "semantic_region_opaque": False,
+                    "rotary_algorithm": "rotate_half",
+                    "rotary_embedding": True,
+                },
+            )
+            if operation.op_id in roles_by_operator
+            else operation
+            for operation in operators
+        )
+        result = OperatorGraph(
+            graph_id=graph.graph_id,
+            tensors=graph.tensors,
+            operators=annotated,
+            edges=graph.edges,
+            attributes={
+                **dict(graph.attributes),
+                "canonical_passes": [
+                    *dict(graph.attributes).get("canonical_passes", ()),
+                    self.name,
+                ],
+                "semantic_regions": [
+                    *dict(graph.attributes).get("semantic_regions", ()),
+                    *regions,
+                ],
+            },
+        )
+        issues = result.validate()
+        if issues:
+            raise ValueError("recover_rotary_embedding produced an invalid graph: " + "; ".join(issues))
+        return PassResult(
+            result,
+            (
+                PassDiagnostic(
+                    "info",
+                    self.name,
+                    f"recovered {len(regions)} shared rotary embedding region(s)",
+                ),
+            ),
+        )
 
 
 class AttentionRegionPass:
@@ -1988,6 +2454,7 @@ __all__ = [
     "PassResult",
     "RecoverStableHLOFlattenedLinearPass",
     "RecoverStableHLOLayerNormPass",
+    "RotaryEmbeddingRegionPass",
     "LayerNormFusionPass",
     "RMSNormFusionPass",
     "SoftmaxFusionPass",
