@@ -85,8 +85,9 @@ prefill 与 decode 必须是不同 case；analytical、source-derived 和 RTL-ob
 
 ### 阶段 1B：模型到 TISA 的语义覆盖
 
-- [ ] Fusion Pattern Registry（Softmax、Norm、Attention、SwiGLU）；
-- [ ] BERT/GPT-J one-block 的真实前端回归；
+- [x] Fusion Pattern Registry 基础设施与现有 LayerNorm/RMSNorm/Softmax pattern；
+- [x] Attention region 与 SwiGLU semantic pattern；
+- [x] BERT/GPT-J one-block 的真实前端回归；
 - [ ] LLaMA2 的 RoPE、KV-cache 和 prefill/decode；
 - [ ] ResNet 的 Conv2D、BatchNorm inference、pooling；
 - [ ] DeepSeek 结构确认以及 dense/MoE 路径。

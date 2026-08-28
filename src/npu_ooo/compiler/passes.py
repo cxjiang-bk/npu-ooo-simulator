@@ -8,11 +8,14 @@ the common explicit RMSNorm formula emitted by ``torch.export``; unsupported
 patterns remain visible instead of being silently rewritten.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from npu_ooo.ir import DataEdge, OperatorGraph, OperatorSpec, TensorSpec
+
+if TYPE_CHECKING:
+    from .fusion_patterns import SemanticFusionPatternRegistry
 
 
 @dataclass(frozen=True)
@@ -535,6 +538,32 @@ def _is_elementwise(operator: OperatorSpec, *names: str) -> bool:
         return False
     target = _frontend_target(operator)
     return any(name in target for name in names)
+
+
+def _is_passthrough_convert(operator: OperatorSpec) -> bool:
+    """Return whether an elementwise StableHLO convert is shape-preserving."""
+
+    return (
+        _is_elementwise(operator, "stablehlo.convert")
+        and len(operator.inputs) == 1
+        and len(operator.outputs) == 1
+    )
+
+
+def _unwrap_convert_chain(
+    tensor: str,
+    producer: dict[str, OperatorSpec],
+) -> tuple[str, tuple[OperatorSpec, ...]]:
+    """Remove a single-input convert chain while retaining its operations."""
+
+    current = tensor
+    converts: list[OperatorSpec] = []
+    while True:
+        operation = producer.get(current)
+        if operation is None or not _is_passthrough_convert(operation):
+            return current, tuple(converts)
+        converts.append(operation)
+        current = operation.inputs[0]
 
 
 def _producer_map(operators: list[OperatorSpec]) -> dict[str, OperatorSpec]:
@@ -1526,20 +1555,355 @@ class LayerNormFusionPass:
         return PassResult(graph, (PassDiagnostic("info", self.name, "no supported LayerNorm composite pattern found"),))
 
 
+def _tensor_elements(tensor: TensorSpec | None) -> int | None:
+    if tensor is None or any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in tensor.shape
+    ):
+        return None
+    return math.prod(tensor.shape)
+
+
+class AttentionRegionPass:
+    """Recover an observable QK/Softmax/PV attention region.
+
+    This pass annotates existing operators instead of replacing them.  The
+    region is therefore useful to GC/FC analysis while every member remains a
+    scheduler-visible TISA operation.
+    """
+
+    name = "recover_attention_region"
+
+    @staticmethod
+    def _upstream_qk_path(
+        tensor: str,
+        producer: dict[str, OperatorSpec],
+    ) -> tuple[OperatorSpec, tuple[OperatorSpec, ...]] | None:
+        def visit(
+            current: str,
+            active: frozenset[str],
+        ) -> list[tuple[OperatorSpec, tuple[OperatorSpec, ...]]]:
+            operation = producer.get(current)
+            if operation is None or operation.op_id in active:
+                return []
+            if operation.normalized_type in {"matmul", "batched_matmul"}:
+                return [(operation, ())]
+            if operation.normalized_type not in {"reshape", "transpose", "elementwise"}:
+                return []
+            candidates: list[tuple[OperatorSpec, tuple[OperatorSpec, ...]]] = []
+            for input_tensor in operation.inputs:
+                for qk, path in visit(input_tensor, active | {operation.op_id}):
+                    candidates.append((qk, (*path, operation)))
+            return candidates
+
+        candidates = visit(tensor, frozenset())
+        by_qk: dict[str, list[tuple[OperatorSpec, ...]]] = {}
+        qk_by_id: dict[str, OperatorSpec] = {}
+        for qk, path in candidates:
+            qk_by_id[qk.op_id] = qk
+            by_qk.setdefault(qk.op_id, []).append(path)
+        if len(by_qk) != 1:
+            return None
+        qk_id = next(iter(by_qk))
+        path = min(by_qk[qk_id], key=lambda items: (len(items), tuple(op.op_id for op in items)))
+        return qk_by_id[qk_id], path
+
+    @staticmethod
+    def _downstream_pv_path(
+        tensor: str,
+        consumers: dict[str, list[OperatorSpec]],
+    ) -> tuple[OperatorSpec, tuple[OperatorSpec, ...], str] | None:
+        candidates: list[tuple[OperatorSpec, tuple[OperatorSpec, ...], str]] = []
+
+        def visit(
+            current: str,
+            path: tuple[OperatorSpec, ...],
+            active: frozenset[str],
+        ) -> None:
+            for operation in consumers.get(current, ()):
+                if operation.op_id in active:
+                    continue
+                if operation.normalized_type in {"matmul", "batched_matmul"}:
+                    candidates.append((operation, path, current))
+                    continue
+                if (
+                    operation.normalized_type in {"reshape", "transpose"}
+                    and len(operation.outputs) == 1
+                ):
+                    visit(
+                        operation.outputs[0],
+                        (*path, operation),
+                        active | {operation.op_id},
+                    )
+
+        visit(tensor, (), frozenset())
+        unique = {
+            (pv.op_id, tuple(operation.op_id for operation in path), input_tensor):
+            (pv, path, input_tensor)
+            for pv, path, input_tensor in candidates
+        }
+        return next(iter(unique.values())) if len(unique) == 1 else None
+
+    def run(self, graph: OperatorGraph) -> PassResult:
+        operators = list(graph.operators)
+        tensors = {tensor.name: tensor for tensor in graph.tensors}
+        producer = _producer_map(operators)
+        consumers = _consumer_map(operators)
+        regions: list[dict[str, object]] = []
+        roles_by_operator: dict[str, tuple[str, str]] = {}
+        claimed: set[str] = set()
+
+        for softmax in operators:
+            if softmax.normalized_type != "softmax" or len(softmax.inputs) != 1:
+                continue
+            upstream = self._upstream_qk_path(softmax.inputs[0], producer)
+            downstream = self._downstream_pv_path(_single_output(softmax), consumers)
+            if upstream is None or downstream is None:
+                continue
+            qk, score_path = upstream
+            pv, probability_path, probability_tensor = downstream
+            members = (qk, *score_path, softmax, *probability_path, pv)
+            member_ids = [operation.op_id for operation in members]
+            if len(set(member_ids)) != len(member_ids) or claimed.intersection(member_ids):
+                continue
+            qk_elements = _tensor_elements(tensors.get(_single_output(qk)))
+            score_elements = _tensor_elements(tensors.get(softmax.inputs[0]))
+            probability_elements = _tensor_elements(tensors.get(_single_output(softmax)))
+            pv_input_elements = _tensor_elements(tensors.get(probability_tensor))
+            if (
+                qk_elements is None
+                or qk_elements != score_elements
+                or probability_elements is None
+                or probability_elements != pv_input_elements
+                or tensors[_single_output(softmax)].shape != tensors[softmax.inputs[0]].shape
+                or probability_tensor not in pv.inputs
+                or len(softmax.reduction_dims) != 1
+            ):
+                continue
+
+            region_id = f"attention_region_{len(regions):04d}"
+            claimed.update(member_ids)
+            roles_by_operator[qk.op_id] = (region_id, "qk_matmul")
+            roles_by_operator[softmax.op_id] = (region_id, "softmax")
+            roles_by_operator[pv.op_id] = (region_id, "pv_matmul")
+            for operation in score_path:
+                roles_by_operator[operation.op_id] = (region_id, "score_transform")
+            for operation in probability_path:
+                roles_by_operator[operation.op_id] = (region_id, "probability_transform")
+
+            member_set = set(member_ids)
+            external_inputs = tuple(
+                dict.fromkeys(
+                    tensor
+                    for operation in members
+                    for tensor in operation.inputs
+                    if producer.get(tensor) is None
+                    or producer[tensor].op_id not in member_set
+                )
+            )
+            regions.append(
+                {
+                    "region_id": region_id,
+                    "semantic_family": "attention",
+                    "members": member_ids,
+                    "roles": {
+                        "qk_matmul": qk.op_id,
+                        "score_transforms": [operation.op_id for operation in score_path],
+                        "softmax": softmax.op_id,
+                        "probability_transforms": [
+                            operation.op_id for operation in probability_path
+                        ],
+                        "pv_matmul": pv.op_id,
+                    },
+                    "inputs": list(external_inputs),
+                    "outputs": list(pv.outputs),
+                    "scheduler_visibility": "member_tisa_instructions",
+                    "opaque": False,
+                }
+            )
+
+        if not regions:
+            return PassResult(
+                graph,
+                (PassDiagnostic("info", self.name, "no supported Attention region found"),),
+            )
+
+        annotated = tuple(
+            replace(
+                operation,
+                attributes={
+                    **dict(operation.attributes),
+                    "semantic_region_id": roles_by_operator[operation.op_id][0],
+                    "semantic_region_family": "attention",
+                    "semantic_region_role": roles_by_operator[operation.op_id][1],
+                    "semantic_region_opaque": False,
+                },
+            )
+            if operation.op_id in roles_by_operator
+            else operation
+            for operation in graph.operators
+        )
+        result = OperatorGraph(
+            graph_id=graph.graph_id,
+            tensors=graph.tensors,
+            operators=annotated,
+            edges=graph.edges,
+            attributes={
+                **dict(graph.attributes),
+                "canonical_passes": [
+                    *dict(graph.attributes).get("canonical_passes", ()),
+                    self.name,
+                ],
+                "semantic_regions": [
+                    *dict(graph.attributes).get("semantic_regions", ()),
+                    *regions,
+                ],
+            },
+        )
+        issues = result.validate()
+        if issues:
+            raise ValueError("recover_attention_region produced an invalid graph: " + "; ".join(issues))
+        return PassResult(
+            result,
+            (
+                PassDiagnostic(
+                    "info",
+                    self.name,
+                    f"recovered {len(regions)} observable Attention region(s)",
+                ),
+            ),
+        )
+
+
+class SwiGLUFusionPass:
+    """Recover ``silu(gate) * up`` as a vector semantic operator."""
+
+    name = "fuse_swiglu"
+    repeat_until_stable = True
+
+    def run(self, graph: OperatorGraph) -> PassResult:
+        operators = list(graph.operators)
+        tensors = {tensor.name: tensor for tensor in graph.tensors}
+        producer = _producer_map(operators)
+        consumers = _consumer_map(operators)
+        for final in operators:
+            if not _is_elementwise_mul(final):
+                continue
+            final_inputs = _input_occurrences(final)
+            if len(final_inputs) != 2:
+                continue
+            for silu_tensor in final_inputs:
+                silu_base, silu_converts = _unwrap_convert_chain(silu_tensor, producer)
+                silu = producer.get(silu_base)
+                if silu is None or not _is_elementwise_mul(silu):
+                    continue
+                silu_inputs = _input_occurrences(silu)
+                if len(silu_inputs) != 2:
+                    continue
+                logistic = next(
+                    (
+                        producer.get(tensor)
+                        for tensor in silu_inputs
+                        if producer.get(tensor) is not None
+                        and _is_elementwise(producer[tensor], "stablehlo.logistic")
+                    ),
+                    None,
+                )
+                if logistic is None or len(logistic.inputs) != 1:
+                    continue
+                gate_tensor = logistic.inputs[0]
+                if sorted(silu_inputs) != sorted((gate_tensor, _single_output(logistic))):
+                    continue
+                up_tensor = final_inputs[1] if final_inputs[0] == silu_tensor else final_inputs[0]
+                output_tensor = _single_output(final)
+                gate_spec = tensors.get(gate_tensor)
+                up_spec = tensors.get(up_tensor)
+                output_spec = tensors.get(output_tensor)
+                if (
+                    gate_spec is None
+                    or up_spec is None
+                    or output_spec is None
+                    or gate_spec.shape != up_spec.shape
+                    or gate_spec.shape != output_spec.shape
+                    or gate_spec.dtype != up_spec.dtype
+                    or gate_spec.dtype != output_spec.dtype
+                    or consumers.get(_single_output(logistic), ()) != [silu]
+                ):
+                    continue
+                conversion_chain = tuple(reversed(silu_converts))
+                value_chain = (silu, *conversion_chain, final)
+                if any(
+                    consumers.get(_single_output(current), ()) != [successor]
+                    for current, successor in zip(value_chain, value_chain[1:])
+                ):
+                    continue
+                conversion_steps = [
+                    {
+                        "source_dtype": operation.attributes.get("source_dtype"),
+                        "target_dtype": operation.attributes.get("target_dtype"),
+                    }
+                    for operation in conversion_chain
+                ]
+                if any(
+                    not step["source_dtype"] or not step["target_dtype"]
+                    for step in conversion_steps
+                ):
+                    continue
+                matched_operations = (logistic, silu, *conversion_chain, final)
+                source_ops = [operation.op_id for operation in matched_operations]
+                fused = OperatorSpec(
+                    op_id=f"{final.op_id}.swiglu",
+                    op_type="swiglu",
+                    inputs=(gate_tensor, up_tensor),
+                    outputs=(output_tensor,),
+                    iteration_dims=final.iteration_dims,
+                    attributes={
+                        "frontend_target": "semantic.swiglu",
+                        "semantic_family": "swiglu",
+                        "semantic_op": "swiglu",
+                        "operand_arity": 2,
+                        "backend_capability_key": "swiglu",
+                        "activation": "silu",
+                        "conversion_steps": conversion_steps,
+                        "fusion": "swiglu",
+                        "source_ops": source_ops,
+                    },
+                    provenance={
+                        "compiler_pass": self.name,
+                        "source_graph": graph.graph_id,
+                        "source_ops": source_ops,
+                    },
+                )
+                result = _rebuild_graph(
+                    graph,
+                    operators,
+                    {operation.op_id for operation in matched_operations},
+                    fused,
+                    min(operators.index(operation) for operation in matched_operations),
+                    fusion_kind=self.name,
+                )
+                return PassResult(
+                    result,
+                    (
+                        PassDiagnostic(
+                            "info",
+                            self.name,
+                            f"fused SwiGLU primitives into '{fused.op_id}'",
+                        ),
+                    ),
+                )
+
+        return PassResult(
+            graph,
+            (PassDiagnostic("info", self.name, "no supported SwiGLU pattern found"),),
+        )
+
+
 class PassManager:
     """Run ordered graph passes with stable per-pass diagnostics."""
 
     def __init__(self, passes: tuple[GraphPass, ...] | None = None) -> None:
-        self.passes = passes or (
-            CanonicalizeGraphPass(),
-            LinearDecompositionPass(),
-            RecoverStableHLOLayerNormPass(),
-            RecoverStableHLOFlattenedLinearPass(),
-            FoldTransposeIntoMatmulPass(),
-            LayerNormFusionPass(),
-            RMSNormFusionPass(),
-            SoftmaxFusionPass(),
-        )
+        self.passes = _default_pipeline() if passes is None else passes
 
     def run(self, graph: OperatorGraph) -> PassResult:
         current = graph
@@ -1570,11 +1934,52 @@ class PassManager:
         return PassResult(current, tuple(diagnostics), tuple(snapshots))
 
 
-def default_pass_manager() -> PassManager:
-    return PassManager()
+def _default_pipeline(
+    registry: SemanticFusionPatternRegistry | None = None,
+) -> tuple[GraphPass, ...]:
+    """Compose structural GC passes with registered semantic patterns.
+
+    The import is intentionally lazy: ``fusion_patterns`` imports the pass
+    classes, while this module owns ``PassManager``.  Delaying the registry
+    import keeps both modules independently usable without a circular import.
+    """
+
+    if registry is None:
+        from .fusion_patterns import default_semantic_fusion_registry
+
+        registry = default_semantic_fusion_registry()
+
+    structural = (
+        (10, 0, CanonicalizeGraphPass()),
+        (15, 1, LinearDecompositionPass()),
+        (30, 2, RecoverStableHLOFlattenedLinearPass()),
+        (40, 3, FoldTransposeIntoMatmulPass()),
+    )
+    issues = registry.validate()
+    if issues:
+        raise ValueError("invalid semantic fusion registry: " + "; ".join(issues))
+    semantic = tuple(
+        (pattern.priority, index + len(structural), pattern.graph_pass)
+        for index, pattern in enumerate(registry.patterns())
+    )
+    return tuple(
+        graph_pass
+        for _priority, _order, graph_pass in sorted(
+            (*structural, *semantic), key=lambda item: (item[0], item[1])
+        )
+    )
+
+
+def default_pass_manager(
+    *, fusion_registry: SemanticFusionPatternRegistry | None = None
+) -> PassManager:
+    """Build the default GC pass manager, optionally with a custom registry."""
+
+    return PassManager(_default_pipeline(fusion_registry))
 
 
 __all__ = [
+    "AttentionRegionPass",
     "CanonicalizeGraphPass",
     "GraphPass",
     "PassDiagnostic",
@@ -1586,5 +1991,6 @@ __all__ = [
     "LayerNormFusionPass",
     "RMSNormFusionPass",
     "SoftmaxFusionPass",
+    "SwiGLUFusionPass",
     "default_pass_manager",
 ]

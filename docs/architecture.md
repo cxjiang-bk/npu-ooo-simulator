@@ -152,9 +152,33 @@ FoldTransposeIntoMatmulPass
 LayerNormFusionPass
 RMSNormFusionPass
 SoftmaxFusionPass
+AttentionRegionPass
+SwiGLUFusionPass
 ```
 
 Torch-XLA 可能把复合算子展开为 primitive 子图，recovery/fusion pass 依据图结构、shape 和常量恢复 GC 所需的语义边界，不能按模型名匹配。
+
+GC 明确区分两类扩展点：
+
+```text
+StableHLOOpCapabilityRegistry
+  单条 StableHLO operation -> Canonical OperatorSpec
+
+SemanticFusionPatternRegistry
+  多节点 Canonical 子图 -> 已证明等价的 semantic operator / region
+```
+
+默认 semantic pattern registry 当前注册 LayerNorm recovery、LayerNorm、RMSNorm 和
+Softmax，并以稳定 priority 与 canonical/linear/transpose 等结构 pass 合并成上述
+pipeline。未知 StableHLO operation 必须先在 importer capability boundary 显式失败；
+fusion registry 不能作为绕过未支持 operation 的 fallback。后续 Attention 应保留
+`QK^T Matmul -> Softmax -> PV Matmul` 的 region 内部结构，SwiGLU 也应在证明完整子图、
+shape 和单消费者条件后再注册，不能仅凭模型名折叠。
+
+当前实现中，Attention pattern 只添加非 opaque region metadata，并保留 QK、Softmax、
+PV 及中间 reshape/scale/mask 节点的独立 TISA；SwiGLU pattern 则将已证明等价的
+vector primitive chain 收敛为一个 `swiglu` TISA 边界，内部步骤留在该指令的 backend
+payload 中。输入图若包含 dtype round-trip，转换步骤也会作为 payload primitive 保留。
 
 `softmax_algorithm` 的传播路径是：CLI 或 `MachineConfig.attributes` 给出
 `materialized`/`online` 选择；GC 首先校验取值，然后把它写入 canonical Softmax

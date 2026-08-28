@@ -33,6 +33,10 @@ _ANALYTICAL_PRIMITIVES = frozenset(
         "layernorm_mean",
         "layernorm",
         "online_update",
+        "logistic",
+        "silu_multiply",
+        "gate_multiply",
+        "dtype_convert",
     }
 )
 

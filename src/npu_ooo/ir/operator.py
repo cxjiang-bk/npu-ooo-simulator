@@ -21,6 +21,7 @@ class SemanticOpType(str, Enum):
     ATTENTION = "attention"
     LAYERNORM = "layernorm"
     RMSNORM = "rmsnorm"
+    SWIGLU = "swiglu"
     EMBEDDING = "embedding"
     RESHAPE = "reshape"
     TRANSPOSE = "transpose"

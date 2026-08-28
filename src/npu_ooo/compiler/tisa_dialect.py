@@ -111,6 +111,8 @@ def _stages_for_tile(operator: Any, tile: TileInstance) -> tuple[TISAStage, ...]
         stages = [("load", "load"), ("compute", "rmsnorm"), ("store", "store")]
     elif op_type == "layernorm":
         stages = [("load", "load"), ("compute", "layernorm"), ("store", "store")]
+    elif op_type == "swiglu":
+        stages = [("load", "load"), ("compute", "swiglu"), ("store", "store")]
     elif op_type in {"reshape", "transpose"}:
         primitive = "copy" if op_type == "reshape" else "transpose"
         stages = [("transform", primitive)]
@@ -131,6 +133,15 @@ def _stages_for_tile(operator: Any, tile: TileInstance) -> tuple[TISAStage, ...]
             "center",
             "reduce_sum_square",
             "layernorm",
+        ),
+        "swiglu": (
+            "logistic",
+            "silu_multiply",
+            *(
+                "dtype_convert"
+                for _step in operator.attributes.get("conversion_steps", ())
+            ),
+            "gate_multiply",
         ),
     }
 
@@ -179,7 +190,7 @@ def _readiness_condition(stage: TISAStage) -> str:
         return "full_region_ready"
     if stage.primitive in {"matmul", "batched_matmul", "gemv"}:
         return "operand_regions_ready"
-    if stage.primitive in {"softmax", "rmsnorm", "layernorm", "reduce"}:
+    if stage.primitive in {"softmax", "rmsnorm", "layernorm", "swiglu", "reduce"}:
         return "semantic_tile_ready"
     return "operand_regions_ready"
 
@@ -693,7 +704,7 @@ class AnalyticalBackendCodegen:
         consumed: set[str] = set()
         original_tasks = {task.task_id: task for task in lowering.execution_graph.tasks}
 
-        composite_ops = {"softmax", "rmsnorm", "layernorm"}
+        composite_ops = {"softmax", "rmsnorm", "layernorm", "swiglu"}
         for instruction in program.instructions:
             stage = str(instruction.attributes.get("tisa_stage", ""))
             semantic_op = str(instruction.attributes.get("semantic_op_type", ""))

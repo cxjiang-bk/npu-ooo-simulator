@@ -6,6 +6,7 @@ from .reduce import lower_reduce_graph
 from .softmax import lower_softmax_graph
 from .norm import lower_rmsnorm_graph
 from .layernorm import lower_layernorm_graph
+from .swiglu import lower_swiglu_graph
 from .transform import lower_transform_graph
 from .registry import (
     LoweringRegistry,
@@ -20,6 +21,7 @@ __all__ = [
     "lower_softmax_graph",
     "lower_rmsnorm_graph",
     "lower_layernorm_graph",
+    "lower_swiglu_graph",
     "lower_transform_graph",
     "lower_matmul_graph",
     "LoweringRegistry",

@@ -152,6 +152,16 @@ StableHLO semantic capability
 
 不要新增按模型名或算子名分支的 CLI/builder 路线。
 
+单条 StableHLO operation 的导入能力由 `StableHLOOpCapabilityRegistry` 管理；
+Softmax、Norm 等多节点语义恢复由独立的 `SemanticFusionPatternRegistry` 管理。
+后者只接受已经证明 shape、常量和数据流等价的图 pattern，不能用来吞掉未知
+StableHLO operation 或作为静默 fallback。
+
+Attention pattern 只添加非 opaque region metadata，并保留
+`QK^T Matmul -> Softmax -> PV Matmul` 及其中间 transform 的独立 TISA；SwiGLU pattern
+才会将已证明等价的 vector primitive chain 收敛为一个 `swiglu` TISA 边界，内部步骤
+留在该指令的 backend payload 中。
+
 ## 输出目录
 
 ```text
@@ -249,6 +259,7 @@ src/npu_ooo/frontend/bridge.py           torch.export 捕获与源图 provenance
 src/npu_ooo/frontend/torch_xla_export.py Torch-XLA StableHLO 导出
 src/npu_ooo/frontend/stablehlo_official.py 官方 verifier 和导入边界
 src/npu_ooo/compiler/graph_compiler.py   论文 GC：图优化、切 tile、依赖
+src/npu_ooo/compiler/fusion_patterns.py  GC 多节点语义恢复/融合 pattern registry
 src/npu_ooo/compiler/fusion_compiler.py  论文 FC：TileGraph 到 TISA dialect
 src/npu_ooo/compiler/tisa_generator.py   TISA dialect 到 virtual TISAProgram
 src/npu_ooo/compiler/tisa_dialect.py     TISA 方言 stage/metadata 构造与语义 payload 绑定

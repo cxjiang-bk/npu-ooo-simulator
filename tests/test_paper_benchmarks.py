@@ -53,6 +53,32 @@ class PaperBenchmarkFrontendTest(unittest.TestCase):
                 tile_size=4,
             )
             self.assertTrue(compiled.tisa_program.instructions)
+            regions = compiled.graph.attributes.get("semantic_regions", ())
+            self.assertEqual(len(regions), 1)
+            self.assertEqual(regions[0]["semantic_family"], "attention")
+            self.assertFalse(regions[0]["opaque"])
+            if case_id == "llama2-13b-oneblk":
+                swiglu = [
+                    operator
+                    for operator in compiled.graph.operators
+                    if operator.normalized_type == "swiglu"
+                ]
+                self.assertEqual(len(swiglu), 1)
+                self.assertEqual(
+                    swiglu[0].attributes["conversion_steps"],
+                    [
+                        {"source_dtype": "f32", "target_dtype": "f16"},
+                        {"source_dtype": "f16", "target_dtype": "f32"},
+                    ],
+                )
+                self.assertIn(
+                    "dtype_convert",
+                    {
+                        task.primitive
+                        for task in compiled.backend_artifact.execution_graph.tasks
+                        if task.operator_id == swiglu[0].op_id
+                    },
+                )
             self.assertEqual(compiled.validate(), ())
 
     def test_resnet_reports_missing_convolution_capability(self) -> None:

@@ -102,6 +102,24 @@ class PyTorchFrontendTest(unittest.TestCase):
         self.assertTrue(
             {"reduce_max", "exp", "reduce_sum", "normalize"}.issubset(payload_primitives)
         )
+        regions = compiled.graph.attributes.get("semantic_regions", ())
+        self.assertEqual(len(regions), 1)
+        self.assertEqual(regions[0]["semantic_family"], "attention")
+        self.assertFalse(regions[0]["opaque"])
+        roles = regions[0]["roles"]
+        self.assertIn(roles["qk_matmul"], regions[0]["members"])
+        self.assertIn(roles["softmax"], regions[0]["members"])
+        self.assertIn(roles["pv_matmul"], regions[0]["members"])
+        region_tisa = [
+            instruction
+            for instruction in compiled.tisa_program.instructions
+            if instruction.attributes.get("semantic_region_id") == regions[0]["region_id"]
+        ]
+        self.assertTrue(region_tisa)
+        self.assertEqual(
+            {instruction.operator_id for instruction in region_tisa},
+            set(regions[0]["members"]),
+        )
 
     def test_silu_uses_stablehlo_logistic_capability(self) -> None:
         import torch
@@ -191,7 +209,9 @@ class PyTorchFrontendTest(unittest.TestCase):
         )
         operator_types = {operator.normalized_type for operator in compiled.graph.operators}
         self.assertTrue(
-            {"rmsnorm", "batched_matmul", "softmax", "elementwise"}.issubset(operator_types)
+            {"rmsnorm", "batched_matmul", "softmax", "swiglu", "elementwise"}.issubset(
+                operator_types
+            )
         )
         static = schedule_tisa_program(
             compiled.backend_artifact,
@@ -205,6 +225,52 @@ class PyTorchFrontendTest(unittest.TestCase):
         )
         self.assertGreater(static.total_cycles, 0)
         self.assertGreater(dynamic.total_cycles, 0)
+        self.assertEqual(compiled.validate(), ())
+
+    def test_swiglu_recovery_keeps_one_tisa_boundary_and_local_payload(self) -> None:
+        import torch
+
+        from examples.torch_models import PreNormDecoderBlock
+
+        compiled = compile_torch_module(
+            PreNormDecoderBlock(),
+            (torch.randn(1, 4, 8), torch.zeros(1, 1, 4, 4)),
+            minimal_machine_config(),
+            model_id="swiglu-decoder-block",
+            tile_size=4,
+        )
+
+        swiglu = [
+            operator
+            for operator in compiled.graph.operators
+            if operator.normalized_type == "swiglu"
+        ]
+        self.assertEqual(len(swiglu), 1)
+        self.assertEqual(swiglu[0].attributes["activation"], "silu")
+        self.assertEqual(len(swiglu[0].attributes["source_ops"]), 3)
+        compute = [
+            instruction
+            for instruction in compiled.tisa_program.instructions
+            if instruction.operator_id == swiglu[0].op_id
+            and instruction.op_type == "swiglu"
+        ]
+        self.assertTrue(compute)
+        self.assertTrue(
+            all(
+                instruction.attributes["payload_primitives"]
+                == ["logistic", "silu_multiply", "gate_multiply"]
+                for instruction in compute
+            )
+        )
+        payload_primitives = {
+            task.primitive
+            for task in compiled.backend_artifact.execution_graph.tasks
+            if task.operator_id == swiglu[0].op_id
+        }
+        self.assertEqual(
+            payload_primitives,
+            {"load", "logistic", "silu_multiply", "gate_multiply", "store"},
+        )
         self.assertEqual(compiled.validate(), ())
 
     def test_attention_online_configuration_survives_softmax_recovery(self) -> None:

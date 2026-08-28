@@ -150,6 +150,16 @@ def enumerate_operator_tiles(operator: OperatorSpec, schedule: OperatorSchedule)
                     "backend_capability_key",
                     operator.attributes.get("backend_capability_key"),
                 ),
+                ("semantic_region_id", operator.attributes.get("semantic_region_id")),
+                (
+                    "semantic_region_family",
+                    operator.attributes.get("semantic_region_family"),
+                ),
+                ("semantic_region_role", operator.attributes.get("semantic_region_role")),
+                (
+                    "semantic_region_opaque",
+                    operator.attributes.get("semantic_region_opaque"),
+                ),
             )
             if value not in {None, ""}
         }

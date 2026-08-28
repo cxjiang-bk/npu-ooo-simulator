@@ -47,7 +47,9 @@ minimal analytical device: static 2344, dynamic 2119 cycles
 
 ## 下一步
 
-先把真实 Attention 扩展为 pre-norm decoder block，并细化 stride-aware transform 与 pass dump；随后接入更细的 device queue/hazard 模型和外部 MXU/memory timing。
+保持模型到 TISA 为当前主线：先补 Attention region 与 SwiGLU semantic pattern，并用
+BERT/GPT-J one-block 回归验证；随后实现 LLaMA2 RoPE/KV-cache，以及 ResNet
+Conv2D/BatchNorm/pooling capability。scheduler/backend 校准继续后置。
 
 ## 2026-08-27：阶段 1A
 
@@ -57,3 +59,31 @@ minimal analytical device: static 2344, dynamic 2119 cycles
 - 全量回归：69 tests passed；BERT/GPT-J/LLaMA2 micro workload 已能从 PyTorch 生成 TISA；
 - 补齐 StableHLO `f16/f32` 到 TISA/runtime 的 dtype-byte 规范化别名；
 - 下一项：建立 Fusion Pattern Registry，随后补 Transformer/ResNet 模型语义。
+
+## 2026-08-28：阶段 1B Fusion Pattern Registry
+
+- 新增独立的 `SemanticFusionPatternRegistry`，与单操作
+  `StableHLOOpCapabilityRegistry` 保持职责分离；
+- 注册现有 LayerNorm recovery、LayerNorm、RMSNorm、Softmax 多节点 pattern；
+- 默认 GC pipeline 由结构 pass 与 semantic pattern priority 确定性合并，八个 pass 的
+  历史顺序、名称、fixed-point 与 dump 行为保持不变；
+- 新增 5 项 registry 回归；全量回归为 78 tests passed；
+- BERT、GPT-J、LLaMA2、DeepSeek prefill/decode micro workload 均重新生成有效 TISA；
+  ResNet 仍按预期在 `stablehlo.convolution` capability boundary 显式失败；
+- 下一项：实现 Attention region 与 SwiGLU pattern，并以 BERT/GPT-J one-block 回归验证。
+
+## 2026-08-28：阶段 1B Attention/SwiGLU
+
+- 新增 `recover_attention_region`：识别真实 Torch-XLA 图中的
+  `QK matmul -> score transform -> Softmax -> probability transform -> PV matmul`，
+  生成非 opaque region metadata，但保留每个成员为 scheduler-visible TISA；
+- 新增 `fuse_swiglu`：将 `logistic -> silu multiply -> gate multiply` 恢复为一个
+  `swiglu` semantic operator，projection Matmul 保持 region 外部；
+- 新增 SwiGLU analytical lowering，compute payload 在同一 vector EU 内执行
+  `logistic/silu_multiply/gate_multiply`；对 LLaMA2 Torch-XLA 的 `f32 -> f16 -> f32`
+  round-trip 保留显式 `dtype_convert` payload，不丢失 dtype 语义；
+- FC、lowering registry、backend capability registry 和 TileGraph metadata 已同步；
+- MHA、pre-norm decoder、BERT/GPT-J/LLaMA2 micro 回归及 static/dynamic 仿真通过；
+- BERT/GPT-J one-block 已有独立 Attention region、SwiGLU payload 和 artifact validity
+  回归；全量测试为 79 tests passed；
+- 下一项是开始 LLaMA2 RoPE/KV-cache 需求分析。
