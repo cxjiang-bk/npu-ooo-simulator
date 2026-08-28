@@ -21,7 +21,11 @@ from npu_ooo.ir import (
 )
 
 from .bridge import FrontendImport, FrontendImportError, FrontendKind
-from .stablehlo_semantics import stablehlo_capability
+from .stablehlo_semantics import (
+    normalize_stablehlo_op_name,
+    registered_stablehlo_ops,
+    stablehlo_capability,
+)
 
 
 _TENSOR_TYPE = re.compile(r"tensor<([^>]+)>")
@@ -308,11 +312,15 @@ def _graph_from_text(text: str, *, graph_id: str) -> OperatorGraph:
             continue
         all_values = _VALUE_NAME.findall(body)
         operand_arity = len(all_values)
-        capability = stablehlo_capability(target)
+        normalized_target = normalize_stablehlo_op_name(target)
+        capability = stablehlo_capability(normalized_target)
         if capability is None:
             raise FrontendImportError(
-                f"unsupported StableHLO operation '{target}' at the import capability boundary; "
-                "register its semantic family before compiling it"
+                f"missing StableHLO capability for '{target}' "
+                f"(normalized as '{normalized_target}') at the import boundary; "
+                "register a StableHLOOpCapability entry before compiling it. "
+                "Known operations: "
+                + ", ".join(registered_stablehlo_ops())
             )
         if not capability.supports_arity(operand_arity):
             expected = (
@@ -337,7 +345,24 @@ def _graph_from_text(text: str, *, graph_id: str) -> OperatorGraph:
         op_type = capability.semantic_family
         input_shapes = [tensors[name.removeprefix("%")].shape for name in input_names]
         operation_attributes: dict[str, Any] = {}
-        if op_type == SemanticOpType.MATMUL.value:
+        if normalized_target == "stablehlo.convert":
+            source_shape = input_shapes[0]
+            if source_shape != result_shape:
+                raise FrontendImportError(
+                    f"StableHLO convert operation '{result_name}' changes shape from "
+                    f"{source_shape} to {result_shape}; shape-changing convert is invalid"
+                )
+            operation_attributes.update(
+                {
+                    "conversion": True,
+                    "source_dtype": tensors[input_names[0]].dtype,
+                    "target_dtype": result_dtype,
+                    "conversion_kind": "dtype_cast",
+                }
+            )
+            iteration_dims = tuple((f"d{axis}", value) for axis, value in enumerate(result_shape))
+            reduction_dims = ()
+        elif op_type == SemanticOpType.MATMUL.value:
             if len(input_shapes) < 2 or len(result_shape) < 2:
                 raise FrontendImportError(f"StableHLO dot operation '{result_name}' requires rank >= 2 operands")
             dot_dimensions = _dot_dimension_numbers(body, input_shapes[0], input_shapes[1])

@@ -43,6 +43,7 @@ _CAPABILITIES = {
             _pointwise(name, 1)
             for name in (
                 "abs",
+                "convert",
                 "cosine",
                 "exponential",
                 "log",

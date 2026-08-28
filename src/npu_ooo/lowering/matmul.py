@@ -21,8 +21,10 @@ from npu_ooo.ir import (
 
 _DTYPE_BYTES = {
     "fp16": 2,
+    "f16": 2,
     "bf16": 2,
     "fp32": 4,
+    "f32": 4,
     "fp64": 8,
     "int8": 1,
     "uint8": 1,

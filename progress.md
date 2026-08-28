@@ -48,3 +48,12 @@ minimal analytical device: static 2344, dynamic 2119 cycles
 ## 下一步
 
 先把真实 Attention 扩展为 pre-norm decoder block，并细化 stride-aware transform 与 pass dump；随后接入更细的 device queue/hazard 模型和外部 MXU/memory timing。
+
+## 2026-08-27：阶段 1A
+
+- 完成 `stablehlo.convert` capability/import 和 dtype conversion metadata；
+- 完成缺失 StableHLO capability 的显式诊断；
+- 新增 2 个 capability boundary regression tests；
+- 全量回归：69 tests passed；BERT/GPT-J/LLaMA2 micro workload 已能从 PyTorch 生成 TISA；
+- 补齐 StableHLO `f16/f32` 到 TISA/runtime 的 dtype-byte 规范化别名；
+- 下一项：建立 Fusion Pattern Registry，随后补 Transformer/ResNet 模型语义。

@@ -76,8 +76,20 @@ prefill 与 decode 必须是不同 case；analytical、source-derived 和 RTL-ob
 
 ## 当前下一步
 
-下一步细化 FC 的 TISA dialect metadata、strided `TileMem` interval，并补齐 online
-Softmax 的 rescale、最终 normalization 与 workspace 生命周期语义。memory bank
-scoreboard 已作为默认关闭的 analytical structural-conflict 模型接入。
-之后继续加入 stride-aware transform、RoPE、KV-cache 和 SwiGLU，形成第一个真实 decoder
-block。scheduler 微结构和外部 timing backend 放在语义契约稳定之后。
+### 阶段 1A：公共 StableHLO 前端稳定性
+
+- [x] `stablehlo.convert` capability 和 source/target dtype 语义；
+- [x] 未注册 StableHLO operation 显式报告缺失 capability 与已知 operation 集合；
+- [ ] scalar/multi-result/layout/broadcast 的通用 metadata；
+- [ ] Torch-XLA/PJRT dtype 兼容性矩阵和严格/fallback policy。
+
+### 阶段 1B：模型到 TISA 的语义覆盖
+
+- [ ] Fusion Pattern Registry（Softmax、Norm、Attention、SwiGLU）；
+- [ ] BERT/GPT-J one-block 的真实前端回归；
+- [ ] LLaMA2 的 RoPE、KV-cache 和 prefill/decode；
+- [ ] ResNet 的 Conv2D、BatchNorm inference、pooling；
+- [ ] DeepSeek 结构确认以及 dense/MoE 路径。
+
+阶段 1A 完成后继续细化 FC 的 TISA dialect metadata、strided `TileMem` interval，
+再推进上述模型语义。scheduler 微结构和外部 timing backend 保持在编译语义稳定之后。

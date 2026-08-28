@@ -48,3 +48,15 @@ PyTorch nn.Module
 - region-aware dependency、partial-ready 和 memory bank/port conflict；
 - 论文 WQ/IQ/Fu 容量与 dispatch pipeline 的硬件校准；
 - 当前 NPU ISA 中 issue/completion、SET/WAIT/FENCE 和 buffer address 的精确语义。
+
+## 2026-08-27：阶段 1A 首个增量
+
+- `stablehlo.convert` 已注册为单操作 elementwise capability；Canonical Operator 保留
+  `source_dtype`、`target_dtype`、`conversion_kind=dtype_cast`，并验证 convert 不改变 shape。
+- 未注册 operation 现在会报告原始/规范化名称、缺失的 `StableHLOOpCapability` 注册项和
+  当前已知 operation 集合；不会静默跳过或降级。
+- 该增量使 FP16 Transformer benchmark 的 `convert` importer 阻塞解除；当前 BERT、GPT-J、
+  LLaMA2 micro workload 可生成 TISA。ResNet 仍在 `stablehlo.convolution` capability 边界
+  显式失败；DeepSeek BF16 在 CPU Torch-XLA 上仍受设备 dtype 限制。
+- StableHLO 使用 `f16/f32` 类型拼写，内部 TISA/tiling/runtime 字节表已补齐这些别名；否则
+  `f32` 会错误走默认 2-byte 路径，导致 TileMem、residency 和 traffic 统计不一致。

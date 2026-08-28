@@ -37,7 +37,7 @@ def _virtual_region(
     dtype: str = "fp16",
 ) -> BufferRegion:
     elements = math.prod(shape)
-    dtype_size = 2 if dtype in {"fp16", "bf16"} else 4
+    dtype_size = 2 if dtype in {"fp16", "f16", "bf16"} else 4
     return BufferRegion(
         tensor=tensor,
         memory=memory,
