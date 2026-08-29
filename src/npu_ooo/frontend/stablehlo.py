@@ -44,7 +44,10 @@ def _tensor_type(text: str) -> tuple[tuple[int | str, ...], str]:
     match = _TENSOR_TYPE.search(text)
     if match is None:
         raise FrontendImportError(f"StableHLO value is missing a tensor type: {text.strip()}")
-    parts = [part.strip() for part in match.group(1).split("x") if part.strip()]
+    # Tensor encodings follow the element type after a comma, for example
+    # ``tensor<2x3xf32, #layout>``.  They are metadata, not part of dtype.
+    shape_payload = match.group(1).split(",", 1)[0].strip()
+    parts = [part.strip() for part in shape_payload.split("x") if part.strip()]
     if not parts:
         raise FrontendImportError(f"StableHLO tensor type has no shape: {text.strip()}")
     dtype = parts[-1]
@@ -64,6 +67,29 @@ def _tensor_type(text: str) -> tuple[tuple[int | str, ...], str]:
                 raise FrontendImportError(f"StableHLO dimensions must be positive, got {value}")
             dimensions.append(value)
     return tuple(dimensions), dtype
+
+
+def _tensor_layout_encoding(text: str) -> str | None:
+    """Return a StableHLO tensor encoding without interpreting affine maps."""
+
+    match = _TENSOR_TYPE.search(text)
+    if match is None or "," not in match.group(1):
+        return None
+    encoding = match.group(1).split(",", 1)[1].strip()
+    return encoding or None
+
+
+def _tensor_attributes(type_text: str, *, source_kind: str, source_node: str, frontend_target: str) -> dict[str, Any]:
+    encoding = _tensor_layout_encoding(type_text)
+    attributes: dict[str, Any] = {
+        "source_kind": source_kind,
+        "source_node": source_node,
+        "frontend_target": frontend_target,
+        "layout_source": "stablehlo_encoding" if encoding else "default_dense",
+    }
+    if encoding:
+        attributes["layout_encoding"] = encoding
+    return attributes
 
 
 def _result_tensor_type(type_signature: str) -> tuple[tuple[int | str, ...], str]:
@@ -283,13 +309,22 @@ def _graph_from_text(text: str, *, graph_id: str) -> OperatorGraph:
     graph_inputs: list[str] = []
     tensors: dict[str, TensorSpec] = {}
     for argument in _ARGUMENT.finditer(function.group("args")):
-        shape, dtype = _tensor_type(argument.group("type"))
+        type_text = argument.group("type")
+        shape, dtype = _tensor_type(type_text)
         name = argument.group("name").removeprefix("%")
         tensors[name] = TensorSpec(
             name=name,
             shape=shape,
             dtype=dtype,
-            attributes={"source_kind": "input", "source_node": name, "frontend": "stablehlo"},
+            attributes={
+                **_tensor_attributes(
+                    type_text,
+                    source_kind="input",
+                    source_node=name,
+                    frontend_target="",
+                ),
+                "frontend": "stablehlo",
+            },
         )
         graph_inputs.append(name)
 
@@ -312,7 +347,9 @@ def _graph_from_text(text: str, *, graph_id: str) -> OperatorGraph:
         result_name = match.group("result")
         target = match.group("target")
         body = match.group("body")
-        result_shape, result_dtype = _result_tensor_type(match.group("types"))
+        type_signature = match.group("types")
+        result_type_text = type_signature.rsplit("->", 1)[-1].strip()
+        result_shape, result_dtype = _result_tensor_type(type_signature)
         if target.endswith(".constant"):
             constants[result_name] = _constant_value(body)
             normalized_name = result_name.removeprefix("%")
@@ -325,9 +362,12 @@ def _graph_from_text(text: str, *, graph_id: str) -> OperatorGraph:
                     shape=result_shape,
                     dtype=result_dtype,
                     attributes={
-                        "source_kind": "constant",
-                        "source_node": normalized_name,
-                        "frontend_target": target,
+                        **_tensor_attributes(
+                            result_type_text,
+                            source_kind="constant",
+                            source_node=normalized_name,
+                            frontend_target=target,
+                        ),
                         "constant_value": constants[result_name],
                     },
                 )
@@ -786,17 +826,21 @@ def _graph_from_text(text: str, *, graph_id: str) -> OperatorGraph:
                 },
             )
         )
-        tensors[result_name.removeprefix("%")] = TensorSpec(
-            name=result_name.removeprefix("%"),
+        result_tensor_name = result_name.removeprefix("%")
+        tensors[result_tensor_name] = TensorSpec(
+            name=result_tensor_name,
             shape=result_shape,
             dtype=result_dtype,
             attributes={
-                "source_kind": "activation",
-                "source_node": result_name.removeprefix("%"),
-                "frontend_target": target,
+                **_tensor_attributes(
+                    result_type_text,
+                    source_kind="activation",
+                    source_node=result_tensor_name,
+                    frontend_target=target,
+                ),
             },
         )
-        produced_by[result_name.removeprefix("%")] = result_name.removeprefix("%")
+        produced_by[result_tensor_name] = result_tensor_name
 
     if not graph_outputs:
         consumed = {tensor for operator in operators for tensor in operator.inputs}

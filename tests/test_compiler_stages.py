@@ -322,6 +322,57 @@ class CompilerStageContractTest(unittest.TestCase):
         self.assertTrue(all(operand.tile_mem.size_bytes == 4 for operand in scalar_operands))
         self.assertEqual(compiled.validate(), ())
 
+    def test_opaque_layout_uses_conservative_tisa_interval(self) -> None:
+        graph = OperatorGraph(
+            graph_id="layout-metadata-test",
+            tensors=(
+                TensorSpec(
+                    "value",
+                    (2, 3),
+                    dtype="f32",
+                    attributes={
+                        "layout_source": "stablehlo_encoding",
+                        "layout_encoding": "#row_major",
+                    },
+                ),
+                TensorSpec("out", (2, 3), dtype="f32"),
+            ),
+            operators=(
+                OperatorSpec(
+                    op_id="negate",
+                    op_type="elementwise",
+                    inputs=("value",),
+                    outputs=("out",),
+                    iteration_dims=(("m", 2), ("n", 3)),
+                    attributes={
+                        "semantic_op": "negate",
+                        "frontend_target": "stablehlo.negate",
+                        "operand_arity": 1,
+                    },
+                ),
+            ),
+        )
+        frontend, stablehlo = _stable_frontend(graph)
+        compiled = compile_operator_graph(
+            graph,
+            minimal_machine_config(),
+            frontend=frontend,
+            source_frontend=frontend,
+            stablehlo=stablehlo,
+            tile_size=2,
+        )
+        encoded = [
+            operand.tile_mem
+            for instruction in compiled.tisa_program.instructions
+            for operand in instruction.operands
+            if operand.tile_mem.tensor == "value"
+        ]
+        self.assertTrue(encoded)
+        self.assertTrue(all(item.layout == "stablehlo:#row_major" for item in encoded))
+        self.assertTrue(all(item.offset_bytes is None and item.size_bytes is None for item in encoded))
+        self.assertTrue(all(item.strides_bytes is None for item in encoded))
+        self.assertEqual(compiled.validate(), ())
+
 
 if __name__ == "__main__":
     unittest.main()

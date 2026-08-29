@@ -273,6 +273,24 @@ def _dense_region(
         return None
     if any(start < 0 or extent <= 0 or start + extent > limit for start, extent, limit in zip(starts, shape, full_shape)):
         return None
+    attributes = getattr(tensor, "attributes", {})
+    explicit = attributes.get("strides_bytes") if isinstance(attributes, Mapping) else None
+    layout_source = attributes.get("layout_source") if isinstance(attributes, Mapping) else None
+    if layout_source == "stablehlo_encoding" and explicit is None:
+        # An opaque StableHLO encoding cannot be converted to a byte interval
+        # without guessing its physical layout.  Keep the logical geometry,
+        # but force conservative dependency/address handling.
+        return None
+    if explicit is not None:
+        try:
+            strides = tuple(int(value) for value in explicit)
+        except (TypeError, ValueError):
+            return None
+        if len(strides) != len(full_shape) or any(value < 0 for value in strides):
+            return None
+        offset_elements = sum(start * stride for start, stride in zip(starts, strides))
+        span_elements = 1 + sum((extent - 1) * stride for extent, stride in zip(shape, strides))
+        return offset_elements * _dtype_bytes(tensor.dtype), span_elements * _dtype_bytes(tensor.dtype)
     strides: list[int] = []
     stride = 1
     for extent in reversed(full_shape):
@@ -313,6 +331,9 @@ def _tensor_strides_bytes(tensor: Any) -> tuple[int, ...] | None:
             strides = ()
         if len(strides) == len(full_shape) and all(value >= 0 for value in strides):
             return strides
+    layout_source = attributes.get("layout_source") if isinstance(attributes, Mapping) else None
+    if layout_source == "stablehlo_encoding":
+        return None
     strides: list[int] = []
     stride = _dtype_bytes(tensor.dtype)
     for extent in reversed(full_shape):
@@ -320,6 +341,14 @@ def _tensor_strides_bytes(tensor: Any) -> tuple[int, ...] | None:
         stride *= extent
     strides.reverse()
     return tuple(strides)
+
+
+def _tensor_layout(tensor: Any) -> str:
+    attributes = getattr(tensor, "attributes", {})
+    encoding = attributes.get("layout_encoding") if isinstance(attributes, Mapping) else None
+    if encoding:
+        return f"stablehlo:{encoding}"
+    return str(getattr(tensor, "layout", "dense"))
 
 
 def _stride_expression(strides_bytes: tuple[int, ...] | None) -> str | None:
@@ -595,7 +624,7 @@ def _stage_operands(
                     address_expr=_address_expression(name, geometry),
                     strides_bytes=strides_bytes,
                     stride_expr=_stride_expression(strides_bytes),
-                    layout=str(getattr(tensor, "layout", "dense")),
+                    layout=_tensor_layout(tensor),
                 ),
                 access_type=access,
             )

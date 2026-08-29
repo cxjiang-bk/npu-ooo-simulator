@@ -76,6 +76,24 @@ class StableHLOCapabilityBoundaryTest(unittest.TestCase):
         self.assertEqual(tensors["c"].attributes["constant_value"], 1.0)
         self.assertEqual(operator.inputs, ("arg0", "c"))
 
+    def test_tensor_encoding_is_preserved_as_layout_metadata(self) -> None:
+        imported = StableHLOAdapter.from_text(
+            """
+            module {
+              func.func @main(%arg0: tensor<2x3xf32, #row_major>) -> tensor<2x3xf32, #row_major> {
+                %0 = stablehlo.negate %arg0 : (tensor<2x3xf32, #row_major>) -> tensor<2x3xf32, #row_major>
+                return %0 : tensor<2x3xf32, #row_major>
+              }
+            }
+            """
+        )
+
+        tensors = {tensor.name: tensor for tensor in imported.graph.tensors}
+        self.assertEqual(tensors["arg0"].shape, (2, 3))
+        self.assertEqual(tensors["arg0"].attributes["layout_source"], "stablehlo_encoding")
+        self.assertEqual(tensors["arg0"].attributes["layout_encoding"], "#row_major")
+        self.assertEqual(tensors["0"].attributes["layout_encoding"], "#row_major")
+
     def test_unknown_operation_reports_missing_capability_and_known_set(self) -> None:
         with self.assertRaisesRegex(
             FrontendImportError,

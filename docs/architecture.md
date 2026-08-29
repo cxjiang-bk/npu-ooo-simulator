@@ -255,7 +255,7 @@ local tile slot 的交替意图；它是 GC metadata，不是 runtime 的实际 
 
 跨算子依赖使用 `logical_tensor_region_v1`：compiler 将 producer/consumer tile 投影到共享 tensor 的逻辑 region，只为重叠 region 建边。Matmul 的 M/N/K、broadcast elementwise、reduce/norm 和 full-tensor transform 都有显式映射；无法证明映射时才对该 operator edge 保守回退 all-to-all。`compile_statistics.json` 会记录回退边数和避免的无效依赖数。
 
-当前 reshape/transpose 采用保守的 full-tensor schedule。reshape 映射为 DMA copy，transpose 映射为 DMA transpose。FC 的 `TileMem` 已为每个 operand 保存 `strides_bytes`、可读的 `stride_expr` 和 `layout`；这些字段描述 logical addressing，当前 concrete offset/size 仍按 conservative dense range 计算，后续 stride-aware region planner 再将其细化为 tile transform。
+当前普通 reshape/transpose 采用保守的 full-tensor schedule。reshape 映射为 DMA copy，transpose 映射为 DMA transpose；静态 `broadcast_in_dim` 则按输出域切 tile，并将源 operand 映射到对应广播切片。FC 的 `TileMem` 为每个 operand 保存 `strides_bytes`、可读的 `stride_expr` 和 `layout`。默认 dense layout 生成 concrete offset/size；带 StableHLO type encoding 但尚未解析 stride 的 tensor 保留 `layout_encoding` 与 logical address expression，不猜测物理区间，依赖检查采用 conservative overlap。
 
 ## 5. Fusion Compiler（FC）
 

@@ -185,3 +185,11 @@ operation 表达。完整 ResNet50 的 stem 7x7、stride/downsample、全层 rep
 - 兼容性修复：StableHLO `reduce` 的 reducer-init scalar 明确留在 `constant_args`，不再
   被误当作第二个 canonical data input。
 - 全量回归：100 tests passed。
+
+## 2026-08-30：StableHLO layout metadata
+
+- `_tensor_type` 从 tensor encoding 中分离 shape/dtype；Canonical `TensorSpec` 记录
+  `layout_source` 与原始 `layout_encoding`，无 encoding 时显式标记 `default_dense`。
+- FC/TISA 对未知 encoding 不再伪造 dense byte interval；仅当存在可验证的
+  `strides_bytes` 时计算 concrete offset/span，否则保留 logical region 并走保守 overlap。
+- 新增 importer 与编译阶段回归；全量测试：102 tests passed。
