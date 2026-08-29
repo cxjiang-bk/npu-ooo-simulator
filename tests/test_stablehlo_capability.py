@@ -154,6 +154,20 @@ class StableHLOCapabilityBoundaryTest(unittest.TestCase):
                 """
             )
 
+    def test_dynamic_slice_is_preserved_until_specialization_boundary(self) -> None:
+        from npu_ooo.frontend.stablehlo_official import OfficialStableHLOAdapter
+
+        text = """
+        module {
+          func.func @main(%arg0: tensor<8x4xf32>, %start0: tensor<i32>, %start1: tensor<i32>) -> tensor<2x3xf32> {
+            %0 = stablehlo.dynamic_slice %arg0, %start0, %start1, sizes = [2, 3] : (tensor<8x4xf32>, tensor<i32>, tensor<i32>) -> tensor<2x3xf32>
+            return %0 : tensor<2x3xf32>
+          }
+        }
+        """
+        with self.assertRaisesRegex(ValueError, r"missing StableHLO capability.*dynamic_slice"):
+            OfficialStableHLOAdapter.import_text(text)
+
 
 if __name__ == "__main__":
     unittest.main()

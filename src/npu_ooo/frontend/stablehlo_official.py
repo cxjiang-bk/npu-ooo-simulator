@@ -310,6 +310,15 @@ def _project_module(module: Any) -> str:
                 f"({', '.join(operand_types)}) -> {result_type}"
             )
             continue
+        if name == "stablehlo.dynamic_slice":
+            sizes = _attribute_ints(operation.attributes["slice_sizes"])
+            lines.append(
+                f"    %{result_name} = stablehlo.dynamic_slice "
+                f"{', '.join('%' + item for item in operands)} "
+                f"sizes = [{', '.join(map(str, sizes))}] : "
+                f"({', '.join(operand_types)}) -> {result_type}"
+            )
+            continue
         if name == "stablehlo.concatenate":
             dimension = _attribute_int(operation.attributes["dimension"])
             lines.append(

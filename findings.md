@@ -95,6 +95,15 @@ PyTorch nn.Module
 - 该 pass 只承诺静态 specialization 子集；未支持的 dynamic operation 保持显式失败，
   不改变“unsupported 不静默降级”的总原则。
 
+## 2026-08-30：dynamic slice specialization 边界
+
+- 官方 `stablehlo.dynamic_slice` 使用一个 data operand、每个轴一个 `tensor<i32>`
+  start operand，以及 `slice_sizes` DenseI64ArrayAttr（custom assembly 显示为 `sizes`）。
+- 当 start operand 是可求值常量时，可按 StableHLO 的 start clamp 语义改写成静态
+  `stablehlo.slice`，继续使用已有 slice importer、tile region 和 backend lowering。
+- 未解析的 start 不能安全地写入静态 TileMem 地址；`dynamic_update_slice` 还需要
+  runtime state、地址绑定和跨 invocation 语义，因此当前必须显式失败，不能把它降级为静态 cache update。
+
 ## 2026-08-30：静态 broadcast tile 语义缺口
 
 - Canonical importer 已保存 `stablehlo.broadcast_in_dim` 的

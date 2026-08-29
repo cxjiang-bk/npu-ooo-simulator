@@ -142,6 +142,33 @@ def _broadcast_dimensions(body: str) -> tuple[int, ...]:
     return values
 
 
+def _slice_sizes(body: str) -> tuple[int, ...]:
+    """Read the static output extents of a dynamic slice."""
+
+    # StableHLO's custom assembly spells this attribute ``sizes``.  Keep the
+    # older ``slice_sizes`` spelling for dependency-light fixtures.
+    match = re.search(r"\b(?:sizes|slice_sizes)\s*=\s*\[([^\]]*)\]", body)
+    if match is None:
+        raise FrontendImportError("shape specialization dynamic slice is missing slice_sizes")
+    values: list[int] = []
+    for raw in match.group(1).split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise FrontendImportError(
+                "shape specialization dynamic slice sizes must be constant integers"
+            ) from exc
+        if value <= 0:
+            raise FrontendImportError(
+                "shape specialization dynamic slice sizes must be positive"
+            )
+        values.append(value)
+    return tuple(values)
+
+
 def _graph_argument_shapes(graph: OperatorGraph) -> dict[str, tuple[int, ...]]:
     tensors = {tensor.name: tensor for tensor in graph.tensors}
     inputs = graph.attributes.get("graph_inputs", ())
@@ -257,6 +284,58 @@ def _specialize_operation(
             f"{match.group('indent')}{result} = stablehlo.broadcast_in_dim "
             f"{operand_names[0]}, dims = [{', '.join(map(str, dimensions))}] : "
             f"({source_type}) -> {output_type}"
+        )
+        return rewritten, normalized_result
+
+    if target == "stablehlo.dynamic_slice":
+        if not operand_names:
+            raise FrontendImportError(f"shape specialization dynamic slice '{result}' has no data operand")
+        source_name = operand_names[0].removeprefix("%")
+        source_shape = value_shapes.get(source_name)
+        raw_start_values = [shape_values.get(name.removeprefix("%")) for name in operand_names[1:]]
+        if source_shape is None:
+            raise FrontendImportError(
+                f"shape specialization cannot resolve dynamic slice '{result}' source shape"
+            )
+        sizes = _slice_sizes(body)
+        if len(sizes) != len(source_shape):
+            raise FrontendImportError(
+                f"shape specialization dynamic slice '{result}' rank does not match operand"
+            )
+        if len(raw_start_values) == len(source_shape) and all(
+            values is not None and len(values) == 1 for values in raw_start_values
+        ):
+            start_values = [int(values[0]) for values in raw_start_values if values is not None]
+        else:
+            raise FrontendImportError(
+                f"shape specialization requires constant start indices for dynamic slice '{result}'"
+            )
+        if len(start_values) != len(source_shape):
+            raise FrontendImportError(
+                f"shape specialization dynamic slice '{result}' requires one start index per axis"
+            )
+        starts: list[int] = []
+        limits: list[int] = []
+        for axis, (extent, size, start_value) in enumerate(zip(source_shape, sizes, start_values)):
+            if not isinstance(extent, int):
+                raise FrontendImportError(
+                    f"shape specialization dynamic slice '{result}' requires resolved operand shape"
+                )
+            if size > extent:
+                raise FrontendImportError(
+                    f"shape specialization dynamic slice '{result}' size {size} exceeds axis {axis} extent {extent}"
+                )
+            # StableHLO clamps dynamic starts to the largest legal start.
+            start = max(0, min(int(start_value), extent - size))
+            starts.append(start)
+            limits.append(start + size)
+        source_type = _format_tensor(source_shape, _tensor_parts(operand_types[0])[1])
+        output_type = _format_tensor(sizes, result_dtype)
+        value_shapes[normalized_result] = sizes
+        ranges = ", ".join(f"{start}:{limit}" for start, limit in zip(starts, limits))
+        rewritten = (
+            f"{match.group('indent')}{result} = stablehlo.slice "
+            f"{operand_names[0]} [{ranges}] : ({source_type}) -> {output_type}"
         )
         return rewritten, normalized_result
 

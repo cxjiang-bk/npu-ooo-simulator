@@ -136,8 +136,11 @@ compiler 已实现一个受限的 operation-level specialization：对 shape ten
 `get_dimension_size -> reshape -> concatenate -> maximum` 数据流求值，将
 `dynamic_broadcast_in_dim` 改成静态 `broadcast_in_dim`，删除 dead shape ops，再交给
 official StableHLO parse/verify。产物 variant 和 `CompiledArtifact.attributes` 会记录该
-pass；其它 dynamic operation 仍显式失败。`shape_environment` 只提供符号契约，不能被
-误用为直接文本替换。
+pass。对官方 `dynamic_slice`，当每个轴的 start operand 能由常量求值时，pass 会按
+StableHLO 的 clamp 语义改写为静态 `slice`；未解析的 start、`dynamic_update_slice`
+以及其它 dynamic operation 仍显式失败。`shape_environment` 只提供符号契约，不能被
+误用为直接文本替换。该 specialization 不等价于 runtime 动态地址绑定，也不覆盖
+paged KV-cache 的动态 position 更新。
 
 ## 4. Graph Compiler（GC）
 
@@ -492,15 +495,15 @@ RuntimeSubmission（除非实验变量就是 runtime）
 
 - StableHLO semantic importer 只覆盖已注册 operation；LayerNorm recovery pass 对同一图中的多个 Torch-XLA `batch_norm_training` 形式按 fixed-point 重复执行，直到不再产生新 canonical LayerNorm；RMSNorm recovery 已覆盖带 power、reshape 和 affine weight 的 Torch-XLA 链，但仍要求静态 shape 和可证明的 row-wise reduction；
 - Torch-XLA 复合模式恢复仍需扩大真实模型覆盖；
-- tile planner 是统一启发式 baseline，尚无 cost model 或 auto-tuning；
-- reshape/transpose 当前是 full-tensor DMA transform，尚未支持 stride-aware tile transform；
+- tile planner 已有可审计的 candidate cost model，但仍是确定性启发式，尚无硬件校准的 auto-tuning；
+- reshape/transpose 当前是 full-tensor DMA transform，尚未支持 stride-aware tile transform；StableHLO opaque layout 只保留逻辑 region 并使用保守地址区间；
 - analytical backend 不是 cycle-accurate RTL；
 - 当前 MXU VCS 日志只有 descriptor-to-done 区间，不能直接作为 isolated Matmul compute latency；
 - online Softmax 目前是 scheduler-level analytical state-chain 模型，尚未覆盖完整的数值 rescale、最终 normalization 和 workspace 生命周期；
 - ResNet bottleneck、BERT/GPT-J/LLaMA2/DeepSeek dense one-block 已有真实 PyTorch
   micro workload；完整模型规模和 DeepSeek MoE path 尚未形成论文实验集。LLaMA2 的 RoPE
   已接入；KV-cache 当前支持固定窗口
-  单步 contract 和多步 `RuntimeSequence` 仿真，但动态写入、真实 cache layout、跨请求
+  单步 contract 和多步 `RuntimeSequence` 仿真，但动态 position 写入、真实 cache layout、跨请求
   生命周期和 full depth 仍未实现。
 
 下一阶段见 [roadmap.md](roadmap.md)。

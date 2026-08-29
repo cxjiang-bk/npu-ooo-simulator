@@ -61,8 +61,8 @@ Torch-XLA StableHLO operation
 目标：在扩大模型覆盖之前，使 tile 数量、依赖和内存流量都可核对。
 
 - 将跨算子的保守依赖细化为基于 tile region 的依赖（第一版 logical region 映射已完成）；
-- 完善 symbolic/dynamic shape 与边界 tile（Torch-XLA 常见 dynamic broadcast 的静态
-  specialization 子集已完成，完整动态索引/动态 layout 仍待实现）；
+- 完善 symbolic/dynamic shape 与边界 tile（Torch-XLA 常见 dynamic broadcast 与常量起点
+  `dynamic_slice` 的 specialization 子集已完成，完整动态索引/动态 layout 仍待实现）；
 - 为 layout、transpose、broadcast、reduction barrier 建立显式规则；
 - 给 TISA operand 增加可绑定的地址表达式和 memory scope（已完成逻辑 slice expression，物理 scope 绑定仍由 runtime 负责）；
 - 在统一 planner 中加入多个合法 tile candidate 和可解释 cost model；
@@ -118,7 +118,7 @@ PyTorch model / shape / phase
 
 ## 下一阶段优先级
 
-当前最高优先级是 B：完善 symbolic/dynamic shape、layout/broadcast 和多 tile candidate
-cost model，并将 ResNet/DeepSeek micro case 纳入统一实验矩阵。runtime state 已进入可
+当前最高优先级是 B：完善 symbolic/dynamic shape、layout/broadcast 和动态索引
+legalization，并将 ResNet/DeepSeek micro case 纳入统一实验矩阵。runtime state 已进入可
 验证的多步 contract；完成编译语义与统计稳定性后再集中增加 scheduler 微结构细节和
 外部 backend，避免用不完整的图语义校准硬件时序。

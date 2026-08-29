@@ -37,8 +37,8 @@ minimal analytical device: static 2344, dynamic 2119 cycles
 ## 当前限制
 
 - StableHLO semantic importer 仍只覆盖已注册 operation；
-- tile planner 还是确定性启发式，没有 cost model；
-- reshape/transpose 仍是 full-tensor transform，symbolic/dynamic shape 与 stride-aware layout 尚未完成；
+- tile planner 已有可审计的 candidate cost model，但仍是确定性启发式，尚无硬件校准的 autotuning；
+- reshape/transpose 仍是 full-tensor transform；symbolic/dynamic shape 仅完成广播和常量起点 `dynamic_slice` specialization 子集，stride-aware layout 只支持显式 stride metadata；
 - analytical event backend 不是 RTL cycle-accurate；
 - 当前 MXU VCS log 主要提供 descriptor-to-completion 区间；
 - GC 当前只生成 completion-boundary readiness；真实 partial-tile producer 语义仍需由 backend/calibration 端接入；
@@ -48,8 +48,8 @@ minimal analytical device: static 2344, dynamic 2119 cycles
 
 ## 下一步
 
-保持模型到 TISA 为当前主线：补齐 symbolic/layout/cost-model 编译能力，并确认
-DeepSeek dense 与 MoE 两条路径的 operation 边界；scheduler/backend 校准继续后置。
+保持模型到 TISA 为当前主线：补齐动态索引/layout legalization，并确认 DeepSeek dense
+与 MoE 两条路径的 operation 边界；scheduler/backend 校准继续后置。
 
 ## 2026-08-27：阶段 1A
 
@@ -215,3 +215,12 @@ operation 表达。完整 ResNet50 的 stem 7x7、stride/downsample、全层 rep
 - 其它 `stablehlo.dynamic_*` operation 仍显式失败；动态 index、动态 layout 和跨
   invocation 动态 shape 尚未完成。
 - Python 3.12（Torch 2.9.1、Torch-XLA 2.9.0、StableHLO 1.12.1）全量回归：106 tests passed。
+
+## 2026-08-30：dynamic index specialization 子集
+
+- 官方 StableHLO `dynamic_slice` 的 `sizes`/`slice_sizes` 与标量 start 语义已核对；
+  specialization 对常量 start 求值，并按 StableHLO clamp 规则改写为静态 `slice`。
+- official projection 保留 dynamic slice 的 size metadata；未解析 start、
+  `dynamic_update_slice` 与其它动态 operation 仍在 Canonical importer 前显式失败。
+- 新增常量越界 clamp、非常量 start 失败和 official capability boundary 回归；
+  该增量不改变 runtime state contract，也不表示支持 paged KV-cache 动态写入。

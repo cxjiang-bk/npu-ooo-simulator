@@ -44,7 +44,7 @@
 - [x] 为 FC stage 和 typed dependency 写入显式 readiness condition；
 - [x] Softmax 提供默认 materialized 与显式 analytical online state-chain 两种 payload 语义；
 - [ ] 完善 symbolic/dynamic shape、layout、broadcast 和边界 tile；
-  - [x] Torch-XLA 常见 dynamic broadcast 的 shape-tensor specialization 子集；
+  - [x] Torch-XLA 常见 dynamic broadcast 与常量起点 `dynamic_slice` 的 shape specialization 子集；
   - [ ] 完整 dynamic index/layout legalization；
 - [x] 为 FC/TISA `TileMem` 增加 concrete stride、stride expression 和 layout metadata；
 - [x] 输出 per-operator tile、TISA、MAC、root traffic 和 dependency statistics；

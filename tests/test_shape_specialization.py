@@ -1,6 +1,6 @@
 import unittest
 
-from npu_ooo.frontend import FrontendImportError
+from npu_ooo.frontend import FrontendImportError, OfficialStableHLOAdapter
 from npu_ooo.frontend.shape_specialization import specialize_stablehlo
 from npu_ooo.ir import OperatorGraph, TensorSpec
 
@@ -48,6 +48,69 @@ class ShapeSpecializationTest(unittest.TestCase):
         }
         """
         with self.assertRaisesRegex(FrontendImportError, "does not support dynamic operation"):
+            specialize_stablehlo(text, self._graph())
+
+    def test_constant_dynamic_slice_is_clamped_and_staticized(self) -> None:
+        text = """
+        module {
+          func.func @main(%arg0: tensor<?x4xf16>) -> tensor<2x3xf16> {
+            %start0 = stablehlo.constant dense<99> : tensor<i32>
+            %start1 = stablehlo.constant dense<1> : tensor<i32>
+            %value = stablehlo.dynamic_slice %arg0, %start0, %start1 sizes = [2, 3] : (tensor<?x4xf16>, tensor<i32>, tensor<i32>) -> tensor<2x3xf16>
+            return %value : tensor<2x3xf16>
+          }
+        }
+        """
+        result = specialize_stablehlo(text, self._graph())
+
+        self.assertIn(
+            "stablehlo.slice %arg0 [0:2, 1:4]",
+            result.text,
+        )
+        self.assertNotIn("stablehlo.dynamic_slice", result.text)
+        self.assertNotIn("%start0", result.text)
+        self.assertNotIn("%start1", result.text)
+        self.assertIn("stablehlo.dynamic_slice", result.dynamic_operations)
+        self.assertTrue(OfficialStableHLOAdapter.parse_text(result.text).verified)
+
+    def test_nonconstant_dynamic_slice_fails_explicitly(self) -> None:
+        text = """
+        module {
+          func.func @main(%arg0: tensor<?x4xf16>, %start: tensor<i32>) -> tensor<2x3xf16> {
+            %value = stablehlo.dynamic_slice %arg0, %start, %start sizes = [2, 3] : (tensor<?x4xf16>, tensor<i32>, tensor<i32>) -> tensor<2x3xf16>
+            return %value : tensor<2x3xf16>
+          }
+        }
+        """
+        with self.assertRaisesRegex(FrontendImportError, "constant start indices"):
+            specialize_stablehlo(text, self._graph())
+
+    def test_dynamic_slice_negative_start_is_clamped(self) -> None:
+        text = """
+        module {
+          func.func @main(%arg0: tensor<?x4xf16>) -> tensor<1x2xf16> {
+            %start0 = stablehlo.constant dense<-3> : tensor<i32>
+            %start1 = stablehlo.constant dense<0> : tensor<i32>
+            %value = stablehlo.dynamic_slice %arg0, %start0, %start1 sizes = [1, 2] : (tensor<?x4xf16>, tensor<i32>, tensor<i32>) -> tensor<1x2xf16>
+            return %value : tensor<1x2xf16>
+          }
+        }
+        """
+        result = specialize_stablehlo(text, self._graph())
+        self.assertIn("stablehlo.slice %arg0 [0:1, 0:2]", result.text)
+
+    def test_dynamic_slice_rejects_size_rank_mismatch(self) -> None:
+        text = """
+        module {
+          func.func @main(%arg0: tensor<?x4xf16>) -> tensor<2x3xf16> {
+            %start0 = stablehlo.constant dense<0> : tensor<i32>
+            %start1 = stablehlo.constant dense<0> : tensor<i32>
+            %value = stablehlo.dynamic_slice %arg0, %start0, %start1 sizes = [2] : (tensor<?x4xf16>, tensor<i32>, tensor<i32>) -> tensor<2x3xf16>
+            return %value : tensor<2x3xf16>
+          }
+        }
+        """
+        with self.assertRaisesRegex(FrontendImportError, "rank does not match"):
             specialize_stablehlo(text, self._graph())
 
 
