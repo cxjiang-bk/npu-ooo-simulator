@@ -137,7 +137,9 @@ compiler 已实现一个受限的 operation-level specialization：对 shape ten
 `dynamic_broadcast_in_dim` 改成静态 `broadcast_in_dim`，删除 dead shape ops，再交给
 official StableHLO parse/verify。产物 variant 和 `CompiledArtifact.attributes` 会记录该
 pass。对官方 `dynamic_slice`，当每个轴的 start operand 能由常量求值时，pass 会按
-StableHLO 的 clamp 语义改写为静态 `slice`；未解析的 start、`dynamic_update_slice`
+StableHLO 的 clamp 语义改写为静态 `slice`；对常量 shape tensor 驱动的
+`dynamic_reshape`，则验证元素总数守恒后改写为静态 `reshape`。未解析的 start、
+`dynamic_update_slice`
 以及其它 dynamic operation 仍显式失败。`shape_environment` 只提供符号契约，不能被
 误用为直接文本替换。该 specialization 不等价于 runtime 动态地址绑定，也不覆盖
 paged KV-cache 的动态 position 更新。
