@@ -6,10 +6,17 @@ from npu_ooo.ir import OperatorGraph, TensorSpec
 
 
 class ShapeSpecializationTest(unittest.TestCase):
-    def _graph(self) -> OperatorGraph:
+    def _graph(
+        self,
+        value_shape: tuple[int, ...] = (2, 4),
+        output_shape: tuple[int, ...] = (2, 4),
+    ) -> OperatorGraph:
         return OperatorGraph(
             graph_id="dynamic-shape-test",
-            tensors=(TensorSpec("value", (2, 4), dtype="f16"), TensorSpec("out", (2, 4), dtype="f16")),
+            tensors=(
+                TensorSpec("value", value_shape, dtype="f16"),
+                TensorSpec("out", output_shape, dtype="f16"),
+            ),
             operators=(),
             attributes={"graph_inputs": ["value"], "graph_outputs": ["out"]},
         )
@@ -72,6 +79,40 @@ class ShapeSpecializationTest(unittest.TestCase):
         self.assertNotIn("%start1", result.text)
         self.assertIn("stablehlo.dynamic_slice", result.dynamic_operations)
         self.assertTrue(OfficialStableHLOAdapter.parse_text(result.text).verified)
+
+    def test_constant_dynamic_reshape_is_staticized(self) -> None:
+        text = """
+        module {
+          func.func @main(%arg0: tensor<2x6xf16>) -> tensor<3x4xf16> {
+            %shape = stablehlo.constant dense<[3, 4]> : tensor<2xi64>
+            %value = stablehlo.dynamic_reshape %arg0, %shape : (tensor<2x6xf16>, tensor<2xi64>) -> tensor<3x4xf16>
+            return %value : tensor<3x4xf16>
+          }
+        }
+        """
+        result = specialize_stablehlo(text, self._graph((2, 6), (3, 4)))
+
+        self.assertIn(
+            "stablehlo.reshape %arg0 : (tensor<2x6xf16>) -> tensor<3x4xf16>",
+            result.text,
+        )
+        self.assertNotIn("stablehlo.dynamic_reshape", result.text)
+        self.assertNotIn("%shape", result.text)
+        self.assertIn("stablehlo.dynamic_reshape", result.dynamic_operations)
+        self.assertTrue(OfficialStableHLOAdapter.parse_text(result.text).verified)
+
+    def test_dynamic_reshape_rejects_element_count_mismatch(self) -> None:
+        text = """
+        module {
+          func.func @main(%arg0: tensor<2x6xf16>) -> tensor<5x3xf16> {
+            %shape = stablehlo.constant dense<[5, 3]> : tensor<2xi64>
+            %value = stablehlo.dynamic_reshape %arg0, %shape : (tensor<2x6xf16>, tensor<2xi64>) -> tensor<5x3xf16>
+            return %value : tensor<5x3xf16>
+          }
+        }
+        """
+        with self.assertRaisesRegex(FrontendImportError, "changes element count"):
+            specialize_stablehlo(text, self._graph((2, 6), (5, 3)))
 
     def test_nonconstant_dynamic_slice_fails_explicitly(self) -> None:
         text = """

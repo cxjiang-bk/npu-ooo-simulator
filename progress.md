@@ -64,6 +64,14 @@ minimal analytical device: static 2344, dynamic 2119 cycles
 - 矩阵根目录写入 `matrix_index.json` 作为本次 case 清单；复用目录时应以该清单为准，
   不把残留 case 目录纳入统计。
 
+## 2026-08-30：dynamic reshape specialization
+
+- 支持常量 shape tensor 驱动的 StableHLO `dynamic_reshape`：先求值 shape dataflow，
+  检查输入/输出元素总数守恒，再改写为官方 `stablehlo.reshape` 并删除 shape-only SSA。
+- 动态 shape、零/负维度、元素数量不一致仍显式失败；没有新增 runtime 地址假设。
+- 新增常量 dynamic reshape 成功与元素总数不一致失败回归，shape specialization 专项共
+  8 项通过。
+
 ## 2026-08-27：阶段 1A
 
 - 完成 `stablehlo.convert` capability/import 和 dtype conversion metadata；

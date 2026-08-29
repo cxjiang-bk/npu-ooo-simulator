@@ -287,6 +287,37 @@ def _specialize_operation(
         )
         return rewritten, normalized_result
 
+    if target == "stablehlo.dynamic_reshape":
+        if len(operand_names) < 2:
+            raise FrontendImportError(
+                f"shape specialization dynamic reshape '{result}' needs data and shape operands"
+            )
+        source_name = operand_names[0].removeprefix("%")
+        source_shape = value_shapes.get(source_name)
+        target_values = shape_values.get(operand_names[1].removeprefix("%"))
+        if source_shape is None or target_values is None:
+            raise FrontendImportError(
+                f"shape specialization cannot resolve dynamic reshape '{result}'"
+            )
+        output_shape = tuple(int(value) for value in target_values)
+        if not output_shape or any(value <= 0 for value in output_shape):
+            raise FrontendImportError(
+                f"shape specialization dynamic reshape '{result}' requires positive output dimensions"
+            )
+        if _product(source_shape) != _product(output_shape):
+            raise FrontendImportError(
+                f"shape specialization dynamic reshape '{result}' changes element count "
+                f"from {_product(source_shape)} to {_product(output_shape)}"
+            )
+        value_shapes[normalized_result] = output_shape
+        source_type = _format_tensor(source_shape, result_dtype)
+        output_type = _format_tensor(output_shape, result_dtype)
+        rewritten = (
+            f"{match.group('indent')}{result} = stablehlo.reshape "
+            f"{operand_names[0]} : ({source_type}) -> {output_type}"
+        )
+        return rewritten, normalized_result
+
     if target == "stablehlo.dynamic_slice":
         if not operand_names:
             raise FrontendImportError(f"shape specialization dynamic slice '{result}' has no data operand")

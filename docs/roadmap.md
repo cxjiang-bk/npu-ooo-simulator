@@ -61,8 +61,9 @@ Torch-XLA StableHLO operation
 目标：在扩大模型覆盖之前，使 tile 数量、依赖和内存流量都可核对。
 
 - 将跨算子的保守依赖细化为基于 tile region 的依赖（第一版 logical region 映射已完成）；
-- 完善 symbolic/dynamic shape 与边界 tile（Torch-XLA 常见 dynamic broadcast 与常量起点
-  `dynamic_slice` 的 specialization 子集已完成，完整动态索引/动态 layout 仍待实现）；
+- 完善 symbolic/dynamic shape 与边界 tile（Torch-XLA 常见 dynamic broadcast、常量起点
+  `dynamic_slice` 和常量 shape `dynamic_reshape` 的 specialization 子集已完成，完整动态
+  索引/动态 layout 仍待实现）；
 - 为 layout、transpose、broadcast、reduction barrier 建立显式规则；
 - 给 TISA operand 增加可绑定的地址表达式和 memory scope（已完成逻辑 slice expression，物理 scope 绑定仍由 runtime 负责）；
 - 在统一 planner 中加入多个合法 tile candidate 和可解释 cost model；
