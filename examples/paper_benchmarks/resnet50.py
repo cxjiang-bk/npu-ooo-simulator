@@ -34,7 +34,7 @@ class ResNet50BottleneckWorkload(torch.nn.Module):
 SPEC = PaperBenchmarkSpec(
     "resnet50", "ResNet50", "cnn_residual", "inference", "float16", 128, None, (224, 224),
     None, None, None, 6.2, 9.3, 1.50, "resnet_bottleneck",
-    ("stablehlo.convolution", "stablehlo.batch_norm_inference", "pooling"),
+    ("stem", "full_model_depth", "global_average_pool", "classification_head"),
 )
 
 

@@ -1,7 +1,7 @@
 import importlib.util
 import unittest
 
-from examples.paper_benchmarks import build_paper_benchmark, paper_benchmark_specs
+from examples.paper_benchmarks import build_paper_benchmark, get_paper_benchmark, paper_benchmark_specs
 from examples.paper_benchmarks.llama2 import build_decode
 from npu_ooo.arch import minimal_machine_config
 from npu_ooo.compiler import compile_torch_module
@@ -37,6 +37,14 @@ class PaperBenchmarkRegistryTest(unittest.TestCase):
         )
         self.assertEqual(specs[0].reference_a100_ms, 9.3)
         self.assertEqual(specs[-1].phase, "decode")
+
+    def test_resnet_unsupported_features_describe_model_omissions(self) -> None:
+        unsupported = set(get_paper_benchmark("resnet50").unsupported_features)
+        self.assertNotIn("stablehlo.convolution", unsupported)
+        self.assertNotIn("stablehlo.batch_norm_inference", unsupported)
+        self.assertNotIn("pooling", unsupported)
+        self.assertIn("full_model_depth", unsupported)
+        self.assertIn("classification_head", unsupported)
 
     def test_each_row_builds_an_independent_real_pytorch_workload(self) -> None:
         for spec in paper_benchmark_specs():
