@@ -164,6 +164,13 @@ def _project_module(module: Any) -> str:
         if not name.startswith("stablehlo.") or not operation.results:
             continue
 
+        if len(operation.results) > 1 and name != "stablehlo.batch_norm_training":
+            raise FrontendImportError(
+                f"official StableHLO projection does not support multi-result operation "
+                f"'{name}' ({len(operation.results)} results); add a multi-result canonical "
+                "capability before compiling this graph"
+            )
+
         result_names: list[str] = []
         for result_index, operation_result in enumerate(operation.results):
             result_name = f"v{counter}"

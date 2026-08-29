@@ -111,6 +111,16 @@ PyTorch nn.Module
   projection 必须显式裁剪为单个数据输入，同时把 init 保留在 `constant_args`，否则既有
   norm/attention 图会在 analytical lowering 阶段失败。
 
+## 2026-08-30：dtype 与 multi-result 契约
+
+- 当前 lowering 的 dtype-byte 表覆盖常用 f16/bf16/f32/f64 和整数类型，但未知 dtype
+  会默认走 2-byte，存在静默错误风险；因此 machine `supported_dtypes` 与
+  `dtype_policy={strict,fallback}` 在 compiler 入口统一校验，fallback 只能用于显式标记的
+  analytical 结果。
+- Official StableHLO projection 不能把任意 multi-result op 截断为第一个结果。唯一保留
+  的例外是现有 LayerNorm recovery 依赖的 `batch_norm_training`；其 secondary result
+  仍在被消费或返回时失败。
+
 - `stablehlo.convert` 已注册为单操作 elementwise capability；Canonical Operator 保留
   `source_dtype`、`target_dtype`、`conversion_kind=dtype_cast`，并验证 convert 不改变 shape。
 - 未注册 operation 现在会报告原始/规范化名称、缺失的 `StableHLOOpCapability` 注册项和

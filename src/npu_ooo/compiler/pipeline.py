@@ -33,6 +33,83 @@ from .statistics import build_compile_statistics
 from .tisa_generator import default_tisa_generator
 
 
+_KNOWN_DTYPES = frozenset(
+    {
+        "bool",
+        "pred",
+        "int8",
+        "uint8",
+        "int16",
+        "uint16",
+        "int32",
+        "uint32",
+        "int64",
+        "uint64",
+        "float16",
+        "fp16",
+        "f16",
+        "bfloat16",
+        "bf16",
+        "float32",
+        "fp32",
+        "f32",
+        "float64",
+        "fp64",
+        "f64",
+    }
+)
+
+
+def _normalize_dtype(dtype: Any) -> str:
+    return str(dtype).lower().replace("torch.", "")
+
+
+def _dtype_compatibility(graph: OperatorGraph, machine: MachineConfig) -> dict[str, Any]:
+    """Validate graph dtypes against an optional machine capability contract."""
+
+    attributes = machine.attributes
+    policy = str(attributes.get("dtype_policy", "strict")).lower()
+    if policy not in {"strict", "fallback"}:
+        raise ValueError("machine attribute 'dtype_policy' must be 'strict' or 'fallback'")
+    graph_dtypes = tuple(sorted({_normalize_dtype(tensor.dtype) for tensor in graph.tensors}))
+    unknown = tuple(dtype for dtype in graph_dtypes if dtype not in _KNOWN_DTYPES)
+    if unknown:
+        raise ValueError(
+            "graph contains unknown dtype(s): "
+            + ", ".join(unknown)
+            + "; register byte width and backend capability before compiling"
+        )
+    declared = attributes.get("supported_dtypes")
+    if declared is None:
+        supported = tuple(sorted(_KNOWN_DTYPES))
+    elif isinstance(declared, (tuple, list, set, frozenset)) and all(
+        isinstance(item, str) and item.strip() for item in declared
+    ):
+        supported = tuple(sorted({_normalize_dtype(item) for item in declared}))
+        unknown_supported = tuple(dtype for dtype in supported if dtype not in _KNOWN_DTYPES)
+        if unknown_supported:
+            raise ValueError(
+                "machine attribute 'supported_dtypes' contains unknown dtype(s): "
+                + ", ".join(unknown_supported)
+            )
+    else:
+        raise ValueError("machine attribute 'supported_dtypes' must be a sequence of dtype names")
+    unsupported = tuple(dtype for dtype in graph_dtypes if dtype not in supported)
+    if unsupported and policy == "strict":
+        raise ValueError(
+            f"machine '{machine.config_id}' does not natively support dtype(s): "
+            + ", ".join(unsupported)
+            + "; set dtype_policy='fallback' to run an explicitly marked analytical fallback"
+        )
+    return {
+        "policy": policy,
+        "graph_dtypes": list(graph_dtypes),
+        "supported_dtypes": list(supported),
+        "unsupported_dtypes": list(unsupported),
+        "status": "fallback" if unsupported else "native",
+    }
+
+
 @dataclass(frozen=True)
 class CompilerDiagnostic:
     """One stable compiler diagnostic for CLI and manifest output."""
@@ -115,6 +192,7 @@ def compile_operator_graph(
     machine_issues = machine.validate()
     if machine_issues:
         raise ValueError("compiler machine is invalid: " + "; ".join(machine_issues))
+    dtype_compatibility = _dtype_compatibility(graph, machine)
 
     gc_artifact = default_graph_compiler().compile(
         graph,
@@ -195,6 +273,7 @@ def compile_operator_graph(
             "stablehlo_version": stablehlo.stablehlo_version,
             "stablehlo_fallback": False,
             "stablehlo_fallback_reason": None,
+            "dtype_compatibility": dtype_compatibility,
             "codegen_direction": backend_artifact.attributes.get(
                 "codegen_direction", "tilegraph->tisa->backend-payload"
             ),

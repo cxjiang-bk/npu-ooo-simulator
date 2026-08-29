@@ -193,3 +193,14 @@ operation 表达。完整 ResNet50 的 stem 7x7、stride/downsample、全层 rep
 - FC/TISA 对未知 encoding 不再伪造 dense byte interval；仅当存在可验证的
   `strides_bytes` 时计算 concrete offset/span，否则保留 logical region 并走保守 overlap。
 - 新增 importer 与编译阶段回归；全量测试：102 tests passed。
+
+## 2026-08-30：dtype policy 与 multi-result boundary
+
+- `compile_operator_graph` 新增 machine-level `dtype_policy`：未声明能力时已知 dtype
+  默认 native；`supported_dtypes + strict` 对不支持 dtype 显式失败；`fallback` 允许已知
+  dtype继续走 analytical backend，并在 compiled artifact 的 `dtype_compatibility` 中记录。
+- 未知 dtype 不再落入各 lowering 的默认 2-byte 路径，必须先注册字节宽度与 backend
+  capability。
+- Official StableHLO projection 对未知 multi-result operation 显式失败；现有
+  `batch_norm_training` 三结果 recovery 保持兼容，并继续禁止 secondary result 被消费或返回。
+- 全量回归：104 tests passed。

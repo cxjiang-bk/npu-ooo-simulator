@@ -1,7 +1,9 @@
 import unittest
+from types import SimpleNamespace
 
 from npu_ooo.frontend import FrontendImportError
 from npu_ooo.frontend.stablehlo import StableHLOAdapter
+from npu_ooo.frontend.stablehlo_official import _project_module
 
 
 class StableHLOCapabilityBoundaryTest(unittest.TestCase):
@@ -93,6 +95,48 @@ class StableHLOCapabilityBoundaryTest(unittest.TestCase):
         self.assertEqual(tensors["arg0"].attributes["layout_source"], "stablehlo_encoding")
         self.assertEqual(tensors["arg0"].attributes["layout_encoding"], "#row_major")
         self.assertEqual(tensors["0"].attributes["layout_encoding"], "#row_major")
+
+    def test_official_projection_rejects_multi_result_operation_explicitly(self) -> None:
+        class Value:
+            def __init__(self, type_name):
+                self.type = type_name
+
+        class Operation:
+            def __init__(self, name, *, results=(), operands=()):
+                self.name = name
+                self.operation = self
+                self.results = list(results)
+                self.operands = list(operands)
+                self.attributes = {}
+                self.regions = []
+
+        arguments = [Value("tensor<2x3xf32>")]
+        first = Value("tensor<2x3xf32>")
+        second = Value("tensor<2x3xf32>")
+        multi = Operation("stablehlo.fake_multi", results=(first, second), operands=arguments)
+        returned = Operation("func.return", operands=(first,))
+        block = SimpleNamespace(arguments=arguments)
+        block.__iter__ = lambda self: iter((multi, returned))
+        # A tiny iterable block object is enough for the projection boundary.
+        class Block:
+            def __init__(self, arguments, operations):
+                self.arguments = arguments
+                self._operations = operations
+
+            def __iter__(self):
+                return iter(self._operations)
+
+        function_block = Block(arguments, (multi, returned))
+        function = Operation("func.func")
+        function.regions = [SimpleNamespace(blocks=[function_block])]
+        function.attributes = {"function_type": "(tensor<2x3xf32>) -> tensor<2x3xf32>"}
+        module_block = Block([], (function,))
+        module = SimpleNamespace(
+            operation=SimpleNamespace(regions=[SimpleNamespace(blocks=[module_block])])
+        )
+
+        with self.assertRaisesRegex(FrontendImportError, "multi-result operation.*2 results"):
+            _project_module(module)
 
     def test_unknown_operation_reports_missing_capability_and_known_set(self) -> None:
         with self.assertRaisesRegex(

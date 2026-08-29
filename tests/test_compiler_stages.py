@@ -373,6 +373,52 @@ class CompilerStageContractTest(unittest.TestCase):
         self.assertTrue(all(item.strides_bytes is None for item in encoded))
         self.assertEqual(compiled.validate(), ())
 
+    def test_machine_dtype_policy_strict_and_explicit_fallback(self) -> None:
+        graph = OperatorGraph(
+            graph_id="dtype-policy-test",
+            tensors=(TensorSpec("x", (4, 4), dtype="f32"), TensorSpec("y", (4, 4), dtype="f32")),
+            operators=(
+                OperatorSpec(
+                    op_id="negate",
+                    op_type="elementwise",
+                    inputs=("x",),
+                    outputs=("y",),
+                    iteration_dims=(("m", 4), ("n", 4)),
+                    attributes={"semantic_op": "negate", "frontend_target": "stablehlo.negate"},
+                ),
+            ),
+        )
+        frontend, stablehlo = _stable_frontend(graph)
+        strict_machine = replace(
+            minimal_machine_config(),
+            attributes={"supported_dtypes": ["f16"], "dtype_policy": "strict"},
+        )
+        with self.assertRaisesRegex(ValueError, "does not natively support dtype.*f32"):
+            compile_operator_graph(
+                graph,
+                strict_machine,
+                frontend=frontend,
+                source_frontend=frontend,
+                stablehlo=stablehlo,
+                tile_size=2,
+            )
+
+        fallback_machine = replace(
+            strict_machine,
+            attributes={"supported_dtypes": ["f16"], "dtype_policy": "fallback"},
+        )
+        compiled = compile_operator_graph(
+            graph,
+            fallback_machine,
+            frontend=frontend,
+            source_frontend=frontend,
+            stablehlo=stablehlo,
+            tile_size=2,
+        )
+        self.assertEqual(compiled.attributes["dtype_compatibility"]["status"], "fallback")
+        self.assertEqual(compiled.attributes["dtype_compatibility"]["unsupported_dtypes"], ["f32"])
+        self.assertEqual(compiled.validate(), ())
+
 
 if __name__ == "__main__":
     unittest.main()

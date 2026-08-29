@@ -257,6 +257,12 @@ local tile slot 的交替意图；它是 GC metadata，不是 runtime 的实际 
 
 当前普通 reshape/transpose 采用保守的 full-tensor schedule。reshape 映射为 DMA copy，transpose 映射为 DMA transpose；静态 `broadcast_in_dim` 则按输出域切 tile，并将源 operand 映射到对应广播切片。FC 的 `TileMem` 为每个 operand 保存 `strides_bytes`、可读的 `stride_expr` 和 `layout`。默认 dense layout 生成 concrete offset/size；带 StableHLO type encoding 但尚未解析 stride 的 tensor 保留 `layout_encoding` 与 logical address expression，不猜测物理区间，依赖检查采用 conservative overlap。
 
+机器可通过 `supported_dtypes` 和 `dtype_policy` 声明 dtype 能力。`strict` 对未声明支持的
+已知 dtype 在 compiler 入口失败；`fallback` 允许 analytical backend 继续运行，但会在
+`CompiledArtifact.attributes.dtype_compatibility` 标记 fallback。未知 dtype 始终失败，避免
+落入默认字节宽度。除已有 `batch_norm_training` recovery 外，官方 StableHLO projection
+对 multi-result operation 显式失败，不截断 secondary result。
+
 ## 5. Fusion Compiler（FC）
 
 FC 接收 `GCArtifact`，不再直接从普通 `OperatorGraph` 重新推导 tile。它将融合区域和 tile stage 专化为 TISA dialect operations，并为每条 scheduler-visible operation 附加：
