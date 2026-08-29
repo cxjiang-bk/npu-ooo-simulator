@@ -7,13 +7,14 @@ from npu_ooo.simulator import (
     AnalyticalTimingModel,
     SimulationResult,
     SimulatorConfig,
+    RuntimeSequenceSimulationResult,
     StaticPipelineConfig,
     TaskTiming,
     TimingModel,
     TraceEvent,
     simulate_execution_graph,
 )
-from npu_ooo.ir import BackendArtifact, ExecutionGraph, RuntimeSubmission
+from npu_ooo.ir import BackendArtifact, ExecutionGraph, RuntimeSequence, RuntimeSubmission
 from npu_ooo.arch import MachineConfig
 
 if TYPE_CHECKING:
@@ -72,4 +73,30 @@ def schedule_tisa_program(
         timing_provider=timing_model or AnalyticalTimingModel(),
         simulator_config=simulator_config,
         runtime_submission=runtime_submission,
+    )
+
+
+def schedule_tisa_sequence(
+    artifact: BackendArtifact,
+    sequence: RuntimeSequence,
+    machine: MachineConfig,
+    policy: SchedulerPolicy | str = SchedulerPolicy.STATIC_PIPELINE,
+    *,
+    timing_model: TimingModel | None = None,
+    simulator_config: SimulatorConfig | None = None,
+    event_backend: EventBackend | None = None,
+) -> RuntimeSequenceSimulationResult:
+    """Schedule a multi-invocation runtime sequence with stable state."""
+
+    normalized_policy = policy.value if isinstance(policy, SchedulerPolicy) else str(policy)
+    from npu_ooo.simulator import simulate_tisa_sequence
+
+    return simulate_tisa_sequence(
+        artifact,
+        sequence,
+        machine,
+        normalized_policy,
+        timing_model=timing_model or AnalyticalTimingModel(),
+        config=simulator_config,
+        event_backend=event_backend,
     )

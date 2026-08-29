@@ -122,6 +122,24 @@ def _named_integer(text: str, name: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _named_integer_list(text: str, name: str) -> tuple[int, ...] | None:
+    match = re.search(rf"\b{re.escape(name)}\s*=\s*\[([^\]]*)\]", text)
+    if match is None:
+        return None
+    values: list[int] = []
+    for raw in match.group(1).split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            values.append(int(raw))
+        except ValueError as exc:
+            raise FrontendImportError(
+                f"StableHLO {name} must contain constant integers"
+            ) from exc
+    return tuple(values)
+
+
 def _named_float(text: str, name: str) -> float | None:
     match = re.search(
         rf"\b{re.escape(name)}\s*=\s*([-+]?\d+(?:\.\d*)?(?:[eE][-+]?\d+)?)",
@@ -362,6 +380,168 @@ def _graph_from_text(text: str, *, graph_id: str) -> OperatorGraph:
             )
             iteration_dims = tuple((f"d{axis}", value) for axis, value in enumerate(result_shape))
             reduction_dims = ()
+        elif op_type == SemanticOpType.BATCH_NORM.value:
+            if len(input_shapes) != 5 or len(result_shape) != 4 or any(len(shape) != 1 for shape in input_shapes[1:]):
+                raise FrontendImportError(
+                    f"StableHLO batch_norm_inference '{result_name}' requires rank-4 input and four rank-1 statistics"
+                )
+            if input_shapes[1] != input_shapes[2] or input_shapes[1] != input_shapes[3] or input_shapes[1] != input_shapes[4]:
+                raise FrontendImportError(
+                    f"StableHLO batch_norm_inference '{result_name}' statistics must have matching channel shapes"
+                )
+            feature_index = _named_integer(body, "feature_index")
+            epsilon = _named_float(body, "epsilon")
+            if feature_index is None or feature_index < 0 or feature_index >= len(result_shape):
+                raise FrontendImportError(
+                    f"StableHLO batch_norm_inference '{result_name}' has an invalid feature_index"
+                )
+            if input_shapes[1][0] != result_shape[feature_index]:
+                raise FrontendImportError(
+                    f"StableHLO batch_norm_inference '{result_name}' statistics do not match feature extent"
+                )
+            operation_attributes.update(
+                {
+                    "feature_index": feature_index,
+                    "epsilon": epsilon if epsilon is not None else 1e-5,
+                    "training": False,
+                }
+            )
+            iteration_dims = tuple((f"d{axis}", value) for axis, value in enumerate(result_shape))
+            reduction_dims = ()
+        elif op_type == SemanticOpType.POOL.value:
+            if len(input_shapes) < 1 or len(input_shapes[0]) != 4 or len(result_shape) != 4:
+                raise FrontendImportError(
+                    f"StableHLO reduce_window '{result_name}' currently requires rank-4 NCHW tensors"
+                )
+            # The init value is a scalar constant and is not a data operand in
+            # the canonical pool contract.
+            input_names = (input_names[0],)
+            input_shape = input_shapes[0]
+            window_dimensions = _named_integer_list(body, "window_dimensions")
+            window_strides = _named_integer_list(body, "window_strides")
+            padding = _named_integer_list(body, "padding")
+            base_dilations = _named_integer_list(body, "base_dilations") or (1, 1, 1, 1)
+            window_dilations = _named_integer_list(body, "window_dilations") or (1, 1, 1, 1)
+            reducer = re.search(r"\breducer\s*=\s*([A-Za-z_][\w.]*)", body)
+            reducer_name = reducer.group(1).lower() if reducer else "add"
+            if window_dimensions is None or len(window_dimensions) != 4:
+                raise FrontendImportError(f"StableHLO reduce_window '{result_name}' requires four window_dimensions")
+            if window_strides is None or len(window_strides) != 4:
+                raise FrontendImportError(f"StableHLO reduce_window '{result_name}' requires four window_strides")
+            if padding is None or len(padding) != 8:
+                raise FrontendImportError(f"StableHLO reduce_window '{result_name}' requires eight padding values")
+            if base_dilations != (1, 1, 1, 1) or window_dilations != (1, 1, 1, 1):
+                raise FrontendImportError(f"StableHLO reduce_window '{result_name}' currently requires unit dilations")
+            if window_dimensions[:2] != (1, 1) or window_strides[:2] != (1, 1) or any(padding[index] for index in (0, 1, 2, 3)):
+                raise FrontendImportError(f"StableHLO reduce_window '{result_name}' currently requires N/C-preserving windows")
+            if reducer_name not in {"maximum", "add"}:
+                raise FrontendImportError(
+                    f"StableHLO reduce_window '{result_name}' reducer '{reducer_name}' is unsupported"
+                )
+            expected_spatial = tuple(
+                (input_shape[axis + 2] + padding[2 * (axis + 2)] + padding[2 * (axis + 2) + 1] - window_dimensions[axis + 2])
+                // window_strides[axis + 2] + 1
+                for axis in range(2)
+            )
+            if tuple(result_shape) != (input_shape[0], input_shape[1], *expected_spatial):
+                raise FrontendImportError(
+                    f"StableHLO reduce_window '{result_name}' result shape {result_shape} does not match "
+                    f"window/padding (expected {(input_shape[0], input_shape[1], *expected_spatial)})"
+                )
+            operation_attributes.update(
+                {
+                    "window_dimensions": list(window_dimensions),
+                    "window_strides": list(window_strides),
+                    "padding": list(padding),
+                    "base_dilations": list(base_dilations),
+                    "window_dilations": list(window_dilations),
+                    "pool_reducer": reducer_name,
+                }
+            )
+            iteration_dims = tuple((f"d{axis}", value) for axis, value in enumerate(result_shape))
+            reduction_dims = ()
+        elif op_type == SemanticOpType.CONV2D.value:
+            if len(input_shapes) != 2 or len(input_shapes[0]) != 4 or len(input_shapes[1]) != 4 or len(result_shape) != 4:
+                raise FrontendImportError(
+                    f"StableHLO convolution '{result_name}' currently requires rank-4 NCHW/OIHW tensors"
+                )
+            lhs_shape, rhs_shape = input_shapes
+            dimension_numbers = re.search(
+                r"dimension_numbers\s*=\s*([^\s]+(?:\s*[^\s]+)*?)\s+(?:window_strides|strides)\s*=",
+                body,
+            )
+            dimensions_text = dimension_numbers.group(1) if dimension_numbers else ""
+            if dimensions_text and not (
+                "[b, f, 0, 1]x[o, i, 0, 1]->[b, f, 0, 1]" in dimensions_text
+            ):
+                raise FrontendImportError(
+                    f"StableHLO convolution '{result_name}' uses unsupported dimension_numbers "
+                    f"'{dimensions_text}'"
+                )
+            strides = _named_integer_list(body, "window_strides")
+            if strides is None:
+                strides = _named_integer_list(body, "strides")
+            padding = _named_integer_list(body, "padding")
+            lhs_dilation = _named_integer_list(body, "lhs_dilation")
+            rhs_dilation = _named_integer_list(body, "rhs_dilation")
+            feature_groups = _named_integer(body, "feature_group_count") or 1
+            batch_groups = _named_integer(body, "batch_group_count") or 1
+            if strides is None or len(strides) != 2:
+                raise FrontendImportError(
+                    f"StableHLO convolution '{result_name}' requires two window_strides"
+                )
+            if padding is None or len(padding) != 4:
+                raise FrontendImportError(
+                    f"StableHLO convolution '{result_name}' requires [h_low,h_high,w_low,w_high] padding"
+                )
+            lhs_dilation = lhs_dilation or (1, 1)
+            rhs_dilation = rhs_dilation or (1, 1)
+            if lhs_dilation != (1, 1) or rhs_dilation != (1, 1):
+                raise FrontendImportError(
+                    f"StableHLO convolution '{result_name}' currently requires unit dilation"
+                )
+            if any(value <= 0 for value in (*strides, feature_groups, batch_groups)):
+                raise FrontendImportError(
+                    f"StableHLO convolution '{result_name}' has invalid stride/group attributes"
+                )
+            if feature_groups != 1 or batch_groups != 1:
+                raise FrontendImportError(
+                    f"StableHLO convolution '{result_name}' currently requires feature_group_count=batch_group_count=1"
+                )
+            if lhs_shape[1] != rhs_shape[1] or result_shape[0] != lhs_shape[0] or result_shape[1] != rhs_shape[0]:
+                raise FrontendImportError(
+                    f"StableHLO convolution '{result_name}' has incompatible channel/batch shapes"
+                )
+            expected_spatial = tuple(
+                (lhs_shape[axis + 2] + padding[2 * axis] + padding[2 * axis + 1] - rhs_shape[axis + 2]) // strides[axis] + 1
+                for axis in range(2)
+            )
+            if tuple(result_shape[2:]) != expected_spatial:
+                raise FrontendImportError(
+                    f"StableHLO convolution '{result_name}' result shape {result_shape} does not match "
+                    f"window/padding (expected {(lhs_shape[0], rhs_shape[0], *expected_spatial)})"
+                )
+            iteration_dims = (
+                ("N", result_shape[0]),
+                ("O", result_shape[1]),
+                ("OH", result_shape[2]),
+                ("OW", result_shape[3]),
+            )
+            reduction_dims = (("K", rhs_shape[1] * rhs_shape[2] * rhs_shape[3]),)
+            operation_attributes.update(
+                {
+                    "convolution_dimension_numbers": "nchw_oihw_nchw",
+                    "window_strides": list(strides),
+                    "padding": list(padding),
+                    "lhs_dilation": list(lhs_dilation),
+                    "rhs_dilation": list(rhs_dilation),
+                    "feature_group_count": feature_groups,
+                    "batch_group_count": batch_groups,
+                    "kernel_shape": list(rhs_shape[2:]),
+                    "input_channels": lhs_shape[1],
+                    "output_channels": rhs_shape[0],
+                }
+            )
         elif op_type == SemanticOpType.MATMUL.value:
             if len(input_shapes) < 2 or len(result_shape) < 2:
                 raise FrontendImportError(f"StableHLO dot operation '{result_name}' requires rank >= 2 operands")
@@ -476,6 +656,81 @@ def _graph_from_text(text: str, *, graph_id: str) -> OperatorGraph:
                         "broadcast_dimensions": list(dimensions),
                     }
                 )
+        elif op_type == "slice":
+            starts = _named_integer_list(body, "starts")
+            limits = _named_integer_list(body, "limits")
+            strides = _named_integer_list(body, "strides")
+            if starts is None or limits is None or strides is None:
+                raise FrontendImportError(
+                    f"StableHLO slice operation '{result_name}' requires starts, limits and strides"
+                )
+            if not (
+                len(starts) == len(limits) == len(strides) == len(input_shapes[0])
+            ):
+                raise FrontendImportError(
+                    f"StableHLO slice operation '{result_name}' index rank does not match operand rank"
+                )
+            operand_shape = input_shapes[0]
+            if any(
+                start < 0
+                or limit < start
+                or limit > extent
+                or stride <= 0
+                for start, limit, stride, extent in zip(
+                    starts, limits, strides, operand_shape
+                )
+                if isinstance(extent, int)
+            ):
+                raise FrontendImportError(
+                    f"StableHLO slice operation '{result_name}' has invalid bounds"
+                )
+            if any(
+                not isinstance(extent, int)
+                for extent in operand_shape
+            ):
+                raise FrontendImportError(
+                    f"StableHLO slice operation '{result_name}' requires a resolved operand shape"
+                )
+            expected_shape = tuple(
+                (limit - start + stride - 1) // stride
+                for start, limit, stride in zip(starts, limits, strides)
+            )
+            if tuple(result_shape) != expected_shape:
+                raise FrontendImportError(
+                    f"StableHLO slice operation '{result_name}' result shape {result_shape} "
+                    f"does not match bounds {expected_shape}"
+                )
+            operation_attributes.update(
+                {
+                    "slice_starts": list(starts),
+                    "slice_limits": list(limits),
+                    "slice_strides": list(strides),
+                }
+            )
+            iteration_dims = tuple((f"d{axis}", value) for axis, value in enumerate(result_shape))
+            reduction_dims = ()
+        elif op_type == "concatenate":
+            dimension = _named_integer(body, "dim")
+            if dimension is None:
+                dimension = _named_integer(body, "dimension")
+            if dimension is None or dimension < 0 or dimension >= len(result_shape):
+                raise FrontendImportError(
+                    f"StableHLO concatenate operation '{result_name}' has an invalid dimension"
+                )
+            if any(
+                len(shape) != len(result_shape)
+                or any(
+                    axis != dimension and extent != result_shape[axis]
+                    for axis, extent in enumerate(shape)
+                )
+                for shape in input_shapes
+            ) or sum(shape[dimension] for shape in input_shapes) != result_shape[dimension]:
+                raise FrontendImportError(
+                    f"StableHLO concatenate operation '{result_name}' has incompatible shapes"
+                )
+            operation_attributes["concatenate_dimension"] = dimension
+            iteration_dims = tuple((f"d{axis}", value) for axis, value in enumerate(result_shape))
+            reduction_dims = ()
         elif op_type == SemanticOpType.TRANSPOSE.value:
             iteration_dims = tuple((f"d{axis}", value) for axis, value in enumerate(result_shape))
             reduction_dims = ()

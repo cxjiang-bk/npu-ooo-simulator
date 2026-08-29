@@ -201,7 +201,7 @@ def _tile_tensor_region(
     reduction = tuple(name for name, _extent in operator.reduction_dims)
     op_type = operator.normalized_type
 
-    if op_type in {"reshape", "transpose"}:
+    if op_type in {"reshape", "transpose", "kv_cache_update"}:
         return (0,) * len(tensor_shape), tensor_shape
 
     if op_type in {"matmul", "batched_matmul", "gemv"}:
@@ -245,6 +245,100 @@ def _tile_tensor_region(
                 (*rhs_shape, inner_shape, column_shape),
             )
         return None
+
+    if op_type == "conv2d":
+        # The output tile is indexed by N/O/OH/OW while the input operand
+        # carries a spatial halo for the kernel window.  Keeping this
+        # projection in TileGraph aligned with the analytical lowering is
+        # required for exact cross-operator readiness dependencies.
+        if (
+            len(operator.inputs) < 2
+            or len(operator.outputs) != 1
+            or tuple(iteration) != ("N", "O", "OH", "OW")
+            or len(reduction) != 1
+            or len(tensor_shape) != 4
+        ):
+            return None
+        bounds = tile.bound_map
+        n_start, n_stop = bounds["N"]
+        o_start, o_stop = bounds["O"]
+        oh_start, oh_stop = bounds["OH"]
+        ow_start, ow_stop = bounds["OW"]
+        kernel_h, kernel_w = tuple(
+            int(value)
+            for value in operator.attributes.get("kernel_shape", (1, 1))
+        )
+        stride_h, stride_w = tuple(
+            int(value)
+            for value in operator.attributes.get("window_strides", (1, 1))
+        )
+        pad_top, _pad_bottom, pad_left, _pad_right = tuple(
+            int(value) for value in operator.attributes.get("padding", (0, 0, 0, 0))
+        )
+        if tensor_name == operator.outputs[0]:
+            return (
+                (n_start, o_start, oh_start, ow_start),
+                (n_stop - n_start, o_stop - o_start, oh_stop - oh_start, ow_stop - ow_start),
+            )
+        if tensor_name == operator.inputs[1]:
+            # Weight tiles are currently materialized as a full OIHW tensor by
+            # the analytical backend; retain that conservative region here.
+            return (0, 0, 0, 0), tensor_shape
+        if tensor_name == operator.inputs[0]:
+            input_start_h = max(0, oh_start * stride_h - pad_top)
+            input_start_w = max(0, ow_start * stride_w - pad_left)
+            input_h = tensor_shape[2]
+            input_w = tensor_shape[3]
+            input_h_extent = min(
+                input_h - input_start_h,
+                (oh_stop - oh_start - 1) * stride_h + kernel_h,
+            )
+            input_w_extent = min(
+                input_w - input_start_w,
+                (ow_stop - ow_start - 1) * stride_w + kernel_w,
+            )
+            return (
+                (n_start, 0, input_start_h, input_start_w),
+                (
+                    n_stop - n_start,
+                    int(dict(operator.attributes).get("input_channels", tensor_shape[1])),
+                    max(1, input_h_extent),
+                    max(1, input_w_extent),
+                ),
+            )
+        return None
+
+    if op_type == "pool":
+        if len(operator.inputs) != 1 or len(operator.outputs) != 1 or len(tensor_shape) != 4:
+            return None
+        if tuple(iteration) != ("d0", "d1", "d2", "d3"):
+            return None
+        bounds = tile.bound_map
+        starts = tuple(bounds[name][0] for name in iteration)
+        output_shape = tuple(bounds[name][1] - bounds[name][0] for name in iteration)
+        if tensor_name == operator.outputs[0]:
+            return starts, output_shape
+        if tensor_name != operator.inputs[0]:
+            return None
+        window = tuple(int(value) for value in operator.attributes.get("window_dimensions", (1, 1, 1, 1)))
+        stride = tuple(int(value) for value in operator.attributes.get("window_strides", (1, 1, 1, 1)))
+        padding = tuple(int(value) for value in operator.attributes.get("padding", (0,) * 8))
+        if len(window) != 4 or len(stride) != 4 or len(padding) != 8:
+            return None
+        input_start_h = max(0, starts[2] * stride[2] - padding[4])
+        input_start_w = max(0, starts[3] * stride[3] - padding[6])
+        input_h_extent = min(
+            int(tensor_shape[2]) - input_start_h,
+            (output_shape[2] - 1) * stride[2] + window[2],
+        )
+        input_w_extent = min(
+            int(tensor_shape[3]) - input_start_w,
+            (output_shape[3] - 1) * stride[3] + window[3],
+        )
+        return (
+            (starts[0], starts[1], input_start_h, input_start_w),
+            (output_shape[0], output_shape[1], max(1, input_h_extent), max(1, input_w_extent)),
+        )
 
     if op_type in {"elementwise", "residual_add"}:
         output_starts, output_shape = _dimension_region(tile, iteration)
@@ -384,7 +478,7 @@ def build_tile_graph(graph: OperatorGraph, schedule: ScheduleSpec) -> TileGraph:
             continue
         kind = (
             "accumulate"
-            if operator.normalized_type in {"matmul", "batched_matmul", "gemv"}
+            if operator.normalized_type in {"matmul", "batched_matmul", "gemv", "conv2d"}
             else "state"
         )
         for row_tiles in rows.values():

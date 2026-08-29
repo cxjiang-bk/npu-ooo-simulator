@@ -184,6 +184,16 @@ cos/sin/rotation matrix 和 Q/K 两条路径记录为非 opaque `rotary_embeddin
 vector primitive chain 收敛为一个 `swiglu` TISA 边界，内部步骤留在该指令的 backend
 payload 中。输入图若包含 dtype round-trip，转换步骤也会作为 payload primitive 保留。
 
+KV-cache recovery 当前只接受固定窗口的 `slice(cache) + concatenate(update)` 形式；
+`examples/paper_benchmarks/llama2.py` 中的 `LLaMA2DecodeOneBlock` 用真实 PyTorch
+one-token decode 图覆盖该 contract。
+GC 将其收敛为带 `state_id/state_buffer` 的 `kv_cache_update`，输出 tensor 与持久
+state buffer 建立别名；FC 生成 `load -> kv_cache_update -> store` 三个 stage，runtime
+要求对应 buffer 标记为 `persistent` 并在 submission 中导出 state contract。多步 decode
+通过 `RuntimeStateRegistry` 与 `RuntimeSequence` 复用该地址，并以 `state_complete` 串联
+invocation；该 contract 不等价于已实现动态索引、paged cache、跨 request ownership 或
+真实 LLaMA decode cache layout。
+
 `softmax_algorithm` 的传播路径是：CLI 或 `MachineConfig.attributes` 给出
 `materialized`/`online` 选择；GC 首先校验取值，然后把它写入 canonical Softmax
 operator 的 attributes，再交给 planner 和 `TileGraph`。它只选择 Softmax 的实现
@@ -387,6 +397,23 @@ device policy: 已到达描述符何时 issue 到 execution unit
 
 两层可通过 `--runtime-device-matrix` 形成四组合实验。
 
+### 8.1 跨 invocation state
+
+固定窗口 KV-cache 在单次编译中携带 `state_id/state_buffer`。运行时通过
+`RuntimeStateRegistry` 将该 state 绑定到稳定的物理地址，并保留同一组普通输入/输出
+buffer。需要重复执行同一个 decode block 时，`RuntimeSequence` 复用同一份
+`BackendArtifact`，为每次 invocation 创建独立的 command chunks，并显式添加：
+
+```text
+invocation[n-1] --state_complete(state_id)--> invocation[n]
+```
+
+sequence simulator 逐 invocation 调用同一个 EventBackend，在前一步完成后再提交下一步，
+把事件和 timing 平移合并；`STATE_RELEASE/STATE_WAIT/STATE_READY` 事件用于在 trace 中
+核对状态边界。persistent buffer 不参与普通临时 tensor 的 lifetime reuse，且所有
+invocation 必须保持相同的地址、memory scope 和容量。当前 contract 仍限定为固定 shape、
+unit stride、固定窗口的 `slice + concatenate`，不代表完整动态 KV-cache runtime。
+
 ## 9. Device Scheduler
 
 `schedule_tisa_program()` 消费 BackendArtifact、MachineConfig、RuntimeSubmission、SimulatorConfig、TimingProvider 和 EventBackend。
@@ -449,8 +476,10 @@ RuntimeSubmission（除非实验变量就是 runtime）
 - analytical backend 不是 cycle-accurate RTL；
 - 当前 MXU VCS 日志只有 descriptor-to-done 区间，不能直接作为 isolated Matmul compute latency；
 - online Softmax 目前是 scheduler-level analytical state-chain 模型，尚未覆盖完整的数值 rescale、最终 normalization 和 workspace 生命周期；
-- 真实 ResNet50、DeepSeek block 尚未形成可复现实验集；BERT/GPT-J/LLaMA2 当前已有
-  one-block PyTorch micro workload，LLaMA2 的 RoPE 已接入，但 KV-cache 和 full depth
-  仍未实现。
+- ResNet bottleneck、BERT/GPT-J/LLaMA2/DeepSeek dense one-block 已有真实 PyTorch
+  micro workload；完整模型规模和 DeepSeek MoE path 尚未形成论文实验集。LLaMA2 的 RoPE
+  已接入；KV-cache 当前支持固定窗口
+  单步 contract 和多步 `RuntimeSequence` 仿真，但动态写入、真实 cache layout、跨请求
+  生命周期和 full depth 仍未实现。
 
 下一阶段见 [roadmap.md](roadmap.md)。

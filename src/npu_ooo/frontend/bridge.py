@@ -350,6 +350,12 @@ def _operator_graph_from_fx_graph(
                 raise FrontendImportError(
                     f"node '{name}' has no tensor shape metadata; run torch.export with shape propagation"
                 )
+            # Inference modules may expose bookkeeping scalars (for example
+            # BatchNorm's num_batches_tracked) as unused export placeholders.
+            # They are not part of the dataflow and cannot be represented as a
+            # dense tensor tile, so omit only this provably dead zero-rank case.
+            if not shape and not getattr(node, "users", {}):
+                continue
             source = dict((input_sources or {}).get(name, {}))
             source_kind = source.get(
                 "source_kind",

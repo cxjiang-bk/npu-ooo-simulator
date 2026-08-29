@@ -60,13 +60,13 @@ class StableHLOCapabilityBoundaryTest(unittest.TestCase):
     def test_unknown_operation_reports_missing_capability_and_known_set(self) -> None:
         with self.assertRaisesRegex(
             FrontendImportError,
-            r"missing StableHLO capability.*stablehlo.convolution.*Known operations:.*stablehlo.dot_general",
+            r"missing StableHLO capability.*stablehlo.custom_call.*Known operations:.*stablehlo.dot_general",
         ):
             StableHLOAdapter.from_text(
                 """
                 module {
                   func.func @main(%arg0: tensor<1x3x4x4xf32>) -> tensor<1x3x4x4xf32> {
-                    %0 = stablehlo.convolution %arg0, %arg0 : (tensor<1x3x4x4xf32>, tensor<1x3x4x4xf32>) -> tensor<1x3x4x4xf32>
+                    %0 = stablehlo.custom_call %arg0 {call_target_name = "unsupported"} : (tensor<1x3x4x4xf32>) -> tensor<1x3x4x4xf32>
                     return %0 : tensor<1x3x4x4xf32>
                   }
                 }

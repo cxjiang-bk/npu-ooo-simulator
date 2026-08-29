@@ -160,7 +160,11 @@ def plan_uniform_tiles(graph: OperatorGraph, *, tile_size: int = 32) -> Schedule
         dimensions = (*operator.iteration_dims, *operator.reduction_dims)
         if any(not isinstance(extent, int) for _name, extent in dimensions):
             raise ValueError("schedule planning requires a resolved graph")
-        full_tensor_transform = operator.normalized_type in {"reshape", "transpose"}
+        full_tensor_transform = operator.normalized_type in {
+            "reshape",
+            "transpose",
+            "kv_cache_update",
+        }
         schedules.append(
             OperatorSchedule(
                 operator_id=operator.op_id,

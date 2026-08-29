@@ -102,6 +102,32 @@ def _ints(text: str) -> tuple[int, ...]:
     return tuple(int(item) for item in re.findall(r"-?\d+", text))
 
 
+def _attribute_ints(value: Any) -> tuple[int, ...]:
+    """Extract integer payloads without treating MLIR element types as values."""
+
+    text = str(value)
+    dense_scalar = re.search(r"(?:array|dense)<\s*(-?\d+)\s*>", text)
+    if dense_scalar is not None:
+        return (int(dense_scalar.group(1)),)
+    match = re.search(r"(?:array|dense)<(?:i\d+|ui\d+)?\s*:\s*([^>]+)>", text)
+    if match is not None:
+        text = match.group(1)
+    else:
+        # Scalar MLIR integers print as ``2 : i64``.  The type suffix is not
+        # part of the attribute value and must not be returned as ``64``.
+        scalar = re.fullmatch(r"\s*(-?\d+)\s*:\s*(?:ui|i)\d+\s*", text)
+        if scalar is not None:
+            text = scalar.group(1)
+    return _ints(text)
+
+
+def _attribute_int(value: Any) -> int:
+    values = _attribute_ints(value)
+    if not values:
+        raise FrontendImportError(f"MLIR integer attribute has no value: {value}")
+    return values[-1]
+
+
 def _project_module(module: Any) -> str:
     """Project verified MLIR operations to the semantic importer's readable form."""
 
@@ -204,6 +230,48 @@ def _project_module(module: Any) -> str:
                 f"({', '.join(operand_types)}) -> {result_type}"
             )
             continue
+        if name == "stablehlo.convolution":
+            dimension_numbers = str(operation.attributes["dimension_numbers"])
+            window = str(operation.attributes["window_strides"]) if "window_strides" in operation.attributes else ""
+            padding = str(operation.attributes["padding"]) if "padding" in operation.attributes else ""
+            lhs_dilation = str(operation.attributes["lhs_dilation"]) if "lhs_dilation" in operation.attributes else ""
+            rhs_dilation = str(operation.attributes["rhs_dilation"]) if "rhs_dilation" in operation.attributes else ""
+            feature_groups = str(operation.attributes["feature_group_count"]) if "feature_group_count" in operation.attributes else "1"
+            batch_groups = str(operation.attributes["batch_group_count"]) if "batch_group_count" in operation.attributes else "1"
+
+            def array_values(value: str) -> str:
+                match = re.search(r"(?:array|dense)<[^:>]*:\s*([^>]+)>", value)
+                if match is not None:
+                    return match.group(1).replace("[", "").replace("]", "")
+                return value.split(":", 1)[0].strip()
+
+            # StableHLO commonly prints a symmetric padding attribute as
+            # ``dense<1> : tensor<2x2xi64>``.  Parse the payload only: the
+            # dimensions and element type in the trailing MLIR type are not
+            # padding values.  A scalar payload is expanded to one low/high
+            # pair for each spatial dimension (NCHW has two spatial dims).
+            dense_scalar = re.search(r"dense<\s*(-?\d+)\s*>", padding)
+            if dense_scalar is not None:
+                padding_values = [dense_scalar.group(1)] * 4
+            else:
+                payload_match = re.search(r"(?:array|dense)<[^:>]*:\s*([^>]+)>", padding)
+                if payload_match is not None:
+                    payload = payload_match.group(1)
+                else:
+                    payload = padding.split(":", 1)[0].strip()
+                padding_values = [str(value) for value in _ints(payload)]
+            lines.append(
+                f"    %{result_name} = stablehlo.convolution %{operands[0]}, %{operands[1]} "
+                f"dimension_numbers = {dimension_numbers} "
+                f"window_strides = [{array_values(window)}] "
+                f"padding = [{', '.join(padding_values)}] "
+                f"lhs_dilation = [{array_values(lhs_dilation)}] "
+                f"rhs_dilation = [{array_values(rhs_dilation)}] "
+                f"feature_group_count = {feature_groups.split(':', 1)[0].strip()} "
+                f"batch_group_count = {batch_groups.split(':', 1)[0].strip()} : "
+                f"({', '.join(operand_types)}) -> {result_type}"
+            )
+            continue
         if name == "stablehlo.transpose":
             permutation_text = str(operation.attributes["permutation"])
             permutation_match = re.search(r"array<i64:\s*([^>]*)>", permutation_text)
@@ -211,6 +279,31 @@ def _project_module(module: Any) -> str:
             lines.append(
                 f"    %{result_name} = stablehlo.transpose %{operands[0]}, "
                 f"dimensions = [{', '.join(map(str, permutation))}] : {result_type}"
+            )
+            continue
+        if name == "stablehlo.slice":
+            starts = _attribute_ints(operation.attributes["start_indices"])
+            limits = _attribute_ints(operation.attributes["limit_indices"])
+            strides_attribute = (
+                operation.attributes["strides"]
+                if "strides" in operation.attributes
+                else ""
+            )
+            strides = _attribute_ints(strides_attribute)
+            lines.append(
+                f"    %{result_name} = stablehlo.slice %{operands[0]} "
+                f"starts = [{', '.join(map(str, starts))}] "
+                f"limits = [{', '.join(map(str, limits))}] "
+                f"strides = [{', '.join(map(str, strides))}] : "
+                f"({', '.join(operand_types)}) -> {result_type}"
+            )
+            continue
+        if name == "stablehlo.concatenate":
+            dimension = _attribute_int(operation.attributes["dimension"])
+            lines.append(
+                f"    %{result_name} = stablehlo.concatenate "
+                f"{', '.join('%' + item for item in operands)} dim = {dimension} : "
+                f"({', '.join(operand_types)}) -> {result_type}"
             )
             continue
         if name == "stablehlo.batch_norm_training":
@@ -221,6 +314,48 @@ def _project_module(module: Any) -> str:
                 f"{', '.join('%' + item for item in operands)} "
                 f"feature_index = {feature_index} epsilon = {epsilon} : "
                 f"({', '.join(operand_types)}) -> {result_type}"
+            )
+            continue
+        if name == "stablehlo.batch_norm_inference":
+            feature_index = str(operation.attributes["feature_index"]).split(":", 1)[0].strip()
+            epsilon = str(operation.attributes["epsilon"]).split(":", 1)[0].strip()
+            lines.append(
+                f"    %{result_name} = stablehlo.batch_norm_inference "
+                f"{', '.join('%' + item for item in operands)} "
+                f"feature_index = {feature_index} epsilon = {epsilon} : "
+                f"({', '.join(operand_types)}) -> {result_type}"
+            )
+            continue
+        if name == "stablehlo.reduce_window":
+            window_dimensions = _attribute_ints(operation.attributes["window_dimensions"])
+            window_strides = _attribute_ints(operation.attributes["window_strides"])
+            padding_values = _attribute_ints(operation.attributes["padding"])
+            base_dilations = _attribute_ints(
+                operation.attributes["base_dilations"]
+                if "base_dilations" in operation.attributes
+                else ""
+            )
+            window_dilations = _attribute_ints(
+                operation.attributes["window_dilations"]
+                if "window_dilations" in operation.attributes
+                else ""
+            )
+            if len(padding_values) == 1:
+                padding_values *= 8
+            reducer = "add"
+            if operation.regions and operation.regions[0].blocks:
+                for region_op in operation.regions[0].blocks[0]:
+                    if region_op.name.startswith("stablehlo.") and region_op.name != "stablehlo.return":
+                        reducer = region_op.name.removeprefix("stablehlo.")
+                        break
+            lines.append(
+                f"    %{result_name} = stablehlo.reduce_window %{operands[0]}, %{operands[1]} "
+                f"window_dimensions = [{', '.join(map(str, window_dimensions))}] "
+                f"window_strides = [{', '.join(map(str, window_strides))}] "
+                f"padding = [{', '.join(map(str, padding_values))}] "
+                f"base_dilations = [{', '.join(map(str, base_dilations))}] "
+                f"window_dilations = [{', '.join(map(str, window_dilations))}] "
+                f"reducer = {reducer} : ({', '.join(operand_types)}) -> {result_type}"
             )
             continue
         target = name.removeprefix("stablehlo.")

@@ -25,9 +25,9 @@
 - [x] attention micrograph 的 `QK^T -> Softmax -> PV`；
 - [x] 首个静态 shape multi-head attention：scale、additive mask、head reshape、output projection；
 - [x] 首个静态 shape pre-norm decoder block：RMSNorm、attention、residual、SwiGLU/MLP；
-- [ ] decoder block extensions：RoPE、KV-cache；
-- [ ] ResNet bottleneck：Conv2D、BatchNorm inference、ReLU、pooling；
-- [ ] BERT/GPT-J/LLaMA2/DeepSeek 的真实 one-block module。
+- [x] decoder block extensions：RoPE、固定窗口 KV-cache 与多步 decode sequence；
+- [x] ResNet bottleneck micro：Conv2D、BatchNorm inference、ReLU、MaxPool；
+- [x] BERT/GPT-J/LLaMA2/DeepSeek 的真实 one-block module（LLaMA2 decode/cache 为 scaled micro workload）。
 
 每个新增能力都必须同时补 semantic capability、graph recovery/fusion、TISA stage、backend lowering 和真实 PyTorch 回归。
 
@@ -88,9 +88,19 @@ prefill 与 decode 必须是不同 case；analytical、source-derived 和 RTL-ob
 - [x] Fusion Pattern Registry 基础设施与现有 LayerNorm/RMSNorm/Softmax pattern；
 - [x] Attention region 与 SwiGLU semantic pattern；
 - [x] BERT/GPT-J one-block 的真实前端回归；
-- [ ] LLaMA2 的 RoPE、KV-cache 和 prefill/decode；
-- [ ] ResNet 的 Conv2D、BatchNorm inference、pooling；
+- [x] LLaMA2 的 RoPE、固定窗口 KV-cache 和 prefill/decode micro workload；
+- [x] ResNet micro 的 Conv2D、BatchNorm inference、pooling；完整 ResNet50 仍需扩展；
 - [ ] DeepSeek 结构确认以及 dense/MoE 路径。
 
 阶段 1A 完成后继续细化 FC 的 TISA dialect metadata、strided `TileMem` interval，
 再推进上述模型语义。scheduler 微结构和外部 timing backend 保持在编译语义稳定之后。
+
+### 阶段 1C：跨 invocation runtime state
+
+- [x] 建立 persistent state registry，稳定绑定 `state_id` 与物理 buffer；
+- [x] 建立多步 `RuntimeSequence`，显式记录 invocation 间 state-complete 依赖；
+- [x] sequence simulator 复用同一 compiled artifact，拼接多次 invocation 的周期与事件；
+- [x] 用固定窗口 KV-cache 两步 decode 回归验证地址稳定、状态依赖和 static/dynamic 周期。
+
+阶段 1C 的 contract 仍只覆盖固定窗口、静态 shape、unit stride 和顺序 decode；动态
+position 写入、跨 request 生命周期和真实 cache layout 留到后续阶段。

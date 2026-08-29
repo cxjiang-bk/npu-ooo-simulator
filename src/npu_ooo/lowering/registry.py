@@ -20,6 +20,10 @@ from .norm import lower_rmsnorm_graph
 from .reduce import lower_reduce_graph
 from .softmax import lower_softmax_graph
 from .swiglu import lower_swiglu_graph
+from .kv_cache import lower_kv_cache_graph
+from .conv2d import lower_conv2d_graph
+from .batch_norm import lower_batch_norm_graph
+from .pool import lower_pool_graph
 from .transform import lower_transform_graph
 
 
@@ -62,6 +66,10 @@ def default_lowering_registry() -> LoweringRegistry:
     registry.register(("rmsnorm",), lower_rmsnorm_graph)
     registry.register(("layernorm",), lower_layernorm_graph)
     registry.register(("swiglu",), lower_swiglu_graph)
+    registry.register(("kv_cache_update",), lower_kv_cache_graph)
+    registry.register(("conv2d",), lower_conv2d_graph)
+    registry.register(("batch_norm",), lower_batch_norm_graph)
+    registry.register(("pool",), lower_pool_graph)
     registry.register(("reshape", "transpose"), lower_transform_graph)
     return registry
 

@@ -46,6 +46,23 @@ class CliSurfaceTest(unittest.TestCase):
         )
         self.assertEqual(args.softmax_algorithm, "online")
 
+    def test_compile_model_accepts_runtime_sequence_configuration(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "compile-model",
+                "--torch-module",
+                "examples.torch_models:AttentionMicrograph",
+                "--input-shape",
+                "1,4,8",
+                "--runtime-invocations",
+                "3",
+                "--runtime-inter-invocation-gap",
+                "5",
+            ]
+        )
+        self.assertEqual(args.runtime_invocations, 3)
+        self.assertEqual(args.runtime_inter_invocation_gap, 5)
+
 
 @unittest.skipUnless(FRONTEND_AVAILABLE, "requires PyTorch, Torch-XLA and official StableHLO")
 class CompileModelCliTest(unittest.TestCase):

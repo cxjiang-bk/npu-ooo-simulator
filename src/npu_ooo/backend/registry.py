@@ -37,6 +37,10 @@ _ANALYTICAL_PRIMITIVES = frozenset(
         "silu_multiply",
         "gate_multiply",
         "dtype_convert",
+        "kv_cache_update",
+        "conv2d",
+        "batch_norm",
+        "pool",
     }
 )
 

@@ -48,6 +48,8 @@ PyTorch nn.Module
 - 使用逻辑 tensor region 生成跨算子 tile dependency，并输出 MAC/traffic/依赖统计；
 - Static 和 Dynamic device policy 共享同一份 `TISAProgram/BackendArtifact`；
 - runtime 单独负责物理地址、command chunk、descriptor availability 和提交开销；
+- 固定窗口 KV-cache 支持 `RuntimeStateRegistry` 和多步 `RuntimeSequence`，可核对
+  跨 invocation 的 state-complete 依赖与稳定物理地址；
 - backend codegen、event engine、timing provider 均可替换；
 - 输出 TISA/backend payload timing、SVG/PNG 泳道图和 Perfetto JSON。
 
@@ -116,7 +118,19 @@ PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-model \
 该通用示例暂不包含 RoPE 和 KV-cache；它们需要额外的 state/stride 语义，不应被普通
 decoder block 的结果隐式代替。论文 benchmark 中的 `llama2-13b-oneblk` 另有显式
 `rope_cos`/`rope_sin` 输入，当前已能恢复为非 opaque `rotary_embedding` region，并
-将 Q/K 旋转路径的底层成员继续暴露给 TISA。KV-cache 仍未实现。
+将 Q/K 旋转路径的底层成员继续暴露给 TISA。KV-cache 当前支持固定 shape、unit-stride
+的 `slice(cache) + concatenate(update)` 滑动窗口 contract，并可用
+`RuntimeSequence` 仿真多步 decode；动态索引写入、真实 cache layout、跨请求 state
+生命周期和完整 decode loop 仍未实现。
+
+论文 benchmark 目录提供 `examples.paper_benchmarks.llama2:LLaMA2DecodeOneBlock` 作为
+scaled one-token decode 输入。它用于验证真实 PyTorch -> Torch-XLA -> StableHLO -> TISA
+和多步 state contract，不代表论文完整 LLaMA2-13B 的 hidden/head/cache 尺寸。
+
+CLI 中可用 `--runtime-invocations N` 重复提交同一个 compiled artifact；配合
+`--runtime-inter-invocation-gap C` 可显式加入 state 完成后的等待周期。多步结果额外
+写入 `05_runtime/runtime_sequence.json`，汇总周期和 trace 仍写入 `06_simulation/`、
+`07_trace/`。
 
 ## 添加 PyTorch 算子或模型
 

@@ -75,6 +75,13 @@ _CAPABILITIES = {
             backend_capability_key="matmul",
         ),
         StableHLOOpCapability(
+            op_name="stablehlo.convolution",
+            semantic_family=SemanticOpType.CONV2D.value,
+            min_operands=2,
+            max_operands=2,
+            backend_capability_key="convolution",
+        ),
+        StableHLOOpCapability(
             op_name="stablehlo.reduce",
             semantic_family=SemanticOpType.REDUCE.value,
             min_operands=2,
@@ -103,11 +110,42 @@ _CAPABILITIES = {
             requires_recovery=True,
         ),
         StableHLOOpCapability(
+            op_name="stablehlo.slice",
+            semantic_family="slice",
+            min_operands=1,
+            max_operands=1,
+            requires_recovery=True,
+            backend_capability_key="slice",
+        ),
+        StableHLOOpCapability(
+            op_name="stablehlo.concatenate",
+            semantic_family="concatenate",
+            min_operands=2,
+            max_operands=32,
+            requires_recovery=True,
+            backend_capability_key="concatenate",
+        ),
+        StableHLOOpCapability(
             op_name="stablehlo.batch_norm_training",
             semantic_family="stablehlo.batch_norm_training",
             min_operands=3,
             max_operands=3,
             requires_recovery=True,
+        ),
+        StableHLOOpCapability(
+            op_name="stablehlo.batch_norm_inference",
+            semantic_family=SemanticOpType.BATCH_NORM.value,
+            min_operands=5,
+            max_operands=5,
+            backend_capability_key="batch_norm",
+        ),
+        StableHLOOpCapability(
+            op_name="stablehlo.reduce_window",
+            semantic_family=SemanticOpType.POOL.value,
+            min_operands=2,
+            max_operands=2,
+            requires_recovery=True,
+            backend_capability_key="pool",
         ),
         # These composite spellings are accepted by the dependency-light
         # textual route for compatibility.  Official StableHLO producers

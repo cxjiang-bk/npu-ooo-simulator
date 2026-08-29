@@ -2,6 +2,7 @@
 
 from .core import (
     AnalyticalTimingModel,
+    RuntimeSequenceSimulationResult,
     SimulationResult,
     SimulatorConfig,
     StaticPipelineConfig,
@@ -13,7 +14,7 @@ from .core import (
     simulate_execution_graph,
 )
 from .address import AddressConflict, AddressDependency, AddressHazardKind, AddressScoreboard, add_address_dependencies
-from .tisa import simulate_tisa_artifact
+from .tisa import simulate_tisa_artifact, simulate_tisa_sequence
 
 __all__ = [
     "AnalyticalTimingModel",
@@ -22,6 +23,7 @@ __all__ = [
     "AddressHazardKind",
     "AddressScoreboard",
     "SimulationResult",
+    "RuntimeSequenceSimulationResult",
     "SimulatorConfig",
     "StaticPipelineConfig",
     "TaskTiming",
@@ -32,4 +34,5 @@ __all__ = [
     "add_address_dependencies",
     "simulate_execution_graph",
     "simulate_tisa_artifact",
+    "simulate_tisa_sequence",
 ]

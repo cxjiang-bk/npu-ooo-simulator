@@ -286,14 +286,14 @@ def minimal_machine_config() -> MachineConfig:
             ),
             ExecutionUnitConfig(
                 "MXU",
-                supported_ops=("matmul", "batched_matmul", "gemv"),
+                supported_ops=("matmul", "batched_matmul", "gemv", "conv2d"),
                 queue_depth=4,
                 latency_cycles=16,
                 initiation_interval_cycles=4,
             ),
             ExecutionUnitConfig(
                 "ARU",
-                supported_ops=("elementwise", "reduce"),
+                supported_ops=("elementwise", "reduce", "kv_cache_update", "batch_norm", "pool"),
                 queue_depth=8,
                 latency_cycles=4,
                 initiation_interval_cycles=2,
@@ -343,8 +343,8 @@ def lpu_like_machine_config() -> MachineConfig:
         execution_units=(
             ExecutionUnitConfig("GDMA", supported_ops=("load", "store", "copy"), queue_depth=8, latency_cycles=4, initiation_interval_cycles=1),
             ExecutionUnitConfig("LDMA", supported_ops=("load", "store", "transpose"), queue_depth=8, latency_cycles=4, initiation_interval_cycles=1),
-            ExecutionUnitConfig("MXU", supported_ops=("matmul", "batched_matmul", "gemv"), queue_depth=8, pipeline_depth=4, latency_cycles=32, initiation_interval_cycles=4, attributes={"rows": 16, "cols": 8, "k": 8}),
-            ExecutionUnitConfig("ARU", supported_ops=("softmax", "layernorm", "rmsnorm", "reduce", "elementwise"), queue_depth=8, latency_cycles=8, initiation_interval_cycles=2),
+            ExecutionUnitConfig("MXU", supported_ops=("matmul", "batched_matmul", "gemv", "conv2d"), queue_depth=8, pipeline_depth=4, latency_cycles=32, initiation_interval_cycles=4, attributes={"rows": 16, "cols": 8, "k": 8}),
+            ExecutionUnitConfig("ARU", supported_ops=("softmax", "layernorm", "rmsnorm", "reduce", "elementwise", "kv_cache_update", "batch_norm", "pool"), queue_depth=8, latency_cycles=8, initiation_interval_cycles=2),
         ),
         transfer_paths=(
             TransferPathConfig("GM", "UB", "GDMA", bandwidth_bytes_per_cycle=16, setup_latency_cycles=4),

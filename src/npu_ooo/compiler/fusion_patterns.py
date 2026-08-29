@@ -18,6 +18,7 @@ from .passes import (
     GraphPass,
     LayerNormFusionPass,
     RecoverStableHLOLayerNormPass,
+    RecoverStableHLOKVCachePass,
     RotaryEmbeddingRegionPass,
     RMSNormFusionPass,
     SoftmaxFusionPass,
@@ -125,6 +126,12 @@ def default_semantic_fusion_registry() -> SemanticFusionPatternRegistry:
                 semantic_family="softmax",
                 graph_pass=SoftmaxFusionPass(),
                 priority=70,
+            ),
+            SemanticFusionPattern(
+                name="recover_stablehlo_kv_cache",
+                semantic_family="kv_cache",
+                graph_pass=RecoverStableHLOKVCachePass(),
+                priority=72,
             ),
             SemanticFusionPattern(
                 name="recover_rotary_embedding",

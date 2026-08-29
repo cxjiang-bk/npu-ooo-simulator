@@ -37,9 +37,11 @@ PyTorch nn.Module
 
 1. 完成 Linear、batched Matmul、reshape/transpose、bias、activation 的组合覆盖；
 2. 支持完整 multi-head attention，包括 scale、mask、head reshape 和 output projection（首个静态 shape 两头 Attention 已完成）；
-3. 支持 decoder block 的 RoPE、KV-cache；首个静态 shape pre-norm decoder（RMSNorm、attention、residual、SwiGLU/MLP）已完成，LLaMA2 one-block 的显式 RoPE region 已完成；KV-cache 仍待实现；
-4. 支持 ResNet bottleneck 所需的 Conv2D、BatchNorm inference、ReLU 和 pooling；
-5. 接入 BERT、GPT-J、LLaMA2、DeepSeek 的一个真实 block，最后再扩展 full model。
+3. 支持 decoder block 的 RoPE、KV-cache；首个静态 shape pre-norm decoder（RMSNorm、attention、residual、SwiGLU/MLP）已完成，LLaMA2 one-block 的显式 RoPE region 已完成；KV-cache 已完成固定窗口单步 contract 与多步 `RuntimeSequence` 仿真，动态索引、真实 layout 和跨请求生命周期仍待实现；
+4. 支持 ResNet bottleneck 所需的 Conv2D、BatchNorm inference、ReLU 和 pooling（micro
+   workload 已完成，完整模型仍待扩展）；
+5. 接入 BERT、GPT-J、LLaMA2、DeepSeek 的一个真实 block（dense one-block 已完成，
+   DeepSeek MoE 与 full model 仍待确认和扩展）。
 
 每次扩展都沿同一边界完成：
 
@@ -115,4 +117,7 @@ PyTorch model / shape / phase
 
 ## 下一阶段优先级
 
-当前最高优先级是 A 和 B：先用真实 PyTorch module 扩展一个完整 attention/decoder block，同时完善 region dependency 与编译统计。完成后再集中增加 scheduler 微结构细节和外部 backend，避免用不完整的图语义校准硬件时序。
+当前最高优先级是 B：完善 symbolic/dynamic shape、layout/broadcast 和多 tile candidate
+cost model，并将 ResNet/DeepSeek micro case 纳入统一实验矩阵。runtime state 已进入可
+验证的多步 contract；完成编译语义与统计稳定性后再集中增加 scheduler 微结构细节和
+外部 backend，避免用不完整的图语义校准硬件时序。

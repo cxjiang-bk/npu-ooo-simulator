@@ -43,13 +43,13 @@ minimal analytical device: static 2344, dynamic 2119 cycles
 - 当前 MXU VCS log 主要提供 descriptor-to-completion 区间；
 - GC 当前只生成 completion-boundary readiness；真实 partial-tile producer 语义仍需由 backend/calibration 端接入；
 - memory bank scoreboard 目前是 analytical structural-conflict model，不是 cycle-accurate SRAM/DRAM backend；logical scope 且无 runtime physical binding 时不会强行猜测 bank；
-- 论文中的完整 ResNet50、BERT、GPT-J、LLaMA2、DeepSeek block 尚未形成可复现实验集。
+- 论文规模的完整 ResNet50、BERT、GPT-J、LLaMA2、DeepSeek block 尚未形成可复现实验集；
+  当前已具备 ResNet bottleneck、BERT/GPT-J/LLaMA2/DeepSeek dense one-block micro case。
 
 ## 下一步
 
-保持模型到 TISA 为当前主线：先补 Attention region 与 SwiGLU semantic pattern，并用
-BERT/GPT-J one-block 回归验证；随后实现 LLaMA2 RoPE/KV-cache，以及 ResNet
-Conv2D/BatchNorm/pooling capability。scheduler/backend 校准继续后置。
+保持模型到 TISA 为当前主线：补齐 symbolic/layout/cost-model 编译能力，并确认
+DeepSeek dense 与 MoE 两条路径的 operation 边界；scheduler/backend 校准继续后置。
 
 ## 2026-08-27：阶段 1A
 
@@ -87,3 +87,53 @@ Conv2D/BatchNorm/pooling capability。scheduler/backend 校准继续后置。
 - BERT/GPT-J one-block 已有独立 Attention region、SwiGLU payload 和 artifact validity
   回归；全量测试为 79 tests passed；
 - 下一项是开始 LLaMA2 RoPE/KV-cache 需求分析。
+
+## 2026-08-29：阶段 1C 开始
+
+- 固定窗口 KV-cache 已具备单次 `persistent_buffer_v1` contract，并能从真实
+  PyTorch/Torch-XLA 图恢复 `kv_cache_update`；当前缺少跨 invocation 的 state 生命周期。
+- 本阶段新增 `RuntimeStateRegistry`、`RuntimeSequence` 和 sequence simulator，目标是让
+  第 N 次 submission 显式依赖第 N-1 次 state completion，同时保持单次 API 兼容。
+
+## 2026-08-29：阶段 1C 完成
+
+- `RuntimeStateRegistry` 同时保存完整 runtime buffer 集合与 persistent state 子集，按
+  `state_id` 校验 alias 的地址、memory scope 和容量稳定性；persistent binding 不进入
+  临时 buffer reuse。
+- `RuntimeSequence` 为同一 `BackendArtifact` 创建多次 invocation，生成明确的
+  `state_complete` 依赖边，并支持每步替换普通 input/output bindings。
+- `simulate_tisa_sequence` / `schedule_tisa_sequence` 复用现有 EventBackend，平移合并
+  invocation timing，发出 `STATE_RELEASE/STATE_WAIT/STATE_READY` 事件并统计 sequence
+  总周期、间隔等待和 invocation 周期。
+- 新增固定窗口 KV-cache 两步 decode 回归；全量回归为 92 tests passed。
+
+## 2026-08-29：LLaMA2 decode workload
+
+- 在 `examples/paper_benchmarks/llama2.py` 增加独立的 `LLaMA2DecodeOneBlock`，输入为
+  one-token hidden、K/V cache、显式 RoPE cos/sin 与 attention mask，输出 hidden 和更新后
+  的两个 cache；cache 更新严格使用 `slice + concatenate`，便于对齐当前 GC contract。
+- `build_decode()` 不新增或伪造论文 Table IX 的测量行，只提供带 `phase=decode` 的 scaled
+  micro workload；完整模型、真实 hidden/head/cache layout 仍不在范围内。
+- 真实 Torch-XLA 编译恢复两个 `kv_cache_update`，并可构造两步 `RuntimeSequence`；CLI
+  实测输出 307 TISA instructions、2 invocations、8851 analytical cycles，产物包含
+  `05_runtime/runtime_sequence.json` 和合并泳道图。
+- LLaMA2 decode 的 static/dynamic sequence 回归均通过；全量回归更新为 94 tests passed。
+
+## 2026-08-29：ResNet Conv2D/BatchNorm/Pooling
+
+- 官方 StableHLO 投影修复 `dense<scalar> : tensor<...>` 属性解析，避免把 MLIR
+  类型维度误读成 padding 数据；`stablehlo.convolution` 的对称 padding 可正确展开。
+- 新增 StableHLO `batch_norm_inference` 与 `reduce_window` capability、官方投影和
+  Canonical importer；未覆盖的 grouped/layout/dynamic 变体仍显式失败。
+- 新增 BatchNorm inference 与 NCHW max/sum pooling analytical lowering、TISA stage、
+  ARU capability 和 region-aware halo dependency。Torch Export 会忽略未使用的零秩
+  BatchNorm bookkeeping placeholder（例如 `num_batches_tracked`）。
+- `ResNet50BottleneckWorkload` 现在包含 stem MaxPool、四个 inference BatchNorm、四个
+  Conv2D、ReLU 与 residual；micro shape 可完整生成 TISA/backend artifact。
+- 回归覆盖 padding、卷积 halo、BatchNorm/Pool 任务归属与 artifact validation；全量
+  回归为 94 tests passed。
+
+当前 ResNet 语义边界：静态 NCHW/OIHW、unit dilation、feature/batch group 为 1；
+pooling 使用 N/C-preserving `reduce_window`，平均池化的除法仍由后续 elementwise
+operation 表达。完整 ResNet50 的 stem 7x7、stride/downsample、全层 repetition 还未
+形成论文规模实验矩阵。

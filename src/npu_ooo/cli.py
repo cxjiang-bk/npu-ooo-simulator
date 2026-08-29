@@ -31,11 +31,18 @@ from npu_ooo.compiler import compile_torch_module
 from npu_ooo.experiments import run_runtime_device_matrix
 from npu_ooo.ir import (
     allocate_buffer_bindings,
+    create_runtime_sequence,
+    create_runtime_state_registry,
     create_runtime_submission,
     derive_tensor_lifetimes,
     derive_tensor_reuse_pairs,
 )
-from npu_ooo.scheduler import SchedulerPolicy, SimulatorConfig, schedule_tisa_program
+from npu_ooo.scheduler import (
+    SchedulerPolicy,
+    SimulatorConfig,
+    schedule_tisa_program,
+    schedule_tisa_sequence,
+)
 from npu_ooo.trace import (
     ensure_output_layout,
     write_artifact_index,
@@ -202,6 +209,18 @@ def _add_compile_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--runtime-availability-config", type=Path)
     parser.add_argument("--runtime-launch-latency", type=float, default=0.0)
     parser.add_argument("--runtime-synchronization-cycles", type=float, default=0.0)
+    parser.add_argument(
+        "--runtime-invocations",
+        type=int,
+        default=1,
+        help="number of repeated invocations sharing persistent runtime state",
+    )
+    parser.add_argument(
+        "--runtime-inter-invocation-gap",
+        type=float,
+        default=0.0,
+        help="cycles between state completion and the next invocation",
+    )
     parser.add_argument(
         "--runtime-device-matrix",
         action="store_true",
@@ -432,16 +451,48 @@ def run_compile_model(args: argparse.Namespace) -> int:
         reuse_pairs=reuse_pairs,
     )
     descriptor_availability = _descriptor_availability(args.runtime_availability_config)
-    runtime_submission = create_runtime_submission(
-        compiled.backend_artifact,
-        runtime_buffers,
-        submission_id=f"submission.{compiled.tisa_program.program_id}",
-        policy=args.runtime_policy,
-        chunk_size=args.runtime_chunk_size,
-        launch_latency_cycles=args.runtime_launch_latency,
-        synchronization_cycles=args.runtime_synchronization_cycles,
-        descriptor_available_cycles=descriptor_availability,
-    )
+    if args.runtime_invocations <= 0:
+        raise ValueError("--runtime-invocations must be a positive integer")
+    runtime_sequence = None
+    if args.runtime_invocations > 1:
+        if args.runtime_device_matrix:
+            raise ValueError(
+                "--runtime-device-matrix currently supports one invocation; "
+                "run a RuntimeSequence separately for multi-step decode"
+            )
+        state_registry = create_runtime_state_registry(
+            compiled.backend_artifact,
+            runtime_buffers,
+        )
+        if not state_registry.state_ids():
+            raise ValueError(
+                "--runtime-invocations > 1 requires a compiled persistent state contract"
+            )
+        runtime_sequence = create_runtime_sequence(
+            compiled.backend_artifact,
+            state_registry,
+            invocation_count=args.runtime_invocations,
+            sequence_id=f"sequence.{compiled.tisa_program.program_id}",
+            policy=args.runtime_policy,
+            chunk_size=args.runtime_chunk_size,
+            launch_latency_cycles=args.runtime_launch_latency,
+            synchronization_cycles=args.runtime_synchronization_cycles,
+            descriptor_available_cycles=descriptor_availability,
+            inter_invocation_gap_cycles=args.runtime_inter_invocation_gap,
+        )
+        runtime_submission = runtime_sequence.invocations[0]
+        write_artifact_json(runtime_sequence, args.output_dir / "runtime_sequence.json")
+    else:
+        runtime_submission = create_runtime_submission(
+            compiled.backend_artifact,
+            runtime_buffers,
+            submission_id=f"submission.{compiled.tisa_program.program_id}",
+            policy=args.runtime_policy,
+            chunk_size=args.runtime_chunk_size,
+            launch_latency_cycles=args.runtime_launch_latency,
+            synchronization_cycles=args.runtime_synchronization_cycles,
+            descriptor_available_cycles=descriptor_availability,
+        )
     write_artifact_json(runtime_submission, args.output_dir / "runtime_submission.json")
 
     simulator_config = SimulatorConfig(
@@ -456,15 +507,26 @@ def run_compile_model(args: argparse.Namespace) -> int:
     )
     timing_model = _timing_model(args.timing_config, args.timing_provider)
     event_backend = default_event_backend_registry().create(args.event_backend)
-    result = schedule_tisa_program(
-        compiled.backend_artifact,
-        machine,
-        args.policy,
-        timing_model=timing_model,
-        simulator_config=simulator_config,
-        runtime_submission=runtime_submission,
-        event_backend=event_backend,
-    )
+    if runtime_sequence is not None:
+        result = schedule_tisa_sequence(
+            compiled.backend_artifact,
+            runtime_sequence,
+            machine,
+            args.policy,
+            timing_model=timing_model,
+            simulator_config=simulator_config,
+            event_backend=event_backend,
+        )
+    else:
+        result = schedule_tisa_program(
+            compiled.backend_artifact,
+            machine,
+            args.policy,
+            timing_model=timing_model,
+            simulator_config=simulator_config,
+            runtime_submission=runtime_submission,
+            event_backend=event_backend,
+        )
     write_json(result, args.output_dir / "summary.json")
     write_csv(result, args.output_dir / "tasks.csv")
     write_instruction_csv(result, args.output_dir / "tisa_instructions.csv")
@@ -498,6 +560,26 @@ def run_compile_model(args: argparse.Namespace) -> int:
         "runtime_buffer_policy": args.runtime_buffer_policy,
         "runtime_command_chunk_count": len(runtime_submission.commands),
         "runtime_buffer_count": len(runtime_submission.buffers),
+        "runtime_invocation_count": (
+            len(runtime_sequence.invocations) if runtime_sequence is not None else 1
+        ),
+        "runtime_state_contract": (
+            runtime_sequence.attributes.get("state_contract")
+            if runtime_sequence is not None
+            else runtime_submission.attributes.get("state_contract")
+        ),
+        "runtime_state_ids": (
+            list(runtime_sequence.state_registry.state_ids())
+            if runtime_sequence is not None
+            else [
+                item["state_id"]
+                for item in runtime_submission.attributes.get("state_buffers", ())
+                if isinstance(item, dict) and "state_id" in item
+            ]
+        ),
+        "runtime_state_dependency_count": (
+            len(runtime_sequence.dependencies) if runtime_sequence is not None else 0
+        ),
         "runtime_allocation_span_bytes": allocation_span,
         "policy": result.policy,
         "scheduler_target": "tisa",

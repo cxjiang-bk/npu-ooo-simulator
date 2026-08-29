@@ -989,6 +989,7 @@ def _rebuild_graph(
     replacement_index: int,
     *,
     fusion_kind: str,
+    tensor_updates: dict[str, TensorSpec] | None = None,
 ) -> OperatorGraph:
     rewritten: list[OperatorSpec] = []
     inserted = False
@@ -1007,9 +1008,14 @@ def _rebuild_graph(
         for output in operator.outputs
         if output not in fused.outputs
     }
+    updates = tensor_updates or {}
     result = OperatorGraph(
         graph_id=graph.graph_id,
-        tensors=tuple(tensor for tensor in graph.tensors if tensor.name not in removed_tensors),
+        tensors=tuple(
+            updates.get(tensor.name, tensor)
+            for tensor in graph.tensors
+            if tensor.name not in removed_tensors
+        ),
         operators=tuple(rewritten),
         edges=_infer_edges(tuple(rewritten)),
         attributes={
@@ -1613,6 +1619,163 @@ def _tensor_elements(tensor: TensorSpec | None) -> int | None:
     ):
         return None
     return math.prod(tensor.shape)
+
+
+class RecoverStableHLOKVCachePass:
+    """Recover a fixed-window KV-cache append from slice + concatenate.
+
+    A decode step commonly materializes ``cache[..., 1:, :]`` and appends a
+    one-token K/V tensor.  The canonical op records the persistent state
+    contract explicitly so runtime can bind the cache buffer and FC can emit a
+    typed ``STATE`` dependency.  The graph rewrite is intentionally limited to
+    unit stride, fixed-shape append windows; other cache layouts fail at their
+    StableHLO capability or remain visible as unsupported semantics.
+    """
+
+    name = "recover_stablehlo_kv_cache"
+    repeat_until_stable = True
+
+    def run(self, graph: OperatorGraph) -> PassResult:
+        operators = list(graph.operators)
+        tensors = {tensor.name: tensor for tensor in graph.tensors}
+        producer = _producer_map(operators)
+        for concatenate in operators:
+            if concatenate.normalized_type != "concatenate" or len(concatenate.inputs) != 2:
+                continue
+            axis = concatenate.attributes.get("concatenate_dimension")
+            if not isinstance(axis, int):
+                continue
+            output = _single_output(concatenate)
+            output_spec = tensors.get(output)
+            if output_spec is None or axis >= len(output_spec.shape):
+                continue
+            slice_op: OperatorSpec | None = None
+            update_tensor: str | None = None
+            for input_tensor in concatenate.inputs:
+                candidate = producer.get(input_tensor)
+                if candidate is not None and candidate.normalized_type == "slice":
+                    if slice_op is not None:
+                        slice_op = None
+                        break
+                    slice_op = candidate
+                else:
+                    update_tensor = input_tensor
+            if slice_op is None or update_tensor is None or len(slice_op.inputs) != 1:
+                continue
+            cache_tensor = slice_op.inputs[0]
+            cache_spec = tensors.get(cache_tensor)
+            update_spec = tensors.get(update_tensor)
+            sliced_spec = tensors.get(_single_output(slice_op))
+            if cache_spec is None or update_spec is None or sliced_spec is None:
+                continue
+            if (
+                len(cache_spec.shape) != len(output_spec.shape)
+                or len(update_spec.shape) != len(output_spec.shape)
+                or len(sliced_spec.shape) != len(output_spec.shape)
+            ):
+                continue
+            starts = slice_op.attributes.get("slice_starts")
+            limits = slice_op.attributes.get("slice_limits")
+            strides = slice_op.attributes.get("slice_strides")
+            if not (
+                isinstance(starts, (tuple, list))
+                and isinstance(limits, (tuple, list))
+                and isinstance(strides, (tuple, list))
+                and len(starts) == len(cache_spec.shape)
+                and len(limits) == len(cache_spec.shape)
+                and len(strides) == len(cache_spec.shape)
+                and all(value == 1 for value in strides)
+                and starts[axis] > 0
+                and limits[axis] == cache_spec.shape[axis]
+                and sliced_spec.shape[axis] + update_spec.shape[axis] == output_spec.shape[axis]
+                and sliced_spec.shape[axis] == limits[axis] - starts[axis]
+                and output_spec.shape == cache_spec.shape
+            ):
+                continue
+            if any(
+                cache_spec.shape[index] != output_spec.shape[index]
+                for index in range(len(cache_spec.shape))
+                if index != axis
+            ) or any(
+                update_spec.shape[index] != output_spec.shape[index]
+                for index in range(len(update_spec.shape))
+                if index != axis
+            ):
+                continue
+            fused = OperatorSpec(
+                op_id=output,
+                op_type="kv_cache_update",
+                inputs=(cache_tensor, update_tensor),
+                outputs=(output,),
+                iteration_dims=tuple(
+                    (f"d{index}", extent)
+                    for index, extent in enumerate(output_spec.shape)
+                ),
+                attributes={
+                    "frontend_target": "semantic.kv_cache_update",
+                    "semantic_family": "kv_cache",
+                    "semantic_op": "kv_cache_update",
+                    "operand_arity": 2,
+                    "backend_capability_key": "kv_cache_update",
+                    "stateful": True,
+                    "state_id": cache_tensor,
+                    "state_buffer": cache_tensor,
+                    "cache_axis": axis,
+                    "cache_window": cache_spec.shape[axis],
+                    "update_length": update_spec.shape[axis],
+                    "slice_start": starts[axis],
+                    "state_transition": "drop_oldest_append_new",
+                    "source_ops": [slice_op.op_id, concatenate.op_id],
+                },
+                provenance={
+                    "compiler_pass": self.name,
+                    "source_graph": graph.graph_id,
+                    "source_ops": [slice_op.op_id, concatenate.op_id],
+                },
+            )
+            result = _rebuild_graph(
+                graph,
+                operators,
+                {slice_op.op_id, concatenate.op_id},
+                fused,
+                min(operators.index(slice_op), operators.index(concatenate)),
+                fusion_kind=self.name,
+                tensor_updates={
+                    cache_tensor: replace(
+                        cache_spec,
+                        attributes={
+                            **dict(cache_spec.attributes),
+                            "persistent": True,
+                            "state_id": cache_tensor,
+                            "state_buffer": cache_tensor,
+                        },
+                    ),
+                    output: replace(
+                        output_spec,
+                        attributes={
+                            **dict(output_spec.attributes),
+                            "alias_of": cache_tensor,
+                            "persistent": True,
+                            "state_id": cache_tensor,
+                            "state_buffer": cache_tensor,
+                        },
+                    ),
+                },
+            )
+            return PassResult(
+                result,
+                (
+                    PassDiagnostic(
+                        "info",
+                        self.name,
+                        f"recovered KV-cache append '{output}' with state buffer '{cache_tensor}'",
+                    ),
+                ),
+            )
+        return PassResult(
+            graph,
+            (PassDiagnostic("info", self.name, "no fixed-window KV-cache append found"),),
+        )
 
 
 @dataclass(frozen=True)
@@ -2454,6 +2617,7 @@ __all__ = [
     "PassResult",
     "RecoverStableHLOFlattenedLinearPass",
     "RecoverStableHLOLayerNormPass",
+    "RecoverStableHLOKVCachePass",
     "RotaryEmbeddingRegionPass",
     "LayerNormFusionPass",
     "RMSNormFusionPass",

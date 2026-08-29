@@ -49,6 +49,33 @@ PyTorch nn.Module
 - 论文 WQ/IQ/Fu 容量与 dispatch pipeline 的硬件校准；
 - 当前 NPU ISA 中 issue/completion、SET/WAIT/FENCE 和 buffer address 的精确语义。
 
+## 2026-08-29：LLaMA2 decode/cache 验证
+
+- `LLaMA2DecodeOneBlock` 采用 `x:[B,1,H]`、`cache:[B,heads,W,D]`、`update:[B,heads,1,D]`
+  的固定窗口布局；`cache[...,1:,:]` 与新 token 沿 `-2` 拼接后参与 QK/PV attention。
+- 当前 Torch-XLA/StableHLO/GC 链路会将 K/V 两条 cache 更新分别恢复为
+  `kv_cache_update(state_id=arg18/arg11)`；输出 cache 与输入 cache alias 到同一物理地址。
+- 两次 invocation 必须复用同一 `BackendArtifact` 与 persistent state registry；sequence
+  simulator 用 `state_complete` 串联 invocation。该边界表达 runtime state 生命周期，尚不
+  表示动态 position 写入、paged cache、GQA/MQA layout 或跨 request ownership。
+- decode workload 的周期是 analytical 结果，只用于比较 static/dynamic 调度趋势；不能
+  与论文 A100/epoch 绝对时间直接比较。
+
+## 2026-08-29：ResNet convolution/pooling 语义边界
+
+- Torch-XLA 对 inference `Conv2d` 产生 `stablehlo.convolution`，常见 padding 以
+  `dense<1> : tensor<2x2xi64>` 打印；官方投影必须只读取 dense payload，再将标量扩展
+  为每个空间维度的 low/high pair。
+- inference `BatchNorm2d` 产生五输入 `stablehlo.batch_norm_inference`；未使用的
+  `num_batches_tracked` 仍可能出现在 Torch Export placeholder 集合中，应在 source
+  graph 边界丢弃该死的零秩 placeholder。
+- MaxPool/AvgPool 由 `stablehlo.reduce_window` 加 reducer region 表达。当前 Canonical
+  `pool` 只接受 rank-4 NCHW、N/C-preserving window、unit dilation；`maximum` 和
+  `add` reducer 可区分，平均池化的 scale/divide 保持为后续 elementwise 节点。
+- 卷积与池化输入 tile 不是输出矩形的简单同构：kernel/window 会产生空间 halo。TileGraph
+  和 FC `TileMem` 必须使用相同的 halo 区域，否则 backend primitive 的 root-memory
+  producer/consumer 边会多于 TISA dependency，artifact validation 会拒绝该结果。
+
 ## 2026-08-27：阶段 1A 首个增量
 
 - `stablehlo.convert` 已注册为单操作 elementwise capability；Canonical Operator 保留

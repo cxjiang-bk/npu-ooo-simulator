@@ -400,6 +400,85 @@ class SimulationResult:
         return {"traceEvents": trace_events, "displayTimeUnit": "cycle"}
 
 
+@dataclass(frozen=True)
+class RuntimeSequenceSimulationResult:
+    """Merged timing result for an ordered sequence of invocations."""
+
+    backend: str
+    policy: str
+    sequence_id: str
+    total_cycles: float
+    timings: tuple[TaskTiming, ...]
+    events: tuple[TraceEvent, ...]
+    metrics: Mapping[str, Any] = field(default_factory=dict)
+    instruction_timings: tuple[TaskTiming, ...] = ()
+    runtime_timings: tuple[TaskTiming, ...] = ()
+    invocation_results: tuple[SimulationResult, ...] = ()
+
+    @property
+    def graph_id(self) -> str:
+        return self.sequence_id
+
+    def timing(self, task_id: str) -> TaskTiming:
+        for timing in self.timings:
+            if timing.task_id == task_id:
+                return timing
+        raise KeyError(task_id)
+
+    def instruction_timing(self, tisa_id: str) -> TaskTiming:
+        for timing in self.instruction_timings:
+            if timing.task_id == tisa_id:
+                return timing
+        raise KeyError(tisa_id)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "backend": self.backend,
+            "policy": self.policy,
+            "sequence_id": self.sequence_id,
+            "graph_id": self.graph_id,
+            "total_cycles": self.total_cycles,
+            "timings": [timing.to_dict() for timing in self.timings],
+            "instruction_timings": [
+                timing.to_dict() for timing in self.instruction_timings
+            ],
+            "runtime_timings": [timing.to_dict() for timing in self.runtime_timings],
+            "events": [event.to_dict() for event in self.events],
+            "metrics": dict(self.metrics),
+            "invocations": [result.to_dict() for result in self.invocation_results],
+        }
+
+    def perfetto_trace(self) -> dict[str, Any]:
+        trace_events: list[dict[str, Any]] = []
+        for event in self.events:
+            if event.event in {"START", "COMPLETE"}:
+                phase = "B" if event.event == "START" else "E"
+                pid = 2
+            elif event.event in {"TISA_ISSUE", "TISA_COMPLETE"}:
+                phase = "B" if event.event == "TISA_ISSUE" else "E"
+                pid = 1
+            elif event.event in {"RUNTIME_SUBMIT_START", "RUNTIME_SUBMIT_COMPLETE"}:
+                phase = "B" if event.event == "RUNTIME_SUBMIT_START" else "E"
+                pid = 0
+            elif event.event in {"STATE_RELEASE", "STATE_WAIT", "STATE_READY"}:
+                phase = "i"
+                pid = 3
+            else:
+                continue
+            trace_events.append(
+                {
+                    "name": event.task_id,
+                    "cat": event.resource,
+                    "ph": phase,
+                    "ts": event.timestamp,
+                    "pid": pid,
+                    "tid": f"{event.resource}[{event.instance}]",
+                    "args": dict(event.details),
+                }
+            )
+        return {"traceEvents": trace_events, "displayTimeUnit": "cycle"}
+
+
 @dataclass
 class _ResourceState:
     unit: ExecutionUnitConfig

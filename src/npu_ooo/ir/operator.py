@@ -15,6 +15,7 @@ class SemanticOpType(str, Enum):
     BATCHED_MATMUL = "batched_matmul"
     GEMV = "gemv"
     CONV2D = "conv2d"
+    BATCH_NORM = "batch_norm"
     ELEMENTWISE = "elementwise"
     REDUCE = "reduce"
     SOFTMAX = "softmax"
@@ -28,6 +29,9 @@ class SemanticOpType(str, Enum):
     POOL = "pool"
     RESIDUAL_ADD = "residual_add"
     MOE_DISPATCH = "moe_dispatch"
+    SLICE = "slice"
+    CONCATENATE = "concatenate"
+    KV_CACHE_UPDATE = "kv_cache_update"
 
 
 def _validate_shape_value(value: ShapeValue, *, context: str) -> None:

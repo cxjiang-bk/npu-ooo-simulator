@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Hardware-like scheduling over TISA descriptors and bound backend payloads."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import heapq
 import math
 from typing import Any
@@ -13,6 +13,7 @@ from npu_ooo.ir import (
     AccessType,
     BackendArtifact,
     RuntimeOperandBinding,
+    RuntimeSequence,
     RuntimeSubmission,
     TISAInstruction,
     TISAOperand,
@@ -23,6 +24,7 @@ from .core import (
     SimulationResult,
     SimulatorConfig,
     TaskTiming,
+    RuntimeSequenceSimulationResult,
     TimingModel,
     TraceEvent,
 )
@@ -1064,4 +1066,204 @@ def simulate_tisa_artifact(
         runtime_timings=tuple(runtime_timings),
         events=tuple(events),
         metrics=metrics,
+    )
+
+
+def simulate_tisa_sequence(
+    artifact: BackendArtifact,
+    sequence: RuntimeSequence,
+    machine: MachineConfig,
+    policy: str = "static_pipeline",
+    *,
+    timing_model: TimingModel | None = None,
+    config: SimulatorConfig | None = None,
+    event_backend: Any | None = None,
+) -> RuntimeSequenceSimulationResult:
+    """Replay multiple invocations while preserving persistent state identity.
+
+    Each invocation uses the same compiled artifact and is scheduled by the
+    regular TISA event backend.  A later invocation starts only after the
+    preceding invocation's completion (plus the configured inter-invocation
+    gap), which is the conservative interpretation of ``state_complete``.
+    Results are shifted and merged with invocation-qualified ids so they can
+    be rendered as one sequence swimlane without collisions.
+    """
+
+    if not isinstance(sequence, RuntimeSequence):
+        raise TypeError("sequence must be a RuntimeSequence")
+    sequence_issues = sequence.validate(artifact.program)
+    if sequence.program_id != artifact.program.program_id:
+        sequence_issues = (
+            *sequence_issues,
+            f"runtime sequence program '{sequence.program_id}' does not match "
+            f"'{artifact.program.program_id}'",
+        )
+    if sequence.artifact_id not in {None, artifact.artifact_id}:
+        sequence_issues = (
+            *sequence_issues,
+            f"runtime sequence artifact '{sequence.artifact_id}' does not match "
+            f"'{artifact.artifact_id}'",
+        )
+    if sequence_issues:
+        raise ValueError("runtime sequence validation failed: " + "; ".join(sequence_issues))
+    timing_model = timing_model or AnalyticalTimingModel()
+    if event_backend is None:
+        from npu_ooo.backend import default_event_backend_registry
+
+        event_backend = default_event_backend_registry().create("analytical_event")
+
+    invocation_results: list[SimulationResult] = []
+    merged_timings: list[TaskTiming] = []
+    merged_instruction_timings: list[TaskTiming] = []
+    merged_runtime_timings: list[TaskTiming] = []
+    merged_events: list[TraceEvent] = []
+    invocation_cycles: list[float] = []
+    cursor = 0.0
+    for ordinal, invocation in enumerate(sequence.invocations):
+        if ordinal and sequence.dependencies:
+            dependency = sequence.dependencies[ordinal - 1]
+            merged_events.extend(
+                (
+                    TraceEvent(
+                        cursor,
+                        "STATE_WAIT",
+                        f"{invocation.submission_id}/state",
+                        "Runtime/State",
+                        details={
+                            "source_invocation": dependency.source_invocation,
+                            "target_invocation": dependency.target_invocation,
+                            "state_ids": list(dependency.state_ids),
+                            "condition": dependency.condition,
+                            "wait_cycles": sequence.inter_invocation_gap_cycles,
+                        },
+                    ),
+                    TraceEvent(
+                        cursor + sequence.inter_invocation_gap_cycles,
+                        "STATE_READY",
+                        f"{invocation.submission_id}/state",
+                        "Runtime/State",
+                        details={
+                            "source_invocation": dependency.source_invocation,
+                            "target_invocation": dependency.target_invocation,
+                            "state_ids": list(dependency.state_ids),
+                            "condition": dependency.condition,
+                        },
+                    ),
+                )
+            )
+            cursor += sequence.inter_invocation_gap_cycles
+        elif ordinal:
+            cursor += sequence.inter_invocation_gap_cycles
+        result = event_backend.simulate(
+            artifact,
+            machine,
+            policy,
+            timing_provider=timing_model,
+            simulator_config=config,
+            runtime_submission=invocation,
+        )
+        if not isinstance(result, SimulationResult):
+            raise TypeError("event backend returned an unsupported simulation result")
+        invocation_results.append(result)
+        prefix = f"{invocation.submission_id}"
+
+        def shifted_timing(timing: TaskTiming) -> TaskTiming:
+            return replace(
+                timing,
+                task_id=f"{prefix}/{timing.task_id}",
+                issue=timing.issue + cursor,
+                start=timing.start + cursor,
+                finish=timing.finish + cursor,
+                dependency_ready=timing.dependency_ready + cursor,
+                resource_ready=timing.resource_ready + cursor,
+            )
+
+        for timing in result.timings:
+            merged_timings.append(shifted_timing(timing))
+        for timing in result.instruction_timings:
+            merged_instruction_timings.append(shifted_timing(timing))
+        for timing in result.runtime_timings:
+            merged_runtime_timings.append(shifted_timing(timing))
+        for event in result.events:
+            merged_events.append(
+                replace(
+                    event,
+                    timestamp=event.timestamp + cursor,
+                    task_id=f"{prefix}/{event.task_id}",
+                    details={
+                        **dict(event.details),
+                        "invocation_id": invocation.submission_id,
+                        "invocation_ordinal": ordinal,
+                    },
+                )
+            )
+        invocation_finish = cursor + result.total_cycles
+        for state_id in sequence.state_registry.state_ids():
+            merged_events.append(
+                TraceEvent(
+                    invocation_finish,
+                    "STATE_RELEASE",
+                    f"{invocation.submission_id}/state/{state_id}",
+                    "Runtime/State",
+                    details={
+                        "invocation_id": invocation.submission_id,
+                        "state_id": state_id,
+                        "condition": "state_complete",
+                    },
+                )
+            )
+        invocation_cycles.append(result.total_cycles)
+        cursor = invocation_finish
+
+    event_order = {
+        "STATE_RELEASE": 0,
+        "STATE_WAIT": 1,
+        "STATE_READY": 2,
+        "RUNTIME_SUBMIT_START": 3,
+        "RUNTIME_SUBMIT_COMPLETE": 4,
+        "TISA_RECEIVE": 5,
+        "TISA_ISSUE": 6,
+        "ISSUE": 7,
+        "START": 8,
+        "COMPLETE": 9,
+        "TISA_PARTIAL_READY": 10,
+        "TISA_COMPLETE": 11,
+    }
+    merged_events.sort(
+        key=lambda event: (
+            event.timestamp,
+            event_order.get(event.event, len(event_order)),
+            event.task_id,
+            event.instance,
+        )
+    )
+    metrics: dict[str, Any] = dict(invocation_results[-1].metrics)
+    metrics.update(
+        {
+            "sequence_id": sequence.sequence_id,
+            "invocation_count": len(invocation_results),
+            "invocation_total_cycles": invocation_cycles,
+            "state_contract": "persistent_buffer_v1"
+            if sequence.state_registry.state_ids()
+            else None,
+            "state_ids": list(sequence.state_registry.state_ids()),
+            "state_dependency_count": len(sequence.dependencies),
+            "state_wait_cycles": sequence.inter_invocation_gap_cycles * len(sequence.dependencies),
+            "inter_invocation_gap_cycles": sequence.inter_invocation_gap_cycles,
+            "runtime_sequence": True,
+            "compiled_program_reused": True,
+            "total_cycles_including_runtime": cursor,
+        }
+    )
+    return RuntimeSequenceSimulationResult(
+        backend=invocation_results[-1].backend,
+        policy=policy,
+        sequence_id=sequence.sequence_id,
+        total_cycles=cursor,
+        timings=tuple(merged_timings),
+        instruction_timings=tuple(merged_instruction_timings),
+        runtime_timings=tuple(merged_runtime_timings),
+        events=tuple(merged_events),
+        metrics=metrics,
+        invocation_results=tuple(invocation_results),
     )

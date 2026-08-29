@@ -47,7 +47,7 @@ class TISAStage:
 def _unit_map(primitive: str) -> UnitMap:
     if primitive in {"load", "load_transpose", "store", "copy", "transpose"}:
         return UnitMap("dma", affinity="data")
-    if primitive in {"matmul"}:
+    if primitive in {"matmul", "conv2d"}:
         return UnitMap("tensor", affinity="matrix")
     return UnitMap("vector", affinity="vector")
 
@@ -99,6 +99,14 @@ def _stages_for_tile(operator: Any, tile: TileInstance) -> tuple[TISAStage, ...]
         stages.append(("compute", "matmul"))
         if _is_last_reduction_tile(tile, operator):
             stages.append(("store", "store"))
+    elif op_type == "conv2d":
+        stages = [("load", "load"), ("compute", "conv2d")]
+        if _is_last_reduction_tile(tile, operator):
+            stages.append(("store", "store"))
+    elif op_type == "batch_norm":
+        stages = [("load", "load"), ("compute", "batch_norm"), ("store", "store")]
+    elif op_type == "pool":
+        stages = [("load", "load"), ("compute", "pool"), ("store", "store")]
     elif op_type in {"elementwise", "residual_add"}:
         stages = [("load", "load"), ("compute", "elementwise"), ("store", "store")]
     elif op_type == "reduce":
@@ -113,6 +121,8 @@ def _stages_for_tile(operator: Any, tile: TileInstance) -> tuple[TISAStage, ...]
         stages = [("load", "load"), ("compute", "layernorm"), ("store", "store")]
     elif op_type == "swiglu":
         stages = [("load", "load"), ("compute", "swiglu"), ("store", "store")]
+    elif op_type == "kv_cache_update":
+        stages = [("load", "load"), ("compute", "kv_cache_update"), ("store", "store")]
     elif op_type in {"reshape", "transpose"}:
         primitive = "copy" if op_type == "reshape" else "transpose"
         stages = [("transform", primitive)]
@@ -143,6 +153,7 @@ def _stages_for_tile(operator: Any, tile: TileInstance) -> tuple[TISAStage, ...]
             ),
             "gate_multiply",
         ),
+        "kv_cache_update": ("kv_cache_update",),
     }
 
     def payload_for_stage(key: str, primitive: str) -> tuple[str, ...]:
@@ -151,6 +162,24 @@ def _stages_for_tile(operator: Any, tile: TileInstance) -> tuple[TISAStage, ...]
         if key == "store":
             return ("store",)
         return composite_payloads.get(op_type, (primitive,))
+
+    # Stateful semantic operators carry their state contract on every stage.
+    # This keeps the scheduler-visible TISA descriptor self-contained while
+    # allowing the backend payload to remain an implementation detail.
+    state_attributes = {
+        key: operator.attributes[key]
+        for key in (
+            "stateful",
+            "state_id",
+            "state_buffer",
+            "cache_axis",
+            "cache_window",
+            "update_length",
+            "slice_start",
+            "state_transition",
+        )
+        if key in operator.attributes
+    }
 
     return tuple(
         TISAStage(
@@ -163,6 +192,7 @@ def _stages_for_tile(operator: Any, tile: TileInstance) -> tuple[TISAStage, ...]
                 "primitive": primitive,
                 "semantic_op": op_type,
                 "payload_primitives": list(payload_for_stage(key, primitive)),
+                **state_attributes,
                 **(
                     {
                         "softmax_algorithm": operator.attributes.get(
@@ -188,9 +218,18 @@ def _readiness_condition(stage: TISAStage) -> str:
         return "output_region_ready"
     if stage.key == "transform":
         return "full_region_ready"
-    if stage.primitive in {"matmul", "batched_matmul", "gemv"}:
+    if stage.primitive in {"matmul", "batched_matmul", "gemv", "conv2d"}:
         return "operand_regions_ready"
-    if stage.primitive in {"softmax", "rmsnorm", "layernorm", "swiglu", "reduce"}:
+    if stage.primitive in {
+        "softmax",
+        "rmsnorm",
+        "layernorm",
+        "swiglu",
+        "reduce",
+        "kv_cache_update",
+        "batch_norm",
+        "pool",
+    }:
         return "semantic_tile_ready"
     return "operand_regions_ready"
 
@@ -309,6 +348,7 @@ def _operand_geometry(
     operator: Any,
     tile: TileInstance,
     tensor: Any,
+    tensors: Mapping[str, Any],
 ) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
     """Return dense tensor starts/shape for one semantic tile operand."""
 
@@ -345,6 +385,79 @@ def _operand_geometry(
             return (*batch_starts, out0_start, out1_start), (*batch_shape, out0_shape, out1_shape)
         return None
 
+    if op_type == "conv2d":
+        if len(operator.inputs) < 2 or len(operator.outputs) != 1:
+            return None
+        if tuple(name for name, _ in operator.iteration_dims) != ("N", "O", "OH", "OW"):
+            return None
+        if len(operator.reduction_dims) != 1:
+            return None
+        n_start, n_stop = bounds["N"]
+        o_start, o_stop = bounds["O"]
+        oh_start, oh_stop = bounds["OH"]
+        ow_start, ow_stop = bounds["OW"]
+        k_start, k_stop = bounds[operator.reduction_dims[0][0]]
+        input_tensor = tensors[operator.inputs[0]]
+        weight_tensor = tensors[operator.inputs[1]]
+        channels = int(input_tensor.shape[1])
+        kernel_h, kernel_w = (int(value) for value in operator.attributes.get("kernel_shape", (1, 1)))
+        input_h, input_w = int(input_tensor.shape[2]), int(input_tensor.shape[3])
+        stride_h, stride_w = (int(value) for value in operator.attributes.get("window_strides", (1, 1)))
+        pad = tuple(int(value) for value in operator.attributes.get("padding", (0, 0, 0, 0)))
+        pad_top, _pad_bottom, pad_left, _pad_right = pad
+        if name == operator.outputs[0]:
+            return (n_start, o_start, oh_start, ow_start), (n_stop - n_start, o_stop - o_start, oh_stop - oh_start, ow_stop - ow_start)
+        if name == operator.inputs[1]:
+            return (0, 0, 0, 0), tuple(int(value) for value in weight_tensor.shape)
+        if name == operator.inputs[0]:
+            # A flattened K tile maps to channel/kernel coordinates.  Use a
+            # conservative halo region so dependency construction never
+            # under-approximates a convolution window.
+            input_oh = max(0, oh_start * stride_h - pad_top)
+            input_ow = max(0, ow_start * stride_w - pad_left)
+            input_h_extent = min(input_h - input_oh, (oh_stop - oh_start - 1) * stride_h + kernel_h)
+            input_w_extent = min(input_w - input_ow, (ow_stop - ow_start - 1) * stride_w + kernel_w)
+            return (n_start, 0, input_oh, input_ow), (
+                n_stop - n_start,
+                channels,
+                max(1, input_h_extent),
+                max(1, input_w_extent),
+            )
+        return None
+
+    if op_type == "pool":
+        if len(operator.inputs) != 1 or len(operator.outputs) != 1:
+            return None
+        iteration = tuple(name for name, _ in operator.iteration_dims)
+        if iteration != ("d0", "d1", "d2", "d3") or len(tensor.shape) != 4:
+            return None
+        bounds = tile.bound_map
+        starts = tuple(bounds[name][0] for name in iteration)
+        output_shape = tuple(bounds[name][1] - bounds[name][0] for name in iteration)
+        if name == operator.outputs[0]:
+            return starts, output_shape
+        if name != operator.inputs[0]:
+            return None
+        window = tuple(int(value) for value in operator.attributes.get("window_dimensions", (1, 1, 1, 1)))
+        stride = tuple(int(value) for value in operator.attributes.get("window_strides", (1, 1, 1, 1)))
+        padding = tuple(int(value) for value in operator.attributes.get("padding", (0,) * 8))
+        if len(window) != 4 or len(stride) != 4 or len(padding) != 8:
+            return None
+        input_start_h = max(0, starts[2] * stride[2] - padding[4])
+        input_start_w = max(0, starts[3] * stride[3] - padding[6])
+        input_h_extent = min(
+            int(tensor.shape[2]) - input_start_h,
+            (output_shape[2] - 1) * stride[2] + window[2],
+        )
+        input_w_extent = min(
+            int(tensor.shape[3]) - input_start_w,
+            (output_shape[3] - 1) * stride[3] + window[3],
+        )
+        return (
+            (starts[0], starts[1], input_start_h, input_start_w),
+            (output_shape[0], output_shape[1], max(1, input_h_extent), max(1, input_w_extent)),
+        )
+
     if op_type in {"elementwise", "residual_add"}:
         output = operator.outputs[0]
         output_dims = iteration
@@ -368,7 +481,7 @@ def _operand_geometry(
                 shape.append(output_shape[output_axis])
         return tuple(starts), tuple(shape)
 
-    if op_type in {"reshape", "transpose"}:
+    if op_type in {"reshape", "transpose", "kv_cache_update"}:
         full_shape = _resolved_tensor_shape(tensor)
         if full_shape is None:
             return None
@@ -412,7 +525,7 @@ def _stage_operands(
             continue
         seen.add(key)
         tensor = tensors[name]
-        geometry = _operand_geometry(operator, tile, tensor)
+        geometry = _operand_geometry(operator, tile, tensor, tensors)
         operand_shape = geometry[1] if geometry is not None else tuple(
             stop - start for _name, start, stop in tile.bounds
         ) or (1,)
@@ -580,7 +693,7 @@ class TISASemanticBuilder:
                     row_tiles,
                     key=lambda tile: tile.bound_map[reduction][0] if reduction else tile.ordinal,
                 )
-                if op_type in {"matmul", "batched_matmul", "gemv"} and reduction:
+                if op_type in {"matmul", "batched_matmul", "gemv", "conv2d"} and reduction:
                     output_dims = tuple(name for name, _ in operator.iteration_dims if name != reduction)
                     groups: dict[tuple[int, ...], list[TileInstance]] = {}
                     for tile in ordered:
@@ -605,7 +718,7 @@ class TISASemanticBuilder:
                         add_dependency(
                             instruction_id(current.tile_id, barrier_stage),
                             instruction_id(previous.tile_id, barrier_stage),
-                            "ACCUMULATE" if op_type in {"matmul", "batched_matmul", "gemv"} else "STATE",
+                                "ACCUMULATE" if op_type in {"matmul", "batched_matmul", "gemv", "conv2d"} else "STATE",
                         )
                 if op_type == "softmax" and reduction:
                     if operator.attributes.get("softmax_algorithm", "materialized") == "online":
@@ -704,7 +817,7 @@ class AnalyticalBackendCodegen:
         consumed: set[str] = set()
         original_tasks = {task.task_id: task for task in lowering.execution_graph.tasks}
 
-        composite_ops = {"softmax", "rmsnorm", "layernorm", "swiglu"}
+        composite_ops = {"softmax", "rmsnorm", "layernorm", "swiglu", "kv_cache_update"}
         for instruction in program.instructions:
             stage = str(instruction.attributes.get("tisa_stage", ""))
             semantic_op = str(instruction.attributes.get("semantic_op_type", ""))

@@ -9,6 +9,7 @@ from .core import (
     StaticPipelineConfig,
     schedule_execution_graph,
     schedule_tisa_program,
+    schedule_tisa_sequence,
 )
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "StaticPipelineConfig",
     "schedule_execution_graph",
     "schedule_tisa_program",
+    "schedule_tisa_sequence",
 ]

@@ -12,16 +12,22 @@ class ResNet50BottleneckWorkload(torch.nn.Module):
 
     def __init__(self, channels: int = 16, bottleneck_channels: int = 4) -> None:
         super().__init__()
+        self.pool = torch.nn.MaxPool2d(2, stride=2)
         self.conv1 = torch.nn.Conv2d(3, bottleneck_channels, 1, bias=False)
         self.conv2 = torch.nn.Conv2d(bottleneck_channels, bottleneck_channels, 3, padding=1, bias=False)
         self.conv3 = torch.nn.Conv2d(bottleneck_channels, channels, 1, bias=False)
         self.shortcut = torch.nn.Conv2d(3, channels, 1, bias=False)
+        self.bn1 = torch.nn.BatchNorm2d(bottleneck_channels)
+        self.bn2 = torch.nn.BatchNorm2d(bottleneck_channels)
+        self.bn3 = torch.nn.BatchNorm2d(channels)
+        self.bn_shortcut = torch.nn.BatchNorm2d(channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = self.shortcut(x)
-        value = torch.nn.functional.relu(self.conv1(x))
-        value = torch.nn.functional.relu(self.conv2(value))
-        value = self.conv3(value)
+        x = self.pool(x)
+        residual = self.bn_shortcut(self.shortcut(x))
+        value = torch.nn.functional.relu(self.bn1(self.conv1(x)))
+        value = torch.nn.functional.relu(self.bn2(self.conv2(value)))
+        value = self.bn3(self.conv3(value))
         return torch.nn.functional.relu(value + residual)
 
 
