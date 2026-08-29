@@ -419,6 +419,56 @@ class CompilerStageContractTest(unittest.TestCase):
         self.assertEqual(compiled.attributes["dtype_compatibility"]["unsupported_dtypes"], ["f32"])
         self.assertEqual(compiled.validate(), ())
 
+    def test_backend_regions_follow_explicit_strides(self) -> None:
+        graph = OperatorGraph(
+            graph_id="strided-region-test",
+            tensors=(
+                TensorSpec(
+                    "value",
+                    (2, 3),
+                    dtype="f32",
+                    attributes={"strides_bytes": [16, 4]},
+                ),
+                TensorSpec("out", (2, 3), dtype="f32"),
+            ),
+            operators=(
+                OperatorSpec(
+                    op_id="negate",
+                    op_type="elementwise",
+                    inputs=("value",),
+                    outputs=("out",),
+                    iteration_dims=(("m", 2), ("n", 3)),
+                    attributes={"semantic_op": "negate", "frontend_target": "stablehlo.negate"},
+                ),
+            ),
+        )
+        frontend, stablehlo = _stable_frontend(graph)
+        compiled = compile_operator_graph(
+            graph,
+            minimal_machine_config(),
+            frontend=frontend,
+            source_frontend=frontend,
+            stablehlo=stablehlo,
+            tile_size=2,
+        )
+        load = next(
+            task
+            for task in compiled.backend_artifact.execution_graph.tasks
+            if task.primitive == "load" and task.operator_id == "negate"
+        )
+        self.assertEqual(load.reads[0].offset_bytes, 0)
+        self.assertEqual(load.reads[0].size_bytes, 24)
+        tisa = next(
+            operand.tile_mem
+            for instruction in compiled.tisa_program.instructions
+            if instruction.operator_id == "negate"
+            for operand in instruction.operands
+            if operand.tile_mem.tensor == "value"
+        )
+        self.assertEqual(tisa.strides_bytes, (16, 4))
+        self.assertEqual(tisa.size_bytes, 24)
+        self.assertEqual(compiled.validate(), ())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from npu_ooo.arch import MachineConfig
 from npu_ooo.ir import (
@@ -120,6 +120,49 @@ def _region(
     access: AccessType,
 ) -> BufferRegion:
     element_size = dtype_bytes(tensor.dtype)
+    attributes = getattr(tensor, "attributes", {})
+    explicit = attributes.get("strides_bytes") if isinstance(attributes, Mapping) else None
+    layout_source = attributes.get("layout_source") if isinstance(attributes, Mapping) else None
+    if layout_source == "stablehlo_encoding" and explicit is None:
+        # Unknown physical encodings cannot be mapped to a precise interval;
+        # use the full allocation as a conservative scoreboard range.
+        offset_bytes = 0
+        size_bytes = math.prod(tensor.shape) * element_size
+        return BufferRegion(
+            tensor=tensor.name,
+            memory=memory,
+            shape=shape,
+            starts=starts,
+            dtype=tensor.dtype,
+            access=access,
+            offset_bytes=offset_bytes,
+            size_bytes=size_bytes,
+            layout=tensor.layout,
+        )
+    if explicit is not None:
+        try:
+            strides = tuple(int(value) for value in explicit)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"tensor '{tensor.name}' strides_bytes must contain integers") from exc
+        if len(strides) != len(tensor.shape) or any(value < 0 for value in strides):
+            raise ValueError(
+                f"tensor '{tensor.name}' strides_bytes rank/values do not match its shape"
+            )
+        offset_bytes = sum(start * stride for start, stride in zip(starts, strides))
+        size_bytes = element_size + sum(
+            (extent - 1) * stride for extent, stride in zip(shape, strides)
+        )
+        return BufferRegion(
+            tensor=tensor.name,
+            memory=memory,
+            shape=shape,
+            starts=starts,
+            dtype=tensor.dtype,
+            access=access,
+            offset_bytes=offset_bytes,
+            size_bytes=size_bytes,
+            layout=tensor.layout,
+        )
     strides: list[int] = []
     stride = 1
     for extent in reversed(tensor.shape):

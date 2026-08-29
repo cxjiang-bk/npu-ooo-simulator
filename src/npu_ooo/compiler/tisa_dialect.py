@@ -289,7 +289,7 @@ def _dense_region(
         if len(strides) != len(full_shape) or any(value < 0 for value in strides):
             return None
         offset_elements = sum(start * stride for start, stride in zip(starts, strides))
-        span_elements = 1 + sum((extent - 1) * stride for extent, stride in zip(shape, strides))
+        span_elements = 1 + sum((extent - 1) * stride // _dtype_bytes(tensor.dtype) for extent, stride in zip(shape, strides))
         return offset_elements * _dtype_bytes(tensor.dtype), span_elements * _dtype_bytes(tensor.dtype)
     strides: list[int] = []
     stride = 1
