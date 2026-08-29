@@ -458,6 +458,25 @@ def _operand_geometry(
             (output_shape[0], output_shape[1], max(1, input_h_extent), max(1, input_w_extent)),
         )
 
+    if op_type == "batch_norm":
+        if len(operator.inputs) != 5 or len(operator.outputs) != 1:
+            return None
+        if len(tensor.shape) == 4:
+            output_dims = tuple(name for name, _ in operator.iteration_dims)
+            if output_dims != ("d0", "d1", "d2", "d3"):
+                return None
+            starts, shape = _dim_geometry(bounds, output_dims)
+            if name in {operator.inputs[0], operator.outputs[0]}:
+                return starts, shape
+        if len(tensor.shape) == 1 and name in operator.inputs[1:]:
+            feature_index = int(operator.attributes.get("feature_index", 1))
+            if feature_index < 0 or feature_index >= len(operator.iteration_dims):
+                return None
+            feature_name = tuple(name for name, _ in operator.iteration_dims)[feature_index]
+            start, stop = bounds[feature_name]
+            return (start,), (stop - start,)
+        return None
+
     if op_type in {"elementwise", "residual_add"}:
         output = operator.outputs[0]
         output_dims = iteration

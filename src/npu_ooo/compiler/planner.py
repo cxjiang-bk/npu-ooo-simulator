@@ -150,15 +150,13 @@ class SchedulePlanner:
 
     @staticmethod
     def _unit_for_operator(operator_type: str, machine: MachineConfig):
-        if operator_type in {"matmul", "batched_matmul", "gemv", "conv2d"}:
-            return machine.unit("MXU")
+        for unit in machine.execution_units:
+            if operator_type in unit.supported_ops:
+                return unit
         if operator_type in {"reshape", "transpose"}:
             for unit in machine.execution_units:
                 if "copy" in unit.supported_ops or "transpose" in unit.supported_ops:
                     return unit
-        for unit in machine.execution_units:
-            if operator_type in unit.supported_ops:
-                return unit
         return None
 
     @staticmethod

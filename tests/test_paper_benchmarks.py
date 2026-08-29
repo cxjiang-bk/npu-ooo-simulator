@@ -187,6 +187,24 @@ class PaperBenchmarkFrontendTest(unittest.TestCase):
         ]
         self.assertTrue(conv_instructions)
         self.assertIn("conv2d", {instruction.op_type for instruction in conv_instructions})
+        batch_norm_operator = next(
+            operator
+            for operator in compiled.graph.operators
+            if operator.normalized_type == "batch_norm"
+        )
+        batch_norm_instruction = next(
+            instruction
+            for instruction in compiled.tisa_program.instructions
+            if instruction.operator_id == batch_norm_operator.op_id
+            and instruction.op_type == "load"
+        )
+        statistics_operands = [
+            operand
+            for operand in batch_norm_instruction.operands
+            if operand.tile_mem.tensor in batch_norm_operator.inputs[1:]
+        ]
+        self.assertTrue(statistics_operands)
+        self.assertTrue(all(operand.tile_mem.offset_bytes is not None for operand in statistics_operands))
         self.assertTrue(compiled.backend_artifact.execution_graph.tasks)
         self.assertEqual(compiled.validate(), ())
 
