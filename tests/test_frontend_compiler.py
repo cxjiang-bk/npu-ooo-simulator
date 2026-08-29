@@ -6,7 +6,6 @@ import unittest
 from npu_ooo.arch import minimal_machine_config
 from npu_ooo.compiler import compile_torch_module
 from npu_ooo.frontend import (
-    FrontendImportError,
     official_stablehlo_available,
     torch_xla_available,
 )
@@ -418,7 +417,7 @@ class PyTorchFrontendTest(unittest.TestCase):
         }
         self.assertTrue(legacy.isdisjoint(compiler.__all__))
 
-    def test_dynamic_stablehlo_requires_explicit_shape_specialization(self) -> None:
+    def test_dynamic_stablehlo_is_specialized_before_import(self) -> None:
         import torch
 
         class DynamicAdd(torch.nn.Module):
@@ -426,20 +425,23 @@ class PyTorchFrontendTest(unittest.TestCase):
                 return value + value
 
         dynamic_batch = torch.export.Dim("batch", min=1, max=4)
-        with self.assertRaisesRegex(
-            FrontendImportError,
-            r"shape-specialization pass.*stablehlo\.dynamic_broadcast_in_dim.*"
-            r"stablehlo\.get_dimension_size",
-        ):
-            compile_torch_module(
-                DynamicAdd(),
-                (torch.randn(2, 4, dtype=torch.float16),),
-                minimal_machine_config(),
-                dynamic_shapes={"value": {0: dynamic_batch}},
-                shape_environment={"batch": 2},
-                model_id="dynamic-add",
-                tile_size=2,
-            )
+        compiled = compile_torch_module(
+            DynamicAdd(),
+            (torch.randn(2, 4, dtype=torch.float16),),
+            minimal_machine_config(),
+            dynamic_shapes={"value": {0: dynamic_batch}},
+            shape_environment={"batch": 2},
+            model_id="dynamic-add",
+            tile_size=2,
+        )
+        self.assertNotIn("stablehlo.dynamic_broadcast_in_dim", compiled.stablehlo.text)
+        self.assertNotIn("stablehlo.get_dimension_size", compiled.stablehlo.text)
+        self.assertEqual(
+            compiled.attributes["shape_specialization"]["pass"],
+            "torch-xla-dynamic-shape-specialization-v1",
+        )
+        self.assertEqual(compiled.graph.tensors[-1].shape, (2, 4))
+        self.assertEqual(compiled.validate(), ())
 
 
 if __name__ == "__main__":

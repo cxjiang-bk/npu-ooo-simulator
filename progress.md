@@ -204,3 +204,14 @@ operation 表达。完整 ResNet50 的 stem 7x7、stride/downsample、全层 rep
 - Official StableHLO projection 对未知 multi-result operation 显式失败；现有
   `batch_norm_training` 三结果 recovery 保持兼容，并继续禁止 secondary result 被消费或返回。
 - 全量回归：104 tests passed。
+
+## 2026-08-30：dynamic broadcast specialization
+
+- 新增独立 `frontend.shape_specialization` pass：按 operation 语义求值
+  `get_dimension_size -> reshape -> concatenate -> maximum` shape tensor，将动态广播
+  静态化并删除 dead shape 子图；最终仍通过 official StableHLO parse/verify。
+- `compile_torch_module` 对 specialization 结果生成带 variant/provenance 的 StableHLO
+  artifact，并在 `CompiledArtifact.attributes.shape_specialization` 保存 pass 诊断。
+- 其它 `stablehlo.dynamic_*` operation 仍显式失败；动态 index、动态 layout 和跨
+  invocation 动态 shape 尚未完成。
+- Python 3.12（Torch 2.9.1、Torch-XLA 2.9.0、StableHLO 1.12.1）全量回归：106 tests passed。

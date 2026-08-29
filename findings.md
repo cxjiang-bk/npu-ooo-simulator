@@ -85,6 +85,16 @@ PyTorch nn.Module
   StableHLO 上执行 shape specialization、constant propagation 和 dynamic-to-static
   legalization，再进入现有 Canonical importer。
 
+## 2026-08-30：dynamic broadcast specialization 实测
+
+- 当前安装的 StableHLO 1.12.1 Python bindings 未注册 `stablehlo-refine-shapes` 等现成
+  pass；因此实现独立 operation-level pass，而不是调用不存在的 pass 名称或做 `?` 文本
+  替换。
+- Torch-XLA dynamic add 的 shape program 可由常量与 `get_dimension_size` 求值；转换后
+  static module 能通过 official parse/verify，并可继续生成 Canonical IR/TISA。
+- 该 pass 只承诺静态 specialization 子集；未支持的 dynamic operation 保持显式失败，
+  不改变“unsupported 不静默降级”的总原则。
+
 ## 2026-08-30：静态 broadcast tile 语义缺口
 
 - Canonical importer 已保存 `stablehlo.broadcast_in_dim` 的

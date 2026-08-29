@@ -192,9 +192,14 @@ def _project_module(module: Any) -> str:
         if name == "stablehlo.broadcast_in_dim":
             dimensions_text = str(operation.attributes["broadcast_dimensions"])
             dimensions_match = re.search(r"array<i64:\s*([^>]*)>", dimensions_text)
-            dimensions = _ints(
-                dimensions_match.group(1) if dimensions_match else dimensions_text
-            )
+            if dimensions_match is not None:
+                dimensions = _ints(dimensions_match.group(1))
+            elif re.search(r"array<i64\s*>", dimensions_text):
+                # MLIR prints an empty DenseIntElementsAttr as ``array<i64>``;
+                # parsing the type suffix would incorrectly produce [64].
+                dimensions = ()
+            else:
+                dimensions = _ints(dimensions_text)
             lines.append(
                 f"    %{result_name} = stablehlo.broadcast_in_dim %{operands[0]}, "
                 f"dims = [{', '.join(map(str, dimensions))}] : "

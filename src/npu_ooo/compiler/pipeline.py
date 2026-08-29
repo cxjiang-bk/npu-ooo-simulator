@@ -183,6 +183,7 @@ def compile_operator_graph(
     tile_size_candidates: Sequence[int] | None = None,
     registry: LoweringRegistry | None = None,
     codegen_backend: CodegenBackend | None = None,
+    shape_specialization: Any | None = None,
 ) -> CompiledArtifact:
     """Compile an imported StableHLO graph from Canonical IR through backend payloads."""
 
@@ -274,6 +275,7 @@ def compile_operator_graph(
             "stablehlo_fallback": False,
             "stablehlo_fallback_reason": None,
             "dtype_compatibility": dtype_compatibility,
+            "shape_specialization": shape_specialization.to_dict() if shape_specialization else None,
             "codegen_direction": backend_artifact.attributes.get(
                 "codegen_direction", "tilegraph->tisa->backend-payload"
             ),
@@ -310,6 +312,7 @@ def compile_torch_module(
         TorchExportAdapter,
         TorchXLAStableHLOExporter,
     )
+    from npu_ooo.frontend.shape_specialization import specialize_stablehlo
 
     # 1. Capture Python execution as a stable ATen/FX program.
     exported_program = TorchExportAdapter.capture_module(
@@ -341,12 +344,43 @@ def compile_torch_module(
             )
         )
     )
+    shape_specialization = None
     if dynamic_operations:
-        raise FrontendImportError(
-            "dynamic StableHLO requires a shape-specialization pass before Canonical "
-            "import; shape_environment resolves Canonical symbols but does not rewrite "
-            "StableHLO shape-tensor subgraphs. Dynamic operations: "
-            + ", ".join(dynamic_operations)
+        shape_specialization = specialize_stablehlo(
+            stablehlo.text,
+            source_frontend.graph,
+            shape_environment=shape_environment,
+        )
+        remaining_dynamic = tuple(
+            sorted(
+                set(
+                    re.findall(
+                        r"stablehlo\.(?:get_dimension_size|dynamic_[A-Za-z_][\w.]*)",
+                        shape_specialization.text,
+                    )
+                )
+            )
+        )
+        if remaining_dynamic:
+            raise FrontendImportError(
+                "dynamic StableHLO requires a shape-specialization pass before Canonical "
+                "import; unsupported remaining operations: "
+                + ", ".join(remaining_dynamic)
+            )
+        stablehlo = replace(
+            stablehlo,
+            text=shape_specialization.text,
+            canonical_text=shape_specialization.text,
+            variant=f"{stablehlo.variant}-shape-specialized",
+            provenance={
+                **dict(stablehlo.provenance),
+                "shape_specialization": {
+                    "pass": "torch-xla-dynamic-shape-specialization-v1",
+                    "source_dynamic_operations": list(shape_specialization.dynamic_operations),
+                    "removed_shape_operations": list(shape_specialization.removed_shape_operations),
+                    "shape_environment": dict(shape_environment or {}),
+                },
+            },
         )
 
     # 3. Verify with official MLIR bindings and import supported semantics.
@@ -383,6 +417,7 @@ def compile_torch_module(
         tile_size_candidates=tile_size_candidates,
         registry=registry,
         codegen_backend=codegen_backend,
+        shape_specialization=shape_specialization,
     )
 
 

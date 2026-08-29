@@ -132,8 +132,12 @@ StableHLO semantic family
 
 动态 shape 还有一层更早的边界：Torch-XLA 会为 `tensor<?x...>` 生成
 `stablehlo.get_dimension_size`、`dynamic_broadcast_in_dim` 和 shape-tensor 子图。当前
-compiler 会明确报告需要 StableHLO shape-specialization pass；`shape_environment` 只能
-解析已经进入 Canonical IR 的符号，不能被误用为对 StableHLO shape program 的文本替换。
+compiler 已实现一个受限的 operation-level specialization：对 shape tensor 的
+`get_dimension_size -> reshape -> concatenate -> maximum` 数据流求值，将
+`dynamic_broadcast_in_dim` 改成静态 `broadcast_in_dim`，删除 dead shape ops，再交给
+official StableHLO parse/verify。产物 variant 和 `CompiledArtifact.attributes` 会记录该
+pass；其它 dynamic operation 仍显式失败。`shape_environment` 只提供符号契约，不能被
+误用为直接文本替换。
 
 ## 4. Graph Compiler（GC）
 
