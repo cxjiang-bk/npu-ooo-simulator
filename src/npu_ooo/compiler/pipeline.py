@@ -12,11 +12,12 @@ unit tests need to start after the framework boundary.
 """
 
 from dataclasses import dataclass, field, replace
+import re
 from typing import Any, Mapping, Sequence
 
 from npu_ooo.arch import MachineConfig
 from npu_ooo.backend import CodegenBackend, default_codegen_backend_registry
-from npu_ooo.frontend import FrontendImport, OfficialStableHLOModule
+from npu_ooo.frontend import FrontendImport, FrontendImportError, OfficialStableHLOModule
 from npu_ooo.ir import (
     BackendArtifact,
     OperatorGraph,
@@ -251,6 +252,23 @@ def compile_torch_module(
         model_id=model_id,
         variant="stablehlo-torch-xla-v1",
     )
+    dynamic_operations = tuple(
+        sorted(
+            set(
+                re.findall(
+                    r"stablehlo\.(?:get_dimension_size|dynamic_[A-Za-z_][\w.]*)",
+                    stablehlo.text,
+                )
+            )
+        )
+    )
+    if dynamic_operations:
+        raise FrontendImportError(
+            "dynamic StableHLO requires a shape-specialization pass before Canonical "
+            "import; shape_environment resolves Canonical symbols but does not rewrite "
+            "StableHLO shape-tensor subgraphs. Dynamic operations: "
+            + ", ".join(dynamic_operations)
+        )
 
     # 3. Verify with official MLIR bindings and import supported semantics.
     stable_frontend = OfficialStableHLOAdapter.import_text(

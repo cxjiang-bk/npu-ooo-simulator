@@ -130,6 +130,11 @@ StableHLO semantic family
 
 当前 importer 仍有明确限制：官方 MLIR object 先投影到项目支持的可读 operation 子集，再由 semantic importer 建图。未注册 operation 会在 capability boundary 失败，不会静默降级。
 
+动态 shape 还有一层更早的边界：Torch-XLA 会为 `tensor<?x...>` 生成
+`stablehlo.get_dimension_size`、`dynamic_broadcast_in_dim` 和 shape-tensor 子图。当前
+compiler 会明确报告需要 StableHLO shape-specialization pass；`shape_environment` 只能
+解析已经进入 Canonical IR 的符号，不能被误用为对 StableHLO shape program 的文本替换。
+
 ## 4. Graph Compiler（GC）
 
 GC 的输入是已经由官方 MLIR bindings 验证的 StableHLO projection；其第一步导入 Canonical OperatorGraph。恢复的信息包括：

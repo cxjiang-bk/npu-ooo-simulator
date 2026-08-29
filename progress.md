@@ -149,3 +149,11 @@ operation 表达。完整 ResNet50 的 stem 7x7、stride/downsample、全层 rep
 - `ScheduleSpec` 保存 `candidate_costs`、`selected_tile_size` 和模型版本，方便把编译
   选择与后端实际周期分开分析；该模型不是 RTL timing。
 - 新增 planner regression；全量回归为 96 tests passed。
+
+## 2026-08-29：dynamic shape 失败契约
+
+- 真实 Torch-XLA dynamic export 会产生 `get_dimension_size`、
+  `dynamic_broadcast_in_dim` 和 shape-tensor dataflow，不是把 `?` 替换为整数即可完成。
+- compiler 现在在 official StableHLO import 之前报告需要 shape-specialization pass，并
+  列出实际动态 operation；`shape_environment` 明确只负责 Canonical symbol resolution。
+- 新增真实 dynamic `torch.export` regression；symbolic/dynamic shape 仍未标记完成。

@@ -76,6 +76,15 @@ PyTorch nn.Module
   和 FC `TileMem` 必须使用相同的 halo 区域，否则 backend primitive 的 root-memory
   producer/consumer 边会多于 TISA dependency，artifact validation 会拒绝该结果。
 
+## 2026-08-29：Torch-XLA dynamic shape 图形态
+
+- 即使提供具体 example input，带 `torch.export.Dim` 的 Torch-XLA StableHLO 仍保留
+  `tensor<?x...>`，并插入 `get_dimension_size -> reshape/concatenate/maximum ->
+  dynamic_broadcast_in_dim` shape program。
+- `shape_environment={symbol: value}` 不能安全地直接替换上述程序；正确实现需要在官方
+  StableHLO 上执行 shape specialization、constant propagation 和 dynamic-to-static
+  legalization，再进入现有 Canonical importer。
+
 ## 2026-08-27：阶段 1A 首个增量
 
 - `stablehlo.convert` 已注册为单操作 elementwise capability；Canonical Operator 保留
