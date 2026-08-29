@@ -124,8 +124,9 @@ PyTorch model / shape / phase
 模型或论文芯片的绝对性能结果。
 
 输出约定为：矩阵根目录保存 `sweep.csv/json` 和本次 `matrix_index.json`，每个
-`<case-id>/<variant>/` 保存完整的 `00_frontend` 到 `07_trace` staged artifact，策略
-专属结果位于 `policy_matrix/`。复用输出目录时应以 `matrix_index.json` 的 case 清单为准；
+`<case-id>/<variant>/` 保存共享的 `00_frontend` 到 `04_backend` staged artifact；统一布局
+创建的 `05_runtime` 到 `07_trace` 在策略子目录中各自写入，策略专属结果位于
+`policy_matrix/`。复用输出目录时应以 `matrix_index.json` 的 case 清单为准；
 旧目录不会自动删除，避免把残留结果混入统计。
 
 ## 下一阶段优先级

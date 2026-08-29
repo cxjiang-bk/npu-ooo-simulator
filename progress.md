@@ -56,8 +56,8 @@ minimal analytical device: static 2344, dynamic 2119 cycles
 - 新增 `paper-matrix` 批处理路径：每个 registry case 只编译一次，然后在同一份
   `BackendArtifact` 与 buffer binding 上比较 runtime/device policy；默认固定 runtime
   为 `static`，可显式展开四组合。
-- 矩阵输出按 case/variant 保存完整 `00_frontend` 到 `07_trace`，策略专属结果位于
-  `policy_matrix/`，根目录通过 `sweep.csv/json` 汇总周期、reference、tile/TISA 数量和
+- 矩阵输出按 case/variant 保存共享的 `00_frontend` 到 `04_backend`，策略专属的
+  `05_runtime` 到 `07_trace` 位于 `policy_matrix/`，根目录通过 `sweep.csv/json` 汇总周期、reference、tile/TISA 数量和
   artifact/program ID。
 - `micro` 用于快速、确定性回归；`paper_shape` 只是接近论文形状的 representative
   proxy，可能显著增加资源开销，不能与论文芯片绝对周期直接比较。

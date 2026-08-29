@@ -167,7 +167,7 @@ out/paper-matrix/
 ├── sweep.csv
 ├── sweep.json
 └── bert-base/micro/
-    ├── 00_frontend/ ... 07_trace/  # 共享编译产物
+    ├── 00_frontend/ ... 04_backend/ # 共享编译产物；05-07 为统一布局的空阶段目录
     ├── artifact_index.json
     ├── manifest.json
     ├── summary.json

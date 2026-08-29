@@ -81,8 +81,8 @@ prefill 与 decode 必须是不同 case；analytical、source-derived 和 RTL-ob
 - [x] `paper-matrix` 对 registry case 执行一次编译并复用同一 `BackendArtifact`、
   `program_id` 和 buffer binding；
 - [x] 默认比较 device static/dynamic，显式 `--runtime-device-matrix` 才运行四组合；
-- [x] 为每个 `<case-id>/<variant>/` 保存完整 staged compiler artifact，并将策略结果放入
-  `policy_matrix/`；
+- [x] 为每个 `<case-id>/<variant>/` 保存共享 `00_frontend` 到 `04_backend` compiler
+  artifact，并将策略的 `05_runtime` 到 `07_trace` 结果放入 `policy_matrix/`；
 - [x] 在矩阵根目录写入 `matrix_index.json`，用于识别本次 case 清单并诊断旧输出目录；
 - [ ] 补齐 full-model repetition、request-level runtime，以及 source-derived/RTL-observed
   分组统计。
