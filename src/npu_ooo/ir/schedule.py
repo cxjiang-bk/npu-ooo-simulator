@@ -160,11 +160,18 @@ def plan_uniform_tiles(graph: OperatorGraph, *, tile_size: int = 32) -> Schedule
         dimensions = (*operator.iteration_dims, *operator.reduction_dims)
         if any(not isinstance(extent, int) for _name, extent in dimensions):
             raise ValueError("schedule planning requires a resolved graph")
+        # A broadcast has an output-domain tile space: each output tile can
+        # read the corresponding source slice independently.  Plain views
+        # and cache updates still require a single full-tensor transform.
+        is_broadcast = bool(
+            operator.attributes.get("broadcast")
+            or operator.attributes.get("stablehlo_op") == "stablehlo.broadcast_in_dim"
+        )
         full_tensor_transform = operator.normalized_type in {
             "reshape",
             "transpose",
             "kv_cache_update",
-        }
+        } and not is_broadcast
         schedules.append(
             OperatorSchedule(
                 operator_id=operator.op_id,

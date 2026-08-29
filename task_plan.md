@@ -81,6 +81,8 @@ prefill 与 decode 必须是不同 case；analytical、source-derived 和 RTL-ob
 - [x] `stablehlo.convert` capability 和 source/target dtype 语义；
 - [x] 未注册 StableHLO operation 显式报告缺失 capability 与已知 operation 集合；
 - [ ] scalar/multi-result/layout/broadcast 的通用 metadata；
+  - [x] 静态 `broadcast_in_dim` 输出域 tile、源 operand region 与边界 tile 契约；
+  - [ ] scalar elementwise operand 的零秩/常量 metadata 与 tile region 契约；
 - [ ] Torch-XLA/PJRT dtype 兼容性矩阵和严格/fallback policy。
 
 ### 阶段 1B：模型到 TISA 的语义覆盖

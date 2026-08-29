@@ -85,6 +85,24 @@ PyTorch nn.Module
   StableHLO 上执行 shape specialization、constant propagation 和 dynamic-to-static
   legalization，再进入现有 Canonical importer。
 
+## 2026-08-30：静态 broadcast tile 语义缺口
+
+- Canonical importer 已保存 `stablehlo.broadcast_in_dim` 的
+  `broadcast_dimensions`，但 planner 仍把所有 `reshape` 当成 full-tensor transform；因此
+  广播只有一个 TileGraph 节点，跨算子依赖无法暴露输出域的 tile 并行性。
+- 广播不是普通 reshape。输出 tile 到源 tensor 的映射必须按 `broadcast_dimensions`
+  投影：未映射的输出轴不读取源数据，源 extent 为 1 的轴始终读取 `[0:1]`，其余轴读取
+  对应输出 tile 区域。
+- GC TileGraph、FC `TileMem` 和 analytical backend 必须使用同一映射，否则 TISA RAW
+  dependency 与 backend root-memory handoff 会不一致，`BackendArtifact.validate()` 会失败。
+- 本阶段只处理静态 `broadcast_in_dim`。动态广播仍要求 official StableHLO shape
+  specialization；普通 reshape/transpose 继续保持 full-tensor transform。
+
+- 当前 `TensorSpec.validate()` 要求至少一个维度；PyTorch 的 `x + scalar` 可能在
+  Torch-XLA 中表现为零秩常量或 `broadcast_in_dim`。scalar 支持必须先定义零秩 tensor 的
+  metadata、字节大小和 region 表示，再接入 elementwise tile 映射，不能简单把 shape 改成
+  `(1,)`，否则会改变 StableHLO rank/广播语义。
+
 ## 2026-08-27：阶段 1A 首个增量
 
 - `stablehlo.convert` 已注册为单操作 elementwise capability；Canonical Operator 保留

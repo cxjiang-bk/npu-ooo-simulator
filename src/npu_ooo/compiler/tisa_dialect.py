@@ -357,6 +357,36 @@ def _operand_geometry(
     reduction = tuple(name for name, _ in operator.reduction_dims)
     op_type = operator.normalized_type
     name = tensor.name
+    if op_type == "reshape" and (
+        operator.attributes.get("broadcast")
+        or operator.attributes.get("stablehlo_op") == "stablehlo.broadcast_in_dim"
+    ):
+        dimensions = operator.attributes.get("broadcast_dimensions")
+        if not isinstance(dimensions, (tuple, list)):
+            return None
+        if name == operator.outputs[0]:
+            return _dim_geometry(bounds, iteration)
+        if name != operator.inputs[0]:
+            return None
+        if len(dimensions) != len(tensor.shape):
+            return None
+        starts: list[int] = []
+        shape: list[int] = []
+        for source_axis, output_axis in enumerate(dimensions):
+            if not isinstance(output_axis, int) or output_axis < 0 or output_axis >= len(iteration):
+                return None
+            source_extent = int(tensor.shape[source_axis])
+            output_start, output_stop = bounds[iteration[output_axis]]
+            output_extent = output_stop - output_start
+            if source_extent == 1:
+                starts.append(0)
+                shape.append(1)
+            elif source_extent == output_extent or output_stop <= source_extent:
+                starts.append(output_start)
+                shape.append(output_extent)
+            else:
+                return None
+        return tuple(starts), tuple(shape)
     if op_type in {"matmul", "batched_matmul", "gemv"}:
         if len(operator.inputs) < 2 or not operator.outputs:
             return None

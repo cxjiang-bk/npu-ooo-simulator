@@ -201,6 +201,40 @@ def _tile_tensor_region(
     reduction = tuple(name for name, _extent in operator.reduction_dims)
     op_type = operator.normalized_type
 
+    if op_type == "reshape" and (
+        operator.attributes.get("broadcast")
+        or operator.attributes.get("stablehlo_op") == "stablehlo.broadcast_in_dim"
+    ):
+        if tensor_name == operator.outputs[0]:
+            return _dimension_region(tile, iteration)
+        if tensor_name != operator.inputs[0]:
+            return None
+        dimensions = operator.attributes.get("broadcast_dimensions")
+        if not isinstance(dimensions, (tuple, list)):
+            return None
+        source_shape = tuple(tensor_shape)
+        if len(dimensions) != len(source_shape):
+            return None
+        output_bounds = tile.bound_map
+        starts: list[int] = []
+        shape: list[int] = []
+        for source_axis, output_axis in enumerate(dimensions):
+            if not isinstance(output_axis, int) or output_axis < 0 or output_axis >= len(iteration):
+                return None
+            source_extent = source_shape[source_axis]
+            output_start, output_stop = output_bounds[iteration[output_axis]]
+            if source_extent == 1:
+                starts.append(0)
+                shape.append(1)
+            elif source_extent == output_stop - output_start or source_extent > 1:
+                if output_stop > source_extent:
+                    return None
+                starts.append(output_start)
+                shape.append(output_stop - output_start)
+            else:
+                return None
+        return tuple(starts), tuple(shape)
+
     if op_type in {"reshape", "transpose", "kv_cache_update"}:
         return (0,) * len(tensor_shape), tensor_shape
 

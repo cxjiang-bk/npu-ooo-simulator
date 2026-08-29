@@ -157,3 +157,20 @@ operation 表达。完整 ResNet50 的 stem 7x7、stride/downsample、全层 rep
 - compiler 现在在 official StableHLO import 之前报告需要 shape-specialization pass，并
   列出实际动态 operation；`shape_environment` 明确只负责 Canonical symbol resolution。
 - 新增真实 dynamic `torch.export` regression；symbolic/dynamic shape 仍未标记完成。
+
+## 2026-08-30：静态 layout/broadcast 增量开始
+
+- 提交 `bd5bfd2 align planner units and batch norm tile operands`；全量 97 tests passed。
+- 确认静态 `broadcast_in_dim` 当前仍被强制为 full-tensor transform，下一步对齐 GC、FC
+  与 analytical backend 的逐 tile region 语义。
+- 检查过程中一次命令使用了错误工作目录 `npu-ooo_simulator`；已改回项目实际目录，未产生修改。
+
+## 2026-08-30：静态 broadcast 输出域 tiling
+
+- `plan_uniform_tiles` 不再把静态 `broadcast_in_dim` 误标为 full-tensor transform；广播
+  按输出域保留边界 tile，普通 reshape/transpose/KV-cache 仍保持单 tile。
+- TileGraph 与 FC `TileMem` 使用 `broadcast_dimensions` 将输出 tile 映射到源向量切片；
+  源 singleton 轴固定读取 `[0:1]`，最后边界 tile 不越界。
+- analytical transform backend 为每个广播 tile 生成独立 copy payload，并通过 root
+  region overlap 建立跨算子依赖；真实 PyTorch `bias + value` 回归覆盖 12 个 tile。
+- 定向与全量回归：98 tests passed；本项尚未提交，下一步补 scalar operand 语义。

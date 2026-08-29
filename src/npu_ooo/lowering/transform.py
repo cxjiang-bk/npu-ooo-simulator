@@ -22,7 +22,7 @@ def lower_transform_graph(
     schedule: ScheduleSpec,
     machine: MachineConfig,
 ) -> LoweringResult:
-    """Lower a full-tensor view/layout transform to one DMA payload."""
+    """Lower views/layout transforms and output-tiled static broadcasts."""
 
     graph_issues = graph.validate()
     schedule_issues = schedule.validate(graph)
@@ -87,66 +87,99 @@ def lower_transform_graph(
         operator_tiles = tuple(
             tile for tile in tile_graph.tiles if tile.operator_id == operator_id
         )
-        if len(operator_tiles) != 1:
+        if not is_broadcast and len(operator_tiles) != 1:
             raise ValueError(
                 f"transform operator '{operator.op_id}' requires a full-tensor schedule"
             )
-        tile = operator_tiles[0]
         primitive = (
             "copy"
             if operator.normalized_type == "reshape"
             else "transpose"
         )
         unit = _unit_for(machine, primitive)
-        input_region = _region(
-            input_tensor,
-            root,
-            (0,) * len(input_tensor.shape),
-            tuple(input_tensor.shape),
-            AccessType.READ,
-        )
-        output_region = _region(
-            output_tensor,
-            root,
-            (0,) * len(output_tensor.shape),
-            tuple(output_tensor.shape),
-            AccessType.WRITE,
-        )
-        transfer_cycles = math.ceil(
-            input_region.size_bytes / memory.read_bandwidth_bytes_per_cycle
-        ) + math.ceil(
-            output_region.size_bytes / memory.write_bandwidth_bytes_per_cycle
-        )
-        duration = (
-            unit.latency_cycles
-            + memory.read_latency_cycles
-            + memory.write_latency_cycles
-            + transfer_cycles
-        )
-        tasks.append(
-            ExecutionTask(
-                task_id=f"{tile.tile_id}.{primitive}",
-                tile_id=tile.tile_id,
-                operator_id=operator_id,
-                primitive=primitive,
-                resource=unit.name,
-                reads=(input_region,),
-                writes=(output_region,),
-                duration_cycles=float(duration),
-                initiation_interval_cycles=float(unit.initiation_interval_cycles),
-                stage_id=tile.stage_id,
-                program_order=len(tasks),
-                attributes={
-                    "semantic_family": operator.normalized_type,
-                    "frontend_target": operator.attributes.get("frontend_target", ""),
-                    "transpose_dims": operator.attributes.get("transpose_dims"),
-                    "broadcast": is_broadcast,
-                    "broadcast_dimensions": operator.attributes.get("broadcast_dimensions"),
-                    "full_tensor_transform": True,
-                },
+        dimensions = tuple(name for name, _ in operator.iteration_dims)
+        for tile in operator_tiles:
+            if is_broadcast:
+                broadcast_dimensions = operator.attributes.get("broadcast_dimensions")
+                if not isinstance(broadcast_dimensions, (tuple, list)):
+                    raise ValueError(
+                        f"broadcast operator '{operator.op_id}' is missing broadcast_dimensions"
+                    )
+                source_starts: list[int] = []
+                source_shape: list[int] = []
+                for source_axis, output_axis in enumerate(broadcast_dimensions):
+                    output_start, output_stop = tile.bound_map[dimensions[output_axis]]
+                    source_extent = int(input_tensor.shape[source_axis])
+                    output_extent = output_stop - output_start
+                    if source_extent == 1:
+                        source_starts.append(0)
+                        source_shape.append(1)
+                    elif source_extent == output_extent or output_stop <= source_extent:
+                        source_starts.append(output_start)
+                        source_shape.append(output_extent)
+                    else:
+                        raise ValueError(
+                            f"broadcast operator '{operator.op_id}' tile exceeds source extent"
+                        )
+                output_starts = tuple(tile.bound_map[name][0] for name in dimensions)
+                output_shape = tuple(tile.bound_map[name][1] - tile.bound_map[name][0] for name in dimensions)
+                input_region = _region(
+                    input_tensor, root, tuple(source_starts), tuple(source_shape), AccessType.READ
+                )
+                output_region = _region(
+                    output_tensor, root, output_starts, output_shape, AccessType.WRITE
+                )
+            else:
+                input_region = _region(
+                    input_tensor,
+                    root,
+                    (0,) * len(input_tensor.shape),
+                    tuple(input_tensor.shape),
+                    AccessType.READ,
+                )
+                output_region = _region(
+                    output_tensor,
+                    root,
+                    (0,) * len(output_tensor.shape),
+                    tuple(output_tensor.shape),
+                    AccessType.WRITE,
+                )
+            transfer_cycles = math.ceil(
+                input_region.size_bytes / memory.read_bandwidth_bytes_per_cycle
+            ) + math.ceil(
+                output_region.size_bytes / memory.write_bandwidth_bytes_per_cycle
             )
-        )
-        bytes_moved += input_region.size_bytes + output_region.size_bytes
+            duration = (
+                unit.latency_cycles
+                + memory.read_latency_cycles
+                + memory.write_latency_cycles
+                + transfer_cycles
+            )
+            tasks.append(
+                ExecutionTask(
+                    task_id=f"{tile.tile_id}.{primitive}",
+                    tile_id=tile.tile_id,
+                    operator_id=operator_id,
+                    primitive=primitive,
+                    resource=unit.name,
+                    reads=(input_region,),
+                    writes=(output_region,),
+                    duration_cycles=float(duration),
+                    initiation_interval_cycles=float(unit.initiation_interval_cycles),
+                    stage_id=tile.stage_id,
+                    program_order=len(tasks),
+                    attributes={
+                        "semantic_family": operator.normalized_type,
+                        "frontend_target": operator.attributes.get("frontend_target", ""),
+                        "transpose_dims": operator.attributes.get("transpose_dims"),
+                        "broadcast": is_broadcast,
+                        "broadcast_dimensions": operator.attributes.get("broadcast_dimensions"),
+                        "full_tensor_transform": not is_broadcast,
+                        "transform_granularity": "output_tile" if is_broadcast else "full_tensor",
+                    },
+                )
+            )
+            bytes_moved += input_region.size_bytes + output_region.size_bytes
 
     execution = ExecutionGraph(
         graph_id=f"{graph.graph_id}.execution",
@@ -154,7 +187,10 @@ def lower_transform_graph(
         attributes={
             "source": "transform-lowering",
             "root_memory": root,
-            "granularity": "full_tensor",
+            "granularity": "output_tile" if any(
+                bool(operator.attributes.get("broadcast"))
+                for operator in graph.operators
+            ) else "full_tensor",
         },
     )
     issues = execution.validate()

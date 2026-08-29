@@ -359,6 +359,53 @@ class PyTorchFrontendTest(unittest.TestCase):
         self.assertGreater(static_result.total_cycles, 0)
         self.assertGreater(dynamic_result.total_cycles, 0)
 
+    def test_static_broadcast_is_output_tiled_and_maps_source_regions(self) -> None:
+        import torch
+
+        class BroadcastAdd(torch.nn.Module):
+            def forward(self, value, bias):
+                return value + bias
+
+        compiled = compile_torch_module(
+            BroadcastAdd(),
+            (torch.randn(1, 5, 7), torch.randn(7)),
+            minimal_machine_config(),
+            model_id="broadcast-add",
+            tile_size=2,
+        )
+
+        broadcast = next(
+            operator
+            for operator in compiled.graph.operators
+            if operator.attributes.get("stablehlo_op") == "stablehlo.broadcast_in_dim"
+        )
+        tiles = [tile for tile in compiled.tile_graph.tiles if tile.operator_id == broadcast.op_id]
+        self.assertGreater(len(tiles), 1)
+        self.assertFalse(compiled.schedule.for_operator(broadcast.op_id).attributes["full_tensor_transform"])
+        transform_tasks = [
+            task for task in compiled.backend_artifact.execution_graph.tasks
+            if task.operator_id == broadcast.op_id
+        ]
+        self.assertEqual(len(transform_tasks), len(tiles))
+        self.assertEqual(
+            {task.attributes["transform_granularity"] for task in transform_tasks},
+            {"output_tile"},
+        )
+        source_regions = [task.reads[0] for task in transform_tasks]
+        self.assertEqual({region.tensor for region in source_regions}, {broadcast.inputs[0]})
+        self.assertEqual({region.shape for region in source_regions}, {(1,), (2,)})
+        self.assertEqual(max(region.starts[0] + region.shape[0] for region in source_regions), 7)
+        output_operands = [
+            operand
+            for instruction in compiled.tisa_program.instructions
+            if instruction.operator_id == broadcast.op_id
+            for operand in instruction.operands
+            if operand.tile_mem.tensor == broadcast.outputs[0]
+        ]
+        self.assertTrue(output_operands)
+        self.assertTrue(all(operand.tile_mem.size_bytes is not None for operand in output_operands))
+        self.assertEqual(compiled.validate(), ())
+
     def test_public_compiler_api_has_no_legacy_frontend_wrappers(self) -> None:
         import npu_ooo.compiler as compiler
 
