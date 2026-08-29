@@ -38,7 +38,9 @@ minimal analytical device: static 2344, dynamic 2119 cycles
 
 - StableHLO semantic importer 仍只覆盖已注册 operation；
 - tile planner 已有可审计的 candidate cost model，但仍是确定性启发式，尚无硬件校准的 autotuning；
-- reshape/transpose 仍是 full-tensor transform；symbolic/dynamic shape 仅完成广播和常量起点 `dynamic_slice` specialization 子集，stride-aware layout 只支持显式 stride metadata；
+- reshape/transpose 仍是 full-tensor transform；symbolic/dynamic shape 已完成广播、常量起点
+  `dynamic_slice` 和常量 shape `dynamic_reshape` specialization 子集，stride-aware layout
+  只支持显式 stride metadata；
 - analytical event backend 不是 RTL cycle-accurate；
 - 当前 MXU VCS log 主要提供 descriptor-to-completion 区间；
 - GC 当前只生成 completion-boundary readiness；真实 partial-tile producer 语义仍需由 backend/calibration 端接入；
