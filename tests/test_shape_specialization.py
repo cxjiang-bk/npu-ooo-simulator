@@ -57,6 +57,18 @@ class ShapeSpecializationTest(unittest.TestCase):
         with self.assertRaisesRegex(FrontendImportError, "does not support dynamic operation"):
             specialize_stablehlo(text, self._graph())
 
+    def test_dynamic_update_slice_remains_an_explicit_boundary(self) -> None:
+        text = """
+        module {
+          func.func @main(%arg0: tensor<4x4xf16>, %arg1: tensor<1x4xf16>, %start: tensor<i32>) -> tensor<4x4xf16> {
+            %value = stablehlo.dynamic_update_slice %arg0, %arg1, %start, %start : (tensor<4x4xf16>, tensor<1x4xf16>, tensor<i32>, tensor<i32>) -> tensor<4x4xf16>
+            return %value : tensor<4x4xf16>
+          }
+        }
+        """
+        with self.assertRaisesRegex(FrontendImportError, "does not support dynamic operation"):
+            specialize_stablehlo(text, self._graph((4, 4), (4, 4)))
+
     def test_constant_dynamic_slice_is_clamped_and_staticized(self) -> None:
         text = """
         module {

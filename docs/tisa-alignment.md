@@ -155,6 +155,10 @@ StableHLO clamp 语义改写为静态 `slice`，因此不会把动态 start 误�
 的 start 和 `dynamic_update_slice` 仍在 importer 前显式失败。后者需要 runtime state、
 地址绑定和跨 invocation 语义共同确定，不能仅靠文本替换支持。
 
+常量 shape tensor 驱动的 `dynamic_reshape` 已在同一 specialization pass 中静态化，只有
+输入/输出元素总数守恒且目标维度均为正整数时才会改写为官方 `reshape`；运行时 shape
+仍保持显式失败。
+
 因此当前结果应称为“TISA instruction-level analytical scheduling baseline”。默认编译
 路径仍是 completion-boundary 语义；`payload_ready:<task_id>` 只作为校准 backend
 和 micro-test 的 partial-ready 原型，不能称为论文硬件的 cycle-accurate 复现。
