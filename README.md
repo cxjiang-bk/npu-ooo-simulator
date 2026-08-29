@@ -132,6 +132,59 @@ CLI 中可用 `--runtime-invocations N` 重复提交同一个 compiled artifact�
 写入 `05_runtime/runtime_sequence.json`，汇总周期和 trace 仍写入 `06_simulation/`、
 `07_trace/`。
 
+批量比较论文模型的 scaled workload：
+
+```bash
+PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli paper-matrix \
+  --benchmarks all \
+  --variant micro \
+  --arch minimal \
+  --tile-size 4 \
+  --output-dir out/paper-matrix
+```
+
+`paper-matrix` 对每个 registry case 只编译一次，默认固定 runtime 为 `static`，输出
+`static_pipeline` 与 `dynamic_ready_queue` 两行；加上 `--runtime-device-matrix` 才会
+展开 runtime/device 四组合。矩阵根目录的 `sweep.csv/json` 保存 reference、artifact
+ID、tile/TISA 数量和周期；每个 case 的 `summary.json` 与 `manifest.json` 位于
+`<case-id>/<variant>/`。这些 case 是 scaled micro 或 representative proxy，论文
+reference 与 analytical/RTL cycle 分开记录。
+
+`--variant` 控制 workload 的规模，不改变编译和仿真语义：
+
+- `micro`（默认）使用小尺寸、确定性的输入，适合回归测试、检查依赖和快速比较调度；
+- `paper_shape` 使用接近论文报告的 batch/sequence/hidden 形状，可能显著增加编译时间、
+  tile 数和内存占用。它仍是一个 representative proxy，不是完整的论文模型，也不能把
+  输出周期直接解释为论文硬件的绝对性能。
+
+矩阵输出与单 case 输出分开组织。矩阵根目录只保存汇总和本次 case 索引；每个 case
+  目录保存一份共享的编译产物，策略目录只保存 runtime、仿真和 trace：
+
+```text
+out/paper-matrix/
+├── README.md
+├── matrix_index.json       # 本次实际选择的 case、variant 和相对输出路径
+├── sweep.csv
+├── sweep.json
+└── bert-base/micro/
+    ├── 00_frontend/ ... 07_trace/  # 共享编译产物
+    ├── artifact_index.json
+    ├── manifest.json
+    ├── summary.json
+    └── policy_matrix/
+        ├── runtime-static__device-static_pipeline/
+        │   ├── 05_runtime/ 06_simulation/ 07_trace/
+        │   └── ...
+        └── runtime-static__device-dynamic_ready_queue/
+            ├── 05_runtime/ 06_simulation/ 07_trace/
+            └── ...
+```
+
+`paper-matrix` 不会根据策略重新编译、切 tile 或分配地址；同一个 case 的策略行共享
+`artifact_id`、`program_id` 和 buffer binding。复用已有 `--output-dir` 时，不要把旧的
+case 目录当成本次结果：以 `matrix_index.json` 中记录的清单和相对路径为准，并优先为
+每次实验使用新的输出目录。未知文件不会被命令删除。
+
 ## 添加 PyTorch 算子或模型
 
 在任意可导入 Python 模块中定义真实的 `torch.nn.Module`。无参数构造的 module class 可以直接作为 CLI 入口：
@@ -226,6 +279,11 @@ out/<run>/
 ```
 
 推荐按目录编号依次检查。`generated.mlir` 是确认 Torch-XLA 输出的第一现场；`01_gc/pass_dumps/` 按顺序展示每个 GC pass 的输入图、输出图和诊断，`01_gc/gc_artifact.json` 展示最终融合、切分、初始顺序和依赖；`02_fc/tisa_dialect.json` 展示 FC 生成的语义 TISA op；`03_tisa/tisa_program.json` 是 device scheduler 的输入；`backend_artifact.json` 记录每条 TISA instruction 对应的后端 payload。复合算子的 reduce/exp 等内部步骤只在 backend payload 中出现。
+
+对 `paper-matrix`，上述阶段目录位于 `<case-id>/<variant>/`，而不是矩阵根目录；矩阵
+根目录的 `sweep.csv/json` 只用于跨 case 汇总。先查看 `matrix_index.json` 确认本次实际
+运行了哪些 case，再进入对应 case 的 `manifest.json` 和 `artifact_index.json`，最后在
+`policy_matrix/<runtime>__<device>/06_simulation/`、`07_trace/` 比较策略结果。
 
 当前 Softmax 的语义 TISA 已按 tile 粒度生成 `load -> softmax -> store`，默认使用
 materialized row-wise lowering。可以通过 `--softmax-algorithm online` 启用分析版

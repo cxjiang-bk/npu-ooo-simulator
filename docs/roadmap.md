@@ -116,6 +116,18 @@ PyTorch model / shape / phase
 
 首批 case：ResNet50 bottleneck、BERT encoder block、GPT-J one block、LLaMA2 one block，以及确认结构后的 DeepSeek block。Prefill 与 decode 必须作为不同 case，proxy、source-derived、analytical 和 RTL-observed 结果不得混在同一统计组。
 
+当前已提供 `paper-matrix` 批处理入口：每个 registry case 只编译一次，在同一份
+`BackendArtifact` 和 buffer binding 上运行 runtime/device policy 矩阵。默认使用
+`micro` variant，并只比较 device static/dynamic；显式传入 `--runtime-device-matrix`
+才展开 runtime static/dynamic 与 device static/dynamic 的四组合。`paper_shape` 仅用于
+接近论文形状的 representative proxy，可能带来较高的编译和内存开销，不能当作完整
+模型或论文芯片的绝对性能结果。
+
+输出约定为：矩阵根目录保存 `sweep.csv/json` 和本次 `matrix_index.json`，每个
+`<case-id>/<variant>/` 保存完整的 `00_frontend` 到 `07_trace` staged artifact，策略
+专属结果位于 `policy_matrix/`。复用输出目录时应以 `matrix_index.json` 的 case 清单为准；
+旧目录不会自动删除，避免把残留结果混入统计。
+
 ## 下一阶段优先级
 
 当前最高优先级是 B：完善 symbolic/dynamic shape、layout/broadcast 和动态索引

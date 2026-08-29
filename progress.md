@@ -51,6 +51,19 @@ minimal analytical device: static 2344, dynamic 2119 cycles
 保持模型到 TISA 为当前主线：补齐动态索引/layout legalization，并确认 DeepSeek dense
 与 MoE 两条路径的 operation 边界；scheduler/backend 校准继续后置。
 
+## 2026-08-30：论文 benchmark 矩阵入口
+
+- 新增 `paper-matrix` 批处理路径：每个 registry case 只编译一次，然后在同一份
+  `BackendArtifact` 与 buffer binding 上比较 runtime/device policy；默认固定 runtime
+  为 `static`，可显式展开四组合。
+- 矩阵输出按 case/variant 保存完整 `00_frontend` 到 `07_trace`，策略专属结果位于
+  `policy_matrix/`，根目录通过 `sweep.csv/json` 汇总周期、reference、tile/TISA 数量和
+  artifact/program ID。
+- `micro` 用于快速、确定性回归；`paper_shape` 只是接近论文形状的 representative
+  proxy，可能显著增加资源开销，不能与论文芯片绝对周期直接比较。
+- 矩阵根目录写入 `matrix_index.json` 作为本次 case 清单；复用目录时应以该清单为准，
+  不把残留 case 目录纳入统计。
+
 ## 2026-08-27：阶段 1A
 
 - 完成 `stablehlo.convert` capability/import 和 dtype conversion metadata；

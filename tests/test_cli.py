@@ -25,7 +25,7 @@ class CliSurfaceTest(unittest.TestCase):
         )
         self.assertEqual(
             set(subparsers.choices),
-            {"compile-model", "import-rtl-trace", "import-rtl-log"},
+            {"compile-model", "paper-matrix", "import-rtl-trace", "import-rtl-log"},
         )
 
     def test_removed_benchmark_command_is_rejected(self) -> None:
@@ -62,6 +62,21 @@ class CliSurfaceTest(unittest.TestCase):
         )
         self.assertEqual(args.runtime_invocations, 3)
         self.assertEqual(args.runtime_inter_invocation_gap, 5)
+
+    def test_paper_matrix_accepts_registry_and_variant_configuration(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "paper-matrix",
+                "--benchmarks",
+                "bert-base,gpt-j-6b-oneblk",
+                "--variant",
+                "micro",
+                "--runtime-device-matrix",
+            ]
+        )
+        self.assertEqual(args.benchmarks, "bert-base,gpt-j-6b-oneblk")
+        self.assertEqual(args.variant, "micro")
+        self.assertTrue(args.runtime_device_matrix)
 
 
 @unittest.skipUnless(FRONTEND_AVAILABLE, "requires PyTorch, Torch-XLA and official StableHLO")
@@ -121,6 +136,50 @@ class CompileModelCliTest(unittest.TestCase):
             self.assertTrue(manifest["stablehlo_verified"])
             self.assertEqual(manifest["scheduler_target"], "tisa")
             self.assertGreater(manifest["tisa_instruction_count"], 0)
+
+    def test_paper_matrix_writes_case_summaries_without_flat_stage_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            output = Path(directory)
+            exit_code = main(
+                [
+                    "paper-matrix",
+                    "--benchmarks",
+                    "bert-base",
+                    "--tile-size",
+                    "4",
+                    "--output-dir",
+                    str(output),
+                ]
+            )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(
+                {path.name for path in output.iterdir()},
+                {
+                    "README.md",
+                    "matrix_manifest.json",
+                    "matrix_index.json",
+                    "sweep.csv",
+                    "sweep.json",
+                    "bert-base",
+                },
+            )
+            case_dir = output / "bert-base" / "micro"
+            self.assertTrue((case_dir / "summary.json").exists())
+            self.assertTrue((case_dir / "manifest.json").exists())
+            self.assertTrue((case_dir / "artifact_index.json").exists())
+            self.assertTrue((case_dir / "00_frontend" / "generated.mlir").exists())
+            self.assertTrue(
+                (case_dir / "policy_matrix" / "runtime-static__device-static_pipeline" / "06_simulation" / "summary.json").exists()
+            )
+            self.assertTrue(
+                (case_dir / "policy_matrix" / "runtime-static__device-static_pipeline" / "07_trace" / "swimlane.svg").exists()
+            )
+            self.assertFalse((output / "00_frontend").exists())
+            records = json.loads((output / "sweep.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(records), 2)
+            self.assertEqual({record["benchmark_id"] for record in records}, {"bert-base"})
+            self.assertEqual({record["artifact_id"] for record in records}, {records[0]["artifact_id"]})
 
 
 if __name__ == "__main__":

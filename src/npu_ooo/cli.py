@@ -28,7 +28,7 @@ from npu_ooo.backend import (
     load_mxu_vcs_log,
 )
 from npu_ooo.compiler import compile_torch_module
-from npu_ooo.experiments import run_runtime_device_matrix
+from npu_ooo.experiments import run_paper_benchmark_matrix, run_runtime_device_matrix
 from npu_ooo.ir import (
     allocate_buffer_bindings,
     create_runtime_sequence,
@@ -232,6 +232,88 @@ def _add_compile_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_paper_matrix_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--benchmarks",
+        default="all",
+        help="all or a comma-separated list of paper benchmark case ids",
+    )
+    parser.add_argument(
+        "--variant",
+        choices=("micro", "paper_shape"),
+        default="micro",
+        help="benchmark workload scale; micro is the default reproducible proxy",
+    )
+    parser.add_argument("--tile-size", type=int, default=32)
+    parser.add_argument(
+        "--tile-size-candidates",
+        help="comma-separated tile sizes ranked by the GC cost model",
+    )
+    parser.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
+    parser.add_argument("--machine-config", type=Path)
+    parser.add_argument("--timing-config", type=Path)
+    parser.add_argument(
+        "--timing-provider",
+        choices=default_timing_provider_registry().names(),
+        default=None,
+    )
+    parser.add_argument(
+        "--event-backend",
+        choices=default_event_backend_registry().names(),
+        default="analytical_event",
+    )
+    parser.add_argument(
+        "--codegen-backend",
+        choices=default_codegen_backend_registry().names(),
+        default="analytical",
+    )
+    parser.add_argument(
+        "--softmax-algorithm",
+        choices=("materialized", "online"),
+        default=None,
+        help="softmax strategy applied during GC/FC compilation",
+    )
+    parser.add_argument(
+        "--runtime-device-matrix",
+        action="store_true",
+        help="also vary runtime submission policy, producing four combinations per case",
+    )
+    parser.add_argument(
+        "--device-policies",
+        default="static_pipeline,dynamic_ready_queue",
+        help="comma-separated device scheduler policies",
+    )
+    parser.add_argument("--instruction-queue-depth", type=int)
+    parser.add_argument("--rob-entries", type=int)
+    parser.add_argument("--max-inflight-tiles", type=int)
+    parser.add_argument("--dependency-window", type=int)
+    parser.add_argument("--ready-queue-depth", type=int)
+    parser.add_argument("--address-scoreboard", action="store_true")
+    parser.add_argument("--memory-bank-scoreboard", action="store_true")
+    parser.add_argument(
+        "--dynamic-priority",
+        choices=("critical_path", "oldest_first"),
+        default="critical_path",
+    )
+    parser.add_argument("--runtime-chunk-size", type=int)
+    parser.add_argument("--runtime-launch-latency", type=float, default=0.0)
+    parser.add_argument("--runtime-synchronization-cycles", type=float, default=0.0)
+    parser.add_argument("--runtime-availability-config", type=Path)
+    parser.add_argument("--runtime-base-address", type=lambda value: int(value, 0), default=0x10000000)
+    parser.add_argument("--runtime-alignment", type=int, default=256)
+    parser.add_argument(
+        "--runtime-buffer-policy",
+        choices=("linear", "lifetime_reuse"),
+        default="linear",
+    )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="record an explicit error row and continue compiling other cases",
+    )
+    parser.add_argument("--output-dir", type=Path, default=Path("out/paper-matrix"))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Compile PyTorch modules to TISA and run scheduling experiments"
@@ -242,6 +324,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="PyTorch -> torch.export -> Torch-XLA -> StableHLO -> TISA -> simulator",
     )
     _add_compile_arguments(compile_model)
+
+    paper_matrix = commands.add_parser(
+        "paper-matrix",
+        help="compile the paper benchmark registry once per case and compare device policies",
+    )
+    _add_paper_matrix_arguments(paper_matrix)
 
     rtl_trace = commands.add_parser(
         "import-rtl-trace",
@@ -380,6 +468,282 @@ def _write_policy_matrix(
         json.dumps(records, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+
+def _paper_case_ids(value: str) -> tuple[str, ...] | None:
+    if value.strip().lower() == "all":
+        return None
+    case_ids = tuple(item.strip() for item in value.split(",") if item.strip())
+    if not case_ids:
+        raise ValueError("--benchmarks must be 'all' or a comma-separated list of case ids")
+    return case_ids
+
+
+def _paper_device_policies(value: str) -> tuple[str, ...]:
+    policies = tuple(item.strip() for item in value.split(",") if item.strip())
+    valid = {policy.value for policy in SchedulerPolicy}
+    if not policies or any(policy not in valid for policy in policies):
+        raise ValueError(
+            "--device-policies must contain one or more of: " + ", ".join(sorted(valid))
+        )
+    if len(set(policies)) != len(policies):
+        raise ValueError("--device-policies must not contain duplicates")
+    return policies
+
+
+def _write_compiled_case_artifacts(compiled, case_dir: Path, machine) -> None:
+    """Write the shared staged compiler artifacts for one matrix case."""
+
+    ensure_output_layout(case_dir)
+    write_artifact_json(compiled.source_frontend, case_dir / "source_frontend_import.json")
+    write_artifact_json(compiled.stablehlo, case_dir / "stablehlo_module.json")
+    (case_dir / "00_frontend" / "generated.mlir").write_text(
+        compiled.stablehlo.text, encoding="utf-8"
+    )
+    write_artifact_json(compiled.frontend, case_dir / "frontend_import.json")
+    write_artifact_json(compiled.graph, case_dir / "canonical_graph.json")
+    if compiled.gc_artifact is not None:
+        write_artifact_json(compiled.gc_artifact, case_dir / "gc_artifact.json")
+        pass_dump_dir = case_dir / "01_gc" / "pass_dumps"
+        for snapshot in compiled.gc_artifact.pass_dumps:
+            write_artifact_json(
+                snapshot,
+                pass_dump_dir / f"{snapshot.pass_index:02d}_{snapshot.pass_name}.json",
+            )
+    write_artifact_json(compiled.schedule, case_dir / "schedule.json")
+    write_artifact_json(compiled.attributes["compile_statistics"], case_dir / "compile_statistics.json")
+    write_artifact_json(compiled.tile_graph, case_dir / "tile_graph.json")
+    if compiled.tisa_dialect is not None:
+        write_artifact_json(compiled.tisa_dialect, case_dir / "tisa_dialect.json")
+        write_artifact_json(compiled.tisa_dialect.attributes, case_dir / "fc_diagnostics.json")
+    write_artifact_json(compiled.tisa_program, case_dir / "tisa_program.json")
+    write_artifact_json(compiled, case_dir / "compiled_artifact.json")
+    write_artifact_json(compiled.backend_artifact, case_dir / "backend_artifact.json")
+    write_artifact_json(compiled.backend_artifact.execution_graph, case_dir / "execution_graph.json")
+    write_artifact_json(machine, case_dir / "machine.json")
+    write_operator_graph_dot(compiled.graph, case_dir / "operator_graph.dot")
+    write_operator_graph_svg(compiled.graph, case_dir / "operator_graph.svg")
+    write_tile_graph_dot(compiled.tile_graph, case_dir / "tile_graph.dot")
+    write_execution_graph_dot(compiled.backend_artifact.execution_graph, case_dir / "execution_graph.dot")
+
+
+def _write_paper_policy_artifacts(case_dir: Path, case) -> None:
+    """Write one policy's runtime, simulation and trace artifacts."""
+
+    policy_dir = case_dir / "policy_matrix" / case.case_id
+    (policy_dir / "05_runtime").mkdir(parents=True, exist_ok=True)
+    (policy_dir / "06_simulation").mkdir(parents=True, exist_ok=True)
+    (policy_dir / "07_trace").mkdir(parents=True, exist_ok=True)
+    write_artifact_json(case.submission, policy_dir / "05_runtime" / "runtime_submission.json")
+    write_json(case.result, policy_dir / "06_simulation" / "summary.json")
+    write_csv(case.result, policy_dir / "06_simulation" / "tasks.csv")
+    write_instruction_csv(case.result, policy_dir / "06_simulation" / "tisa_instructions.csv")
+    write_svg(case.result, policy_dir / "07_trace" / "swimlane.svg")
+    write_png(case.result, policy_dir / "07_trace" / "swimlane.png")
+    write_artifact_json(case.result.perfetto_trace(), policy_dir / "07_trace" / "perfetto.json")
+
+
+def _write_paper_matrix(root: Path, matrix, machine) -> list[dict[str, Any]]:
+    root.mkdir(parents=True, exist_ok=True)
+    records: list[dict[str, Any]] = []
+    index_entries: list[dict[str, Any]] = []
+    for run in matrix.runs:
+        case_dir = root / run.case_id / run.variant
+        case_dir.mkdir(parents=True, exist_ok=True)
+        if run.compiled is not None:
+            _write_compiled_case_artifacts(run.compiled, case_dir, machine)
+        for case in run.cases:
+            _write_paper_policy_artifacts(case_dir, case)
+        case_records = [dict(record) for record in run.to_records()]
+        for record in case_records:
+            record["case_output_dir"] = str(case_dir.relative_to(root))
+            record["policy_output_dir"] = str(
+                (case_dir / "policy_matrix" / str(record["policy_case_id"])).relative_to(root)
+            ) if record.get("policy_case_id") else None
+        records.extend(case_records)
+        (case_dir / "summary.json").write_text(
+            json.dumps(case_records, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        (case_dir / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "benchmark_id": run.case_id,
+                    "variant": run.variant,
+                    "spec": dict(run.spec),
+                    "status": "error" if run.error else "ok",
+                    "error": run.error,
+                    "artifact_id": run.artifact_id,
+                    "program_id": run.program_id,
+                    "tisa_instruction_count": run.tisa_instruction_count,
+                    "tile_count": run.tile_count,
+                    "primitive_task_count": run.primitive_task_count,
+                },
+                indent=2,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        write_artifact_index(case_dir)
+        index_entries.append(
+            {
+                "benchmark_id": run.case_id,
+                "variant": run.variant,
+                "status": "error" if run.error else "ok",
+                "case_output_dir": str(case_dir.relative_to(root)),
+                "policy_output_dirs": [
+                    str((case_dir / "policy_matrix" / case.case_id).relative_to(root))
+                    for case in run.cases
+                ],
+            }
+        )
+    if records:
+        fieldnames = tuple(sorted({key for record in records for key in record}))
+        with (root / "sweep.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for record in records:
+                writer.writerow(
+                    {
+                        key: json.dumps(value, ensure_ascii=False, sort_keys=True)
+                        if isinstance(value, (dict, list, tuple))
+                        else value
+                        for key, value in record.items()
+                    }
+                )
+    (root / "sweep.json").write_text(
+        json.dumps(records, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (root / "matrix_index.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "variant": matrix.variant,
+                "case_count": len(index_entries),
+                "cases": index_entries,
+            },
+            indent=2,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (root / "README.md").write_text(
+        "# 论文模型矩阵\n\n"
+        "每个 benchmark 只编译一次，然后在同一份 TISA/backend artifact 和 buffer binding 上比较设备调度策略。"
+        "默认 runtime 固定为 static，只改变 device policy；使用 `--runtime-device-matrix` 才会展开四组合。\n\n"
+        "`sweep.csv/json` 是跨 case 汇总；每个 `<benchmark>/<variant>/` 目录保存该 case 的汇总和 manifest。"
+        "`matrix_index.json` 是本次运行实际 case 的权威索引；复用 output 目录时，旧 case 目录可能仍存在，"
+        "应以该索引而不是目录枚举为准。当前 workload 是 scaled micro 或 representative paper_shape proxy，"
+        "reference 字段来自论文，不能与 analytical cycle 混为绝对性能。\n",
+        encoding="utf-8",
+    )
+    return records
+
+
+def run_paper_matrix(args: argparse.Namespace) -> int:
+    if args.variant == "paper_shape":
+        print(
+            "warning: paper_shape uses representative large inputs and may require substantial "
+            "compile time and memory; it is not a full-model or absolute paper-performance run",
+            file=sys.stderr,
+        )
+    machine = _machine(args.arch, args.machine_config)
+    if args.softmax_algorithm is not None:
+        machine = replace(
+            machine,
+            attributes={
+                **dict(machine.attributes),
+                "softmax_algorithm": args.softmax_algorithm,
+            },
+        )
+    tile_size_candidates = (
+        _parse_positive_int_list(args.tile_size_candidates, name="--tile-size-candidates")
+        if args.tile_size_candidates
+        else None
+    )
+    simulator_config = SimulatorConfig(
+        instruction_queue_depth=args.instruction_queue_depth,
+        rob_entries=args.rob_entries,
+        max_inflight_tiles=args.max_inflight_tiles,
+        dependency_window=args.dependency_window,
+        ready_queue_depth=args.ready_queue_depth,
+        address_scoreboard=args.address_scoreboard,
+        memory_bank_scoreboard=args.memory_bank_scoreboard,
+        dynamic_priority=args.dynamic_priority,
+    )
+    timing_model = _timing_model(args.timing_config, args.timing_provider)
+    event_backend = default_event_backend_registry().create(args.event_backend)
+    codegen_backend = default_codegen_backend_registry().create(args.codegen_backend)
+    device_policies = _paper_device_policies(args.device_policies)
+    descriptor_availability = _descriptor_availability(args.runtime_availability_config)
+    runtime_policies = (
+        ("static", "dynamic_ready_queue")
+        if args.runtime_device_matrix
+        else ("static",)
+    )
+    matrix = run_paper_benchmark_matrix(
+        machine,
+        case_ids=_paper_case_ids(args.benchmarks),
+        variant=args.variant,
+        tile_size=args.tile_size,
+        tile_size_candidates=tile_size_candidates,
+        runtime_policies=runtime_policies,
+        device_policies=device_policies,
+        runtime_chunk_size=args.runtime_chunk_size,
+        runtime_launch_latency=args.runtime_launch_latency,
+        runtime_synchronization_cycles=args.runtime_synchronization_cycles,
+        descriptor_available_cycles=descriptor_availability,
+        runtime_base_address=args.runtime_base_address,
+        runtime_alignment=args.runtime_alignment,
+        runtime_buffer_policy=args.runtime_buffer_policy,
+        softmax_algorithm=args.softmax_algorithm,
+        timing_model=timing_model,
+        simulator_config=simulator_config,
+        event_backend=event_backend,
+        codegen_backend=codegen_backend,
+        continue_on_error=args.continue_on_error,
+    )
+    records = _write_paper_matrix(args.output_dir, matrix, machine)
+    manifest = {
+        "schema_version": 1,
+        "variant": args.variant,
+        "benchmarks": [run.case_id for run in matrix.runs],
+        "architecture": args.arch,
+        "machine_hash": machine.stable_hash(),
+        "tile_size": args.tile_size,
+        "tile_size_candidates": list(tile_size_candidates or (args.tile_size,)),
+        "softmax_algorithm": machine.attributes.get("softmax_algorithm", "materialized"),
+        "codegen_backend": codegen_backend.name,
+        "runtime_policies": list(runtime_policies),
+        "device_policies": list(device_policies),
+        "timing_provider": getattr(timing_model, "name", "analytical"),
+        "event_backend": event_backend.name,
+        "record_count": len(records),
+        "failed_cases": [run.case_id for run in matrix.runs if run.error],
+    }
+    (args.output_dir / "matrix_manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    print(
+        json.dumps(
+            {
+                "output_dir": str(args.output_dir),
+                "case_count": len(matrix.runs),
+                "record_count": len(records),
+                "failed_cases": manifest["failed_cases"],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    return 1 if manifest["failed_cases"] else 0
 
 
 def run_compile_model(args: argparse.Namespace) -> int:
@@ -635,6 +999,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     runners = {
         "compile-model": run_compile_model,
+        "paper-matrix": run_paper_matrix,
         "import-rtl-trace": run_import_rtl_trace,
         "import-rtl-log": run_import_rtl_log,
     }

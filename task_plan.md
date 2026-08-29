@@ -76,6 +76,20 @@ PyTorch module / input shape / phase
 
 prefill 与 decode 必须是不同 case；analytical、source-derived 和 RTL-observed 结果必须分组统计。完成 one-block 后再扩展 full-model repetition 和 request-level runtime。
 
+当前矩阵入口与输出契约：
+
+- [x] `paper-matrix` 对 registry case 执行一次编译并复用同一 `BackendArtifact`、
+  `program_id` 和 buffer binding；
+- [x] 默认比较 device static/dynamic，显式 `--runtime-device-matrix` 才运行四组合；
+- [x] 为每个 `<case-id>/<variant>/` 保存完整 staged compiler artifact，并将策略结果放入
+  `policy_matrix/`；
+- [x] 在矩阵根目录写入 `matrix_index.json`，用于识别本次 case 清单并诊断旧输出目录；
+- [ ] 补齐 full-model repetition、request-level runtime，以及 source-derived/RTL-observed
+  分组统计。
+
+`micro` 是默认快速 proxy；`paper_shape` 只用于接近论文形状的代表性输入，预计需要
+更大的内存和更长的编译时间，不能直接替代完整论文 benchmark。
+
 ## 当前下一步
 
 ### 阶段 1A：公共 StableHLO 前端稳定性
