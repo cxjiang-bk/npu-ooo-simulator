@@ -226,6 +226,52 @@ class CompilerStageContractTest(unittest.TestCase):
         self.assertGreater(result.total_cycles, 0)
         self.assertEqual(result.metrics["calibration_status"], "analytical")
 
+    def test_planner_ranks_tile_size_candidates_and_records_costs(self) -> None:
+        graph = OperatorGraph(
+            graph_id="candidate-plan-test",
+            tensors=(
+                TensorSpec("lhs", (16, 16)),
+                TensorSpec("rhs", (16, 16)),
+                TensorSpec("out", (16, 16)),
+            ),
+            operators=(
+                OperatorSpec(
+                    op_id="mm",
+                    op_type="matmul",
+                    inputs=("lhs", "rhs"),
+                    outputs=("out",),
+                    iteration_dims=(("M", 16), ("N", 16)),
+                    reduction_dims=(("K", 16),),
+                ),
+            ),
+        )
+        frontend, stablehlo = _stable_frontend(graph)
+        compiled = compile_operator_graph(
+            graph,
+            minimal_machine_config(),
+            frontend=frontend,
+            source_frontend=frontend,
+            stablehlo=stablehlo,
+            tile_size=4,
+            tile_size_candidates=(2, 4, 8),
+        )
+
+        candidate_costs = compiled.schedule.attributes["candidate_costs"]
+        self.assertEqual(set(candidate_costs), {"2", "4", "8"})
+        self.assertEqual(compiled.schedule.attributes["selected_tile_size"], 8)
+        self.assertEqual(
+            compiled.schedule.for_operator("mm").tile_size_map,
+            {"M": 8, "N": 8, "K": 8},
+        )
+        self.assertEqual(
+            compiled.schedule.attributes["selected_tile_size"],
+            min(
+                (int(size) for size, cost in candidate_costs.items()),
+                key=lambda size: (candidate_costs[str(size)]["score"], size),
+            ),
+        )
+        self.assertEqual(compiled.validate(), ())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -168,6 +168,12 @@ StableHLO semantic capability
 
 不要新增按模型名或算子名分支的 CLI/builder 路线。
 
+GC 默认使用 `--tile-size` 生成确定性 baseline；研究多个切分方案时可传入
+`--tile-size-candidates 2,4,8`。planner 会基于 tile 数、估算计算周期、root traffic
+和 local working-set overflow 选择一个候选，并在 `01_gc/schedule.json` 的
+`candidate_costs`、`selected_tile_size` 中保留可审计的评分。该 cost model 只用于编译期
+排序，不替代后端 timing provider，也不会让 static/dynamic 使用不同的 compiled artifact。
+
 单条 StableHLO operation 的导入能力由 `StableHLOOpCapabilityRegistry` 管理；
 Softmax、Norm 等多节点语义恢复由独立的 `SemanticFusionPatternRegistry` 管理。
 后者只接受已经证明 shape、常量和数据流等价的图 pattern，不能用来吞掉未知

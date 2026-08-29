@@ -8,7 +8,7 @@ to inspect and validate.
 """
 
 from dataclasses import dataclass, field, replace
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from npu_ooo.arch import MachineConfig
 from npu_ooo.ir import OperatorGraph, ScheduleSpec, TileGraph, build_tile_graph
@@ -63,6 +63,7 @@ class GraphCompiler:
         machine: MachineConfig,
         *,
         tile_size: int = 32,
+        tile_size_candidates: Sequence[int] | None = None,
     ) -> GCArtifact:
         graph_issues = graph.validate()
         machine_issues = machine.validate()
@@ -96,6 +97,7 @@ class GraphCompiler:
             canonical_graph,
             tile_size=tile_size,
             machine=machine,
+            tile_size_candidates=tile_size_candidates,
         )
         tile_graph = build_tile_graph(canonical_graph, schedule)
         schedule = replace(

@@ -141,6 +141,10 @@ def _add_compile_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model-id")
     parser.add_argument("--tile-size", type=int, default=32)
     parser.add_argument(
+        "--tile-size-candidates",
+        help="comma-separated tile sizes ranked by the GC cost model",
+    )
+    parser.add_argument(
         "--softmax-algorithm",
         choices=("materialized", "online"),
         default=None,
@@ -385,6 +389,11 @@ def run_compile_model(args: argparse.Namespace) -> int:
         args.input_dtype,
     )
     machine = _machine(args.arch, args.machine_config)
+    tile_size_candidates = (
+        _parse_positive_int_list(args.tile_size_candidates, name="--tile-size-candidates")
+        if args.tile_size_candidates
+        else None
+    )
     if args.softmax_algorithm is not None:
         machine = replace(
             machine,
@@ -400,6 +409,7 @@ def run_compile_model(args: argparse.Namespace) -> int:
         machine,
         model_id=args.model_id or factory_name,
         tile_size=args.tile_size,
+        tile_size_candidates=tile_size_candidates,
         codegen_backend=codegen_backend,
     )
 

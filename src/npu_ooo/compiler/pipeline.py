@@ -102,6 +102,7 @@ def compile_operator_graph(
     source_frontend: FrontendImport,
     stablehlo: OfficialStableHLOModule,
     tile_size: int = 32,
+    tile_size_candidates: Sequence[int] | None = None,
     registry: LoweringRegistry | None = None,
     codegen_backend: CodegenBackend | None = None,
 ) -> CompiledArtifact:
@@ -118,6 +119,7 @@ def compile_operator_graph(
         graph,
         machine,
         tile_size=tile_size,
+        tile_size_candidates=tile_size_candidates,
     )
     graph = gc_artifact.graph
     frontend = replace(
@@ -217,6 +219,7 @@ def compile_torch_module(
     model_id: str = "torch_model",
     shape_environment: Mapping[str, int] | None = None,
     tile_size: int = 32,
+    tile_size_candidates: Sequence[int] | None = None,
     registry: LoweringRegistry | None = None,
     codegen_backend: CodegenBackend | None = None,
 ) -> CompiledArtifact:
@@ -280,6 +283,7 @@ def compile_torch_module(
         source_frontend=source_frontend,
         stablehlo=stablehlo,
         tile_size=tile_size,
+        tile_size_candidates=tile_size_candidates,
         registry=registry,
         codegen_backend=codegen_backend,
     )

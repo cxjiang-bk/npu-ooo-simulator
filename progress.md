@@ -137,3 +137,15 @@ DeepSeek dense 与 MoE 两条路径的 operation 边界；scheduler/backend 校�
 pooling 使用 N/C-preserving `reduce_window`，平均池化的除法仍由后续 elementwise
 operation 表达。完整 ResNet50 的 stem 7x7、stride/downsample、全层 repetition 还未
 形成论文规模实验矩阵。
+
+## 2026-08-29：GC tile candidate cost model
+
+- `SchedulePlanner` 从单一 heuristic baseline 升级为可审计的 `cost-model-v1`，支持
+  `tile_size_candidates`；候选依据 tile 数、估算计算周期、root traffic 和 local
+  working-set overflow 排序，tie-break 使用较小 tile size。
+- `compile_torch_module`、`compile_operator_graph` 和 CLI 新增
+  `--tile-size-candidates 2,4,8`；最终只选择一份 schedule，因此 static/dynamic 仍严格
+  复用同一 TISA/backend artifact。
+- `ScheduleSpec` 保存 `candidate_costs`、`selected_tile_size` 和模型版本，方便把编译
+  选择与后端实际周期分开分析；该模型不是 RTL timing。
+- 新增 planner regression；全量回归为 96 tests passed。

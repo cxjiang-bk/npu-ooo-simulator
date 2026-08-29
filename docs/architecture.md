@@ -230,6 +230,12 @@ loop_order = iteration dims + reduction dims
 stage_id = operator topological order
 ```
 
+当 CLI 提供 `--tile-size-candidates` 时，GC 对每个候选生成同一套 semantic schedule，
+用 `cost-model-v1` 估算 tile 数、tile-local compute、root-memory traffic 和 local
+working-set overflow，选择分数最低且 tile size 最小优先的方案。候选分数写入
+`ScheduleSpec.attributes.candidate_costs`；这只是可解释的编译期 ranking，不改变 TISA
+语义，也不替代 EventBackend 的执行时序。
+
 在 `MachineConfig` 可用时，planner 还生成 capacity-aware 的 residency intent：
 优先将当前 operator 的输入/输出放入 root 的第一级 local memory，超出容量的
 tensor 保留在 root memory。多 tile operator 会附带 `ping_pong` 计划，描述两个

@@ -47,7 +47,7 @@
 - [x] 为 FC/TISA `TileMem` 增加 concrete stride、stride expression 和 layout metadata；
 - [x] 输出 per-operator tile、TISA、MAC、root traffic 和 dependency statistics；
 - [x] 输出每个 pass 前后的独立 graph dump；
-- [ ] 为多种 tile candidate 增加可解释 cost model。
+- [x] 为多种 tile candidate 增加可解释 cost model。
 
 验收：相同 module、shape、tile size、MachineConfig 和 backend 产生稳定 compiled artifact；static/dynamic 只改变 policy。
 
