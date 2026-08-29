@@ -82,7 +82,7 @@ prefill 与 decode 必须是不同 case；analytical、source-derived 和 RTL-ob
 - [x] 未注册 StableHLO operation 显式报告缺失 capability 与已知 operation 集合；
 - [ ] scalar/multi-result/layout/broadcast 的通用 metadata；
   - [x] 静态 `broadcast_in_dim` 输出域 tile、源 operand region 与边界 tile 契约；
-  - [ ] scalar elementwise operand 的零秩/常量 metadata 与 tile region 契约；
+  - [x] scalar elementwise operand 的零秩/常量 metadata 与 tile region 契约；
 - [ ] Torch-XLA/PJRT dtype 兼容性矩阵和严格/fallback policy。
 
 ### 阶段 1B：模型到 TISA 的语义覆盖
@@ -106,3 +106,9 @@ prefill 与 decode 必须是不同 case；analytical、source-derived 和 RTL-ob
 
 阶段 1C 的 contract 仍只覆盖固定窗口、静态 shape、unit stride 和顺序 decode；动态
 position 写入、跨 request 生命周期和真实 cache layout 留到后续阶段。
+
+## Errors Encountered
+
+| Error | Attempt | Resolution |
+|---|---:|---|
+| Scalar constants caused reduce lowering to see two inputs | 1 | Keep reducer-init SSA value in `constant_args`; canonical reduce retains only the first data operand |

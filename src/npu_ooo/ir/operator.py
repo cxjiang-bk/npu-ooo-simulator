@@ -69,8 +69,9 @@ class TensorSpec:
         issues: list[str] = []
         if not self.name:
             issues.append("tensor name must not be empty")
-        if not self.shape:
-            issues.append(f"tensor '{self.name}' must have at least one dimension")
+        # StableHLO permits zero-rank tensors.  They are used for scalar
+        # constants/operands and must remain rank-0 through the compiler
+        # boundary instead of being rewritten as a length-one vector.
         for index, value in enumerate(self.shape):
             try:
                 _validate_shape_value(value, context=f"tensor '{self.name}' dim {index}")

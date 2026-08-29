@@ -57,6 +57,25 @@ class StableHLOCapabilityBoundaryTest(unittest.TestCase):
         self.assertEqual(operator.attributes["target_dtype"], "f16")
         self.assertEqual(operator.attributes["conversion_kind"], "dtype_cast")
 
+    def test_scalar_constant_remains_rank_zero_operand(self) -> None:
+        imported = StableHLOAdapter.from_text(
+            """
+            module {
+              func.func @main(%arg0: tensor<2x3xf32>) -> tensor<2x3xf32> {
+                %c = stablehlo.constant dense<1.0> : tensor<f32>
+                %0 = stablehlo.add %arg0, %c : (tensor<2x3xf32>, tensor<f32>) -> tensor<2x3xf32>
+                return %0 : tensor<2x3xf32>
+              }
+            }
+            """
+        )
+
+        tensors = {tensor.name: tensor for tensor in imported.graph.tensors}
+        operator = imported.graph.operators[0]
+        self.assertEqual(tensors["c"].shape, ())
+        self.assertEqual(tensors["c"].attributes["constant_value"], 1.0)
+        self.assertEqual(operator.inputs, ("arg0", "c"))
+
     def test_unknown_operation_reports_missing_capability_and_known_set(self) -> None:
         with self.assertRaisesRegex(
             FrontendImportError,

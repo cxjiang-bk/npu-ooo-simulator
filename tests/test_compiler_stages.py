@@ -272,6 +272,56 @@ class CompilerStageContractTest(unittest.TestCase):
         )
         self.assertEqual(compiled.validate(), ())
 
+    def test_scalar_elementwise_operand_preserves_rank_zero_metadata(self) -> None:
+        graph = OperatorGraph(
+            graph_id="scalar-elementwise-test",
+            tensors=(
+                TensorSpec("value", (4, 3), dtype="f32"),
+                TensorSpec(
+                    "scalar",
+                    (),
+                    dtype="f32",
+                    attributes={"source_kind": "constant", "constant_value": 1.0},
+                ),
+                TensorSpec("out", (4, 3), dtype="f32"),
+            ),
+            operators=(
+                OperatorSpec(
+                    op_id="add",
+                    op_type="elementwise",
+                    inputs=("value", "scalar"),
+                    outputs=("out",),
+                    iteration_dims=(("m", 4), ("n", 3)),
+                    attributes={
+                        "semantic_op": "add",
+                        "frontend_target": "stablehlo.add",
+                        "operand_arity": 2,
+                    },
+                ),
+            ),
+        )
+        frontend, stablehlo = _stable_frontend(graph)
+        compiled = compile_operator_graph(
+            graph,
+            minimal_machine_config(),
+            frontend=frontend,
+            source_frontend=frontend,
+            stablehlo=stablehlo,
+            tile_size=2,
+        )
+
+        scalar_operands = [
+            operand
+            for instruction in compiled.tisa_program.instructions
+            for operand in instruction.operands
+            if operand.tile_mem.tensor == "scalar"
+        ]
+        self.assertTrue(scalar_operands)
+        self.assertTrue(all(operand.tile_shape == () for operand in scalar_operands))
+        self.assertTrue(all(operand.tile_mem.strides_bytes == () for operand in scalar_operands))
+        self.assertTrue(all(operand.tile_mem.size_bytes == 4 for operand in scalar_operands))
+        self.assertEqual(compiled.validate(), ())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -174,3 +174,14 @@ operation 表达。完整 ResNet50 的 stem 7x7、stride/downsample、全层 rep
 - analytical transform backend 为每个广播 tile 生成独立 copy payload，并通过 root
   region overlap 建立跨算子依赖；真实 PyTorch `bias + value` 回归覆盖 12 个 tile。
 - 定向与全量回归：98 tests passed；本项尚未提交，下一步补 scalar operand 语义。
+
+## 2026-08-30：scalar elementwise operand
+
+- `TensorSpec`、`BufferRegion`、`TISAOperand` 接受合法零秩 shape `()`；不再把 scalar
+  伪装为 `(1,)`。
+- StableHLO constant importer 保留 `tensor<f32>` 常量 tensor、`constant_value` 和真实
+  elementwise input；TISA/analytical/backend/runtime 均按单元素、4-byte 区间处理。
+- 新增 StableHLO capability 与 GC/FC 端到端回归。
+- 兼容性修复：StableHLO `reduce` 的 reducer-init scalar 明确留在 `constant_args`，不再
+  被误当作第二个 canonical data input。
+- 全量回归：100 tests passed。

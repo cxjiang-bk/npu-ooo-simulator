@@ -48,9 +48,9 @@ class TileMem:
         if not self.layout or not self.layout.strip():
             issues.append("TISA TileMem layout must not be blank")
         if self.strides_bytes is not None:
-            if not self.strides_bytes:
-                issues.append("TISA TileMem strides_bytes must not be empty")
-            elif any(
+            # A rank-0 tensor has no stride axes; ``()`` is its complete
+            # concrete stride metadata and is distinct from missing metadata.
+            if any(
                 isinstance(value, bool)
                 or not isinstance(value, int)
                 or value < 0
@@ -92,8 +92,8 @@ class TISAOperand:
         issues: list[str] = []
         if not self.name:
             issues.append("TISA operand name must not be empty")
-        if not self.tile_shape or any(value <= 0 for value in self.tile_shape):
-            issues.append(f"TISA operand '{self.name}' tile_shape must be positive")
+        if any(value <= 0 for value in self.tile_shape):
+            issues.append(f"TISA operand '{self.name}' tile_shape values must be positive")
         if self.normalized_access not in {item.value for item in AccessType}:
             issues.append(f"TISA operand '{self.name}' has invalid access type '{self.normalized_access}'")
         issues.extend(self.tile_mem.validate())

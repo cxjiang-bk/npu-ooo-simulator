@@ -316,7 +316,10 @@ def _graph_from_text(text: str, *, graph_id: str) -> OperatorGraph:
         if target.endswith(".constant"):
             constants[result_name] = _constant_value(body)
             normalized_name = result_name.removeprefix("%")
-            if result_shape:
+            # Keep scalar constants as rank-0 tensors.  The empty tuple is a
+            # valid StableHLO shape; checking for ``is not None`` avoids
+            # silently dropping ``tensor<f32>`` operands from later ops.
+            if result_shape is not None:
                 tensors[normalized_name] = TensorSpec(
                     name=normalized_name,
                     shape=result_shape,
@@ -325,6 +328,7 @@ def _graph_from_text(text: str, *, graph_id: str) -> OperatorGraph:
                         "source_kind": "constant",
                         "source_node": normalized_name,
                         "frontend_target": target,
+                        "constant_value": constants[result_name],
                     },
                 )
             continue
@@ -603,6 +607,10 @@ def _graph_from_text(text: str, *, graph_id: str) -> OperatorGraph:
             if batch_lhs_dims or rhs_batch or len(lhs) > 2 or len(rhs) > 2:
                 op_type = SemanticOpType.BATCHED_MATMUL.value
         elif op_type == SemanticOpType.REDUCE.value:
+            # StableHLO reduce has one data operand followed by a scalar
+            # reducer-init operand.  The init value is semantic metadata, not
+            # a second tensor input to the canonical reduce operator.
+            input_names = (input_names[0],)
             axes = _dimensions(body, len(input_shapes[0]))
             reduction_dims = tuple((f"d{axis}", input_shapes[0][axis]) for axis in axes)
             iteration_dims = tuple(

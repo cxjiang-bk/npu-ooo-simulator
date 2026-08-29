@@ -105,6 +105,12 @@ PyTorch nn.Module
 
 ## 2026-08-27：阶段 1A 首个增量
 
+## 2026-08-30：scalar reduce compatibility
+
+- 引入零秩常量后，StableHLO `reduce` 的 init SSA value 也会进入 tensor map；因此 reduce
+  projection 必须显式裁剪为单个数据输入，同时把 init 保留在 `constant_args`，否则既有
+  norm/attention 图会在 analytical lowering 阶段失败。
+
 - `stablehlo.convert` 已注册为单操作 elementwise capability；Canonical Operator 保留
   `source_dtype`、`target_dtype`、`conversion_kind=dtype_cast`，并验证 convert 不改变 shape。
 - 未注册 operation 现在会报告原始/规范化名称、缺失的 `StableHLOOpCapability` 注册项和

@@ -40,8 +40,8 @@ class BufferRegion:
         issues: list[str] = []
         if not self.tensor or not self.memory:
             issues.append("buffer region tensor and memory must not be empty")
-        if len(self.shape) != len(self.starts) or not self.shape:
-            issues.append(f"buffer region '{self.tensor}' shape and starts must have equal non-zero rank")
+        if len(self.shape) != len(self.starts):
+            issues.append(f"buffer region '{self.tensor}' shape and starts must have equal rank")
         if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in self.shape):
             issues.append(f"buffer region '{self.tensor}' shape values must be positive")
         if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in self.starts):
