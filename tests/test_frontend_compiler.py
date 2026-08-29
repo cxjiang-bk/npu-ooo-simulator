@@ -443,6 +443,28 @@ class PyTorchFrontendTest(unittest.TestCase):
         self.assertEqual(compiled.graph.tensors[-1].shape, (2, 4))
         self.assertEqual(compiled.validate(), ())
 
+    def test_dynamic_reshape_from_torch_xla_is_specialized_before_import(self) -> None:
+        import torch
+
+        class DynamicFlatten(torch.nn.Module):
+            def forward(self, value):
+                return value.reshape(value.shape[0], -1)
+
+        dynamic_batch = torch.export.Dim("batch", min=1, max=4)
+        compiled = compile_torch_module(
+            DynamicFlatten(),
+            (torch.randn(2, 3, 4),),
+            minimal_machine_config(),
+            dynamic_shapes={"value": {0: dynamic_batch}},
+            shape_environment={"batch": 2},
+            model_id="dynamic-flatten",
+            tile_size=2,
+        )
+        self.assertNotIn("stablehlo.dynamic_reshape", compiled.stablehlo.text)
+        self.assertNotIn("stablehlo.get_dimension_size", compiled.stablehlo.text)
+        self.assertEqual(compiled.graph.tensors[-1].shape, (2, 12))
+        self.assertEqual(compiled.validate(), ())
+
 
 if __name__ == "__main__":
     unittest.main()
