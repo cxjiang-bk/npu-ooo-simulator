@@ -45,7 +45,8 @@ minimal analytical device: static 2344, dynamic 2119 cycles
 - 当前 MXU VCS log 主要提供 descriptor-to-completion 区间；
 - GC 当前只生成 completion-boundary readiness；真实 partial-tile producer 语义仍需由 backend/calibration 端接入；
 - memory bank scoreboard 目前是 analytical structural-conflict model，不是 cycle-accurate SRAM/DRAM backend；logical scope 且无 runtime physical binding 时不会强行猜测 bank；
-- 论文规模的完整 ResNet50、BERT、GPT-J、LLaMA2、DeepSeek block 尚未形成可复现实验集；
+- 六个 benchmark 已形成可复现的 micro proxy 矩阵；论文规模的完整 ResNet50、BERT、
+  GPT-J、LLaMA2、DeepSeek block 以及 full-model repetition 仍不在范围内；
   当前已具备 ResNet bottleneck、BERT/GPT-J/LLaMA2/DeepSeek dense one-block micro case。
 
 ## 下一步
