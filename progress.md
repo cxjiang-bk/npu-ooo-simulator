@@ -1,250 +1,110 @@
 # 当前进度
 
-## 已完成
+## 当前快照
 
-- 唯一生产入口：`compile-model --torch-module MODULE:CLASS_OR_FACTORY`；
-- 完整前端链路：`PyTorch -> torch.export -> Torch-XLA -> official StableHLO -> Canonical IR`；
-- StableHLO 官方 parse/verify 与 semantic capability boundary；
-- 自动 graph pass、tile planner、TISA dialect semantic builder 和 analytical backend payload；
-- TISA instruction 粒度 static/dynamic device scheduler；
-- runtime 地址分配、command chunk、descriptor availability 和 runtime/device 四组合矩阵；
-- 可配置 MachineConfig、codegen/timing/event registry；
-- staged output：`00_frontend` 到 `07_trace`、manifest、artifact index、SVG/PNG/Perfetto；
-- MXU RTL completion trace 和 VCS console log 的离线 profile importer；
-- 删除手写 benchmark、直接 StableHLO/JSON 输入和旧 primitive scheduler 生产入口；
-- 54 个回归测试、真实 attention CLI smoke 均通过。
-- 首个两头 Attention block 已覆盖 head reshape/permute、scale、additive mask、Softmax、PV、output projection 和 residual；
-- reshape/transpose 已生成 DMA-bound TISA transform，TileGraph 已使用逻辑 tensor region 建边；
-- `compile_statistics.json` 已输出 per-operator tile/TISA/payload、MAC、root traffic 和 dependency 统计；
-- 当前回归为 62 项；一次编译的四组合实验中 device static=2344、dynamic=2119 analytical cycles。
-- TISA readiness 已增加 completion-boundary 解释器和显式 `payload_ready:<task_id>` partial-ready 原型；后者可在 source payload 完成前唤醒依赖，并输出 `TISA_PARTIAL_READY` trace 事件。
-- 已接入可选 memory bank/port scoreboard：依据 `MachineConfig.memory_levels` 的 bank 和读写端口容量记录结构冲突；默认关闭，不改变既有 baseline。
-- GC 的 LayerNorm recovery 已改为 fixed-point pass，可完整处理同一 module 中多个 Torch-XLA `batch_norm_training` 规范化节点。
-- RMSNorm recovery 已支持 Torch-XLA 的 `power -> reduce -> rsqrt -> affine` 形式及中间 reshape，并在 backend payload 中建模 affine weight read。
-- 首个真实 PyTorch pre-norm decoder block 已编译并完成 static/dynamic device 仿真，覆盖 RMSNorm、multi-head attention、masked Softmax、residual 和 SwiGLU/MLP；RoPE 与 KV-cache 尚未加入。
-
-## 真实验证
+项目处于“模型到 TISA 语义稳定、后端校准扩展”的阶段。生产链路和实验目录已经固定：
 
 ```text
-Python 3.12
-torch 2.9.1
-torch-xla 2.9.0
-StableHLO 1.12.1...
-multi-head attention: 48 tiles, 121 TISA instructions
-minimal analytical device: static 2344, dynamic 2119 cycles
+PyTorch nn.Module
+  -> torch.export
+  -> Torch-XLA StableHLO
+  -> official StableHLO verify/import
+  -> GC / TileGraph
+  -> FC / TISA dialect
+  -> TISAProgram / BackendArtifact
+  -> RuntimeSubmission
+  -> static 或 dynamic device scheduler
+  -> analytical / calibrated backend
+  -> cycles、stall、swimlane、Perfetto
 ```
 
-## 当前限制
+当前回归：119 tests passed，`git diff --check` clean。
 
-- StableHLO semantic importer 仍只覆盖已注册 operation；
-- tile planner 已有可审计的 candidate cost model，但仍是确定性启发式，尚无硬件校准的 autotuning；
-- reshape/transpose 仍是 full-tensor transform；symbolic/dynamic shape 已完成广播、常量起点
-  `dynamic_slice` 和常量 shape `dynamic_reshape` specialization 子集，stride-aware layout
-  只支持显式 stride metadata；
-- analytical event backend 不是 RTL cycle-accurate；
-- 当前 MXU VCS log 主要提供 descriptor-to-completion 区间；
-- GC 当前只生成 completion-boundary readiness；真实 partial-tile producer 语义仍需由 backend/calibration 端接入；
-- memory bank scoreboard 目前是 analytical structural-conflict model，不是 cycle-accurate SRAM/DRAM backend；logical scope 且无 runtime physical binding 时不会强行猜测 bank；
-- 六个 benchmark 已形成可复现的 micro proxy 矩阵；论文规模的完整 ResNet50、BERT、
-  GPT-J、LLaMA2、DeepSeek block 以及 full-model repetition 仍不在范围内；
-  当前已具备 ResNet bottleneck、BERT/GPT-J/LLaMA2/DeepSeek dense one-block micro case。
+## 已交付能力
+
+### 前端与编译
+
+- 统一入口 `compile-model --torch-module MODULE:CLASS`；
+- torch.export 源图 provenance、Torch-XLA StableHLO 导出和官方 MLIR parse/verify；
+- StableHLO operation capability registry、semantic fusion/recovery registry；
+- GC pass pipeline、固定点规范化、tile planner、candidate cost model；
+- region-aware dependency、卷积/池化 halo、静态 broadcast、scalar region；
+- TileMem 的 stride、layout、dtype metadata；
+- 常量 dynamic broadcast、dynamic_slice、dynamic_reshape specialization；
+- GC/FC/TISA 三阶段 artifact 与逐 pass dump；
+- materialized/online Softmax payload 属性。
+
+### 模型 benchmark
+
+- 两头 multi-head Attention；
+- pre-norm decoder block：RMSNorm、Attention、residual、SwiGLU/MLP；
+- BERT、GPT-J、LLaMA2、DeepSeek dense one-block；
+- LLaMA2 RoPE、固定窗口 KV-cache、prefill/decode micro；
+- ResNet bottleneck micro：Conv2D、BatchNorm inference、ReLU、MaxPool；
+- registry 六个 case 与 paper-matrix 批处理。
+
+### Runtime、scheduler 与 backend
+
+- RuntimeSubmission 的地址绑定、command chunk、descriptor arrival；
+- RuntimeStateRegistry、RuntimeSequence 和 state-complete invocation 链；
+- static_pipeline 与 dynamic_ready_queue 共用同一 BackendArtifact；
+- queue/ROB/window、UnitMap 资源、typed dependency、address scoreboard；
+- 可选 memory bank/port structural-conflict model；
+- analytical、timing table、systolic MXU profile 和 RTL completion importer；
+- staged output、周期/stall 汇总、泳道图和 Perfetto trace。
+
+## 当前能力边界
+
+以下能力已定义为后续扩展项，并在编译或运行时保留清晰的语义入口：
+
+- dynamic index 与 dynamic_update_slice：扩展 dynamic index metadata、state binding 和
+  runtime address expression；
+- stride-aware transform 与完整动态 layout：扩展可验证 stride、layout lowering 和
+  memory timing；
+- online Softmax 数值实现：扩展 rescale、最终 normalization 和 workspace 生命周期；
+- 完整 ResNet/BERT/GPT-J/LLaMA2 repetition 与 DeepSeek MoE routing；
+- 论文 WQ/IQ/Fu 容量、dispatch/wake-up/issue/completion 控制开销校准；
+- SCALE-Sim、Ramulator2/DRAMSys、RTL/Verilator 和 system simulator backend。
+
+当前默认结果标签为 TISA instruction-level analytical scheduling baseline。RTL profile
+加载后，manifest 记录 source、interval、aggregation 和 calibration status。
+
+## 关键里程碑
+
+### 2026-08-29：Runtime state 与 LLaMA2 decode
+
+固定窗口 KV-cache 通过 `state_id/state_buffer` 建立 persistent binding；两次 invocation
+复用同一 BackendArtifact，由 `state_complete` 串联并合并事件。LLaMA2 decode one-block
+生成 scaled micro workload，输出包含 runtime sequence artifact。
+
+### 2026-08-29：ResNet capability
+
+官方 StableHLO convolution、batch_norm_inference、reduce_window capability 接入
+Canonical/GC/FC/backend。卷积和 pooling 的 halo region 进入 TileMem 与 dependency。
+
+### 2026-08-29：GC cost model
+
+SchedulePlanner 支持 tile candidate、计算/traffic/working-set cost，并记录
+`candidate_costs` 与 `selected_tile_size`。
+
+### 2026-08-30：shape、layout、dtype 语义
+
+dynamic broadcast、常量 dynamic_slice、常量 dynamic_reshape specialization 接入官方
+StableHLO verify；scalar tensor、layout encoding、dtype policy 和 multi-result boundary
+进入 Canonical/TISA contract。
+
+### 2026-08-30：论文矩阵
+
+六个 registry case 使用统一 paper-matrix 入口。共享编译产物位于
+`00_frontend` 到 `04_backend`，策略结果位于 `policy_matrix/05_runtime` 到
+`07_trace`，根目录写入 `matrix_index.json`、`sweep.csv/json`。
 
 ## 下一步
 
-保持模型到 TISA 为当前主线：补齐动态索引/layout legalization，并确认 DeepSeek dense
-与 MoE 两条路径的 operation 边界；scheduler/backend 校准继续后置。
+按以下顺序推进：
 
-## 2026-08-30：论文 benchmark 矩阵入口
-
-- 新增 `paper-matrix` 批处理路径：每个 registry case 只编译一次，然后在同一份
-  `BackendArtifact` 与 buffer binding 上比较 runtime/device policy；默认固定 runtime
-  为 `static`，可显式展开四组合。
-- 矩阵输出按 case/variant 保存共享的 `00_frontend` 到 `04_backend`，策略专属的
-  `05_runtime` 到 `07_trace` 位于 `policy_matrix/`，根目录通过 `sweep.csv/json` 汇总周期、reference、tile/TISA 数量和
-  artifact/program ID。
-- `micro` 用于快速、确定性回归；`paper_shape` 只是接近论文形状的 representative
-  proxy，可能显著增加资源开销，不能与论文芯片绝对周期直接比较。
-- 矩阵根目录写入 `matrix_index.json` 作为本次 case 清单；复用目录时应以该清单为准，
-  不把残留 case 目录纳入统计。
-
-## 2026-08-30：dynamic reshape specialization
-
-- 支持常量 shape tensor 驱动的 StableHLO `dynamic_reshape`：先求值 shape dataflow，
-  检查输入/输出元素总数守恒，再改写为官方 `stablehlo.reshape` 并删除 shape-only SSA。
-- 动态 shape、零/负维度、元素数量不一致仍显式失败；没有新增 runtime 地址假设。
-- 新增常量 dynamic reshape 成功与元素总数不一致失败回归，shape specialization 专项共
-  8 项通过。
-
-## 2026-08-27：阶段 1A
-
-- 完成 `stablehlo.convert` capability/import 和 dtype conversion metadata；
-- 完成缺失 StableHLO capability 的显式诊断；
-- 新增 2 个 capability boundary regression tests；
-- 全量回归：69 tests passed；BERT/GPT-J/LLaMA2 micro workload 已能从 PyTorch 生成 TISA；
-- 补齐 StableHLO `f16/f32` 到 TISA/runtime 的 dtype-byte 规范化别名；
-- 下一项：建立 Fusion Pattern Registry，随后补 Transformer/ResNet 模型语义。
-
-## 2026-08-28：阶段 1B Fusion Pattern Registry
-
-- 新增独立的 `SemanticFusionPatternRegistry`，与单操作
-  `StableHLOOpCapabilityRegistry` 保持职责分离；
-- 注册现有 LayerNorm recovery、LayerNorm、RMSNorm、Softmax 多节点 pattern；
-- 默认 GC pipeline 由结构 pass 与 semantic pattern priority 确定性合并，八个 pass 的
-  历史顺序、名称、fixed-point 与 dump 行为保持不变；
-- 新增 5 项 registry 回归；全量回归为 78 tests passed；
-- BERT、GPT-J、LLaMA2、DeepSeek prefill/decode micro workload 均重新生成有效 TISA；
-  ResNet 仍按预期在 `stablehlo.convolution` capability boundary 显式失败；
-- 下一项：实现 Attention region 与 SwiGLU pattern，并以 BERT/GPT-J one-block 回归验证。
-
-## 2026-08-28：阶段 1B Attention/SwiGLU
-
-- 新增 `recover_attention_region`：识别真实 Torch-XLA 图中的
-  `QK matmul -> score transform -> Softmax -> probability transform -> PV matmul`，
-  生成非 opaque region metadata，但保留每个成员为 scheduler-visible TISA；
-- 新增 `fuse_swiglu`：将 `logistic -> silu multiply -> gate multiply` 恢复为一个
-  `swiglu` semantic operator，projection Matmul 保持 region 外部；
-- 新增 SwiGLU analytical lowering，compute payload 在同一 vector EU 内执行
-  `logistic/silu_multiply/gate_multiply`；对 LLaMA2 Torch-XLA 的 `f32 -> f16 -> f32`
-  round-trip 保留显式 `dtype_convert` payload，不丢失 dtype 语义；
-- FC、lowering registry、backend capability registry 和 TileGraph metadata 已同步；
-- MHA、pre-norm decoder、BERT/GPT-J/LLaMA2 micro 回归及 static/dynamic 仿真通过；
-- BERT/GPT-J one-block 已有独立 Attention region、SwiGLU payload 和 artifact validity
-  回归；全量测试为 79 tests passed；
-- 下一项是开始 LLaMA2 RoPE/KV-cache 需求分析。
-
-## 2026-08-29：阶段 1C 开始
-
-- 固定窗口 KV-cache 已具备单次 `persistent_buffer_v1` contract，并能从真实
-  PyTorch/Torch-XLA 图恢复 `kv_cache_update`；当前缺少跨 invocation 的 state 生命周期。
-- 本阶段新增 `RuntimeStateRegistry`、`RuntimeSequence` 和 sequence simulator，目标是让
-  第 N 次 submission 显式依赖第 N-1 次 state completion，同时保持单次 API 兼容。
-
-## 2026-08-29：阶段 1C 完成
-
-- `RuntimeStateRegistry` 同时保存完整 runtime buffer 集合与 persistent state 子集，按
-  `state_id` 校验 alias 的地址、memory scope 和容量稳定性；persistent binding 不进入
-  临时 buffer reuse。
-- `RuntimeSequence` 为同一 `BackendArtifact` 创建多次 invocation，生成明确的
-  `state_complete` 依赖边，并支持每步替换普通 input/output bindings。
-- `simulate_tisa_sequence` / `schedule_tisa_sequence` 复用现有 EventBackend，平移合并
-  invocation timing，发出 `STATE_RELEASE/STATE_WAIT/STATE_READY` 事件并统计 sequence
-  总周期、间隔等待和 invocation 周期。
-- 新增固定窗口 KV-cache 两步 decode 回归；全量回归为 92 tests passed。
-
-## 2026-08-29：LLaMA2 decode workload
-
-- 在 `examples/paper_benchmarks/llama2.py` 增加独立的 `LLaMA2DecodeOneBlock`，输入为
-  one-token hidden、K/V cache、显式 RoPE cos/sin 与 attention mask，输出 hidden 和更新后
-  的两个 cache；cache 更新严格使用 `slice + concatenate`，便于对齐当前 GC contract。
-- `build_decode()` 不新增或伪造论文 Table IX 的测量行，只提供带 `phase=decode` 的 scaled
-  micro workload；完整模型、真实 hidden/head/cache layout 仍不在范围内。
-- 真实 Torch-XLA 编译恢复两个 `kv_cache_update`，并可构造两步 `RuntimeSequence`；CLI
-  实测输出 307 TISA instructions、2 invocations、8851 analytical cycles，产物包含
-  `05_runtime/runtime_sequence.json` 和合并泳道图。
-- LLaMA2 decode 的 static/dynamic sequence 回归均通过；全量回归更新为 94 tests passed。
-
-## 2026-08-29：ResNet Conv2D/BatchNorm/Pooling
-
-- 官方 StableHLO 投影修复 `dense<scalar> : tensor<...>` 属性解析，避免把 MLIR
-  类型维度误读成 padding 数据；`stablehlo.convolution` 的对称 padding 可正确展开。
-- 新增 StableHLO `batch_norm_inference` 与 `reduce_window` capability、官方投影和
-  Canonical importer；未覆盖的 grouped/layout/dynamic 变体仍显式失败。
-- 新增 BatchNorm inference 与 NCHW max/sum pooling analytical lowering、TISA stage、
-  ARU capability 和 region-aware halo dependency。Torch Export 会忽略未使用的零秩
-  BatchNorm bookkeeping placeholder（例如 `num_batches_tracked`）。
-- `ResNet50BottleneckWorkload` 现在包含 stem MaxPool、四个 inference BatchNorm、四个
-  Conv2D、ReLU 与 residual；micro shape 可完整生成 TISA/backend artifact。
-- 回归覆盖 padding、卷积 halo、BatchNorm/Pool 任务归属与 artifact validation；全量
-  回归为 94 tests passed。
-
-当前 ResNet 语义边界：静态 NCHW/OIHW、unit dilation、feature/batch group 为 1；
-pooling 使用 N/C-preserving `reduce_window`，平均池化的除法仍由后续 elementwise
-operation 表达。完整 ResNet50 的 stem 7x7、stride/downsample、全层 repetition 还未
-形成论文规模实验矩阵。
-
-## 2026-08-29：GC tile candidate cost model
-
-- `SchedulePlanner` 从单一 heuristic baseline 升级为可审计的 `cost-model-v1`，支持
-  `tile_size_candidates`；候选依据 tile 数、估算计算周期、root traffic 和 local
-  working-set overflow 排序，tie-break 使用较小 tile size。
-- `compile_torch_module`、`compile_operator_graph` 和 CLI 新增
-  `--tile-size-candidates 2,4,8`；最终只选择一份 schedule，因此 static/dynamic 仍严格
-  复用同一 TISA/backend artifact。
-- `ScheduleSpec` 保存 `candidate_costs`、`selected_tile_size` 和模型版本，方便把编译
-  选择与后端实际周期分开分析；该模型不是 RTL timing。
-- 新增 planner regression；全量回归为 96 tests passed。
-
-## 2026-08-29：dynamic shape 失败契约
-
-- 真实 Torch-XLA dynamic export 会产生 `get_dimension_size`、
-  `dynamic_broadcast_in_dim` 和 shape-tensor dataflow，不是把 `?` 替换为整数即可完成。
-- compiler 现在在 official StableHLO import 之前报告需要 shape-specialization pass，并
-  列出实际动态 operation；`shape_environment` 明确只负责 Canonical symbol resolution。
-- 新增真实 dynamic `torch.export` regression；symbolic/dynamic shape 仍未标记完成。
-
-## 2026-08-30：静态 layout/broadcast 增量开始
-
-- 提交 `bd5bfd2 align planner units and batch norm tile operands`；全量 97 tests passed。
-- 确认静态 `broadcast_in_dim` 当前仍被强制为 full-tensor transform，下一步对齐 GC、FC
-  与 analytical backend 的逐 tile region 语义。
-- 检查过程中一次命令使用了错误工作目录 `npu-ooo_simulator`；已改回项目实际目录，未产生修改。
-
-## 2026-08-30：静态 broadcast 输出域 tiling
-
-- `plan_uniform_tiles` 不再把静态 `broadcast_in_dim` 误标为 full-tensor transform；广播
-  按输出域保留边界 tile，普通 reshape/transpose/KV-cache 仍保持单 tile。
-- TileGraph 与 FC `TileMem` 使用 `broadcast_dimensions` 将输出 tile 映射到源向量切片；
-  源 singleton 轴固定读取 `[0:1]`，最后边界 tile 不越界。
-- analytical transform backend 为每个广播 tile 生成独立 copy payload，并通过 root
-  region overlap 建立跨算子依赖；真实 PyTorch `bias + value` 回归覆盖 12 个 tile。
-- 定向与全量回归：98 tests passed；本项尚未提交，下一步补 scalar operand 语义。
-
-## 2026-08-30：scalar elementwise operand
-
-- `TensorSpec`、`BufferRegion`、`TISAOperand` 接受合法零秩 shape `()`；不再把 scalar
-  伪装为 `(1,)`。
-- StableHLO constant importer 保留 `tensor<f32>` 常量 tensor、`constant_value` 和真实
-  elementwise input；TISA/analytical/backend/runtime 均按单元素、4-byte 区间处理。
-- 新增 StableHLO capability 与 GC/FC 端到端回归。
-- 兼容性修复：StableHLO `reduce` 的 reducer-init scalar 明确留在 `constant_args`，不再
-  被误当作第二个 canonical data input。
-- 全量回归：100 tests passed。
-
-## 2026-08-30：StableHLO layout metadata
-
-- `_tensor_type` 从 tensor encoding 中分离 shape/dtype；Canonical `TensorSpec` 记录
-  `layout_source` 与原始 `layout_encoding`，无 encoding 时显式标记 `default_dense`。
-- FC/TISA 对未知 encoding 不再伪造 dense byte interval；仅当存在可验证的
-  `strides_bytes` 时计算 concrete offset/span，否则保留 logical region 并走保守 overlap。
-- 新增 importer 与编译阶段回归；全量测试：102 tests passed。
-
-## 2026-08-30：dtype policy 与 multi-result boundary
-
-- `compile_operator_graph` 新增 machine-level `dtype_policy`：未声明能力时已知 dtype
-  默认 native；`supported_dtypes + strict` 对不支持 dtype 显式失败；`fallback` 允许已知
-  dtype继续走 analytical backend，并在 compiled artifact 的 `dtype_compatibility` 中记录。
-- 未知 dtype 不再落入各 lowering 的默认 2-byte 路径，必须先注册字节宽度与 backend
-  capability。
-- Official StableHLO projection 对未知 multi-result operation 显式失败；现有
-  `batch_norm_training` 三结果 recovery 保持兼容，并继续禁止 secondary result 被消费或返回。
-- 全量回归：104 tests passed。
-
-## 2026-08-30：dynamic broadcast specialization
-
-- 新增独立 `frontend.shape_specialization` pass：按 operation 语义求值
-  `get_dimension_size -> reshape -> concatenate -> maximum` shape tensor，将动态广播
-  静态化并删除 dead shape 子图；最终仍通过 official StableHLO parse/verify。
-- `compile_torch_module` 对 specialization 结果生成带 variant/provenance 的 StableHLO
-  artifact，并在 `CompiledArtifact.attributes.shape_specialization` 保存 pass 诊断。
-- 其它 `stablehlo.dynamic_*` operation 仍显式失败；动态 index、动态 layout 和跨
-  invocation 动态 shape 尚未完成。
-- Python 3.12（Torch 2.9.1、Torch-XLA 2.9.0、StableHLO 1.12.1）全量回归：106 tests passed。
-
-## 2026-08-30：dynamic index specialization 子集
-
-- 官方 StableHLO `dynamic_slice` 的 `sizes`/`slice_sizes` 与标量 start 语义已核对；
-  specialization 对常量 start 求值，并按 StableHLO clamp 规则改写为静态 `slice`。
-- official projection 保留 dynamic slice 的 size metadata；未解析 start、
-  `dynamic_update_slice` 与其它动态 operation 仍在 Canonical importer 前显式失败。
-- 新增常量越界 clamp、非常量 start 失败和 official capability boundary 回归；
-  该增量不改变 runtime state contract，也不表示支持 paged KV-cache 动态写入。
+1. symbolic shape、dynamic index 和 layout binding；
+2. DeepSeek capability 与完整模型 repetition；
+3. scheduler 微结构和控制开销校准；
+4. 外部 timing/memory/RTL backend；
+5. source-derived 与 RTL-observed 论文矩阵。

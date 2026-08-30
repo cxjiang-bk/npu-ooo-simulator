@@ -2,7 +2,7 @@
 
 ## 当前基线
 
-项目已经跑通一条唯一的生产流程：
+项目已跑通以下生产链路：
 
 ```text
 PyTorch nn.Module
@@ -17,122 +17,134 @@ PyTorch nn.Module
   -> 周期、泳道图和 trace
 ```
 
-当前已具备：
+当前基线包含真实 PyTorch module 入口、Matmul/elementwise/reduce/Softmax/LayerNorm/
+RMSNorm/Attention/SwiGLU/RoPE/Conv2D/BatchNorm/pooling 语义、TISA instruction 粒度
+static/dynamic 调度、runtime 地址与四组合 policy、可配置 MachineConfig、可替换
+codegen/timing/event backend、RTL completion profile importer，以及分阶段 artifact。
 
-- 真实 PyTorch module 的命令行入口；
-- Matmul、elementwise、reduce、Softmax、LayerNorm、RMSNorm 的基础语义导入与 lowering；
-- TISA instruction 粒度的 static/dynamic 调度；
-- runtime 地址分配、提交策略和 device policy 四组合实验；
-- 可配置 MachineConfig，以及 codegen、timing、event 三类 backend 接口；
-- analytical timing、timing table、MXU RTL completion trace/profile 导入；
-- 分阶段 artifact、泳道图、Perfetto trace 和 manifest。
+默认 cycle 来源为 analytical backend。RTL-observed profile 通过 manifest 的 calibration
+status 单独标识，结果用于与 analytical 趋势分组比较。
 
-当前 cycle 主要来自 analytical backend。没有加载 RTL-observed profile 的结果只适合比较调度趋势，不能作为芯片绝对性能结论。
+## 阶段 A：前端与模型覆盖
 
-## A. 扩大真实前端覆盖
+目标：让论文模型 block 统一由 PyTorch module 驱动，沿 Torch-XLA -> StableHLO -> GC ->
+FC -> TISA 链路进入 simulator。
 
-目标：让论文中的模型 block 直接以 PyTorch `nn.Module` 输入，不添加模型专用 builder。
+已完成：
 
-优先顺序：
+- 静态 Attention、pre-norm decoder、BERT/GPT-J/LLaMA2/DeepSeek dense one-block；
+- LLaMA2 RoPE、固定窗口 KV-cache 和多步 RuntimeSequence；
+- ResNet bottleneck micro 的 Conv2D、BatchNorm inference、ReLU、pooling；
+- StableHLO capability registry 与 semantic fusion registry。
 
-1. 完成 Linear、batched Matmul、reshape/transpose、bias、activation 的组合覆盖；
-2. 支持完整 multi-head attention，包括 scale、mask、head reshape 和 output projection（首个静态 shape 两头 Attention 已完成）；
-3. 支持 decoder block 的 RoPE、KV-cache；首个静态 shape pre-norm decoder（RMSNorm、attention、residual、SwiGLU/MLP）已完成，LLaMA2 one-block 的显式 RoPE region 已完成；KV-cache 已完成固定窗口单步 contract 与多步 `RuntimeSequence` 仿真，动态索引、真实 layout 和跨请求生命周期仍待实现；
-4. 支持 ResNet bottleneck 所需的 Conv2D、BatchNorm inference、ReLU 和 pooling（micro
-   workload 已完成，完整模型仍待扩展）；
-5. 接入 BERT、GPT-J、LLaMA2、DeepSeek 的一个真实 block（dense one-block 已完成，
-   DeepSeek MoE 与 full model 仍待确认和扩展）。
+当前工作项：
 
-每次扩展都沿同一边界完成：
+1. 完成 DeepSeek dense/MoE 结构的 capability 清单；
+2. 扩展完整 ResNet50、BERT、GPT-J、LLaMA2 的层重复与论文形状 proxy；
+3. 将 embedding、position embedding、causal mask 和更多 layout 变体纳入统一 registry。
+
+每个新能力遵循：
 
 ```text
 Torch-XLA StableHLO operation
   -> semantic capability/import
-  -> graph recovery/fusion（需要时）
+  -> graph recovery/fusion
   -> TISA stage
   -> backend lowering
-  -> PyTorch 端到端测试
+  -> PyTorch regression
 ```
 
-验收标准：不按 module 名称匹配；不维护项目自有 StableHLO emitter；不允许 unsupported operation 静默降级。
+模型名称作为 provenance 和 benchmark registry 字段。
 
-## B. 提升编译正确性与可探索性
+## 阶段 B：编译语义与可审计性
 
-目标：在扩大模型覆盖之前，使 tile 数量、依赖和内存流量都可核对。
+目标：让 tile、依赖、内存流量和 shape 变换都能从 artifact 逐项核对。
 
-- 将跨算子的保守依赖细化为基于 tile region 的依赖（第一版 logical region 映射已完成）；
-- 完善 symbolic/dynamic shape 与边界 tile（Torch-XLA 常见 dynamic broadcast、常量起点
-  `dynamic_slice` 和常量 shape `dynamic_reshape` 的 specialization 子集已完成，完整动态
-  索引/动态 layout 仍待实现）；
-- 为 layout、transpose、broadcast、reduction barrier 建立显式规则；
-- 给 TISA operand 增加可绑定的地址表达式和 memory scope（已完成逻辑 slice expression，物理 scope 绑定仍由 runtime 负责）；
-- 在统一 planner 中加入多个合法 tile candidate 和可解释 cost model；
-- 输出每个 pass 前后的诊断、MAC、传输字节和依赖统计。
+已完成：
 
-验收标准：Static 和 Dynamic 严格复用同一份 `BackendArtifact`；相同输入与配置生成稳定 hash；小图的 tile、依赖、MAC 和 traffic 可手算对账。
+- PassManager、统一 tile planner、candidate cost model；
+- region-aware dependency、卷积/池化 halo、静态 broadcast 和 scalar region；
+- TileMem 的 stride expression、layout metadata、dtype policy；
+- GC pass dump、compile statistics、residency/ping-pong intent；
+- 常量 dynamic broadcast、dynamic_slice、dynamic_reshape specialization；
+- readiness condition、state/accumulate/buffer-reuse dependency。
 
-## C. 提升 device scheduler 对论文的对齐度
+当前工作项：
 
-目标：从 instruction-level analytical baseline 逐步逼近论文硬件调度器。
+1. 建立 symbolic shape 的统一 binding contract；
+2. 扩展 dynamic index、dynamic layout 和 stride-aware transform；
+3. 为每类 layout、transpose、broadcast、reduction 建立可验证的 region rule；
+4. 为完整模型 proxy 增加 shape/traffic 对账样例。
 
-- 明确 reception queue、per-unit WQ/IQ、ROB/Fu 和 completion feedback；
-- 实现并验证 typed RAW/WAR/WAW、`payload_ready:<task_id>` partial-ready 原型和 address conflict；
-- 增加可选 memory bank/port conflict model，消费 MachineConfig 的 memory-level 参数并记录独立 stall 计数；
-- 校准 dispatch、wake-up、issue 和 completion 的控制开销；
-- 验证同一 TISA instruction 的 backend payload 只在 instruction 内部执行，不进入全局 OOO window；
-- 为 queue full、dependency wait、resource busy、memory conflict 分别记录 stall 原因。
+验收标准：同一 module、shape、tile、MachineConfig 和 backend 产生稳定 artifact hash；
+static/dynamic 的差异来自 policy；小图的 tile、MAC、traffic 和 dependency 可手算核对。
 
-验收标准：micro-test 能逐 cycle 对账，`window=1` 的退化行为可解释，dynamic 的收益可以从 ready/issue/stall trace 直接定位；memory bank 模型的开启/关闭不改变编译产物。
+## 阶段 C：Device scheduler 对齐
 
-## D. 扩展可插拔硬件 backend
+目标：逐步复现论文 WQ/IQ/Fu/ROB 和 completion feedback 的行为。
 
-目标：在不修改 compiler 和 scheduler policy 的情况下替换硬件时序来源。
+已完成：
+
+- reception availability、queue、ROB/window、资源占用和 completion feedback analytical
+  模型；
+- typed RAW/WAR/WAW/STATE/ACCUMULATE、address scoreboard、partial-ready 原型；
+- 可选 memory bank/port structural-conflict 模型；
+- queue、dependency、resource、memory stall 计数和泳道事件。
+
+当前工作项：
+
+1. 根据论文和 NPU ISA 参数化 dispatch、wake-up、issue、completion 控制开销；
+2. 校准 WQ/IQ/Fu 容量、dispatch width、in-flight tile 和 queue backpressure；
+3. 让 partial-ready 从 backend calibration contract 进入 GC 语义；
+4. 增加逐 cycle micro-test 对账和稳定的 stall taxonomy。
+
+## 阶段 D：可插拔硬件 backend
+
+目标：在 compiler 与 scheduler 接口稳定的基础上替换时序来源。
 
 推进顺序：
 
 ```text
 analytical baseline
   -> SCALE-Sim 类 MXU timing
-  -> Ramulator2/DRAMSys 类 memory timing
-  -> RTL/Verilator unit timing
+  -> Ramulator2 / DRAMSys memory timing
+  -> RTL / Verilator unit timing
   -> system simulator adapter
 ```
 
-每个 backend 必须声明支持的 operation/resource/memory capability、时序区间和校准状态。未覆盖的任务只能显式失败，或在用户显式允许时回退并记录 mixed calibration。
+每个 backend 声明 operation、resource、memory capability、timing interval 和 calibration
+status。Backend 切换保留 TISAProgram、trace schema 和实验 manifest 结构。
 
-验收标准：切换 backend 不改变 TISAProgram；trace schema 保持一致；同一 workload 可以比较不同 MachineConfig 与 timing source。
+## 阶段 E：论文实验矩阵
 
-## E. 建立论文实验矩阵
-
-模型 block 覆盖后，固定以下实验维度：
+固定维度：
 
 ```text
-PyTorch model / shape / phase
-  x compiler tile candidate
+PyTorch model / input shape / phase
+  x tile candidate
   x runtime policy
-  x device scheduler policy
+  x device policy
   x MachineConfig
   x timing/event backend
 ```
 
-首批 case：ResNet50 bottleneck、BERT encoder block、GPT-J one block、LLaMA2 one block，以及确认结构后的 DeepSeek block。Prefill 与 decode 必须作为不同 case，proxy、source-derived、analytical 和 RTL-observed 结果不得混在同一统计组。
+registry case：
 
-当前已提供 `paper-matrix` 批处理入口：每个 registry case 只编译一次，在同一份
-`BackendArtifact` 和 buffer binding 上运行 runtime/device policy 矩阵。默认使用
-`micro` variant，并只比较 device static/dynamic；显式传入 `--runtime-device-matrix`
-才展开 runtime static/dynamic 与 device static/dynamic 的四组合。`paper_shape` 仅用于
-接近论文形状的 representative proxy，可能带来较高的编译和内存开销，不能当作完整
-模型或论文芯片的绝对性能结果。
+- ResNet50 bottleneck；
+- BERT encoder block；
+- GPT-J one block；
+- LLaMA2 prefill/decode one block；
+- DeepSeek dense prefill/decode one block，MoE 作为后续 case。
 
-输出约定为：矩阵根目录保存 `sweep.csv/json` 和本次 `matrix_index.json`，每个
-`<case-id>/<variant>/` 保存共享的 `00_frontend` 到 `04_backend` staged artifact；统一布局
-创建的 `05_runtime` 到 `07_trace` 在策略子目录中各自写入，策略专属结果位于
-`policy_matrix/`。复用输出目录时应以 `matrix_index.json` 的 case 清单为准；
-旧目录不会自动删除，避免把残留结果混入统计。
+矩阵入口 paper-matrix 每个 case 编译一次，在共享 BackendArtifact 和 buffer binding
+上运行 policy 组合。micro 用于回归，paper_shape 用于 representative proxy。输出
+按 case/variant 保存共享的 00_frontend 到 04_backend，策略目录保存
+05_runtime 到 07_trace，根目录通过 sweep.csv/json 汇总。
 
-## 下一阶段优先级
+下一阶段优先级：
 
-当前最高优先级是 B：完善 symbolic/dynamic shape、layout/broadcast 和动态索引
-legalization，并将 ResNet/DeepSeek micro case 纳入统一实验矩阵。runtime state 已进入可
-验证的多步 contract；完成编译语义与统计稳定性后再集中增加 scheduler 微结构细节和
-外部 backend，避免用不完整的图语义校准硬件时序。
+1. B 阶段 symbolic/dynamic shape、layout 和动态索引语义；
+2. A 阶段 DeepSeek 与完整模型 repetition；
+3. C 阶段 scheduler 微结构校准；
+4. D 阶段外部 timing/memory/RTL backend；
+5. E 阶段 source-derived 与 RTL-observed 论文矩阵。

@@ -4,190 +4,155 @@
 
 ```mermaid
 flowchart LR
-    A[PyTorch nn.Module] --> B[PyTorch 前端\ntorch.export + Torch-XLA + StableHLO]
-    B --> C[GC\nStableHLO -> Semantic TileGraph]
-    C --> C2[FC\nTileGraph -> TISA Dialect]
-    C2 --> C3[TISA Generator\nDialect -> TISAProgram]
-    C3 --> D[BackendArtifact]
-    D --> E[Runtime\n地址绑定与提交]
-    E --> F[Device scheduler\nStatic / Dynamic OOO]
-    F --> G[Backend 仿真\n周期与执行事件]
+    A[PyTorch nn.Module] --> B[torch.export + Torch-XLA + StableHLO]
+    B --> C[GC: Canonical IR 与 TileGraph]
+    C --> D[FC: TISA 方言]
+    D --> E[TISAProgram 与 BackendArtifact]
+    E --> F[Runtime 地址绑定与提交]
+    F --> G[Static / Dynamic device scheduler]
     G --> H[周期、stall、泳道图、Perfetto]
 ```
 
-这是一个用于研究 TISA 风格 NPU 动态调度的编译与仿真框架。项目当前只有一条生产前端路线：
+项目用于研究 TISA 风格 NPU 的编译、运行时和乱序调度。生产入口是一条线性的真实
+PyTorch 路径：
 
 ```text
 PyTorch nn.Module
   -> torch.export.ExportedProgram
-  -> Torch-XLA
-  -> 官方 StableHLO
+  -> Torch-XLA StableHLO
+  -> 官方 StableHLO parse/verify
   -> Graph Compiler (GC)
-  -> software-scheduled Semantic TileGraph
+  -> Canonical OperatorGraph / Semantic TileGraph
   -> Fusion Compiler (FC)
-  -> TISA Dialect
-  -> TISA Generator
+  -> TISA 方言
   -> TISAProgram
   -> BackendArtifact
   -> RuntimeSubmission
-  -> static / dynamic TISA scheduler
-  -> 周期结果、泳道图和 Perfetto trace
+  -> TISA device scheduler
+  -> 周期、泳道图和 Perfetto trace
 ```
 
-新增 workload 时只需要提供真实的 PyTorch `nn.Module`，不需要为算子手写 graph builder 或专用 lowering 入口。
+新增 workload 时提供真实的 `torch.nn.Module` 和 example inputs。Torch-XLA 负责
+ATen 到 StableHLO 的转换，项目维护 StableHLO semantic family 到 Canonical、TISA
+和 backend capability 的映射。
 
 ## 当前能力
 
-- 使用 `torch.export` 捕获 PyTorch 模型；
-- 使用 Torch-XLA 完成 ATen 到 StableHLO 的 legalization；
-- 使用 OpenXLA 官方 StableHLO bindings 执行 MLIR parse 和 verify；
-- 将支持的 StableHLO semantic family 导入统一 OperatorGraph；
-- 以论文 GC/FC 为边界执行图 canonicalization、复合算子恢复、切 tile、依赖构造和 TISA dialect 生成；
-- 保存每个 GC pass 的输入/输出图，生成可解释的 residency 与 ping-pong intent；
-- 支持多头 Attention 所需的 reshape、permute、scale、additive mask 和 batched Matmul；
-- 使用逻辑 tensor region 生成跨算子 tile dependency，并输出 MAC/traffic/依赖统计；
-- Static 和 Dynamic device policy 共享同一份 `TISAProgram/BackendArtifact`；
-- runtime 单独负责物理地址、command chunk、descriptor availability 和提交开销；
-- 固定窗口 KV-cache 支持 `RuntimeStateRegistry` 和多步 `RuntimeSequence`，可核对
-  跨 invocation 的 state-complete 依赖与稳定物理地址；
-- backend codegen、event engine、timing provider 均可替换；
-- 输出 TISA/backend payload timing、SVG/PNG 泳道图和 Perfetto JSON。
+- `torch.export` 捕获真实 PyTorch module，并保存源图 provenance；
+- Torch-XLA 生成 StableHLO，OpenXLA 官方 bindings 完成 MLIR parse/verify；
+- GC 完成 canonicalization、复合语义恢复、tile 切分、region/state 依赖和 locality
+  metadata；
+- FC 输出带有 operand、TileMem、UnitMap、typed dependency 和 payload recipe 的
+  TISA 方言；TISA Generator 生成 scheduler 消费的 `TISAProgram`；
+- `AnalyticalCodegenBackend` 生成 `BackendArtifact`，backend、timing provider 和
+  event backend 均可替换；
+- static 和 dynamic device policy 共享同一份编译产物、地址绑定和 timing source；
+- runtime 负责物理地址、command chunk、descriptor arrival 和同步；device scheduler
+  负责 queue、ROB、依赖、资源和 OOO issue；
+- 支持 Matmul、batched Matmul、GEMV、elementwise、reduce、Softmax、LayerNorm、
+  RMSNorm、Attention region、SwiGLU、RoPE、Conv2D、BatchNorm inference、pooling、
+  reshape/transpose、固定窗口 KV-cache；
+- `RuntimeStateRegistry` 和 `RuntimeSequence` 支持固定窗口 decode 的多次 invocation；
+- 输出分阶段 artifact、周期与 stall 统计、SVG/PNG 泳道图和 Perfetto JSON；
+- 支持 analytical、timing table、systolic MXU profile 以及 RTL completion trace
+  importer。
 
-当前默认时序仍是 analytical。除非显式加载来自 RTL 的校准 profile，否则结果不能称为 RTL cycle-accurate。
+默认 timing source 是 analytical event model。加载 RTL-observed profile 后，manifest
+会记录相应 calibration status；两类结果分别用于趋势研究和校准时序分析。
 
 ## 环境
 
-正式前端需要同一个 Python 环境同时提供：
+正式前端使用同一个 Python 环境中的：
 
 ```text
 Python 3.12
 torch 2.9.1
 torch-xla 2.9.0
-OpenXLA StableHLO wheel
+OpenXLA StableHLO wheel 1.12.1
 ```
 
-本机已验证的解释器是 `/usr/bin/python3.12`。安装细节见 [docs/install-stablehlo.md](docs/install-stablehlo.md)。
+本机验证解释器为 `/usr/bin/python3.12`，安装细节见
+[docs/install-stablehlo.md](docs/install-stablehlo.md)。
 
 ## 快速运行
 
-编译并动态调度一个真实的两头 PyTorch Attention block：
+编译并动态调度一个真实的两头 Attention block：
 
 ```bash
 cd /home/lora/OpenTPU/npu-ooo-simulator
 
 PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-model \
   --torch-module examples.torch_models:MultiHeadAttentionBlock \
-  --input-shape 1,4,8 \
-  --input-shape 1,1,4,4 \
+  --input-shape 1,4,8 --input-shape 1,1,4,4 \
   --tile-size 4 \
   --policy dynamic_ready_queue \
   --output-dir out/attention-dynamic
 ```
 
-比较 static 和 dynamic 时，只改变 `--policy` 和输出目录：
+比较 static 与 dynamic 时固定 module、shape、tile planner、MachineConfig、backend 和
+timing provider，实验变量设为 `--policy` 与输出目录：
 
 ```bash
 PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-model \
   --torch-module examples.torch_models:MultiHeadAttentionBlock \
   --input-shape 1,4,8 --input-shape 1,1,4,4 \
-  --tile-size 4 \
-  --policy static_pipeline \
+  --tile-size 4 --policy static_pipeline \
   --output-dir out/attention-static
 ```
 
-两次编译使用相同 shape、tile planner 和 backend。实验脚本若要求严格共享同一个已编译 artifact，可使用：
+`--runtime-device-matrix` 在一次编译后运行 runtime/device 四种组合，保证所有策略行
+共享 `artifact_id`、`program_id` 和 buffer binding。
 
-```text
---runtime-device-matrix
-```
-
-它在一次编译后运行 runtime static/dynamic 与 device static/dynamic 的四种组合。
-
-当前也提供一个包含两次 RMSNorm、masked multi-head attention、residual 和 SwiGLU
-MLP 的真实 PyTorch pre-norm decoder block：
+真实 pre-norm decoder block：
 
 ```bash
 PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-model \
   --torch-module examples.torch_models:PreNormDecoderBlock \
   --input-shape 1,4,8 --input-shape 1,1,4,4 \
-  --tile-size 4 \
-  --policy dynamic_ready_queue \
+  --tile-size 4 --policy dynamic_ready_queue \
   --output-dir out/decoder-dynamic
 ```
 
-该通用示例暂不包含 RoPE 和 KV-cache；它们需要额外的 state/stride 语义，不应被普通
-decoder block 的结果隐式代替。论文 benchmark 中的 `llama2-13b-oneblk` 另有显式
-`rope_cos`/`rope_sin` 输入，当前已能恢复为非 opaque `rotary_embedding` region，并
-将 Q/K 旋转路径的底层成员继续暴露给 TISA。KV-cache 当前支持固定 shape、unit-stride
-的 `slice(cache) + concatenate(update)` 滑动窗口 contract，并可用
-`RuntimeSequence` 仿真多步 decode；动态索引写入、真实 cache layout、跨请求 state
-生命周期和完整 decode loop 仍未实现。
-
-论文 benchmark 目录提供 `examples.paper_benchmarks.llama2:LLaMA2DecodeOneBlock` 作为
-scaled one-token decode 输入。它用于验证真实 PyTorch -> Torch-XLA -> StableHLO -> TISA
-和多步 state contract，不代表论文完整 LLaMA2-13B 的 hidden/head/cache 尺寸。
-
-CLI 中可用 `--runtime-invocations N` 重复提交同一个 compiled artifact；配合
-`--runtime-inter-invocation-gap C` 可显式加入 state 完成后的等待周期。多步结果额外
-写入 `05_runtime/runtime_sequence.json`，汇总周期和 trace 仍写入 `06_simulation/`、
-`07_trace/`。
-
-批量比较论文模型的 scaled workload：
+论文 benchmark 的 scaled case 使用：
 
 ```bash
 PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli paper-matrix \
-  --benchmarks all \
-  --variant micro \
-  --arch minimal \
-  --tile-size 4 \
-  --output-dir out/paper-matrix
+  --benchmarks all --variant micro --arch minimal \
+  --tile-size 4 --output-dir out/paper-matrix
 ```
 
-`paper-matrix` 对每个 registry case 只编译一次，默认固定 runtime 为 `static`，输出
-`static_pipeline` 与 `dynamic_ready_queue` 两行；加上 `--runtime-device-matrix` 才会
-展开 runtime/device 四组合。矩阵根目录的 `sweep.csv/json` 保存 reference、artifact
-ID、tile/TISA 数量和周期；每个 case 的 `summary.json` 与 `manifest.json` 位于
-`<case-id>/<variant>/`。这些 case 是 scaled micro 或 representative proxy，论文
-reference 与 analytical/RTL cycle 分开记录。
+registry 当前包含：`resnet50`、`bert-base`、`gpt-j-6b-oneblk`、`llama2-13b-oneblk`、
+`deepseek-r1-16b-prefill`、`deepseek-r1-16b-decode`。这些 case 以真实 PyTorch block
+构成 scaled micro 或 representative proxy，用于比较编译语义和调度趋势。`micro`
+提供小尺寸确定性输入；`paper_shape` 使用接近论文的形状并记录更高的资源需求。
 
-`--variant` 控制 workload 的规模，不改变编译和仿真语义：
-
-- `micro`（默认）使用小尺寸、确定性的输入，适合回归测试、检查依赖和快速比较调度；
-- `paper_shape` 使用接近论文报告的 batch/sequence/hidden 形状，可能显著增加编译时间、
-  tile 数和内存占用。它仍是一个 representative proxy，不是完整的论文模型，也不能把
-  输出周期直接解释为论文硬件的绝对性能。
-
-矩阵输出与单 case 输出分开组织。矩阵根目录只保存汇总和本次 case 索引；每个 case
-  目录保存一份共享的编译产物，策略目录只保存 runtime、仿真和 trace：
+`paper-matrix` 的目录结构：
 
 ```text
 out/paper-matrix/
 ├── README.md
-├── matrix_index.json       # 本次实际选择的 case、variant 和相对输出路径
+├── matrix_index.json
 ├── sweep.csv
 ├── sweep.json
-└── bert-base/micro/
-    ├── 00_frontend/ ... 04_backend/ # 共享编译产物；05-07 为统一布局的空阶段目录
+└── <case-id>/<variant>/
+    ├── 00_frontend/ ... 04_backend/   # 共享编译产物
     ├── artifact_index.json
     ├── manifest.json
     ├── summary.json
     └── policy_matrix/
-        ├── runtime-static__device-static_pipeline/
-        │   ├── 05_runtime/ 06_simulation/ 07_trace/
-        │   └── ...
-        └── runtime-static__device-dynamic_ready_queue/
-            ├── 05_runtime/ 06_simulation/ 07_trace/
-            └── ...
+        └── runtime-<r>__device-<d>/
+            ├── 05_runtime/
+            ├── 06_simulation/
+            └── 07_trace/
 ```
 
-`paper-matrix` 不会根据策略重新编译、切 tile 或分配地址；同一个 case 的策略行共享
-`artifact_id`、`program_id` 和 buffer binding。复用已有 `--output-dir` 时，不要把旧的
-case 目录当成本次结果：以 `matrix_index.json` 中记录的清单和相对路径为准，并优先为
-每次实验使用新的输出目录。未知文件不会被命令删除。
+矩阵根目录保存 case 清单和跨 case 汇总；每个 case 保存一份共享编译产物；策略目录
+保存 runtime、simulation 和 trace。实验开始前使用新的输出目录，并以
+`matrix_index.json` 作为本次结果清单。
 
 ## 添加 PyTorch 算子或模型
 
-在任意可导入 Python 模块中定义真实的 `torch.nn.Module`。无参数构造的 module class 可以直接作为 CLI 入口：
+在可导入模块中定义真实的 `torch.nn.Module`：
 
 ```python
 import torch
@@ -197,45 +162,35 @@ class MyOperator(torch.nn.Module):
         return torch.matmul(lhs, rhs)
 ```
 
-然后运行：
+运行编译：
 
 ```bash
 PYTHONPATH=src:/path/to/module /usr/bin/python3.12 -m npu_ooo.cli compile-model \
   --torch-module my_module:MyOperator \
-  --input-shape 32,64 \
-  --input-shape 64,128 \
+  --input-shape 32,64 --input-shape 64,128 \
   --output-dir out/my-operator
 ```
 
-每个 `--input-shape` 对应一个 positional tensor input。CLI 会生成确定性的随机 example input；它们用于 `torch.export` 的 shape/dtype 捕获，不用于数值正确性评估。
+每个 `--input-shape` 对应一个 positional tensor input。CLI 生成确定性 example input，
+用于 `torch.export` 的 shape/dtype 捕获。
 
-若 Torch-XLA 产生了项目尚未注册的 StableHLO operation，编译会在 StableHLO semantic capability boundary 明确失败。扩展新算子时，应补充：
+新增 StableHLO operation 时按以下链路注册能力：
 
 ```text
 StableHLO semantic capability
   -> Canonical op mapping 或 composite recovery pass
   -> TISA stage definition
   -> backend lowering capability
-  -> 端到端 PyTorch 测试
+  -> PyTorch 端到端回归
 ```
 
-不要新增按模型名或算子名分支的 CLI/builder 路线。
+编译边界对 registry 外的 operation 产生明确诊断，诊断包含原始名称、缺失的 capability
+和当前已知集合。semantic fusion pattern 依据 shape、常量和数据流证明结果工作，模型名
+归属于 provenance 与 benchmark registry。
 
-GC 默认使用 `--tile-size` 生成确定性 baseline；研究多个切分方案时可传入
-`--tile-size-candidates 2,4,8`。planner 会基于 tile 数、估算计算周期、root traffic
-和 local working-set overflow 选择一个候选，并在 `01_gc/schedule.json` 的
-`candidate_costs`、`selected_tile_size` 中保留可审计的评分。该 cost model 只用于编译期
-排序，不替代后端 timing provider，也不会让 static/dynamic 使用不同的 compiled artifact。
-
-单条 StableHLO operation 的导入能力由 `StableHLOOpCapabilityRegistry` 管理；
-Softmax、Norm 等多节点语义恢复由独立的 `SemanticFusionPatternRegistry` 管理。
-后者只接受已经证明 shape、常量和数据流等价的图 pattern，不能用来吞掉未知
-StableHLO operation 或作为静默 fallback。
-
-Attention pattern 只添加非 opaque region metadata，并保留
-`QK^T Matmul -> Softmax -> PV Matmul` 及其中间 transform 的独立 TISA；SwiGLU pattern
-才会将已证明等价的 vector primitive chain 收敛为一个 `swiglu` TISA 边界，内部步骤
-留在该指令的 backend payload 中。
+GC 使用 `--tile-size` 生成确定性 baseline；`--tile-size-candidates 2,4,8` 启用
+`cost-model-v1`，按 tile 数、估算计算周期、root traffic 和 local working-set 选择
+候选，并把评分写入 `01_gc/schedule.json`。
 
 ## 输出目录
 
@@ -244,20 +199,20 @@ out/<run>/
 ├── manifest.json
 ├── artifact_index.json
 ├── 00_frontend/
-│   ├── source_frontend_import.json   # torch.export 源图摘要
-│   ├── generated.mlir                # Torch-XLA StableHLO
-│   ├── stablehlo_module.json         # verifier、版本和 provenance
-│   └── frontend_import.json          # StableHLO 导入结果
+│   ├── source_frontend_import.json
+│   ├── generated.mlir
+│   ├── stablehlo_module.json
+│   └── frontend_import.json
 ├── 01_gc/
-│   ├── canonical_graph.json       # GC 规范化后的算子图
-│   ├── gc_artifact.json            # GC 完整阶段产物
-│   ├── pass_dumps/                 # 每个 GC pass 的输入/输出图
-│   ├── schedule.json               # 初始软件 schedule
+│   ├── canonical_graph.json
+│   ├── gc_artifact.json
+│   ├── pass_dumps/
+│   ├── schedule.json
 │   ├── compile_statistics.json
 │   ├── tile_graph.{json,dot}
 │   └── operator_graph.{dot,svg}
 ├── 02_fc/
-│   ├── tisa_dialect.json           # FC 输出的 TISA semantic ops
+│   ├── tisa_dialect.json
 │   └── fc_diagnostics.json
 ├── 03_tisa/
 │   ├── tisa_program.json
@@ -278,49 +233,29 @@ out/<run>/
     └── perfetto.json
 ```
 
-推荐按目录编号依次检查。`generated.mlir` 是确认 Torch-XLA 输出的第一现场；`01_gc/pass_dumps/` 按顺序展示每个 GC pass 的输入图、输出图和诊断，`01_gc/gc_artifact.json` 展示最终融合、切分、初始顺序和依赖；`02_fc/tisa_dialect.json` 展示 FC 生成的语义 TISA op；`03_tisa/tisa_program.json` 是 device scheduler 的输入；`backend_artifact.json` 记录每条 TISA instruction 对应的后端 payload。复合算子的 reduce/exp 等内部步骤只在 backend payload 中出现。
+`generated.mlir` 展示 Torch-XLA 输出；`01_gc/pass_dumps/` 展示每个 GC pass 的输入、
+输出和诊断；`02_fc/tisa_dialect.json` 展示 FC 语义 op；`03_tisa/tisa_program.json`
+是 device scheduler 输入；`04_backend/backend_artifact.json` 展示每条 TISA instruction
+的 backend payload。复合算子的内部 primitive 保留在 payload 和 lane trace 中。
 
-对 `paper-matrix`，上述阶段目录位于 `<case-id>/<variant>/`，而不是矩阵根目录；矩阵
-根目录的 `sweep.csv/json` 只用于跨 case 汇总。先查看 `matrix_index.json` 确认本次实际
-运行了哪些 case，再进入对应 case 的 `manifest.json` 和 `artifact_index.json`，最后在
-`policy_matrix/<runtime>__<device>/06_simulation/`、`07_trace/` 比较策略结果。
-
-当前 Softmax 的语义 TISA 已按 tile 粒度生成 `load -> softmax -> store`，默认使用
-materialized row-wise lowering。可以通过 `--softmax-algorithm online` 启用分析版
-online state payload：它保留同一个 `softmax` TISA 边界，将相邻 reduction tile 串成
-`(max, sum)` 状态依赖链，便于比较调度周期。该实现不执行完整数值 online Softmax 的
-rescale、最终归一化和输出 workspace，因此只能用于 scheduler/cycle 研究，不能称为
-论文硬件或数值正确的 FlashAttention online 实现。
-
-例如，使用 online 分析模型运行 Attention：
-
-```bash
-PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-model \
-  --torch-module examples.torch_models:MultiHeadAttentionBlock \
-  --input-shape 1,4,8 --input-shape 1,1,4,4 \
-  --tile-size 4 --softmax-algorithm online \
-  --policy dynamic_ready_queue \
-  --output-dir out/attention-online
-```
-
-运行产物的 `manifest.json` 会记录实际采用的 Softmax 算法；不指定参数时记录为
-`materialized`。
+Softmax 默认使用 materialized row-wise payload。`--softmax-algorithm online` 选择
+分析版 online state-chain：相邻 reduction tile 传递 `(max, sum)` 状态，TISA 语义边界
+保持同一语义边界。该模式用于观察状态依赖对调度周期的影响；完整 rescale、最终归一化和
+workspace 生命周期属于后续数值 backend 扩展。
 
 ## 调度边界
 
-项目刻意区分三层决策：
-
 ```text
-编译期：SchedulePlanner 决定 tile size 和 loop order
-runtime：决定地址、command chunk 和 descriptor 到达时间
-device scheduler：根据依赖、ROB、queue 和资源状态 issue TISA instruction
+编译期 SchedulePlanner：tile size、loop order、residency intent
+runtime：物理地址、command chunk、descriptor arrival、同步
+device scheduler：依赖、ROB、queue、资源状态与 TISA issue
+backend：ExecutionTask 时序、completion event、泳道图
 ```
 
-`--policy static_pipeline` 与 `--policy dynamic_ready_queue` 只改变最后一层。两者不会重新切 tile，也不会生成不同的 TISA 程序。
+`static_pipeline` 按 program order 与依赖 issue；`dynamic_ready_queue` 在到达、依赖
+满足且资源可用的窗口内选择 ready TISA instruction。两种 policy 复用同一份编译产物。
 
 ## Backend 与 RTL 校准
-
-默认 registry：
 
 ```text
 CodegenBackend: analytical
@@ -328,26 +263,30 @@ EventBackend: analytical_event
 TimingProvider: analytical | timing_table | systolic_mxu_profile
 ```
 
-导入 RTL trace 和 MXU VCS log 的方法见 [docs/rtl-calibration.md](docs/rtl-calibration.md)。`descriptor_issue_to_done` 与 isolated Matmul compute latency 是不同区间，provider 会拒绝错误映射。
+RTL completion trace 的 JSON/CSV schema、VCS console log 转换和 interval 选择见
+[docs/rtl-calibration.md](docs/rtl-calibration.md)。`compute_start_to_compute_done`
+对应 isolated matmul primitive；`descriptor_issue_to_done` 对应 full descriptor interval，
+manifest 会保留该区间标签。
 
 ## 代码导航
 
 ```text
-src/npu_ooo/cli.py                       唯一用户入口和实验输出
-src/npu_ooo/compiler/pipeline.py         线性 PyTorch-to-TISA 主流程
-src/npu_ooo/frontend/bridge.py           torch.export 捕获与源图 provenance
+src/npu_ooo/cli.py                       用户入口和实验输出
+src/npu_ooo/compiler/pipeline.py         PyTorch-to-TISA 主流程
+src/npu_ooo/frontend/bridge.py           torch.export 捕获与 provenance
 src/npu_ooo/frontend/torch_xla_export.py Torch-XLA StableHLO 导出
-src/npu_ooo/frontend/stablehlo_official.py 官方 verifier 和导入边界
+src/npu_ooo/frontend/stablehlo_official.py 官方 verifier 与导入边界
 src/npu_ooo/compiler/graph_compiler.py   论文 GC：图优化、切 tile、依赖
-src/npu_ooo/compiler/fusion_patterns.py  GC 多节点语义恢复/融合 pattern registry
-src/npu_ooo/compiler/fusion_compiler.py  论文 FC：TileGraph 到 TISA dialect
-src/npu_ooo/compiler/tisa_generator.py   TISA dialect 到 virtual TISAProgram
-src/npu_ooo/compiler/tisa_dialect.py     TISA 方言 stage/metadata 构造与语义 payload 绑定
+src/npu_ooo/compiler/fusion_patterns.py  semantic recovery/fusion registry
+src/npu_ooo/compiler/fusion_compiler.py  论文 FC：TileGraph 到 TISA 方言
+src/npu_ooo/compiler/tisa_generator.py   TISA 方言到 TISAProgram
+src/npu_ooo/compiler/tisa_dialect.py     TISA stage、metadata 和 payload recipe
 src/npu_ooo/backend/                     可替换 backend 与 timing provider
 src/npu_ooo/simulator/tisa.py            TISA device scheduler simulator
 ```
 
-完整分层说明见 [docs/architecture.md](docs/architecture.md)，论文语义对齐见 [docs/tisa-alignment.md](docs/tisa-alignment.md)。
+完整分层说明见 [docs/architecture.md](docs/architecture.md)，论文语义映射见
+[docs/tisa-alignment.md](docs/tisa-alignment.md)。
 
 ## 验证
 
@@ -357,4 +296,5 @@ PYTHONPATH=src /usr/bin/python3.12 -m compileall -q src tests examples
 git diff --check
 ```
 
-端到端测试真实调用 PyTorch、Torch-XLA 和官方 StableHLO；后端和 scheduler 单元测试可以直接构造其所属层的 IR，但这些 fixture 不是用户前端入口。
+端到端测试调用 PyTorch、Torch-XLA 和官方 StableHLO；后端与 scheduler 单元测试在
+所属 IR 层验证接口契约。

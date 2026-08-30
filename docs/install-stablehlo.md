@@ -1,12 +1,12 @@
 # 安装 PyTorch、Torch-XLA 与 StableHLO
 
-生产前端固定经过：
+生产前端采用：
 
 ```text
 torch.export -> Torch-XLA -> official StableHLO
 ```
 
-没有 project exporter、textual fallback 或绕过 StableHLO 的直接路径。三个组件必须安装在同一个 Python 环境。
+三个组件安装在同一个 Python 环境，保证版本和 MLIR bindings 一致。
 
 ## 已验证版本
 
@@ -17,17 +17,13 @@ torch.export -> Torch-XLA -> official StableHLO
 | Torch-XLA | 2.9.0 |
 | StableHLO wheel | `1.12.1.1751868740+6f7b4ab8` |
 
-本机使用：
+本机解释器：
 
 ```text
 /usr/bin/python3.12
 ```
 
-不要混用系统中其他 Python 的 `torch`、`torch_xla` 或 `mlir` 包。
-
 ## 安装
-
-PyTorch 和 Torch-XLA：
 
 ```bash
 /usr/bin/python3.12 -m pip install \
@@ -35,14 +31,15 @@ PyTorch 和 Torch-XLA：
   'torch-xla==2.9.0'
 ```
 
-StableHLO 官方 wheel 发布在 OpenXLA StableHLO GitHub Releases。当前验证版本：
+StableHLO 官方 wheel：
 
 ```bash
 /usr/bin/python3.12 -m pip install \
   'https://github.com/openxla/stablehlo/releases/download/dev-wheels/stablehlo-1.12.1.1751868740%2B6f7b4ab8-cp312-cp312-linux_x86_64.whl'
 ```
 
-如果上游 wheel URL 发生变化，应选择与 Python 3.12 和当前平台匹配的官方 wheel，并把新版本记录到实验 manifest。
+上游 wheel 地址变化时，选择与 Python 3.12 和平台匹配的 OpenXLA 官方 wheel，并把版本
+写入实验 manifest。
 
 ## 验证依赖
 
@@ -82,15 +79,12 @@ cd /home/lora/OpenTPU/npu-ooo-simulator
 
 PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-model \
   --torch-module examples.torch_models:AttentionMicrograph \
-  --input-shape 1,4,8 \
-  --input-shape 1,4,8 \
-  --input-shape 1,4,8 \
-  --tile-size 4 \
-  --policy dynamic_ready_queue \
+  --input-shape 1,4,8 --input-shape 1,4,8 --input-shape 1,4,8 \
+  --tile-size 4 --policy dynamic_ready_queue \
   --output-dir out/frontend-smoke
 ```
 
-成功后检查：
+重点产物：
 
 ```text
 out/frontend-smoke/00_frontend/generated.mlir
@@ -99,7 +93,7 @@ out/frontend-smoke/03_tisa/tisa_program.json
 out/frontend-smoke/manifest.json
 ```
 
-`manifest.json` 应满足：
+manifest 关键字段：
 
 ```json
 {
@@ -110,4 +104,5 @@ out/frontend-smoke/manifest.json
 }
 ```
 
-Torch-XLA 不可用、版本不兼容或 StableHLO verify 失败时，编译会直接报错，不会切换到另一条前端。
+Torch-XLA、StableHLO bindings 和 verify 结果共同决定前端编译状态；诊断信息写入 CLI
+错误输出和 frontend artifact。

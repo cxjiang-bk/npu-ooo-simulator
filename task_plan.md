@@ -2,132 +2,119 @@
 
 ## 目标
 
-建立从真实 PyTorch 算子/模型到 TISA device simulator 的可配置研究栈，用同一份编译产物比较 static 与 dynamic 调度，并输出可解释的周期、stall 和泳道图。
+建立从真实 PyTorch 算子/模型到 TISA device simulator 的可配置研究栈，用同一份编译产物
+比较 static 与 dynamic 调度，并输出可解释的周期、stall 和泳道图。
 
-## 当前状态
+## 已完成基线
 
-当前已完成阶段 1-3，并完成论文 GC/FC 阶段对齐的第一版：
+- [x] PyTorch nn.Module -> torch.export -> Torch-XLA -> official StableHLO -> Canonical IR；
+- [x] GC canonicalization、semantic recovery、统一 tile planner、region/state dependency；
+- [x] FC TISA 方言、TISA Generator、BackendArtifact；
+- [x] RuntimeSubmission、物理地址绑定、runtime/device policy 四组合；
+- [x] MachineConfig 与 codegen/timing/event backend registry；
+- [x] staged artifact、manifest、泳道图、Perfetto trace；
+- [x] RTL completion trace 和 VCS console log 的离线 profile importer；
+- [x] Matmul、elementwise、reduce、Softmax、LayerNorm、RMSNorm、Attention、SwiGLU、
+      RoPE、Conv2D、BatchNorm、pooling、reshape/transpose、static broadcast、scalar、
+      dtype convert；
+- [x] 固定窗口 KV-cache 与多步 RuntimeSequence；
+- [x] 六个论文 benchmark 的 micro/representative proxy registry 与 paper-matrix 入口。
 
-1. `torch.export -> Torch-XLA -> official StableHLO -> Canonical OperatorGraph` 唯一前端；
-2. Graph Compiler（GC）：Canonical graph passes、统一 tile planner、region/state tile dependency；
-3. Fusion Compiler（FC）与 TISA Generator：TISA dialect proxy、semantic descriptor 和 backend payload ownership；
-4. RuntimeSubmission、物理地址绑定、TISA instruction 粒度的 static/dynamic simulator；
-5. 可配置 MachineConfig，以及 codegen、timing、event backend registry；
-6. 分阶段 artifact、泳道图、Perfetto trace 和 RTL completion profile importer。
+生产入口统一使用 compile-model --torch-module MODULE:CLASS。测试 fixture 可以直接
+构造所属层 IR，用于隔离验证接口契约。
 
-已经删除的生产路径：手写 `src/npu_ooo/benchmarks`、直接 JSON/StableHLO 输入、项目自有 StableHLO emitter、算子专用 CLI 和 primitive scheduler 入口。
+## 阶段 1：模型与前端语义
 
-## 阶段 1：前端语义覆盖
+### 已完成
 
-目标：输入只接受真实 `torch.nn.Module`，通过 Torch-XLA 获得 StableHLO，不按模型名写分支。
+- [x] 静态 Attention 与 pre-norm decoder；
+- [x] BERT、GPT-J、LLaMA2、DeepSeek dense one-block；
+- [x] LLaMA2 RoPE、固定窗口 KV-cache、prefill/decode micro；
+- [x] ResNet bottleneck micro 的 Conv2D、BatchNorm inference、ReLU、pooling；
+- [x] StableHLO operation capability registry 与 semantic fusion registry；
+- [x] 常量 dynamic broadcast、dynamic_slice、dynamic_reshape specialization。
 
-- [x] Matmul、elementwise、reduce、Softmax、RMSNorm、LayerNorm 基础路径；
-- [x] attention micrograph 的 `QK^T -> Softmax -> PV`；
-- [x] 首个静态 shape multi-head attention：scale、additive mask、head reshape、output projection；
-- [x] 首个静态 shape pre-norm decoder block：RMSNorm、attention、residual、SwiGLU/MLP；
-- [x] decoder block extensions：RoPE、固定窗口 KV-cache 与多步 decode sequence；
-- [x] ResNet bottleneck micro：Conv2D、BatchNorm inference、ReLU、MaxPool；
-- [x] BERT/GPT-J/LLaMA2/DeepSeek 的真实 one-block module（LLaMA2 decode/cache 为 scaled micro workload）。
+### 进行中
 
-每个新增能力都必须同时补 semantic capability、graph recovery/fusion、TISA stage、backend lowering 和真实 PyTorch 回归。
+- [ ] DeepSeek dense/MoE capability 清单；
+- [ ] embedding、position embedding、causal mask 和 layout 变体；
+- [ ] 完整模型 repetition 与论文形状 proxy 的输入规模验证。
+
+每个新增能力沿以下契约交付：
+
+```text
+StableHLO capability
+  -> Canonical mapping / recovery
+  -> TISA stage
+  -> backend lowering
+  -> PyTorch regression
+```
 
 ## 阶段 2：编译与 TISA 正确性
 
-- [x] PassManager、统一 tile planner、TISA descriptor 和 backend payload ownership；
-- [x] 明确 GCArtifact、TISADialectProgram、TISAProgram 三个编译阶段契约；
-- [x] 复合 Softmax/Norm 保持 semantic TISA op，内部 primitive 退回 backend payload；
-- [x] 第一版 region-aware tile dependency，无法证明映射时显式保守回退；
-- [x] 保存每个 GC pass 的输入/输出图与诊断 dump；
-- [x] LayerNorm recovery 对多实例图执行 fixed-point，避免第二个规范化节点残留到 FC；
-- [x] RMSNorm recovery 支持 Torch-XLA power/reshape/affine 链，并将 weight 作为 semantic operand 传入 payload；
-- [x] 生成 capacity-aware residency 和多 tile ping-pong intent metadata；
-- [x] 为 FC stage 和 typed dependency 写入显式 readiness condition；
-- [x] Softmax 提供默认 materialized 与显式 analytical online state-chain 两种 payload 语义；
-- [ ] 完善 symbolic/dynamic shape、layout、broadcast 和边界 tile；
-  - [x] Torch-XLA 常见 dynamic broadcast、常量起点 `dynamic_slice` 与常量 shape
-    `dynamic_reshape` 的 shape specialization 子集；
-  - [ ] 完整 dynamic index/layout legalization；
-- [x] 为 FC/TISA `TileMem` 增加 concrete stride、stride expression 和 layout metadata；
-- [x] 输出 per-operator tile、TISA、MAC、root traffic 和 dependency statistics；
-- [x] 输出每个 pass 前后的独立 graph dump；
-- [x] 为多种 tile candidate 增加可解释 cost model。
+### 已完成
 
-验收：相同 module、shape、tile size、MachineConfig 和 backend 产生稳定 compiled artifact；static/dynamic 只改变 policy。
+- [x] PassManager、TileGraph、TISA descriptor 和 payload ownership；
+- [x] region-aware dependency、卷积/池化 halo、broadcast、scalar region；
+- [x] TileMem concrete stride、stride expression、layout metadata；
+- [x] dtype policy、multi-result boundary 和 readiness condition；
+- [x] candidate cost model、residency/ping-pong intent、per-pass dump；
+- [x] materialized 与 online Softmax payload 属性。
+
+### 进行中
+
+- [ ] symbolic shape 统一 binding；
+- [ ] dynamic index、dynamic layout 和 stride-aware transform；
+- [ ] 完整模型 proxy 的 tile/MAC/traffic 对账样例。
+
+验收：固定 module、shape、tile、MachineConfig 和 backend 生成稳定 artifact hash；
+static/dynamic 的差异来自 policy；小图数据可以逐项核对。
 
 ## 阶段 3：设备调度与后端
 
-- [x] reception availability、queue、ROB/window、资源占用、completion feedback 的 analytical 模型；
-- [x] 补齐论文语义的 partial-ready 原型、typed hazard、address conflict 和可选 memory bank/port conflict；
-- [ ] 校准 dispatch/wake-up/issue/completion 控制开销；
-- [ ] 接入 SCALE-Sim 类 MXU timing、memory timing 和 RTL/Verilator 局部时序；
-- [ ] 每个 backend 声明 capability、timing interval 和 calibration status。
+### 已完成
+
+- [x] reception、queue、ROB/window、资源占用和 completion feedback analytical model；
+- [x] typed RAW/WAR/WAW/STATE/ACCUMULATE、address scoreboard、partial-ready 原型；
+- [x] memory bank/port structural-conflict model 与独立 stall 计数。
+
+### 进行中
+
+- [ ] 论文 WQ/IQ/Fu 容量、dispatch width、控制开销校准；
+- [ ] SCALE-Sim/Ramulator2 类 MXU/memory timing；
+- [ ] RTL/Verilator unit timing 与 system simulator adapter；
+- [ ] backend capability、timing interval、calibration status 的统一声明。
 
 ## 阶段 4：论文实验矩阵
 
-固定以下维度进行公平比较：
+固定维度：
 
 ```text
-PyTorch module / input shape / phase
+model / shape / phase
   x tile candidate
   x runtime policy
-  x device scheduler policy
+  x device policy
   x MachineConfig
   x timing/event backend
 ```
 
-prefill 与 decode 必须是不同 case；analytical、source-derived 和 RTL-observed 结果必须分组统计。完成 one-block 后再扩展 full-model repetition 和 request-level runtime。
+- [x] paper-matrix 单次编译、共享 artifact 和 policy matrix；
+- [x] case/variant staged output、matrix_index、sweep 汇总；
+- [ ] full-model repetition、request-level runtime；
+- [ ] source-derived 与 RTL-observed 分组统计。
 
-当前矩阵入口与输出契约：
+## 当前执行顺序
 
-- [x] `paper-matrix` 对 registry case 执行一次编译并复用同一 `BackendArtifact`、
-  `program_id` 和 buffer binding；
-- [x] 默认比较 device static/dynamic，显式 `--runtime-device-matrix` 才运行四组合；
-- [x] 为每个 `<case-id>/<variant>/` 保存共享 `00_frontend` 到 `04_backend` compiler
-  artifact，并将策略的 `05_runtime` 到 `07_trace` 结果放入 `policy_matrix/`；
-- [x] 在矩阵根目录写入 `matrix_index.json`，用于识别本次 case 清单并诊断旧输出目录；
-- [ ] 补齐 full-model repetition、request-level runtime，以及 source-derived/RTL-observed
-  分组统计。
+1. symbolic shape、dynamic index、layout 语义；
+2. DeepSeek 与完整模型 repetition；
+3. scheduler 微结构和控制开销校准；
+4. 外部 timing/memory/RTL backend；
+5. 论文规模 source-derived/RTL-observed 矩阵。
 
-`micro` 是默认快速 proxy；`paper_shape` 只用于接近论文形状的代表性输入，预计需要
-更大的内存和更长的编译时间，不能直接替代完整论文 benchmark。
+## 验证命令
 
-## 当前下一步
-
-### 阶段 1A：公共 StableHLO 前端稳定性
-
-- [x] `stablehlo.convert` capability 和 source/target dtype 语义；
-- [x] 未注册 StableHLO operation 显式报告缺失 capability 与已知 operation 集合；
-- [ ] scalar/multi-result/layout/broadcast 的通用 metadata；
-  - [x] 静态 `broadcast_in_dim` 输出域 tile、源 operand region 与边界 tile 契约；
-  - [x] scalar elementwise operand 的零秩/常量 metadata 与 tile region 契约；
-  - [x] StableHLO tensor encoding 的来源 metadata 与未知 layout 的 conservative interval 契约；
-  - [x] 未知 StableHLO multi-result operation 的显式失败；`batch_norm_training` 保留既有 recovery 例外；
-- [x] Torch-XLA/PJRT dtype 兼容性矩阵和严格/fallback policy。
-
-### 阶段 1B：模型到 TISA 的语义覆盖
-
-- [x] Fusion Pattern Registry 基础设施与现有 LayerNorm/RMSNorm/Softmax pattern；
-- [x] Attention region 与 SwiGLU semantic pattern；
-- [x] BERT/GPT-J one-block 的真实前端回归；
-- [x] LLaMA2 的 RoPE、固定窗口 KV-cache 和 prefill/decode micro workload；
-- [x] ResNet micro 的 Conv2D、BatchNorm inference、pooling；完整 ResNet50 仍需扩展；
-- [ ] DeepSeek 结构确认以及 dense/MoE 路径。
-
-阶段 1A 完成后继续细化 FC 的 TISA dialect metadata、strided `TileMem` interval，
-再推进上述模型语义。scheduler 微结构和外部 timing backend 保持在编译语义稳定之后。
-
-### 阶段 1C：跨 invocation runtime state
-
-- [x] 建立 persistent state registry，稳定绑定 `state_id` 与物理 buffer；
-- [x] 建立多步 `RuntimeSequence`，显式记录 invocation 间 state-complete 依赖；
-- [x] sequence simulator 复用同一 compiled artifact，拼接多次 invocation 的周期与事件；
-- [x] 用固定窗口 KV-cache 两步 decode 回归验证地址稳定、状态依赖和 static/dynamic 周期。
-
-阶段 1C 的 contract 仍只覆盖固定窗口、静态 shape、unit stride 和顺序 decode；动态
-position 写入、跨 request 生命周期和真实 cache layout 留到后续阶段。
-
-## Errors Encountered
-
-| Error | Attempt | Resolution |
-|---|---:|---|
-| Scalar constants caused reduce lowering to see two inputs | 1 | Keep reducer-init SSA value in `constant_args`; canonical reduce retains only the first data operand |
+```bash
+PYTHONPATH=src /usr/bin/python3.12 -m unittest discover -s tests -v
+PYTHONPATH=src /usr/bin/python3.12 -m compileall -q src tests examples
+git diff --check
+```
