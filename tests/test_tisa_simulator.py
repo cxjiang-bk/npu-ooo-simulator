@@ -15,6 +15,7 @@ from npu_ooo.ir import (
     TISAProgram,
     TileMem,
     UnitMap,
+    DynamicIndexBinding,
     create_runtime_submission,
 )
 from npu_ooo.scheduler import SchedulerPolicy, SimulatorConfig, schedule_tisa_program
@@ -482,6 +483,50 @@ class TISADeviceSimulatorTest(unittest.TestCase):
         self.assertEqual(overlapping_result.instruction_timing("dma").issue, 0)
         self.assertEqual(overlapping_result.instruction_timing("tensor").issue, 10)
         self.assertGreater(overlapping_result.metrics["address_scoreboard_block_events"], 0)
+
+    def test_tisa_trace_and_address_hazard_keep_dependency_provenance(self) -> None:
+        shared_write = _operand("shared", AccessType.WRITE)
+        shared_read = _operand("shared", AccessType.READ)
+        instructions = (
+            _instruction("writer", "tile_writer", "dma"),
+            replace(
+                _instruction("reader", "tile_reader", "tensor", dependencies=("writer",)),
+                operands=(shared_read,),
+                dependencies=(TISADependency(
+                    "writer", "RAW", "full_region_ready",
+                    {"source": "gc_tile_dependency", "tensor": "shared"},
+                ),),
+            ),
+        )
+        tasks = (
+            ExecutionTask("writer.load", "tile_writer", "micro", "load", "DMA", duration_cycles=4, program_order=0),
+            ExecutionTask("reader.matmul", "tile_reader", "micro", "matmul", "MXU", predecessors=("writer.load",), duration_cycles=1, program_order=1),
+        )
+        artifact = _artifact(instructions, tasks, {"writer": ("writer.load",), "reader": ("reader.matmul",)})
+        result = schedule_tisa_program(artifact, minimal_machine_config(), SchedulerPolicy.DYNAMIC_READY_QUEUE)
+        issue = next(event for event in result.events if event.event == "TISA_ISSUE" and event.task_id == "reader")
+        self.assertEqual(issue.details["dependencies"][0]["kind"], "RAW")
+        self.assertEqual(issue.details["dependencies"][0]["provenance"]["source"], "gc_tile_dependency")
+
+    def test_runtime_submission_validates_dynamic_index_bindings(self) -> None:
+        instruction = replace(
+            _instruction("slice", "tile_slice", "dma"),
+            attributes={
+                "dynamic_index": {
+                    "expression_id": "slice.index",
+                    "index_rank": 2,
+                }
+            },
+        )
+        task = ExecutionTask("slice.load", "tile_slice", "micro", "load", "DMA", duration_cycles=1, program_order=0)
+        artifact = _artifact((instruction,), (task,), {"slice": ("slice.load",)})
+        buffer = BufferBinding("buffer_slice", 0x4000, 32, "SRAM", "SRAM", alignment_bytes=0x100)
+        submission = create_runtime_submission(
+            artifact,
+            (buffer,),
+            dynamic_index_bindings=(DynamicIndexBinding("slice.index", (1, 2)),),
+        )
+        self.assertEqual(submission.validate(artifact.program), ())
 
     def test_dynamic_runtime_bypasses_an_unavailable_independent_descriptor(self) -> None:
         artifact = self._critical_path_artifact()

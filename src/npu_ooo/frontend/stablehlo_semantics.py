@@ -118,6 +118,22 @@ _CAPABILITIES = {
             backend_capability_key="slice",
         ),
         StableHLOOpCapability(
+            op_name="stablehlo.dynamic_slice",
+            semantic_family="slice",
+            min_operands=2,
+            max_operands=32,
+            requires_recovery=True,
+            backend_capability_key="dynamic_slice",
+        ),
+        StableHLOOpCapability(
+            op_name="stablehlo.dynamic_update_slice",
+            semantic_family="kv_cache_update",
+            min_operands=3,
+            max_operands=32,
+            requires_recovery=True,
+            backend_capability_key="dynamic_update_slice",
+        ),
+        StableHLOOpCapability(
             op_name="stablehlo.concatenate",
             semantic_family="concatenate",
             min_operands=2,

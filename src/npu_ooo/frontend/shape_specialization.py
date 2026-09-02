@@ -15,7 +15,7 @@ from typing import Any, Mapping
 
 from npu_ooo.ir import OperatorGraph
 
-from .bridge import FrontendImportError
+from .bridge import FrontendImportError, normalize_shape_environment
 
 
 _VALUE = re.compile(r"%[A-Za-z_0-9][\w.$-]*")
@@ -169,15 +169,27 @@ def _slice_sizes(body: str) -> tuple[int, ...]:
     return tuple(values)
 
 
-def _graph_argument_shapes(graph: OperatorGraph) -> dict[str, tuple[int, ...]]:
+def _graph_argument_shapes(
+    graph: OperatorGraph,
+    shape_environment: Mapping[str, int],
+) -> dict[str, tuple[int, ...]]:
     tensors = {tensor.name: tensor for tensor in graph.tensors}
     inputs = graph.attributes.get("graph_inputs", ())
     result: dict[str, tuple[int, ...]] = {}
     for name in inputs:
         tensor = tensors.get(str(name))
-        if tensor is None or any(not isinstance(value, int) for value in tensor.shape):
+        if tensor is None:
             continue
-        result[str(name)] = tuple(int(value) for value in tensor.shape)
+        resolved: list[int] = []
+        for value in tensor.shape:
+            if isinstance(value, int):
+                resolved.append(value)
+            elif isinstance(value, str) and value in shape_environment:
+                resolved.append(shape_environment[value])
+            else:
+                break
+        else:
+            result[str(name)] = tuple(resolved)
     return result
 
 
@@ -338,9 +350,11 @@ def _specialize_operation(
         ):
             start_values = [int(values[0]) for values in raw_start_values if values is not None]
         else:
-            raise FrontendImportError(
-                f"shape specialization requires constant start indices for dynamic slice '{result}'"
-            )
+            # Preserve the operation and its symbolic index operands.  The
+            # canonical importer records DynamicIndexExpr and runtime binds
+            # the values after descriptor submission.
+            value_shapes[normalized_result] = tuple(int(value) for value in sizes)
+            return line, None
         if len(start_values) != len(source_shape):
             raise FrontendImportError(
                 f"shape specialization dynamic slice '{result}' requires one start index per axis"
@@ -370,6 +384,20 @@ def _specialize_operation(
         )
         return rewritten, normalized_result
 
+    if target == "stablehlo.dynamic_update_slice":
+        if len(operand_names) < 3 or operand_shapes[0] is None:
+            raise FrontendImportError(
+                f"shape specialization dynamic update slice '{result}' needs resolved operand shape"
+            )
+        if result_shape is None:
+            result_shape = tuple(int(value) for value in operand_shapes[0])
+        if tuple(result_shape) != tuple(operand_shapes[0]):
+            raise FrontendImportError(
+                f"shape specialization dynamic update slice '{result}' result shape must match operand"
+            )
+        value_shapes[normalized_result] = tuple(result_shape)
+        return line, None
+
     if target.startswith("stablehlo.dynamic_"):
         raise FrontendImportError(
             f"shape specialization does not support dynamic operation '{target}'"
@@ -396,14 +424,23 @@ def specialize_stablehlo(
 
     if not text.strip():
         raise FrontendImportError("shape specialization requires non-empty StableHLO text")
-    argument_shapes = _graph_argument_shapes(source_graph)
+    normalized_environment = normalize_shape_environment(shape_environment)
+    argument_shapes = _graph_argument_shapes(source_graph, normalized_environment)
     graph_inputs = tuple(str(item) for item in source_graph.attributes.get("graph_inputs", ()))
     graph_outputs = tuple(str(item) for item in source_graph.attributes.get("graph_outputs", ()))
     tensors = {tensor.name: tensor for tensor in source_graph.tensors}
     output_shapes = tuple(
-        tuple(int(value) for value in tensors[name].shape)
+        tuple(
+            int(value) if isinstance(value, int) else normalized_environment[str(value)]
+            for value in tensors[name].shape
+        )
         for name in graph_outputs
-        if name in tensors and all(isinstance(value, int) for value in tensors[name].shape)
+        if name in tensors
+        and all(
+            isinstance(value, int)
+            or (isinstance(value, str) and value in normalized_environment)
+            for value in tensors[name].shape
+        )
     )
     value_shapes = dict(argument_shapes)
     shape_values: dict[str, list[int]] = {}
@@ -470,7 +507,7 @@ def specialize_stablehlo(
         text=specialized_text,
         dynamic_operations=tuple(sorted(dynamic_operations)),
         removed_shape_operations=tuple(sorted(set(removed_shape_operations))),
-        shape_environment=dict(shape_environment or {}),
+        shape_environment=normalized_environment,
     )
 
 

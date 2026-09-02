@@ -24,6 +24,7 @@ class BufferRegion:
     offset_bytes: int = 0
     size_bytes: int = 0
     layout: str = "dense"
+    strides_bytes: tuple[int, ...] | None = None
 
     @property
     def normalized_access(self) -> str:
@@ -50,6 +51,14 @@ class BufferRegion:
             issues.append(f"buffer region '{self.tensor}' offset_bytes must be non-negative")
         if self.size_bytes < 0:
             issues.append(f"buffer region '{self.tensor}' size_bytes must be non-negative")
+        if self.strides_bytes is not None:
+            if len(self.strides_bytes) != len(self.shape):
+                issues.append(f"buffer region '{self.tensor}' strides and shape must have equal rank")
+            if any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in self.strides_bytes
+            ):
+                issues.append(f"buffer region '{self.tensor}' strides_bytes must be non-negative integers")
         return tuple(issues)
 
     def to_dict(self) -> dict[str, Any]:
@@ -63,6 +72,7 @@ class BufferRegion:
             "offset_bytes": self.offset_bytes,
             "size_bytes": self.size_bytes,
             "layout": self.layout,
+            "strides_bytes": list(self.strides_bytes) if self.strides_bytes is not None else None,
         }
 
 
@@ -81,6 +91,23 @@ class ExecutionTask:
     stage_id: int = 0
     program_order: int = 0
     attributes: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def dependency_provenance(self) -> Mapping[str, Any]:
+        """Return the compiler dependency origin attached to this task."""
+
+        value = self.attributes.get("dependency_provenance", {})
+        return value if isinstance(value, Mapping) else {}
+
+    @property
+    def dependency_kind(self) -> str | None:
+        value = self.attributes.get("dependency_kind")
+        return str(value) if value not in {None, ""} else None
+
+    @property
+    def dependency_condition(self) -> str | None:
+        value = self.attributes.get("dependency_condition")
+        return str(value) if value not in {None, ""} else None
 
     def validate(self) -> tuple[str, ...]:
         issues: list[str] = []

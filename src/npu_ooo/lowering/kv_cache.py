@@ -3,6 +3,7 @@ from __future__ import annotations
 """Analytical lowering for the fixed-window KV-cache state update."""
 
 import math
+from typing import Mapping
 
 from npu_ooo.arch import MachineConfig
 from npu_ooo.ir import (
@@ -12,22 +13,14 @@ from npu_ooo.ir import (
     ExecutionTask,
     OperatorGraph,
     ScheduleSpec,
+    dtype_bytes,
 )
 
 from .matmul import LoweringResult, _local_memory, _root_memory, _transfer_timing, _unit_for
 
 
 def _region(tensor, memory: str, access: AccessType) -> BufferRegion:
-    dtype_bytes = {
-        "fp16": 2,
-        "f16": 2,
-        "float16": 2,
-        "bf16": 2,
-        "bfloat16": 2,
-        "fp32": 4,
-        "f32": 4,
-        "float32": 4,
-    }.get(str(tensor.dtype).lower(), 2)
+    element_bytes = dtype_bytes(tensor.dtype, default=2)
     return BufferRegion(
         tensor=tensor.name,
         memory=memory,
@@ -35,7 +28,7 @@ def _region(tensor, memory: str, access: AccessType) -> BufferRegion:
         starts=(0,) * len(tensor.shape),
         dtype=tensor.dtype,
         access=access,
-        size_bytes=math.prod(tensor.shape) * dtype_bytes,
+        size_bytes=math.prod(tensor.shape) * element_bytes,
         layout=tensor.layout,
     )
 
@@ -84,6 +77,33 @@ def lower_kv_cache_graph(
         machine, local, root, output_root.size_bytes
     )
     tile_id = f"{operator.op_id}.t0000"
+    state_attributes = {
+        "state_id": operator.attributes.get("state_id", cache.name),
+        "state_buffer": operator.attributes.get("state_buffer", cache.name),
+        "stateful": True,
+        "state_update": operator.attributes.get("state_update", False),
+        "dynamic_index": operator.attributes.get("dynamic_index"),
+    }
+    dynamic_index = operator.attributes.get("dynamic_index")
+    dynamic_index_attributes = (
+        dynamic_index.get("attributes", {})
+        if isinstance(dynamic_index, Mapping)
+        else {}
+    )
+    state_region = (
+        {
+            "tensor": operator.attributes.get("state_buffer", cache.name),
+            "dynamic_index": dynamic_index,
+            "window_shape": list(
+                dynamic_index_attributes.get("update_shape", ())
+                if isinstance(dynamic_index_attributes, Mapping)
+                else ()
+            ),
+            "address_semantics": "dynamic_index_window",
+        }
+        if operator.attributes.get("state_update") and isinstance(dynamic_index, Mapping)
+        else None
+    )
     cache_load = ExecutionTask(
         task_id=f"{tile_id}.load_cache",
         tile_id=tile_id,
@@ -94,7 +114,7 @@ def lower_kv_cache_graph(
         writes=(cache_local,),
         duration_cycles=cache_load_duration,
         initiation_interval_cycles=cache_load_ii,
-        attributes={"state_id": operator.attributes.get("state_id", cache.name), "operand": "cache"},
+        attributes={**state_attributes, "operand": "cache"},
     )
     update_load = ExecutionTask(
         task_id=f"{tile_id}.load_update",
@@ -106,7 +126,7 @@ def lower_kv_cache_graph(
         writes=(update_local,),
         duration_cycles=update_load_duration,
         initiation_interval_cycles=update_load_ii,
-        attributes={"state_id": operator.attributes.get("state_id", cache.name), "operand": "update"},
+        attributes={**state_attributes, "operand": "update"},
     )
     compute = ExecutionTask(
         task_id=f"{tile_id}.kv_cache_update",
@@ -120,9 +140,8 @@ def lower_kv_cache_graph(
         duration_cycles=update_duration,
         initiation_interval_cycles=float(update_unit.initiation_interval_cycles),
         attributes={
+            **state_attributes,
             "semantic_family": "kv_cache",
-            "stateful": True,
-            "state_id": operator.attributes.get("state_id", cache.name),
             "cache_axis": operator.attributes.get("cache_axis"),
             "state_transition": operator.attributes.get("state_transition"),
         },
@@ -138,7 +157,7 @@ def lower_kv_cache_graph(
         predecessors=(compute.task_id,),
         duration_cycles=store_duration,
         initiation_interval_cycles=store_ii,
-        attributes={"state_id": operator.attributes.get("state_id", cache.name)},
+        attributes={**state_attributes},
     )
     execution = ExecutionGraph(
         graph_id=f"{graph.graph_id}.execution",
@@ -148,6 +167,8 @@ def lower_kv_cache_graph(
             "stateful": True,
             "state_id": operator.attributes.get("state_id", cache.name),
             "persistent_buffers": [operator.attributes.get("state_buffer", cache.name)],
+            "dynamic_index": dynamic_index,
+            "state_region": state_region,
         },
     )
     issues = execution.validate()

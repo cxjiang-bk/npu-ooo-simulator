@@ -70,7 +70,7 @@ def default_lowering_registry() -> LoweringRegistry:
     registry.register(("conv2d",), lower_conv2d_graph)
     registry.register(("batch_norm",), lower_batch_norm_graph)
     registry.register(("pool",), lower_pool_graph)
-    registry.register(("reshape", "transpose"), lower_transform_graph)
+    registry.register(("reshape", "transpose", "slice"), lower_transform_graph)
     return registry
 
 
@@ -144,6 +144,11 @@ def lower_mixed_graph(
             if name not in {"tile_count", "task_count"}:
                 statistics[f"{operator_id}.{name}"] = value
 
+    # GC owns the semantic tile graph.  Resolve it before backend handoffs so
+    # every execution predecessor can retain the originating typed edge.
+    if tile_graph is None:
+        tile_graph = build_tile_graph(graph, schedule)
+
     tasks_by_operator = {
         operator_id: [task for task in tasks if task.operator_id == operator_id]
         for operator_id in operators
@@ -191,11 +196,78 @@ def lower_mixed_graph(
                 for producer_task_id in overlapping
             )
 
+    tile_dependencies = tuple(tile_graph.dependencies)
+    task_by_id = {task.task_id: task for task in tasks}
+
+    def dependency_metadata(task: object, predecessor_id: str) -> dict[str, object]:
+        predecessor = task_by_id[predecessor_id]
+        matches = [
+            dependency
+            for dependency in tile_dependencies
+            if dependency.producer == predecessor.tile_id
+            and dependency.consumer == task.tile_id
+        ]
+        if matches:
+            # A pair of tiles can carry more than one semantic reason.  Keep
+            # each reason in deterministic order rather than collapsing it.
+            return {
+                "source": "gc_tile_dependency",
+                "edges": [
+                    {
+                        "tensor": dependency.tensor,
+                        "kind": dependency.kind,
+                        "hazard_kind": dependency.hazard_kind,
+                        "condition": dependency.condition,
+                        "producer_tile": dependency.producer,
+                        "consumer_tile": dependency.consumer,
+                        "producer_region": dependency._region_to_dict(dependency.producer_region),
+                        "consumer_region": dependency._region_to_dict(dependency.consumer_region),
+                        "provenance": dict(dependency.provenance),
+                    }
+                    for dependency in sorted(
+                        matches,
+                        key=lambda item: (
+                            item.tensor or "",
+                            item.hazard_kind,
+                            item.condition,
+                        ),
+                    )
+                ],
+            }
+        if predecessor.tile_id == task.tile_id:
+            return {
+                "source": "backend_payload_order",
+                "edges": [
+                    {
+                        "kind": "control",
+                        "hazard_kind": "CONTROL",
+                        "condition": "payload_stage_complete",
+                    }
+                ],
+            }
+        return {
+            "source": "execution_graph_edge",
+            "edges": [
+                {
+                    "kind": "control",
+                    "hazard_kind": "CONTROL",
+                    "condition": "task_complete",
+                }
+            ],
+        }
+
     ordered_tasks = tuple(
         replace(
             task,
             predecessors=tuple(sorted(predecessor_sets[task.task_id])),
             program_order=program_order,
+            attributes={
+                **dict(task.attributes),
+                "dependency_provenance": {
+                    predecessor_id: dependency_metadata(task, predecessor_id)
+                    for predecessor_id in sorted(predecessor_sets[task.task_id])
+                },
+            },
         )
         for program_order, task in enumerate(tasks)
     )
@@ -213,11 +285,6 @@ def lower_mixed_graph(
     issues = execution_graph.validate()
     if issues:
         raise ValueError("; ".join(issues))
-    # GC already owns the semantic TileGraph.  Reusing it
-    # keeps backend payload lowering from silently choosing a second tiling
-    # result; the optional argument preserves the legacy lowering API.
-    if tile_graph is None:
-        tile_graph = build_tile_graph(graph, schedule)
     return LoweringResult(
         tile_graph=tile_graph,
         execution_graph=execution_graph,

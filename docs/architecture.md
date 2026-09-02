@@ -116,6 +116,9 @@ register StableHLO dialect
 负责经过 shape、常量和数据流证明的多节点语义恢复。operation capability 诊断包含原始
 名称、规范名称、缺失注册项和已知 operation 集合。
 
+dtype 名称由 IR 级共享 registry 解析。StableHLO 的 `i32/i64/ui*` 和 PyTorch/Canonical
+别名使用同一 capability family 与 storage byte width，避免索引 tensor 在编译边界被误判。
+
 ### 3.3 Shape specialization
 
 Torch-XLA 对动态 shape 生成 `get_dimension_size`、shape tensor 和 dynamic
@@ -128,9 +131,14 @@ operation。compiler 在官方 parse/verify 前执行 operation-level specializa
   `reshape`；
 - shape-only SSA 在转换后清理，variant、shape environment 和诊断写入 artifact。
 
-这一阶段产出经过语义验证的静态 StableHLO module。runtime dynamic index、
-dynamic_update_slice、paged KV-cache 和完整动态 layout 作为后续 capability 扩展，
-分别需要 dynamic index metadata、state contract、物理地址表达式和 backend primitive。
+这一阶段产出经过语义验证的 StableHLO module。常量索引在 specialization 中静态化；
+运行时索引保留为 `DynamicIndexExpr`，由 runtime `DynamicIndexBinding` 提供本次 invocation
+的具体值。`dynamic_update_slice` 同时生成 `stateful/state_id/state_buffer` contract，并
+将结果 alias 到 persistent state buffer。runtime 先按 StableHLO clamp 规则求解索引，再
+使用 buffer 的 dense 或显式 byte strides 计算动态窗口的 physical offset/span；resolved
+region、索引和 provenance 进入 TISA operand 与 address scoreboard。未解析的 StableHLO
+layout encoding 经过统一 resolver：可验证的 strides/minor-to-major 进入 concrete stride
+metadata，opaque encoding 保留 conservative logical region。
 
 ## 4. Graph Compiler（GC）
 
@@ -206,12 +214,14 @@ ping-pong metadata。该 metadata 描述编译期 locality，runtime 负责实�
 
 `build_tile_graph()` 为每个 `TileInstance` 记录 tile id、operator id、coordinates、
 bounds 和 semantic metadata。跨算子边使用 `logical_tensor_region_v1`：producer 与
-consumer tile 的逻辑 region 重叠时建立 RAW/WAR/WAW 边；Matmul 的 M/N/K、broadcast
+consumer tile 的逻辑 region 重叠时建立 `TileDependency`，并保存 hazard kind、两侧
+logical region、ready condition 和 provenance。数据流边使用 RAW；reduction、state、
+accumulate 和 buffer-reuse 分别使用项目扩展关系。Matmul 的 M/N/K、broadcast
 elementwise、reduce/norm、卷积/池化 halo 和 full-tensor transform 各有对应投影规则。
-映射信息不足时采用记录在统计中的 conservative overlap。reduction、state、accumulate
-和 buffer-reuse 形成额外合法性边。
+映射信息不足时采用记录在统计中的 conservative overlap。
 
-普通 reshape/transpose 使用 full-tensor DMA transform。静态 `broadcast_in_dim` 按
+普通 reshape/transpose 使用 full-tensor DMA transform。slice 使用 output-tile copy，
+其 source operand 记录动态索引表达式；runtime 绑定后使用动态窗口的具体物理区间。静态 `broadcast_in_dim` 按
 输出域切 tile，并依据 `broadcast_dimensions` 投影源 operand region。卷积和 pooling
 输入 region 包含 window/kernel halo。FC `TileMem` 保存 scope、logical address
 expression、concrete offset/size、`strides_bytes`、`stride_expr`、layout 和 dtype
@@ -227,7 +237,7 @@ FC 消费 `GCArtifact` 中的 `OperatorGraph`、`ScheduleSpec` 和 `TileGraph`�
 OpType / semantic family
 Operands: TileShape + TileMem + AccessType
 UnitMap
-typed dependencies + readiness condition
+typed dependencies + readiness condition + provenance
 fusion / reorder attributes
 backend payload recipe
 ```
@@ -266,14 +276,16 @@ tisa_id / tile_id / operator_id
 op_type
 TISAOperand(tile shape, TileMem, access type)
 UnitMap
-typed dependency: RAW/WAR/WAW/STATE/ACCUMULATE/BUFFER_REUSE
+typed dependency: kind、condition、provenance
 semantic metadata
 payload_ref
 ```
 
 `ExecutionTask` 属于 backend payload，表示同一 TISA issue 后在目标 execution unit
 内执行的步骤。全局 scheduler 以 TISA instruction 为唯一调度单位；payload lane 事件
-用于 timing 和泳道图。
+用于 timing 和泳道图。每个 task 的 predecessor metadata 保存对应 GC edge 的
+`hazard_kind`、`condition`、logical region 和 provenance；trace 的 `WAKE_UP`、`ISSUE`、
+`COMPLETE` 与 address scoreboard event 直接消费这份 metadata。
 
 ## 7. BackendArtifact
 
@@ -316,6 +328,13 @@ synchronization cost
 Runtime policy 表示 descriptor 的生成和提交顺序；device policy 表示已到达 TISA
 instruction 的 issue 选择。四种组合由 `--runtime-device-matrix` 一次编译后运行。
 
+Runtime submission 还携带 `DynamicIndexBinding`。binding 的 expression id 必须匹配
+TISA 的 `dynamic_index` metadata，值的 rank 按 expression contract 校验。runtime 为每个
+operand 记录 clamp 后的索引、dynamic region、physical offset/span 和 provenance；TISA
+address scoreboard 直接消费这些范围。`RuntimeLayoutBinding` 可以在每个 invocation 绑定
+具体 shape、byte strides、layout 和 offset，并沿同一 resolver 更新 operand 的 physical
+region；bank-aware 映射使用这些 resolved 地址。
+
 固定窗口 KV-cache 携带 `state_id/state_buffer`。`RuntimeStateRegistry` 绑定稳定的
 persistent address、memory scope 和容量；`RuntimeSequence` 为同一 `BackendArtifact`
 创建多次 invocation，并加入：
@@ -345,6 +364,10 @@ dynamic_ready_queue:
 
 可配置参数包括 instruction queue depth、ROB entries、dependency window、ready queue
 depth、max inflight tiles、address scoreboard 和 dynamic priority。
+
+`address scoreboard` 的 RAW/WAR/WAW 观察包含 predecessor、successor、tensor、memory、
+condition 和 provenance。若冲突来自编译期 GC edge，记录中嵌入同一条 TISA dependency；
+若冲突只由运行时物理区间产生，记录 `address_scoreboard` 作为来源。
 
 memory bank scoreboard 读取 `MachineConfig.memory_levels` 的 bank 数、bank width、
 read/write ports，为 active TISA instruction 建立 analytical reservation，并记录
@@ -378,13 +401,13 @@ policy、TISA instruction count、cycle 和 calibration status。
 
 - Matmul、batched Matmul、GEMV、elementwise、reduce、Softmax、LayerNorm、RMSNorm；
 - Attention、SwiGLU、RoPE、Conv2D、BatchNorm inference、max/avg pooling；
-- reshape/transpose、静态 broadcast、scalar tensor、dtype convert；
-- 固定窗口 KV-cache 与多步 RuntimeSequence；
+- reshape/transpose、slice、静态 broadcast、scalar tensor、dtype convert；
+- 固定窗口 KV-cache、dynamic_update_slice state contract 与多步 RuntimeSequence；
 - analytical、timing table、systolic MXU profile 和 RTL completion trace importer。
 
 扩展项按以下顺序推进：
 
-1. symbolic shape 的通用 binding、dynamic index 和 stride-aware layout；
+1. 更复杂 StableHLO layout dialect 的扩展与 bank-aware memory timing 校准；
 2. online Softmax 的数值 rescale、最终 normalization 与 workspace 生命周期；
 3. 完整 ResNet/BERT/GPT-J/LLaMA2 模型 repetition、DeepSeek MoE routing；
 4. 论文 WQ/IQ/Fu 容量、dispatch/wake-up/issue/completion 控制开销的硬件校准；

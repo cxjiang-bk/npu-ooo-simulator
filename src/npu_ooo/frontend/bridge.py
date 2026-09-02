@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import re
 from typing import Any, Mapping, Sequence
 
 from npu_ooo.ir import (
@@ -25,6 +26,30 @@ class FrontendKind(str, Enum):
     STABLEHLO = "stablehlo"
 
 
+def normalize_shape_environment(
+    shape_environment: Mapping[str, int] | None,
+) -> dict[str, int]:
+    """Validate and normalize symbolic dimension bindings at the frontend boundary."""
+
+    if shape_environment is None:
+        return {}
+    if not isinstance(shape_environment, Mapping):
+        raise FrontendImportError("shape_environment must be a mapping of symbol to positive integer")
+    normalized: dict[str, int] = {}
+    for raw_name, raw_value in shape_environment.items():
+        name = str(raw_name)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise FrontendImportError(
+                f"shape_environment symbol '{name}' must be a valid identifier"
+            )
+        if isinstance(raw_value, bool) or not isinstance(raw_value, int) or raw_value <= 0:
+            raise FrontendImportError(
+                f"shape_environment value for '{name}' must be a positive integer"
+            )
+        normalized[name] = raw_value
+    return normalized
+
+
 @dataclass(frozen=True)
 class FrontendImport:
     """A graph plus model metadata produced by a framework bridge."""
@@ -43,8 +68,10 @@ class FrontendImport:
             issues.append("frontend model_id must not be empty")
         if not self.variant:
             issues.append("frontend model variant must not be empty")
-        if not isinstance(self.shape_environment, Mapping):
-            issues.append("frontend shape_environment must be a mapping")
+        try:
+            normalize_shape_environment(self.shape_environment)
+        except FrontendImportError as exc:
+            issues.append(str(exc))
         return tuple(issues)
 
     def to_dict(self) -> dict[str, Any]:
@@ -132,9 +159,10 @@ class TorchExportAdapter:
                 "source_kind": source_kind,
                 "source_target": str(getattr(spec, "target", "") or ""),
             }
+        normalized_environment = normalize_shape_environment(shape_environment)
         graph = _operator_graph_from_fx_graph(
             graph_module.graph,
-            shape_environment or {},
+            normalized_environment,
             input_sources=input_sources,
             graph_id=(
                 "torch_export_graph"
@@ -146,7 +174,7 @@ class TorchExportAdapter:
             graph=graph,
             model_id=model_id,
             variant=variant,
-            shape_environment=dict(shape_environment or {}),
+            shape_environment=normalized_environment,
             frontend=cls.kind,
             provenance={
                 "source": "torch.export",

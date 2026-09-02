@@ -44,10 +44,84 @@ class TileInstance:
 
 @dataclass(frozen=True)
 class TileDependency:
+    """A dependency between two semantic tiles.
+
+    ``kind`` names the GC semantic reason for the edge.  ``hazard_kind`` is
+    the paper-facing access relation consumed by FC/TISA.  Region coordinates
+    stay in logical tensor space so the edge can be audited before runtime
+    address binding.
+    """
+
     producer: str
     consumer: str
     tensor: str | None = None
-    kind: str = "data"
+    kind: str = "region_data"
+    hazard_kind: str = "RAW"
+    producer_region: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+    consumer_region: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+    condition: str = "full_region_ready"
+    provenance: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def relation(self) -> str:
+        """Return the normalized paper hazard relation."""
+
+        return self.hazard_kind
+
+    @staticmethod
+    def _validate_region(
+        region: tuple[tuple[int, ...], tuple[int, ...]] | None,
+        *,
+        label: str,
+    ) -> tuple[str, ...]:
+        if region is None:
+            return ()
+        starts, shape = region
+        issues: list[str] = []
+        if len(starts) != len(shape):
+            issues.append(f"tile dependency {label} region starts and shape must have equal rank")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in starts
+        ):
+            issues.append(f"tile dependency {label} region starts must be non-negative integers")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in shape
+        ):
+            issues.append(f"tile dependency {label} region shape must contain positive integers")
+        return tuple(issues)
+
+    def validate(self) -> tuple[str, ...]:
+        issues: list[str] = []
+        if not self.producer or not self.consumer:
+            issues.append("tile dependency producer and consumer must not be empty")
+        if self.producer == self.consumer:
+            issues.append(f"tile dependency '{self.producer}' cannot depend on itself")
+        if self.kind not in {
+            "data",
+            "region_data",
+            "state",
+            "accumulate",
+            "buffer_reuse",
+            "control",
+        }:
+            issues.append(f"tile dependency kind '{self.kind}' is unsupported")
+        if self.hazard_kind not in {
+            "RAW",
+            "WAR",
+            "WAW",
+            "STATE",
+            "ACCUMULATE",
+            "BUFFER_REUSE",
+            "CONTROL",
+        }:
+            issues.append(f"tile dependency hazard kind '{self.hazard_kind}' is unsupported")
+        if not self.condition:
+            issues.append("tile dependency condition must not be empty")
+        issues.extend(self._validate_region(self.producer_region, label="producer"))
+        issues.extend(self._validate_region(self.consumer_region, label="consumer"))
+        return tuple(issues)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -55,7 +129,22 @@ class TileDependency:
             "consumer": self.consumer,
             "tensor": self.tensor,
             "kind": self.kind,
+            "hazard_kind": self.hazard_kind,
+            "relation": self.relation,
+            "producer_region": self._region_to_dict(self.producer_region),
+            "consumer_region": self._region_to_dict(self.consumer_region),
+            "condition": self.condition,
+            "provenance": dict(self.provenance),
         }
+
+    @staticmethod
+    def _region_to_dict(
+        region: tuple[tuple[int, ...], tuple[int, ...]] | None,
+    ) -> dict[str, list[int]] | None:
+        if region is None:
+            return None
+        starts, shape = region
+        return {"starts": list(starts), "shape": list(shape)}
 
 
 @dataclass(frozen=True)
@@ -71,6 +160,7 @@ class TileGraph:
         if len(tile_ids) != len(self.tiles):
             issues.append("tile ids must be unique")
         for dependency in self.dependencies:
+            issues.extend(dependency.validate())
             if dependency.producer not in tile_ids:
                 issues.append(f"tile dependency references unknown producer '{dependency.producer}'")
             if dependency.consumer not in tile_ids:
@@ -162,9 +252,30 @@ def enumerate_operator_tiles(operator: OperatorSpec, schedule: OperatorSchedule)
                 ),
                 ("rotary_algorithm", operator.attributes.get("rotary_algorithm")),
                 ("rotary_embedding", operator.attributes.get("rotary_embedding")),
+                ("stateful", operator.attributes.get("stateful")),
+                ("state_id", operator.attributes.get("state_id")),
+                ("state_buffer", operator.attributes.get("state_buffer")),
+                ("state_update", operator.attributes.get("state_update")),
+                ("dynamic_index", operator.attributes.get("dynamic_index")),
             )
-            if value not in {None, ""}
+            if value is not None and value != ""
         }
+        if (
+            operator.attributes.get("state_update")
+            and isinstance(operator.attributes.get("dynamic_index"), Mapping)
+        ):
+            dynamic_index = operator.attributes["dynamic_index"]
+            metadata = dynamic_index.get("attributes", {})
+            semantic_attributes["state_region"] = {
+                "tensor": operator.attributes.get("state_buffer"),
+                "dynamic_index": dict(dynamic_index),
+                "window_shape": list(
+                    metadata.get("update_shape", ())
+                    if isinstance(metadata, Mapping)
+                    else ()
+                ),
+                "address_semantics": "dynamic_index_window",
+            }
         tiles.append(
             TileInstance(
                 tile_id=f"{operator.op_id}.t{ordinal:04d}",
@@ -235,7 +346,44 @@ def _tile_tensor_region(
                 return None
         return tuple(starts), tuple(shape)
 
-    if op_type in {"reshape", "transpose", "kv_cache_update"}:
+    if op_type == "slice":
+        if tensor_name == operator.outputs[0]:
+            return _dimension_region(tile, iteration)
+        if tensor_name != operator.inputs[0]:
+            return None
+        dynamic_index = operator.attributes.get("dynamic_index")
+        if isinstance(dynamic_index, Mapping):
+            sizes = operator.attributes.get("slice_sizes")
+            if isinstance(sizes, (tuple, list)) and len(sizes) == len(tensor_shape):
+                return (0,) * len(tensor_shape), tuple(int(value) for value in sizes)
+        starts = operator.attributes.get("slice_starts")
+        limits = operator.attributes.get("slice_limits")
+        if (
+            isinstance(starts, (tuple, list))
+            and isinstance(limits, (tuple, list))
+            and len(starts) == len(tensor_shape)
+            and len(limits) == len(tensor_shape)
+        ):
+            return (
+                tuple(int(value) for value in starts),
+                tuple(int(limit) - int(start) for start, limit in zip(starts, limits)),
+            )
+        return (0,) * len(tensor_shape), tensor_shape
+
+    if op_type == "kv_cache_update":
+        update_name = operator.attributes.get("update_tensor")
+        dynamic_index = operator.attributes.get("dynamic_index")
+        if (
+            isinstance(dynamic_index, Mapping)
+            and tensor_name == update_name
+            and len(operator.inputs) > 1
+        ):
+            update_shape = _resolved_tensor_shape(tensors[operator.inputs[1]])
+            if update_shape is not None:
+                return (0,) * len(update_shape), update_shape
+        return (0,) * len(tensor_shape), tensor_shape
+
+    if op_type in {"reshape", "transpose"}:
         return (0,) * len(tensor_shape), tensor_shape
 
     if op_type in {"matmul", "batched_matmul", "gemv"}:
@@ -484,7 +632,22 @@ def build_tile_graph(graph: OperatorGraph, schedule: ScheduleSpec) -> TileGraph:
                 conservative_edge_count += 1
         avoided_all_to_all_dependencies += full_count - len(selected)
         dependencies.extend(
-            TileDependency(producer.tile_id, consumer.tile_id, edge.tensor, "region_data")
+            TileDependency(
+                producer=producer.tile_id,
+                consumer=consumer.tile_id,
+                tensor=edge.tensor,
+                kind="region_data",
+                hazard_kind="RAW",
+                producer_region=producer_regions[producer.tile_id],
+                consumer_region=consumer_regions[consumer.tile_id],
+                condition="full_region_ready",
+                provenance={
+                    "source": "operator_graph_edge",
+                    "producer_operator": edge.producer,
+                    "consumer_operator": edge.consumer,
+                    "dependency_model": "logical_tensor_region_v1",
+                },
+            )
             for producer, consumer in selected
         )
 
@@ -522,10 +685,24 @@ def build_tile_graph(graph: OperatorGraph, schedule: ScheduleSpec) -> TileGraph:
             )
             dependencies.extend(
                 TileDependency(
-                    producer.tile_id,
-                    consumer.tile_id,
-                    None,
-                    kind,
+                    producer=producer.tile_id,
+                    consumer=consumer.tile_id,
+                    tensor=None,
+                    kind=kind,
+                    hazard_kind={
+                        "state": "STATE",
+                        "accumulate": "ACCUMULATE",
+                    }[kind],
+                    condition=(
+                        "state_complete"
+                        if kind == "state"
+                        else "accumulate_ready"
+                    ),
+                    provenance={
+                        "source": "reduction_order",
+                        "operator_id": operator.op_id,
+                        "reduction_dims": [name for name, _ in operator.reduction_dims],
+                    },
                 )
                 for producer, consumer in zip(ordered, ordered[1:])
             )

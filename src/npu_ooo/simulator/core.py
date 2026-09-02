@@ -384,6 +384,9 @@ class SimulationResult:
             elif event.event in {"RUNTIME_SUBMIT_START", "RUNTIME_SUBMIT_COMPLETE"}:
                 phase = "B" if event.event == "RUNTIME_SUBMIT_START" else "E"
                 pid = 0
+            elif event.event in {"TISA_PARTIAL_READY", "TISA_ADDRESS_BLOCK"}:
+                phase = "i"
+                pid = 1
             else:
                 continue
             trace_events.append(
@@ -463,6 +466,9 @@ class RuntimeSequenceSimulationResult:
             elif event.event in {"STATE_RELEASE", "STATE_WAIT", "STATE_READY"}:
                 phase = "i"
                 pid = 3
+            elif event.event in {"TISA_PARTIAL_READY", "TISA_ADDRESS_BLOCK"}:
+                phase = "i"
+                pid = 1
             else:
                 continue
             trace_events.append(
@@ -656,6 +662,37 @@ def simulate_execution_graph(
         "pipeline_drain_cycles": 0.0,
         "queue_occupancy_timeline": [],
     }
+
+    def dependency_details(task: ExecutionTask) -> list[dict[str, Any]]:
+        """Serialize predecessor provenance for trace consumers."""
+
+        metadata = task.dependency_provenance
+        result: list[dict[str, Any]] = []
+        for predecessor in task.predecessors:
+            entry = metadata.get(predecessor, {})
+            if isinstance(entry, Mapping):
+                result.append(
+                    {
+                        "predecessor": predecessor,
+                        "source": entry.get("source", "execution_graph_edge"),
+                        "edges": [dict(edge) for edge in entry.get("edges", ()) if isinstance(edge, Mapping)],
+                    }
+                )
+            else:
+                result.append(
+                    {
+                        "predecessor": predecessor,
+                        "source": "execution_graph_edge",
+                        "edges": [],
+                    }
+                )
+        return result
+
+    def dependency_detail(task: ExecutionTask, predecessor: str) -> dict[str, Any]:
+        return next(
+            (item for item in dependency_details(task) if item["predecessor"] == predecessor),
+            {"predecessor": predecessor, "source": "execution_graph_edge", "edges": []},
+        )
     coverage = getattr(timing_model, "coverage", None)
     if callable(coverage):
         metrics["timing_provider_coverage"] = dict(coverage(graph.tasks))
@@ -775,7 +812,12 @@ def simulate_execution_graph(
             if tile_completed_count[task.tile_id] == tile_task_count[task.tile_id]:
                 inflight_tiles.discard(task.tile_id)
             record_occupancy(finish, "COMPLETE")
-            details = {"primitive": task.primitive, "operator_id": task.operator_id, "tile_id": task.tile_id}
+            details = {
+                "primitive": task.primitive,
+                "operator_id": task.operator_id,
+                "tile_id": task.tile_id,
+                "dependencies": dependency_details(task),
+            }
             events.append(TraceEvent(finish, "COMPLETE", task_id, resource_name, resource_instance, details))
             for successor in successors[task_id]:
                 remaining_predecessors[successor] -= 1
@@ -787,7 +829,10 @@ def simulate_execution_graph(
                         successor,
                         tasks[successor].resource,
                         resource_instance,
-                        {"predecessor": task_id},
+                        {
+                            "predecessor": task_id,
+                            "dependency": dependency_detail(tasks[successor], task_id),
+                        },
                     )
                 )
                 if remaining_predecessors[successor] == 0:
@@ -843,6 +888,8 @@ def simulate_execution_graph(
                                 "predecessor": conflict.predecessor,
                                 "tensor": conflict.tensor,
                                 "memory": conflict.memory,
+                                "condition": conflict.condition,
+                                "provenance": dict(conflict.provenance or {}),
                             },
                         )
                         continue
@@ -927,6 +974,7 @@ def simulate_execution_graph(
                 "operator_id": task.operator_id,
                 "tile_id": task.tile_id,
                 "backend": timing_model.name,
+                "dependencies": dependency_details(task),
             }
             events.extend(
                 (

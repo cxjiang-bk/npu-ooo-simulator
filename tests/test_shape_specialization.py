@@ -1,6 +1,10 @@
 import unittest
 
-from npu_ooo.frontend import FrontendImportError, OfficialStableHLOAdapter
+from npu_ooo.frontend import (
+    FrontendImportError,
+    OfficialStableHLOAdapter,
+    normalize_shape_environment,
+)
 from npu_ooo.frontend.shape_specialization import specialize_stablehlo
 from npu_ooo.ir import OperatorGraph, TensorSpec
 
@@ -66,8 +70,9 @@ class ShapeSpecializationTest(unittest.TestCase):
           }
         }
         """
-        with self.assertRaisesRegex(FrontendImportError, "does not support dynamic operation"):
-            specialize_stablehlo(text, self._graph((4, 4), (4, 4)))
+        result = specialize_stablehlo(text, self._graph((4, 4), (4, 4)))
+        self.assertIn("stablehlo.dynamic_update_slice", result.text)
+        self.assertIn("%start", result.text)
 
     def test_constant_dynamic_slice_is_clamped_and_staticized(self) -> None:
         text = """
@@ -126,7 +131,7 @@ class ShapeSpecializationTest(unittest.TestCase):
         with self.assertRaisesRegex(FrontendImportError, "changes element count"):
             specialize_stablehlo(text, self._graph((2, 6), (5, 3)))
 
-    def test_nonconstant_dynamic_slice_fails_explicitly(self) -> None:
+    def test_nonconstant_dynamic_slice_preserves_runtime_indices(self) -> None:
         text = """
         module {
           func.func @main(%arg0: tensor<?x4xf16>, %start: tensor<i32>) -> tensor<2x3xf16> {
@@ -135,8 +140,34 @@ class ShapeSpecializationTest(unittest.TestCase):
           }
         }
         """
-        with self.assertRaisesRegex(FrontendImportError, "constant start indices"):
-            specialize_stablehlo(text, self._graph())
+        result = specialize_stablehlo(text, self._graph())
+        self.assertIn("stablehlo.dynamic_slice", result.text)
+        self.assertIn("%start", result.text)
+
+    def test_symbolic_input_shape_uses_shape_environment_for_specialization(self) -> None:
+        text = """
+        module {
+          func.func @main(%arg0: tensor<?x4xf16>) -> tensor<?x4xf16> {
+            %shape = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?x4xf16>) -> tensor<i32>
+            %shape_vec = stablehlo.reshape %shape : (tensor<i32>) -> tensor<1xi32>
+            %width = stablehlo.constant dense<4> : tensor<1xi32>
+            %target = stablehlo.concatenate %shape_vec, %width, dim = 0 : (tensor<1xi32>, tensor<1xi32>) -> tensor<2xi32>
+            %value = stablehlo.dynamic_broadcast_in_dim %arg0, %target, dims = [0, 1] : (tensor<?x4xf16>, tensor<2xi32>) -> tensor<?x4xf16>
+            return %value : tensor<?x4xf16>
+          }
+        }
+        """
+        graph = self._graph(value_shape=("batch", 4), output_shape=("batch", 4))
+        result = specialize_stablehlo(text, graph, shape_environment={"batch": 3})
+        self.assertIn("tensor<3x4xf16>", result.text)
+        self.assertIn("stablehlo.broadcast_in_dim", result.text)
+
+    def test_shape_environment_requires_positive_identifier_bindings(self) -> None:
+        self.assertEqual(normalize_shape_environment({"batch": 2}), {"batch": 2})
+        with self.assertRaisesRegex(FrontendImportError, "positive integer"):
+            normalize_shape_environment({"batch": 0})
+        with self.assertRaisesRegex(FrontendImportError, "valid identifier"):
+            normalize_shape_environment({"batch-size": 2})
 
     def test_dynamic_slice_negative_start_is_clamped(self) -> None:
         text = """

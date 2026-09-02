@@ -3,18 +3,83 @@ from __future__ import annotations
 """Analytical payload lowering for reshape and transpose operations."""
 
 import math
+from typing import Any
 
 from npu_ooo.arch import MachineConfig
 from npu_ooo.ir import (
     AccessType,
+    BufferRegion,
     ExecutionGraph,
     ExecutionTask,
     OperatorGraph,
     ScheduleSpec,
     build_tile_graph,
+    tensor_layout,
 )
 
 from .matmul import LoweringResult, _region, _root_memory, _unit_for
+
+
+def _transpose_geometry(
+    tile: Any,
+    dimensions: tuple[str, ...],
+    permutation: tuple[int, ...],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Map an output tile to its source coordinates.
+
+    StableHLO uses ``output[d] = input[permutation[d]]``.  The returned source
+    starts and extents therefore index the source tensor in source-axis order.
+    """
+
+    output_starts = tuple(tile.bound_map[name][0] for name in dimensions)
+    output_shape = tuple(
+        tile.bound_map[name][1] - tile.bound_map[name][0] for name in dimensions
+    )
+    source_starts = [0] * len(permutation)
+    source_shape = [0] * len(permutation)
+    for output_axis, source_axis in enumerate(permutation):
+        source_starts[source_axis] = output_starts[output_axis]
+        source_shape[source_axis] = output_shape[output_axis]
+    return tuple(source_starts), tuple(source_shape)
+
+
+def _slice_region(
+    tensor: Any,
+    memory: str,
+    starts: tuple[int, ...],
+    shape: tuple[int, ...],
+    slice_strides: tuple[int, ...],
+    access: AccessType,
+) -> BufferRegion:
+    """Build a source region for a possibly non-unit-stride slice."""
+
+    layout = tensor_layout(tensor)
+    if len(slice_strides) != len(starts) or any(value <= 0 for value in slice_strides):
+        raise ValueError(f"tensor '{tensor.name}' slice strides must be positive and rank-matched")
+    source_strides = layout.strides_bytes
+    effective_strides = (
+        tuple(stride * step for stride, step in zip(source_strides, slice_strides))
+        if source_strides is not None
+        else None
+    )
+    interval = layout.interval(starts, shape, strides_bytes=effective_strides)
+    if interval is None:
+        offset_bytes = 0
+        size_bytes = layout.allocation_size_bytes
+    else:
+        offset_bytes, size_bytes = interval
+    return BufferRegion(
+        tensor=tensor.name,
+        memory=memory,
+        shape=shape,
+        starts=starts,
+        dtype=tensor.dtype,
+        access=access,
+        offset_bytes=offset_bytes,
+        size_bytes=size_bytes,
+        layout=tensor.layout,
+        strides_bytes=effective_strides,
+    )
 
 
 def lower_transform_graph(
@@ -39,7 +104,7 @@ def lower_transform_graph(
 
     for operator_id in graph.topological_order():
         operator = next(item for item in graph.operators if item.op_id == operator_id)
-        if operator.normalized_type not in {"reshape", "transpose"}:
+        if operator.normalized_type not in {"reshape", "transpose", "slice"}:
             raise NotImplementedError(
                 f"transform lowering does not support '{operator.normalized_type}'"
             )
@@ -55,7 +120,27 @@ def lower_transform_graph(
         )
         input_elements = math.prod(input_tensor.shape)
         output_elements = math.prod(output_tensor.shape)
-        if not is_broadcast and input_elements != output_elements:
+        is_slice = operator.normalized_type == "slice"
+        dynamic_index = operator.attributes.get("dynamic_index")
+        is_dynamic_slice = is_slice and isinstance(dynamic_index, dict)
+        permutation = operator.attributes.get("transpose_dims")
+        if operator.normalized_type == "transpose":
+            if not isinstance(permutation, (tuple, list)) or len(permutation) != len(input_tensor.shape):
+                raise ValueError(
+                    f"transpose operator '{operator.op_id}' requires a complete permutation"
+                )
+            permutation = tuple(int(value) for value in permutation)
+            if sorted(permutation) != list(range(len(input_tensor.shape))):
+                raise ValueError(
+                    f"transpose operator '{operator.op_id}' has invalid permutation {permutation}"
+                )
+            expected_output = tuple(input_tensor.shape[index] for index in permutation)
+            if tuple(output_tensor.shape) != expected_output:
+                raise ValueError(
+                    f"transpose operator '{operator.op_id}' output shape {output_tensor.shape} "
+                    f"does not match permutation {permutation} of input shape {input_tensor.shape}"
+                )
+        if not is_broadcast and not is_slice and input_elements != output_elements:
             raise ValueError(
                 f"transform operator '{operator.op_id}' changes element count "
                 f"from {input_elements} to {output_elements}"
@@ -76,6 +161,14 @@ def lower_transform_graph(
                     raise ValueError(
                         f"broadcast operator '{operator.op_id}' has an out-of-range result dimension"
                     )
+        input_layout = tensor_layout(input_tensor)
+        output_layout = tensor_layout(output_tensor)
+        reshape_materialization = "none"
+        if operator.normalized_type == "reshape":
+            if input_layout.concrete and output_layout.concrete and input_layout.contiguous and output_layout.contiguous:
+                reshape_materialization = "contiguous_view_compatible"
+            else:
+                reshape_materialization = "strided_materialize_copy"
                 source_extent = input_tensor.shape[source_axis]
                 result_extent = output_tensor.shape[result_axis]
                 if source_extent != 1 and source_extent != result_extent:
@@ -87,15 +180,16 @@ def lower_transform_graph(
         operator_tiles = tuple(
             tile for tile in tile_graph.tiles if tile.operator_id == operator_id
         )
-        if not is_broadcast and len(operator_tiles) != 1:
+        if (
+            not is_broadcast
+            and not is_dynamic_slice
+            and operator.normalized_type not in {"transpose"}
+            and len(operator_tiles) != 1
+        ):
             raise ValueError(
                 f"transform operator '{operator.op_id}' requires a full-tensor schedule"
             )
-        primitive = (
-            "copy"
-            if operator.normalized_type == "reshape"
-            else "transpose"
-        )
+        primitive = "copy" if operator.normalized_type in {"reshape", "slice"} else "transpose"
         unit = _unit_for(machine, primitive)
         dimensions = tuple(name for name, _ in operator.iteration_dims)
         for tile in operator_tiles:
@@ -129,7 +223,85 @@ def lower_transform_graph(
                 output_region = _region(
                     output_tensor, root, output_starts, output_shape, AccessType.WRITE
                 )
+            elif is_dynamic_slice:
+                output_starts = tuple(tile.bound_map[name][0] for name in dimensions)
+                output_shape = tuple(
+                    tile.bound_map[name][1] - tile.bound_map[name][0] for name in dimensions
+                )
+                input_region = _region(
+                    input_tensor,
+                    root,
+                    (0,) * len(input_tensor.shape),
+                    tuple(int(value) for value in operator.attributes.get("slice_sizes", input_tensor.shape)),
+                    AccessType.READ,
+                )
+                output_region = _region(
+                    output_tensor,
+                    root,
+                    output_starts,
+                    output_shape,
+                    AccessType.WRITE,
+                )
+            elif is_slice:
+                starts = operator.attributes.get("slice_starts")
+                limits = operator.attributes.get("slice_limits")
+                strides = operator.attributes.get("slice_strides")
+                if not (
+                    isinstance(starts, (tuple, list))
+                    and isinstance(limits, (tuple, list))
+                    and isinstance(strides, (tuple, list))
+                    and len(starts) == len(input_tensor.shape)
+                    and len(limits) == len(input_tensor.shape)
+                    and len(strides) == len(input_tensor.shape)
+                ):
+                    raise ValueError(
+                        f"slice operator '{operator.op_id}' is missing complete static bounds"
+                    )
+                source_shape = tuple(
+                    (int(limit) - int(start) + int(stride) - 1) // int(stride)
+                    for start, limit, stride in zip(starts, limits, strides)
+                )
+                input_region = _slice_region(
+                    input_tensor,
+                    root,
+                    tuple(int(value) for value in starts),
+                    source_shape,
+                    tuple(int(value) for value in strides),
+                    AccessType.READ,
+                )
+                output_region = _region(
+                    output_tensor,
+                    root,
+                    (0,) * len(output_tensor.shape),
+                    tuple(int(value) for value in output_tensor.shape),
+                    AccessType.WRITE,
+                )
+            elif operator.normalized_type == "transpose":
+                source_starts, source_shape = _transpose_geometry(
+                    tile, dimensions, tuple(permutation)
+                )
+                input_region = _region(
+                    input_tensor,
+                    root,
+                    source_starts,
+                    source_shape,
+                    AccessType.READ,
+                )
+                output_starts = tuple(tile.bound_map[name][0] for name in dimensions)
+                output_shape = tuple(
+                    tile.bound_map[name][1] - tile.bound_map[name][0] for name in dimensions
+                )
+                output_region = _region(
+                    output_tensor,
+                    root,
+                    output_starts,
+                    output_shape,
+                    AccessType.WRITE,
+                )
             else:
+                # A reshape is a view only when both tensors have a concrete
+                # contiguous layout.  Non-contiguous layouts are materialized
+                # through the same copy primitive with conservative regions.
                 input_region = _region(
                     input_tensor,
                     root,
@@ -172,10 +344,23 @@ def lower_transform_graph(
                         "semantic_family": operator.normalized_type,
                         "frontend_target": operator.attributes.get("frontend_target", ""),
                         "transpose_dims": operator.attributes.get("transpose_dims"),
+                        "input_strides_bytes": list(input_region.strides_bytes)
+                        if input_region.strides_bytes is not None
+                        else None,
+                        "output_strides_bytes": list(output_region.strides_bytes)
+                        if output_region.strides_bytes is not None
+                        else None,
+                        "stride_aware": bool(
+                            input_region.strides_bytes is not None
+                            or output_region.strides_bytes is not None
+                        ),
+                        "reshape_materialization": reshape_materialization,
                         "broadcast": is_broadcast,
                         "broadcast_dimensions": operator.attributes.get("broadcast_dimensions"),
                         "full_tensor_transform": not is_broadcast,
-                        "transform_granularity": "output_tile" if is_broadcast else "full_tensor",
+                        "transform_granularity": "output_tile" if (is_broadcast or is_dynamic_slice) else "full_tensor",
+                        "dynamic_index": operator.attributes.get("dynamic_index"),
+                        "dynamic_address": is_dynamic_slice,
                     },
                 )
             )
@@ -189,6 +374,7 @@ def lower_transform_graph(
             "root_memory": root,
             "granularity": "output_tile" if any(
                 bool(operator.attributes.get("broadcast"))
+                or isinstance(operator.attributes.get("dynamic_index"), dict)
                 for operator in graph.operators
             ) else "full_tensor",
         },

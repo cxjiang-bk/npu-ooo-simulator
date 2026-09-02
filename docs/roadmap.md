@@ -67,14 +67,17 @@ Torch-XLA StableHLO operation
 - TileMem 的 stride expression、layout metadata、dtype policy；
 - GC pass dump、compile statistics、residency/ping-pong intent；
 - 常量 dynamic broadcast、dynamic_slice、dynamic_reshape specialization；
+- `DynamicIndexExpr`/`DynamicIndexBinding`、动态 slice output-tile copy 和
+  `dynamic_update_slice` state/address metadata；
+- 动态索引的 clamp、dense/explicit-stride physical offset/span 解析和 runtime sequence
+  invocation binding；
 - readiness condition、state/accumulate/buffer-reuse dependency。
 
 当前工作项：
 
-1. 建立 symbolic shape 的统一 binding contract；
-2. 扩展 dynamic index、dynamic layout 和 stride-aware transform；
-3. 为每类 layout、transpose、broadcast、reduction 建立可验证的 region rule；
-4. 为完整模型 proxy 增加 shape/traffic 对账样例。
+1. 扩展完整模型 repetition 与 DeepSeek MoE routing；
+2. 为每类 layout、transpose、broadcast、reduction 建立更多可验证的 region rule；
+3. 为完整模型 proxy 增加 shape/traffic 对账样例。
 
 验收标准：同一 module、shape、tile、MachineConfig 和 backend 产生稳定 artifact hash；
 static/dynamic 的差异来自 policy；小图的 tile、MAC、traffic 和 dependency 可手算核对。
@@ -143,8 +146,7 @@ registry case：
 
 下一阶段优先级：
 
-1. B 阶段 symbolic/dynamic shape、layout 和动态索引语义；
-2. A 阶段 DeepSeek 与完整模型 repetition；
-3. C 阶段 scheduler 微结构校准；
-4. D 阶段外部 timing/memory/RTL backend；
-5. E 阶段 source-derived 与 RTL-observed 论文矩阵。
+1. A 阶段 DeepSeek 与完整模型 repetition；
+2. C 阶段 scheduler 微结构校准；
+3. D 阶段外部 timing/memory/RTL backend；
+4. E 阶段 source-derived 与 RTL-observed 论文矩阵。

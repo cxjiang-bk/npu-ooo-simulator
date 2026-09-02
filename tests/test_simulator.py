@@ -422,6 +422,59 @@ class EventSimulatorTest(unittest.TestCase):
         self.assertEqual(war.metrics["address_hazards"][0]["kind"], "WAR")
         self.assertEqual(waw.metrics["address_hazards"][0]["kind"], "WAW")
 
+    def test_trace_and_address_hazard_keep_dependency_provenance(self) -> None:
+        write = BufferRegion(
+            tensor="X",
+            memory="SRAM",
+            shape=(4,),
+            starts=(0,),
+            access=AccessType.WRITE,
+            size_bytes=8,
+        )
+        read = BufferRegion(
+            tensor="X",
+            memory="SRAM",
+            shape=(4,),
+            starts=(0,),
+            access=AccessType.READ,
+            size_bytes=8,
+        )
+        graph = ExecutionGraph(
+            graph_id="provenance_micro",
+            tasks=(
+                ExecutionTask(
+                    "producer", "tile_p", "micro", "store", "DMA",
+                    writes=(write,), duration_cycles=4, program_order=0,
+                ),
+                ExecutionTask(
+                    "consumer", "tile_c", "micro", "load", "DMA",
+                    reads=(read,), predecessors=("producer",), duration_cycles=1,
+                    program_order=1,
+                    attributes={
+                        "dependency_provenance": {
+                            "producer": {
+                                "source": "gc_tile_dependency",
+                                "edges": [{
+                                    "tensor": "X",
+                                    "kind": "region_data",
+                                    "hazard_kind": "RAW",
+                                    "condition": "full_region_ready",
+                                    "provenance": {"source": "operator_graph_edge"},
+                                }],
+                            }
+                        }
+                    },
+                ),
+            ),
+        )
+        result = schedule_execution_graph(
+            graph, minimal_machine_config(), SchedulerPolicy.STATIC_PIPELINE,
+            simulator_config=SimulatorConfig(address_scoreboard=True),
+        )
+        complete = next(event for event in result.events if event.event == "COMPLETE" and event.task_id == "consumer")
+        self.assertEqual(complete.details["dependencies"][0]["source"], "gc_tile_dependency")
+        self.assertEqual(complete.details["dependencies"][0]["edges"][0]["condition"], "full_region_ready")
+
 
 if __name__ == "__main__":
     unittest.main()

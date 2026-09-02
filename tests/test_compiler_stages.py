@@ -107,6 +107,48 @@ class CompilerStageContractTest(unittest.TestCase):
         self.assertEqual(compiled.tisa_program.attributes["paper_stage"], "TISA_GENERATOR")
         self.assertEqual(compiled.validate(), ())
 
+    def test_gc_dependency_provenance_reaches_backend_tasks_and_tisa(self) -> None:
+        graph = OperatorGraph(
+            graph_id="dependency-provenance-test",
+            tensors=(
+                TensorSpec("lhs", (4, 4)),
+                TensorSpec("rhs", (4, 4)),
+                TensorSpec("out", (4, 4)),
+            ),
+            operators=(
+                OperatorSpec(
+                    op_id="mm",
+                    op_type="matmul",
+                    inputs=("lhs", "rhs"),
+                    outputs=("out",),
+                    iteration_dims=(("m", 4), ("n", 4)),
+                    reduction_dims=(("k", 4),),
+                ),
+            ),
+        )
+        frontend, stablehlo = _stable_frontend(graph)
+        compiled = compile_operator_graph(
+            graph,
+            minimal_machine_config(),
+            frontend=frontend,
+            source_frontend=frontend,
+            stablehlo=stablehlo,
+            tile_size=2,
+        )
+        for task in compiled.backend_artifact.execution_graph.tasks:
+            self.assertEqual(
+                set(task.predecessors), set(task.dependency_provenance),
+                msg=task.task_id,
+            )
+        tisa_dependencies = [
+            dependency
+            for instruction in compiled.tisa_program.instructions
+            for dependency in instruction.dependencies
+        ]
+        self.assertTrue(tisa_dependencies)
+        self.assertTrue(all(dependency.condition for dependency in tisa_dependencies))
+        self.assertTrue(all(dependency.provenance for dependency in tisa_dependencies))
+
     def test_composite_payload_is_not_scheduler_visible(self) -> None:
         graph = OperatorGraph(
             graph_id="softmax-stage-test",
@@ -210,6 +252,19 @@ class CompilerStageContractTest(unittest.TestCase):
         self.assertEqual(
             compute[1].dependencies[0].kind,
             "STATE",
+        )
+        state_dependencies = [
+            dependency
+            for instruction in compute
+            for dependency in instruction.dependencies
+            if dependency.kind == "STATE" and dependency.condition == "state_complete"
+        ]
+        self.assertTrue(state_dependencies)
+        self.assertTrue(
+            any(
+                "softmax_online_state_chain" in dependency.provenance.get("sources", ())
+                for dependency in state_dependencies
+            )
         )
         payload_primitives = {
             task.primitive for task in compiled.backend_artifact.execution_graph.tasks

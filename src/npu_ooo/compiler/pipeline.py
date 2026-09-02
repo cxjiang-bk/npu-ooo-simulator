@@ -24,6 +24,9 @@ from npu_ooo.ir import (
     ScheduleSpec,
     TISAProgram,
     TileGraph,
+    canonical_dtype,
+    known_dtype_names,
+    normalize_dtype,
 )
 from npu_ooo.lowering import LoweringRegistry, default_lowering_registry
 
@@ -33,37 +36,6 @@ from .statistics import build_compile_statistics
 from .tisa_generator import default_tisa_generator
 
 
-_KNOWN_DTYPES = frozenset(
-    {
-        "bool",
-        "pred",
-        "int8",
-        "uint8",
-        "int16",
-        "uint16",
-        "int32",
-        "uint32",
-        "int64",
-        "uint64",
-        "float16",
-        "fp16",
-        "f16",
-        "bfloat16",
-        "bf16",
-        "float32",
-        "fp32",
-        "f32",
-        "float64",
-        "fp64",
-        "f64",
-    }
-)
-
-
-def _normalize_dtype(dtype: Any) -> str:
-    return str(dtype).lower().replace("torch.", "")
-
-
 def _dtype_compatibility(graph: OperatorGraph, machine: MachineConfig) -> dict[str, Any]:
     """Validate graph dtypes against an optional machine capability contract."""
 
@@ -71,8 +43,9 @@ def _dtype_compatibility(graph: OperatorGraph, machine: MachineConfig) -> dict[s
     policy = str(attributes.get("dtype_policy", "strict")).lower()
     if policy not in {"strict", "fallback"}:
         raise ValueError("machine attribute 'dtype_policy' must be 'strict' or 'fallback'")
-    graph_dtypes = tuple(sorted({_normalize_dtype(tensor.dtype) for tensor in graph.tensors}))
-    unknown = tuple(dtype for dtype in graph_dtypes if dtype not in _KNOWN_DTYPES)
+    graph_dtypes = tuple(sorted({normalize_dtype(tensor.dtype) for tensor in graph.tensors}))
+    known = known_dtype_names()
+    unknown = tuple(dtype for dtype in graph_dtypes if dtype not in known)
     if unknown:
         raise ValueError(
             "graph contains unknown dtype(s): "
@@ -81,12 +54,12 @@ def _dtype_compatibility(graph: OperatorGraph, machine: MachineConfig) -> dict[s
         )
     declared = attributes.get("supported_dtypes")
     if declared is None:
-        supported = tuple(sorted(_KNOWN_DTYPES))
+        supported = tuple(sorted(known))
     elif isinstance(declared, (tuple, list, set, frozenset)) and all(
         isinstance(item, str) and item.strip() for item in declared
     ):
-        supported = tuple(sorted({_normalize_dtype(item) for item in declared}))
-        unknown_supported = tuple(dtype for dtype in supported if dtype not in _KNOWN_DTYPES)
+        supported = tuple(sorted({normalize_dtype(item) for item in declared}))
+        unknown_supported = tuple(dtype for dtype in supported if dtype not in known)
         if unknown_supported:
             raise ValueError(
                 "machine attribute 'supported_dtypes' contains unknown dtype(s): "
@@ -94,7 +67,11 @@ def _dtype_compatibility(graph: OperatorGraph, machine: MachineConfig) -> dict[s
             )
     else:
         raise ValueError("machine attribute 'supported_dtypes' must be a sequence of dtype names")
-    unsupported = tuple(dtype for dtype in graph_dtypes if dtype not in supported)
+    supported_families = {canonical_dtype(dtype) for dtype in supported}
+    unsupported = tuple(
+        dtype for dtype in graph_dtypes
+        if canonical_dtype(dtype) not in supported_families
+    )
     if unsupported and policy == "strict":
         raise ValueError(
             f"machine '{machine.config_id}' does not natively support dtype(s): "
@@ -312,7 +289,10 @@ def compile_torch_module(
         TorchExportAdapter,
         TorchXLAStableHLOExporter,
     )
+    from npu_ooo.frontend.bridge import normalize_shape_environment
     from npu_ooo.frontend.shape_specialization import specialize_stablehlo
+
+    normalized_shape_environment = normalize_shape_environment(shape_environment)
 
     # 1. Capture Python execution as a stable ATen/FX program.
     exported_program = TorchExportAdapter.capture_module(
@@ -325,7 +305,7 @@ def compile_torch_module(
         exported_program,
         model_id=model_id,
         variant="torch-export-v1",
-        shape_environment=shape_environment,
+        shape_environment=normalized_shape_environment,
     )
 
     # 2. Let torch-xla own ATen-to-StableHLO legalization.
@@ -349,7 +329,7 @@ def compile_torch_module(
         shape_specialization = specialize_stablehlo(
             stablehlo.text,
             source_frontend.graph,
-            shape_environment=shape_environment,
+            shape_environment=normalized_shape_environment,
         )
         remaining_dynamic = tuple(
             sorted(
@@ -361,11 +341,19 @@ def compile_torch_module(
                 )
             )
         )
-        if remaining_dynamic:
+        runtime_dynamic_capabilities = {
+            "stablehlo.dynamic_slice",
+            "stablehlo.dynamic_update_slice",
+        }
+        unsupported_remaining = tuple(
+            operation for operation in remaining_dynamic
+            if operation not in runtime_dynamic_capabilities
+        )
+        if unsupported_remaining:
             raise FrontendImportError(
                 "dynamic StableHLO requires a shape-specialization pass before Canonical "
                 "import; unsupported remaining operations: "
-                + ", ".join(remaining_dynamic)
+                + ", ".join(unsupported_remaining)
             )
         stablehlo = replace(
             stablehlo,
@@ -378,7 +366,7 @@ def compile_torch_module(
                     "pass": "torch-xla-dynamic-shape-specialization-v1",
                     "source_dynamic_operations": list(shape_specialization.dynamic_operations),
                     "removed_shape_operations": list(shape_specialization.removed_shape_operations),
-                    "shape_environment": dict(shape_environment or {}),
+                    "shape_environment": dict(normalized_shape_environment),
                 },
             },
         )
@@ -388,7 +376,7 @@ def compile_torch_module(
         stablehlo.text,
         model_id=model_id,
         variant=stablehlo.variant,
-        shape_environment=shape_environment,
+        shape_environment=normalized_shape_environment,
     )
     stable_frontend = replace(
         stable_frontend,

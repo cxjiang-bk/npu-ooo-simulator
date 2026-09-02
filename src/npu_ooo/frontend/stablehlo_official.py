@@ -13,7 +13,12 @@ import importlib.metadata
 import re
 from typing import Any, Mapping
 
-from .bridge import FrontendImport, FrontendImportError, FrontendKind
+from .bridge import (
+    FrontendImport,
+    FrontendImportError,
+    FrontendKind,
+    normalize_shape_environment,
+)
 from .stablehlo import StableHLOAdapter
 
 
@@ -423,19 +428,20 @@ class OfficialStableHLOAdapter:
         variant: str = "stablehlo-torch-xla-v1",
         shape_environment: Mapping[str, int] | None = None,
     ) -> FrontendImport:
+        normalized_environment = normalize_shape_environment(shape_environment)
         module_obj, canonical, _ = _parse_verified(text)
         projected = _project_module(module_obj)
         imported = StableHLOAdapter.from_text(
             projected,
             model_id=model_id,
             variant=variant,
-            shape_environment=shape_environment,
+            shape_environment=normalized_environment,
         )
         return FrontendImport(
             graph=imported.graph,
             model_id=imported.model_id,
             variant=imported.variant,
-            shape_environment=imported.shape_environment,
+            shape_environment=normalized_environment,
             frontend=imported.frontend,
             provenance={
                 **dict(imported.provenance),

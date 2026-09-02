@@ -165,8 +165,31 @@ class StableHLOCapabilityBoundaryTest(unittest.TestCase):
           }
         }
         """
-        with self.assertRaisesRegex(ValueError, r"missing StableHLO capability.*dynamic_slice"):
-            OfficialStableHLOAdapter.import_text(text)
+        imported = OfficialStableHLOAdapter.import_text(text)
+        operation = imported.graph.operators[0]
+        self.assertEqual(operation.normalized_type, "slice")
+        dynamic_index = operation.attributes["dynamic_index"]
+        self.assertEqual(dynamic_index["clamp_rule"], "stablehlo_dynamic_slice_clamp")
+        self.assertEqual(dynamic_index["index_operands"], ["arg1", "arg2"])
+
+    def test_dynamic_update_slice_records_state_and_index_contract(self) -> None:
+        text = """
+        module {
+          func.func @main(%cache: tensor<4x4xf32>, %update: tensor<1x4xf32>, %row: tensor<i32>, %column: tensor<i32>) -> tensor<4x4xf32> {
+            %0 = stablehlo.dynamic_update_slice %cache, %update, %row, %column : (tensor<4x4xf32>, tensor<1x4xf32>, tensor<i32>, tensor<i32>) -> tensor<4x4xf32>
+            return %0 : tensor<4x4xf32>
+          }
+        }
+        """
+        from npu_ooo.frontend.stablehlo_official import OfficialStableHLOAdapter
+
+        imported = OfficialStableHLOAdapter.import_text(text)
+        operation = imported.graph.operators[0]
+        self.assertEqual(operation.normalized_type, "kv_cache_update")
+        self.assertTrue(operation.attributes["state_update"])
+        dynamic_index = operation.attributes["dynamic_index"]
+        self.assertEqual(dynamic_index["index_rank"], 2)
+        self.assertEqual(dynamic_index["index_operands"], ["arg2", "arg3"])
 
 
 if __name__ == "__main__":

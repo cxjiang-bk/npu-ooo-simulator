@@ -63,9 +63,20 @@ StableHLO capability
 
 ### 进行中
 
-- [ ] symbolic shape 统一 binding；
-- [ ] dynamic index、dynamic layout 和 stride-aware transform；
+- [x] symbolic shape 统一 binding（环境校验、Canonical resolve、shape specialization provenance）；
+- [x] DynamicIndexExpr/Binding、dynamic_slice 和 dynamic_update_slice state metadata；
+- [x] dynamic index -> physical offset/region resolution（clamp、dense/explicit stride、capacity check）；
+- [x] dynamic update state window alias/address contract；
+- [x] dynamic layout 和 stride-aware transform；
+- [x] GC typed dependency 显式保存 hazard relation、logical region 和 readiness condition；
 - [ ] 完整模型 proxy 的 tile/MAC/traffic 对账样例。
+
+阶段 1 的 trace/address provenance 已贯通：ExecutionGraph、TISA、Perfetto、CSV 和
+address scoreboard 共享同一依赖来源；Matmul、broadcast、reduce、Conv2D、pooling 和
+KV-cache 的专项验收继续随模型覆盖测试扩展。
+
+阶段 1 的 trace/address provenance 和阶段 2 的 dynamic index/state address contract 已交付；
+阶段 2 的 dynamic layout 与 stride-aware transform 已交付。
 
 验收：固定 module、shape、tile、MachineConfig 和 backend 生成稳定 artifact hash；
 static/dynamic 的差异来自 policy；小图数据可以逐项核对。
@@ -105,8 +116,7 @@ model / shape / phase
 
 ## 当前执行顺序
 
-1. symbolic shape、dynamic index、layout 语义；
-2. DeepSeek 与完整模型 repetition；
+1. DeepSeek 与完整模型 repetition；
 3. scheduler 微结构和控制开销校准；
 4. 外部 timing/memory/RTL backend；
 5. 论文规模 source-derived/RTL-observed 矩阵。

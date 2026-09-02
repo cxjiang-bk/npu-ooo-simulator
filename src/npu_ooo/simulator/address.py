@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any
+from typing import Any, Mapping
 
 from npu_ooo.ir import AccessType, BufferRegion, ExecutionGraph, ExecutionTask
 
@@ -20,6 +20,8 @@ class AddressDependency:
     kind: AddressHazardKind
     tensor: str
     memory: str
+    condition: str = "address_overlap"
+    provenance: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -28,6 +30,8 @@ class AddressDependency:
             "kind": self.kind.value,
             "tensor": self.tensor,
             "memory": self.memory,
+            "condition": self.condition,
+            "provenance": dict(self.provenance or {}),
         }
 
 
@@ -40,6 +44,8 @@ class AddressConflict:
     kind: AddressHazardKind
     tensor: str
     memory: str
+    condition: str = "address_overlap"
+    provenance: dict[str, Any] | None = None
 
     def to_dependency(self) -> AddressDependency:
         return AddressDependency(
@@ -48,6 +54,8 @@ class AddressConflict:
             kind=self.kind,
             tensor=self.tensor,
             memory=self.memory,
+            condition=self.condition,
+            provenance=dict(self.provenance or {}),
         )
 
 
@@ -90,6 +98,8 @@ class AddressScoreboard:
                 kind=kind,
                 tensor=region.tensor,
                 memory=region.memory,
+                condition=_dependency_condition(task, active.task_id),
+                provenance=_dependency_provenance(task, active.task_id),
             )
         return None
 
@@ -128,6 +138,43 @@ def _conflict(left: ExecutionTask, right: ExecutionTask) -> tuple[AddressHazardK
             if _writes(left_region) and _writes(right_region):
                 return AddressHazardKind.WAW, left_region
     return None
+
+
+def _dependency_entry(task: ExecutionTask, predecessor_id: str) -> dict[str, Any] | None:
+    metadata = task.dependency_provenance.get(predecessor_id)
+    return dict(metadata) if isinstance(metadata, Mapping) else None
+
+
+def _dependency_condition(task: ExecutionTask, predecessor_id: str) -> str:
+    entry = _dependency_entry(task, predecessor_id)
+    if entry is None:
+        return "address_overlap"
+    edges = entry.get("edges", ())
+    conditions = sorted(
+        {
+            str(edge.get("condition"))
+            for edge in edges
+            if isinstance(edge, dict) and edge.get("condition")
+        }
+    )
+    return "+".join(conditions) if conditions else "address_overlap"
+
+
+def _dependency_provenance(task: ExecutionTask, predecessor_id: str) -> dict[str, Any]:
+    entry = _dependency_entry(task, predecessor_id)
+    if entry is None:
+        return {
+            "source": "address_scoreboard",
+            "relation": "runtime_overlap",
+            "predecessor": predecessor_id,
+            "successor": task.task_id,
+        }
+    return {
+        "source": "address_scoreboard",
+        "predecessor": predecessor_id,
+        "successor": task.task_id,
+        "dependency": entry,
+    }
 
 
 def add_address_dependencies(graph: ExecutionGraph) -> tuple[ExecutionGraph, tuple[AddressDependency, ...]]:
@@ -181,6 +228,8 @@ def add_address_dependencies(graph: ExecutionGraph) -> tuple[ExecutionGraph, tup
                         kind=kind,
                         tensor=region.tensor,
                         memory=region.memory,
+                        condition=_dependency_condition(successor, predecessor.task_id),
+                        provenance=_dependency_provenance(successor, predecessor.task_id),
                     )
                 )
 

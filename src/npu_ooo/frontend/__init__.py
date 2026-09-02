@@ -4,6 +4,7 @@ from .bridge import (
     FrontendImport,
     FrontendImportError,
     TorchExportAdapter,
+    normalize_shape_environment,
 )
 from .stablehlo_semantics import (
     StableHLOOpCapability,
@@ -27,6 +28,7 @@ __all__ = [
     "FrontendImport",
     "FrontendImportError",
     "TorchExportAdapter",
+    "normalize_shape_environment",
     "StableHLOOpCapability",
     "normalize_stablehlo_op_name",
     "registered_stablehlo_ops",

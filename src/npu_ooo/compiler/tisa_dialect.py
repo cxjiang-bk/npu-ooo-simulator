@@ -28,6 +28,8 @@ from npu_ooo.ir import (
     TileInstance,
     TileMem,
     UnitMap,
+    dtype_bytes,
+    tensor_layout,
 )
 from npu_ooo.lowering import LoweringRegistry, default_lowering_registry, lower_mixed_graph
 
@@ -42,6 +44,17 @@ class TISAStage:
     ordinal: int
     attributes: Mapping[str, Any]
     payload_primitives: tuple[str, ...] = ()
+
+
+def _tile_region_to_dict(
+    region: tuple[tuple[int, ...], tuple[int, ...]] | None,
+) -> dict[str, list[int]] | None:
+    """Serialize a GC logical region for TISA dependency provenance."""
+
+    if region is None:
+        return None
+    starts, shape = region
+    return {"starts": list(starts), "shape": list(shape)}
 
 
 def _unit_map(primitive: str) -> UnitMap:
@@ -123,8 +136,10 @@ def _stages_for_tile(operator: Any, tile: TileInstance) -> tuple[TISAStage, ...]
         stages = [("load", "load"), ("compute", "swiglu"), ("store", "store")]
     elif op_type == "kv_cache_update":
         stages = [("load", "load"), ("compute", "kv_cache_update"), ("store", "store")]
-    elif op_type in {"reshape", "transpose"}:
+    elif op_type in {"reshape", "transpose", "slice"}:
         primitive = "copy" if op_type == "reshape" else "transpose"
+        if op_type == "slice":
+            primitive = "copy"
         stages = [("transform", primitive)]
     else:
         raise NotImplementedError(
@@ -177,9 +192,28 @@ def _stages_for_tile(operator: Any, tile: TileInstance) -> tuple[TISAStage, ...]
             "update_length",
             "slice_start",
             "state_transition",
+            "dynamic_index",
+            "dynamic_index_operands",
+            "state_update",
         )
         if key in operator.attributes
     }
+    dynamic_index = operator.attributes.get("dynamic_index")
+    if (
+        op_type == "kv_cache_update"
+        and operator.attributes.get("state_update")
+        and isinstance(dynamic_index, Mapping)
+    ):
+        state_attributes["state_region"] = {
+            "tensor": operator.attributes.get("state_buffer"),
+            "dynamic_index": dict(dynamic_index),
+            "window_shape": list(
+                dynamic_index.get("attributes", {}).get("update_shape", ())
+                if isinstance(dynamic_index.get("attributes", {}), Mapping)
+                else ()
+            ),
+            "address_semantics": "dynamic_index_window",
+        }
 
     return tuple(
         TISAStage(
@@ -235,25 +269,7 @@ def _readiness_condition(stage: TISAStage) -> str:
 
 
 def _dtype_bytes(dtype: str) -> int:
-    normalized = str(dtype).lower().replace("torch.", "")
-    return {
-        "bool": 1,
-        "int8": 1,
-        "uint8": 1,
-        "int16": 2,
-        "float16": 2,
-        "fp16": 2,
-        "f16": 2,
-        "bfloat16": 2,
-        "bf16": 2,
-        "int32": 4,
-        "float32": 4,
-        "fp32": 4,
-        "f32": 4,
-        "int64": 8,
-        "float64": 8,
-        "fp64": 8,
-    }.get(normalized, 2)
+    return dtype_bytes(dtype, default=2)
 
 
 def _resolved_tensor_shape(tensor: Any) -> tuple[int, ...] | None:
@@ -273,32 +289,7 @@ def _dense_region(
         return None
     if any(start < 0 or extent <= 0 or start + extent > limit for start, extent, limit in zip(starts, shape, full_shape)):
         return None
-    attributes = getattr(tensor, "attributes", {})
-    explicit = attributes.get("strides_bytes") if isinstance(attributes, Mapping) else None
-    layout_source = attributes.get("layout_source") if isinstance(attributes, Mapping) else None
-    if layout_source == "stablehlo_encoding" and explicit is None:
-        # An opaque StableHLO encoding cannot be converted to a byte interval
-        # without guessing its physical layout.  Keep the logical geometry,
-        # but force conservative dependency/address handling.
-        return None
-    if explicit is not None:
-        try:
-            strides = tuple(int(value) for value in explicit)
-        except (TypeError, ValueError):
-            return None
-        if len(strides) != len(full_shape) or any(value < 0 for value in strides):
-            return None
-        offset_elements = sum(start * stride for start, stride in zip(starts, strides))
-        span_elements = 1 + sum((extent - 1) * stride // _dtype_bytes(tensor.dtype) for extent, stride in zip(shape, strides))
-        return offset_elements * _dtype_bytes(tensor.dtype), span_elements * _dtype_bytes(tensor.dtype)
-    strides: list[int] = []
-    stride = 1
-    for extent in reversed(full_shape):
-        strides.append(stride)
-        stride *= extent
-    strides.reverse()
-    offset_elements = sum(start * stride_value for start, stride_value in zip(starts, strides))
-    return offset_elements * _dtype_bytes(tensor.dtype), math.prod(shape) * _dtype_bytes(tensor.dtype)
+    return tensor_layout(tensor).interval(starts, shape)
 
 
 def _address_expression(
@@ -316,39 +307,50 @@ def _address_expression(
     return f"{tensor_name}[{slices}]"
 
 
+def _dynamic_address_expression(operator: Any, tensor_name: str, geometry: Any) -> str | None:
+    """Render a symbolic address for dynamic slice/state regions."""
+
+    metadata = operator.attributes.get("dynamic_index")
+    if not isinstance(metadata, Mapping):
+        return _address_expression(tensor_name, geometry)
+    if operator.normalized_type == "kv_cache_update":
+        state_buffer = str(operator.attributes.get("state_buffer", ""))
+        is_state_write = tensor_name == operator.outputs[0]
+        if not is_state_write or not state_buffer:
+            return _address_expression(tensor_name, geometry)
+    elif operator.normalized_type != "slice" or tensor_name != operator.inputs[0]:
+        return _address_expression(tensor_name, geometry)
+    operands = tuple(str(item) for item in metadata.get("index_operands", ()))
+    bounds = metadata.get("clamp_bounds", ())
+    sizes = (
+        operator.attributes.get("slice_sizes", ())
+        if operator.normalized_type == "slice"
+        else metadata.get("attributes", {}).get("update_shape", ())
+    )
+    if not operands or not bounds or len(operands) != len(bounds):
+        return _address_expression(tensor_name, geometry)
+    slices: list[str] = []
+    for index, (operand, bound) in enumerate(zip(operands, bounds)):
+        lower = bound[0] if isinstance(bound, (tuple, list)) and bound else 0
+        upper = bound[1] if isinstance(bound, (tuple, list)) and len(bound) > 1 else None
+        size = sizes[index] if index < len(sizes) else "?"
+        upper_text = str(upper) if upper is not None else "extent"
+        slices.append(f"clamp({operand},{lower},{upper_text}):+{size}")
+    return f"{tensor_name}[{', '.join(slices)}]"
+
+
 def _tensor_strides_bytes(tensor: Any) -> tuple[int, ...] | None:
     """Return concrete byte strides, preserving an explicit tensor layout."""
 
-    full_shape = _resolved_tensor_shape(tensor)
-    if full_shape is None:
+    if _resolved_tensor_shape(tensor) is None:
         return None
-    attributes = getattr(tensor, "attributes", {})
-    explicit = attributes.get("strides_bytes") if isinstance(attributes, Mapping) else None
-    if explicit is not None:
-        try:
-            strides = tuple(int(value) for value in explicit)
-        except (TypeError, ValueError):
-            strides = ()
-        if len(strides) == len(full_shape) and all(value >= 0 for value in strides):
-            return strides
-    layout_source = attributes.get("layout_source") if isinstance(attributes, Mapping) else None
-    if layout_source == "stablehlo_encoding":
-        return None
-    strides: list[int] = []
-    stride = _dtype_bytes(tensor.dtype)
-    for extent in reversed(full_shape):
-        strides.append(stride)
-        stride *= extent
-    strides.reverse()
-    return tuple(strides)
+    return tensor_layout(tensor).strides_bytes
 
 
 def _tensor_layout(tensor: Any) -> str:
-    attributes = getattr(tensor, "attributes", {})
-    encoding = attributes.get("layout_encoding") if isinstance(attributes, Mapping) else None
-    if encoding:
-        return f"stablehlo:{encoding}"
-    return str(getattr(tensor, "layout", "dense"))
+    if _resolved_tensor_shape(tensor) is None:
+        return str(getattr(tensor, "layout", "dense"))
+    return tensor_layout(tensor).layout
 
 
 def _stride_expression(strides_bytes: tuple[int, ...] | None) -> str | None:
@@ -416,6 +418,32 @@ def _operand_geometry(
             else:
                 return None
         return tuple(starts), tuple(shape)
+    if op_type == "slice":
+        full_shape = _resolved_tensor_shape(tensor)
+        if full_shape is None:
+            return None
+        if name == operator.outputs[0]:
+            return _dim_geometry(bounds, iteration)
+        if name == operator.inputs[0]:
+            dynamic_index = operator.attributes.get("dynamic_index")
+            if isinstance(dynamic_index, Mapping):
+                sizes = operator.attributes.get("slice_sizes")
+                if isinstance(sizes, (tuple, list)) and len(sizes) == len(full_shape):
+                    return (0,) * len(full_shape), tuple(int(value) for value in sizes)
+            starts = operator.attributes.get("slice_starts")
+            limits = operator.attributes.get("slice_limits")
+            if (
+                isinstance(starts, (tuple, list))
+                and isinstance(limits, (tuple, list))
+                and len(starts) == len(full_shape)
+                and len(limits) == len(full_shape)
+            ):
+                return (
+                    tuple(int(value) for value in starts),
+                    tuple(int(limit) - int(start) for start, limit in zip(starts, limits)),
+                )
+            return (0,) * len(full_shape), full_shape
+        return None
     if op_type in {"matmul", "batched_matmul", "gemv"}:
         if len(operator.inputs) < 2 or not operator.outputs:
             return None
@@ -559,7 +587,24 @@ def _operand_geometry(
                 shape.append(output_shape[output_axis])
         return tuple(starts), tuple(shape)
 
-    if op_type in {"reshape", "transpose", "kv_cache_update"}:
+    if op_type == "kv_cache_update":
+        full_shape = _resolved_tensor_shape(tensor)
+        if full_shape is None:
+            return None
+        update_name = operator.attributes.get("update_tensor")
+        dynamic_index = operator.attributes.get("dynamic_index")
+        if (
+            isinstance(dynamic_index, Mapping)
+            and tensor.name == update_name
+            and len(operator.inputs) > 1
+        ):
+            update_tensor = tensors[operator.inputs[1]]
+            update_shape = _resolved_tensor_shape(update_tensor)
+            if update_shape is not None:
+                return (0,) * len(update_shape), update_shape
+        return (0,) * len(full_shape), full_shape
+
+    if op_type in {"reshape", "transpose"}:
         full_shape = _resolved_tensor_shape(tensor)
         if full_shape is None:
             return None
@@ -621,10 +666,12 @@ def _stage_operands(
                     tensor=name,
                     offset_bytes=offset_bytes,
                     size_bytes=size_bytes,
-                    address_expr=_address_expression(name, geometry),
+                    address_expr=_dynamic_address_expression(operator, name, geometry),
                     strides_bytes=strides_bytes,
                     stride_expr=_stride_expression(strides_bytes),
                     layout=_tensor_layout(tensor),
+                    logical_starts=geometry[0] if geometry is not None else None,
+                    logical_shape=geometry[1] if geometry is not None else None,
                 ),
                 access_type=access,
             )
@@ -693,18 +740,47 @@ class TISASemanticBuilder:
                 )
 
         by_id = {instruction.tisa_id: instruction for instruction in instructions}
-        dependencies: dict[str, dict[str, tuple[str, str]]] = {tisa_id: {} for tisa_id in by_id}
+        dependencies: dict[str, dict[str, tuple[str, str, Mapping[str, Any]]]] = {
+            tisa_id: {} for tisa_id in by_id
+        }
 
-        def add_dependency(target: str, source: str, kind: str = "RAW") -> None:
+        def add_dependency(
+            target: str,
+            source: str,
+            kind: str = "RAW",
+            *,
+            condition: str | None = None,
+            provenance: Mapping[str, Any] | None = None,
+        ) -> None:
             if target == source:
                 return
             current = dependencies[target].get(source)
-            condition = str(
-                by_id[target].attributes.get("readiness_condition", "full_region_ready")
+            normalized_condition = str(
+                condition
+                or by_id[target].attributes.get("readiness_condition", "full_region_ready")
             )
-            candidate = (kind, condition)
+            candidate = (kind, normalized_condition, dict(provenance or {}))
             if current is None or (current[0] != "RAW" and kind == "RAW"):
                 dependencies[target][source] = candidate
+                return
+            if current[0] == kind and current[1] == normalized_condition and provenance:
+                merged = dict(current[2])
+                source_names = {
+                    str(name)
+                    for name in (
+                        merged.get("source"),
+                        *merged.get("sources", ()),
+                        provenance.get("source"),
+                        *provenance.get("sources", ()),
+                    )
+                    if name
+                }
+                if source_names:
+                    merged["sources"] = sorted(source_names)
+                for key, value in provenance.items():
+                    if key not in merged:
+                        merged[key] = value
+                dependencies[target][source] = (current[0], current[1], merged)
 
         def instruction_id(tile_id: str, key: str) -> str:
             try:
@@ -719,6 +795,12 @@ class TISASemanticBuilder:
                 add_dependency(
                     instruction_id(tile.tile_id, current.key),
                     instruction_id(tile.tile_id, previous.key),
+                    provenance={
+                        "source": "tile_stage_order",
+                        "tile_id": tile.tile_id,
+                        "from_stage": previous.key,
+                        "to_stage": current.key,
+                    },
                 )
 
         # Graph edges are represented at the semantic tile boundary.  The
@@ -747,11 +829,18 @@ class TISASemanticBuilder:
             add_dependency(
                 instruction_id(consumer.tile_id, consumer_stage.key),
                 instruction_id(producer.tile_id, producer_stage.key),
-                {
-                    "state": "STATE",
-                    "accumulate": "ACCUMULATE",
-                    "buffer_reuse": "BUFFER_REUSE",
-                }.get(dependency.kind, "RAW"),
+                dependency.hazard_kind,
+                condition=dependency.condition,
+                provenance={
+                    "source": "gc_tile_dependency",
+                    "tile_dependency_kind": dependency.kind,
+                    "tensor": dependency.tensor,
+                    "producer_tile": dependency.producer,
+                    "consumer_tile": dependency.consumer,
+                    "producer_region": _tile_region_to_dict(dependency.producer_region),
+                    "consumer_region": _tile_region_to_dict(dependency.consumer_region),
+                    **dict(dependency.provenance),
+                },
             )
 
         # Reduction barriers and matrix partial accumulation are semantic
@@ -785,6 +874,11 @@ class TISASemanticBuilder:
                                 instruction_id(current.tile_id, "compute"),
                                 instruction_id(previous.tile_id, "compute"),
                                 "ACCUMULATE",
+                                condition="accumulate_ready",
+                                provenance={
+                                    "source": "matmul_partial_accumulate",
+                                    "operator_id": operator_id,
+                                },
                             )
                 barrier_stage = {
                     "reduce": "compute",
@@ -797,6 +891,16 @@ class TISASemanticBuilder:
                             instruction_id(current.tile_id, barrier_stage),
                             instruction_id(previous.tile_id, barrier_stage),
                                 "ACCUMULATE" if op_type in {"matmul", "batched_matmul", "gemv", "conv2d"} else "STATE",
+                                condition=(
+                                    "accumulate_ready"
+                                    if op_type in {"matmul", "batched_matmul", "gemv", "conv2d"}
+                                    else "state_complete"
+                                ),
+                                provenance={
+                                    "source": "reduction_order",
+                                    "operator_id": operator_id,
+                                    "stage": barrier_stage,
+                                },
                         )
                 if op_type == "softmax" and reduction:
                     if operator.attributes.get("softmax_algorithm", "materialized") == "online":
@@ -805,6 +909,11 @@ class TISASemanticBuilder:
                                 instruction_id(current.tile_id, "compute"),
                                 instruction_id(previous.tile_id, "compute"),
                                 "STATE",
+                                condition="state_complete",
+                                provenance={
+                                    "source": "softmax_online_state_chain",
+                                    "operator_id": operator_id,
+                                },
                             )
                     else:
                         # Materialized softmax computes the final row max/sum
@@ -816,6 +925,11 @@ class TISASemanticBuilder:
                                 instruction_id(tile.tile_id, "compute"),
                                 instruction_id(final.tile_id, "compute"),
                                 "STATE",
+                                condition="state_complete",
+                                provenance={
+                                    "source": "softmax_materialized_reduction",
+                                    "operator_id": operator_id,
+                                },
                             )
 
         # Stable topological order is part of the descriptor contract.
@@ -837,8 +951,15 @@ class TISASemanticBuilder:
                 replace(
                     instruction,
                     dependencies=tuple(
-                        TISADependency(source=source, kind=kind, condition=condition)
-                        for source, (kind, condition) in sorted(dependencies[current].items())
+                        TISADependency(
+                            source=source,
+                            kind=kind,
+                            condition=condition,
+                            provenance=provenance,
+                        )
+                        for source, (kind, condition, provenance) in sorted(
+                            dependencies[current].items()
+                        )
                     ),
                     attributes={
                         **dict(instruction.attributes),

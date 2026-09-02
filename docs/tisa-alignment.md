@@ -46,12 +46,12 @@ payload 可以包含该 execution unit 内部的多个步骤。
 | --- | --- | --- |
 | tile bounds | `TileInstance.bounds` | 静态 shape、边界 tile 和 logical region |
 | OpType | `TISAInstruction.op_type`、`semantic_family` | 复合语义保持 semantic op，stage 按 EU 划分 |
-| TileShape | `TISAOperand.tile_shape` | resolved shape；symbolic binding 属于扩展项 |
+| TileShape | `TISAOperand.tile_shape` | resolved shape；symbolic binding 使用 normalized shape environment |
 | TileMem | `TISAOperand.tile_mem` | scope、logical address expression、offset/size、stride/layout metadata |
 | AccessType | operand/buffer access | read、write、read-write |
 | Attributes | `TISAInstruction.attributes` | readiness、region、state、fusion 和 reorder |
 | UnitMap | `TISAInstruction.unit_map` | execution unit 类别与数量 |
-| typed Deps | `TISADependency` | RAW/WAR/WAW/STATE/ACCUMULATE/BUFFER_REUSE |
+| typed Deps | `TISADependency` | kind、condition、provenance；GC 同时保存 logical region |
 | WQ/IQ/Fu | simulator queue/ROB/in-flight | 可配置行为模型，参数来自 MachineConfig |
 
 memory bank scoreboard 读取 MachineConfig 的 bank、width、read/write port，形成
@@ -126,11 +126,13 @@ Backend Timing/Event
 - descriptor arrival、queue/ROB/window、resource、completion feedback analytical model；
 - analytical、timing table、systolic MXU profile 和 RTL importer；
 - `payload_ready:<task_id>` partial-ready 原型和 memory bank scoreboard。
+- GC `TileDependency` 的 hazard kind、logical region、condition 和 provenance，并向
+  TISA dependency 与 compile statistics 贯通。
 
 扩展项：
 
 - 论文全部 operation/model block 的 semantic coverage；
-- symbolic shape、dynamic index、dynamic layout 和 stride-aware transform；
+- 更复杂 StableHLO layout dialect 的扩展与 bank-aware memory timing 校准；
 - 论文 WQ/IQ/Fu 容量、dispatch/wake-up/issue/completion 控制开销；
 - 完整 RTL 与真实芯片 timing calibration；
 - online Softmax 数值 rescale、最终 normalization 和 workspace 生命周期。

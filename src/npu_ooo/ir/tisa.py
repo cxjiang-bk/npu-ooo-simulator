@@ -32,6 +32,8 @@ class TileMem:
     strides_bytes: tuple[int, ...] | None = None
     stride_expr: str | None = None
     layout: str = "dense"
+    logical_starts: tuple[int, ...] | None = None
+    logical_shape: tuple[int, ...] | None = None
 
     def validate(self) -> tuple[str, ...]:
         issues: list[str] = []
@@ -59,6 +61,21 @@ class TileMem:
                 issues.append("TISA TileMem strides_bytes must contain non-negative integers")
         if self.stride_expr is not None and not self.stride_expr.strip():
             issues.append("TISA TileMem stride_expr must not be blank")
+        if (self.logical_starts is None) != (self.logical_shape is None):
+            issues.append("TISA TileMem logical starts and shape must be provided together")
+        if self.logical_starts is not None and self.logical_shape is not None:
+            if len(self.logical_starts) != len(self.logical_shape):
+                issues.append("TISA TileMem logical starts and shape must have equal rank")
+            if any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in self.logical_starts
+            ):
+                issues.append("TISA TileMem logical starts must be non-negative integers")
+            if any(
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                for value in self.logical_shape
+            ):
+                issues.append("TISA TileMem logical shape must contain positive integers")
         return tuple(issues)
 
     def to_dict(self) -> dict[str, Any]:
@@ -72,6 +89,8 @@ class TileMem:
             "strides_bytes": list(self.strides_bytes) if self.strides_bytes is not None else None,
             "stride_expr": self.stride_expr,
             "layout": self.layout,
+            "logical_starts": list(self.logical_starts) if self.logical_starts is not None else None,
+            "logical_shape": list(self.logical_shape) if self.logical_shape is not None else None,
         }
 
 
@@ -135,6 +154,7 @@ class TISADependency:
     source: str
     kind: str = "RAW"
     condition: str = "full_region_ready"
+    provenance: Mapping[str, Any] = field(default_factory=dict)
 
     def validate(self) -> tuple[str, ...]:
         issues: list[str] = []
@@ -155,7 +175,12 @@ class TISADependency:
         return tuple(issues)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"source": self.source, "kind": self.kind, "condition": self.condition}
+        return {
+            "source": self.source,
+            "kind": self.kind,
+            "condition": self.condition,
+            "provenance": dict(self.provenance),
+        }
 
 
 @dataclass(frozen=True)

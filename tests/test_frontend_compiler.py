@@ -54,9 +54,45 @@ class PyTorchFrontendTest(unittest.TestCase):
             dependency_counts,
             {"region_data": 16, "accumulate": 8},
         )
+        region_dependencies = [
+            dependency
+            for dependency in compiled.tile_graph.dependencies
+            if dependency.kind == "region_data"
+        ]
+        self.assertTrue(region_dependencies)
+        self.assertTrue(all(dependency.hazard_kind == "RAW" for dependency in region_dependencies))
+        self.assertTrue(all(dependency.condition == "full_region_ready" for dependency in region_dependencies))
+        self.assertTrue(all(dependency.producer_region for dependency in region_dependencies))
+        self.assertTrue(all(dependency.consumer_region for dependency in region_dependencies))
+        self.assertTrue(
+            all(
+                dependency.provenance.get("source") == "operator_graph_edge"
+                for dependency in region_dependencies
+            )
+        )
+        tisa_region_dependencies = [
+            dependency
+            for instruction in compiled.tisa_program.instructions
+            for dependency in instruction.dependencies
+            if dependency.provenance.get("source") == "operator_graph_edge"
+        ]
+        self.assertTrue(tisa_region_dependencies)
+        self.assertTrue(all(dependency.kind == "RAW" for dependency in tisa_region_dependencies))
+        self.assertTrue(
+            all(dependency.provenance.get("producer_region") for dependency in tisa_region_dependencies)
+        )
         self.assertEqual(
             compiled.tile_graph.attributes["avoided_all_to_all_dependencies"],
             48,
+        )
+        statistics = compiled.attributes["compile_statistics"]
+        self.assertEqual(
+            statistics["dependencies"]["hazard_kind_counts"],
+            {"RAW": 16, "ACCUMULATE": 8},
+        )
+        self.assertEqual(
+            statistics["dependencies"]["condition_counts"],
+            {"full_region_ready": 16, "accumulate_ready": 8},
         )
         self.assertTrue(compiled.tisa_program.instructions)
         address_expressions = [
@@ -342,7 +378,6 @@ class PyTorchFrontendTest(unittest.TestCase):
         statistics = compiled.attributes["compile_statistics"]
         self.assertEqual(statistics["summary"]["tile_count"], len(compiled.tile_graph.tiles))
         self.assertGreater(statistics["summary"]["macs"], 0)
-
         artifact_before = compiled.backend_artifact.to_dict()
         static_result = schedule_tisa_program(
             compiled.backend_artifact,

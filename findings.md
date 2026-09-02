@@ -102,3 +102,99 @@ TISA payload。
 的 source、interval、aggregation 和 calibration status 写入 manifest。泳道图同时展示
 TISA lane 与 backend payload lane，便于定位 dependency wait、resource busy、
 memory conflict 和 completion feedback。
+
+## 2026-08-31：GC typed dependency 语义
+
+论文在 TISA 层定义：
+
+```text
+Deps = {(src, type, condition)}
+type = RAW | WAR | WAW
+```
+
+`RAW` 表示写后读，`WAR` 表示读后写，`WAW` 表示写后写。论文通过 TISA operand 的
+`TileMem` 区间、`scope` 和 `AccessType` 进行区间重叠分析；不重叠区域形成独立 tile，
+`condition` 表示完整区域或部分区域的 ready 条件。`OpType` 和 `UnitMap` 负责语义
+路由与资源选择，它们属于独立字段。
+
+当前项目的 GC 输出使用：
+
+```text
+TileDependency(producer, consumer, tensor, kind)
+kind = region_data | state | accumulate | buffer_reuse
+```
+
+其中 `region_data` 经 FC 映射为 `RAW`，`state` 和 `accumulate` 分别表达状态链与归约
+顺序，映射为项目扩展的 `STATE` 和 `ACCUMULATE`。FC 为每条 TISA dependency 补充
+`condition`，默认使用 `full_region_ready`，校准 backend 可以指定
+`payload_ready:<task_id>`。
+
+因此，当前 GC 边已经保留 producer、consumer、tensor region、hazard relation、ready
+condition 和语义原因。FC、TISA、runtime address scoreboard 与 trace 复用同一 dependency
+provenance，继续保持 region-aware tile overlap 和 scheduler-visible TISA 边界。
+
+## 2026-08-31：GC typed dependency 第一版实现
+
+`TileDependency` 现在显式保存 `hazard_kind`、producer/consumer logical region、
+`condition` 和 `provenance`。`region_data` 建立 RAW 关系并携带 `full_region_ready`；
+reduction/state chain 使用 STATE 或 ACCUMULATE，并携带 `state_complete` 或
+`accumulate_ready`；buffer reuse 使用 BUFFER_REUSE 与释放条件。
+
+FC 将上述字段原样投影到 `TISADependency`，同一 source/target 上的多条语义来源合并到
+`provenance.sources`。这样 GC、FC、TISA、runtime address scoreboard 和 trace 使用同一
+dependency provenance；`compile_statistics` 同时按 hazard 与 condition 汇总。
+
+## 2026-08-31：symbolic shape binding 第一版
+
+shape environment 现在由 frontend 统一校验：键使用 Python/StableHLO 兼容标识符，值为
+正整数。Torch Export、StableHLO importer、shape specialization 和 Canonical resolve 使用
+同一份 normalized mapping；symbolic tensor shape 可以在 specialization 中直接解析，
+解析后的 shape、variant 和 environment 保存在 artifact provenance。
+
+## 2026-09-02：dependency provenance 与动态索引
+
+- Backend lowering 通过 `ExecutionTask.attributes["dependency_provenance"]` 保存
+  predecessor 对应的 GC edge。metadata 同时包含 GC kind、paper hazard kind、logical
+  region、ready condition 和来源；同 tile 的 primitive 顺序使用 `CONTROL`。
+- ExecutionGraph trace、TISA trace、Perfetto 和 address scoreboard 读取同一份 metadata。
+  address hazard 记录分为编译 provenance（能关联到 TISA dependency）和运行时物理区间
+  provenance（`address_scoreboard`）。
+- `DynamicIndexExpr` 是 Canonical/TISA 的符号索引 contract；它描述 source tensor、
+  index operands、index rank、每轴 clamp bounds 和 StableHLO clamp rule。runtime 用
+  `DynamicIndexBinding` 按 expression id 提供具体值并校验 rank。
+- `dynamic_slice` 以 slice semantic family 进入 output-tile copy，并在 source TileMem
+  中保留如 `arg0[clamp(arg1,0,6):+2,...]` 的符号地址表达式；当前 interval 使用完整
+  source allocation，保证 analytical scoreboard 保守正确。
+- `dynamic_update_slice` 进入 `kv_cache_update`，Canonical operator 保存
+  `stateful/state_id/state_buffer` 与 DynamicIndexExpr；runtime state registry 继续
+  管理持久 buffer，动态地址计算留待 stride-aware layout 阶段。
+
+## 2026-09-02：阶段 2 实现审计
+
+- StableHLO 标量索引使用 `i32`/`i64` 等元素类型。编译器当前只识别项目内部的
+  `int32`/`int64` 别名，导致动态 slice 在 `compile_operator_graph()` 的 dtype 校验
+  处提前失败。dtype 名称和字节宽度需要由一个共享模块统一解析。
+- 动态 slice 的 TISA source operand 保留符号 address expression，runtime 使用
+  `DynamicIndexBinding` 按 StableHLO clamp 规则解析窗口，再以 source tensor 的 dense 或
+  显式 byte strides 计算 offset/span，并记录 resolved index/offset provenance。
+- dynamic update slice 的 generic output 建立对 state buffer 的 persistent alias。TISA
+  `state_region`、runtime operand binding 和 address scoreboard observation 使用同一 update
+  window；完整 state allocation 仍由 `RuntimeStateRegistry` 管理。
+- `DynamicIndexBinding` 保存 StableHLO 的原始有符号整数；`resolve_dynamic_index()` 输出
+  clamp 后的非负合法起点，避免在 runtime boundary 提前改变索引语义。
+
+## 2026-09-02：阶段 2 dynamic layout 与 transform
+
+- StableHLO encoding 只有在暴露 byte strides、element strides 或 minor-to-major 等结构化
+  信息时才解析为 concrete layout；裸 tag（如 `#row_major`）没有可验证定义时保留
+  opaque/conservative region。
+- logical region 的起点始终使用基础 tensor stride；slice step 只作用于跨度计算，避免
+  将起始 offset 错误地乘以 slice step。
+- transpose 固定使用 `output[d] = input[permutation[d]]`。TileGraph 在 output domain
+  切分，transform lowering 按 permutation 生成 source region，使 source/output interval
+  可以独立进入 dependency 与 scoreboard。
+- `RuntimeLayoutBinding` 与 `DynamicIndexBinding` 一样按 invocation 提供具体值。编译产物
+  保持不变，runtime 根据 layout 绑定重算 operand offset/span，并将 layout provenance
+  保存到 submission/trace metadata。
+- bank/port timing 使用 resolved physical address。小于 4096 个元素的 strided region
+  展开实际 bank，大 region 使用 bounded fallback，避免 seqlen 增长导致仿真复杂度无界。

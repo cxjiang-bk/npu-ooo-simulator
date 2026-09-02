@@ -16,6 +16,9 @@ from .schedule import (
 )
 from .tile import TileDependency, TileGraph, TileInstance, build_tile_graph, enumerate_operator_tiles
 from .execution import AccessType, BufferRegion, ExecutionGraph, ExecutionTask
+from .index import DynamicIndexBinding, DynamicIndexExpr, IndexValue, resolve_dynamic_index
+from .dtype import canonical_dtype, dtype_bytes, is_known_dtype, known_dtype_names, normalize_dtype
+from .layout import LayoutInfo, resolve_layout, tensor_layout
 from .tisa import (
     BackendArtifact,
     TISADependency,
@@ -28,6 +31,7 @@ from .tisa import (
 from .runtime import (
     BufferBinding,
     RuntimeCommandChunk,
+    RuntimeLayoutBinding,
     RuntimeOperandBinding,
     RuntimeSequence,
     RuntimeStateDependency,
@@ -53,6 +57,18 @@ __all__ = [
     "BufferRegion",
     "ExecutionGraph",
     "ExecutionTask",
+    "DynamicIndexBinding",
+    "DynamicIndexExpr",
+    "IndexValue",
+    "resolve_dynamic_index",
+    "canonical_dtype",
+    "dtype_bytes",
+    "is_known_dtype",
+    "known_dtype_names",
+    "normalize_dtype",
+    "LayoutInfo",
+    "resolve_layout",
+    "tensor_layout",
     "BackendArtifact",
     "TISADependency",
     "TISAInstruction",
@@ -62,6 +78,7 @@ __all__ = [
     "UnitMap",
     "BufferBinding",
     "RuntimeCommandChunk",
+    "RuntimeLayoutBinding",
     "RuntimeOperandBinding",
     "RuntimeSequence",
     "RuntimeStateDependency",

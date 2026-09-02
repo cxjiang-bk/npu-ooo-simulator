@@ -13,25 +13,10 @@ from npu_ooo.ir import (
     ExecutionTask,
     OperatorGraph,
     ScheduleSpec,
+    dtype_bytes,
 )
 
 from .matmul import LoweringResult, _local_memory, _path, _root_memory, _transfer_timing, _unit_for
-
-
-def _dtype_bytes(dtype: str) -> int:
-    return {
-        "bool": 1,
-        "int8": 1,
-        "uint8": 1,
-        "fp16": 2,
-        "f16": 2,
-        "float16": 2,
-        "bf16": 2,
-        "bfloat16": 2,
-        "fp32": 4,
-        "f32": 4,
-        "float32": 4,
-    }.get(str(dtype).lower(), 2)
 
 
 def _region(
@@ -55,8 +40,8 @@ def _region(
         starts=starts,
         dtype=tensor.dtype,
         access=access,
-        offset_bytes=offset * _dtype_bytes(tensor.dtype),
-        size_bytes=math.prod(shape) * _dtype_bytes(tensor.dtype),
+        offset_bytes=offset * dtype_bytes(tensor.dtype, default=2),
+        size_bytes=math.prod(shape) * dtype_bytes(tensor.dtype, default=2),
         layout=tensor.layout,
     )
 

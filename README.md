@@ -53,6 +53,7 @@ ATen 到 StableHLO 的转换，项目维护 StableHLO semantic family 到 Canoni
   RMSNorm、Attention region、SwiGLU、RoPE、Conv2D、BatchNorm inference、pooling、
   reshape/transpose、固定窗口 KV-cache；
 - `RuntimeStateRegistry` 和 `RuntimeSequence` 支持固定窗口 decode 的多次 invocation；
+- symbolic shape 使用 normalized shape environment 完成 Canonical resolve 与 specialization；
 - 输出分阶段 artifact、周期与 stall 统计、SVG/PNG 泳道图和 Perfetto JSON；
 - 支持 analytical、timing table、systolic MXU profile 以及 RTL completion trace
   importer。

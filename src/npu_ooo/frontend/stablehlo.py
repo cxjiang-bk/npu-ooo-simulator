@@ -9,10 +9,12 @@ of being silently dropped.
 """
 
 import re
+from dataclasses import replace
 from typing import Any, Mapping
 
 from npu_ooo.ir import (
     DataEdge,
+    DynamicIndexExpr,
     ModelFamily,
     OperatorGraph,
     OperatorSpec,
@@ -20,7 +22,12 @@ from npu_ooo.ir import (
     TensorSpec,
 )
 
-from .bridge import FrontendImport, FrontendImportError, FrontendKind
+from .bridge import (
+    FrontendImport,
+    FrontendImportError,
+    FrontendKind,
+    normalize_shape_environment,
+)
 from .stablehlo_semantics import (
     normalize_stablehlo_op_name,
     registered_stablehlo_ops,
@@ -407,7 +414,103 @@ def _graph_from_text(text: str, *, graph_id: str) -> OperatorGraph:
         op_type = capability.semantic_family
         input_shapes = [tensors[name.removeprefix("%")].shape for name in input_names]
         operation_attributes: dict[str, Any] = {}
-        if normalized_target == "stablehlo.convert":
+        if normalized_target == "stablehlo.dynamic_slice":
+            source_name = input_names[0].removeprefix("%")
+            source_shape = input_shapes[0]
+            sizes = _named_integer_list(body, "sizes") or _named_integer_list(body, "slice_sizes")
+            if sizes is None or len(sizes) != len(source_shape):
+                raise FrontendImportError(
+                    f"StableHLO dynamic_slice '{result_name}' requires one positive size per source axis"
+                )
+            if any(size <= 0 for size in sizes):
+                raise FrontendImportError(
+                    f"StableHLO dynamic_slice '{result_name}' sizes must be positive"
+                )
+            index_names = input_names[1:]
+            if len(index_names) != len(source_shape):
+                raise FrontendImportError(
+                    f"StableHLO dynamic_slice '{result_name}' requires one index operand per source axis"
+                )
+            operation_attributes["dynamic_index"] = DynamicIndexExpr(
+                expression_id=f"{result_name.removeprefix('%')}.index",
+                source_tensor=source_name,
+                index_operands=tuple(name.removeprefix("%") for name in index_names),
+                index_rank=len(source_shape),
+                clamp_bounds=tuple(
+                    (0, max(0, int(extent) - size)) if isinstance(extent, int) else (0, None)
+                    for extent, size in zip(source_shape, sizes)
+                ),
+                attributes={"operation": "dynamic_slice", "sizes": list(sizes)},
+            ).to_dict()
+            operation_attributes.update(
+                {
+                    "slice_sizes": list(sizes),
+                    "dynamic_index_operands": [name.removeprefix("%") for name in index_names],
+                }
+            )
+            # Index operands belong to DynamicIndexExpr metadata.  The
+            # canonical dataflow input remains the sliced tensor.
+            input_names = (input_names[0],)
+            iteration_dims = tuple((f"d{axis}", value) for axis, value in enumerate(result_shape))
+            reduction_dims = ()
+        elif normalized_target == "stablehlo.dynamic_update_slice":
+            if len(input_names) < 3:
+                raise FrontendImportError(
+                    f"StableHLO dynamic_update_slice '{result_name}' requires operand, update and index vector"
+                )
+            source_name = input_names[0].removeprefix("%")
+            update_name = input_names[1].removeprefix("%")
+            source_shape = input_shapes[0]
+            update_shape = input_shapes[1]
+            if tuple(result_shape) != tuple(source_shape):
+                raise FrontendImportError(
+                    f"StableHLO dynamic_update_slice '{result_name}' result shape must match operand"
+                )
+            if len(update_shape) != len(source_shape):
+                raise FrontendImportError(
+                    f"StableHLO dynamic_update_slice '{result_name}' update rank must match operand rank"
+                )
+            operation_attributes["dynamic_index"] = DynamicIndexExpr(
+                expression_id=f"{result_name.removeprefix('%')}.index",
+                source_tensor=source_name,
+                index_operands=tuple(name.removeprefix("%") for name in input_names[2:]),
+                index_rank=len(source_shape),
+                clamp_bounds=tuple(
+                    (0, max(0, int(extent) - int(update_extent)))
+                    if isinstance(extent, int) and isinstance(update_extent, int)
+                    else (0, None)
+                    for extent, update_extent in zip(source_shape, update_shape)
+                ),
+                attributes={
+                    "operation": "dynamic_update_slice",
+                    "update_tensor": update_name,
+                    "update_shape": list(update_shape),
+                },
+            ).to_dict()
+            operation_attributes.update(
+                {
+                    "state_update": True,
+                    "stateful": True,
+                    "state_id": source_name,
+                    "state_buffer": source_name,
+                    "update_tensor": update_name,
+                    "dynamic_index_operands": [name.removeprefix("%") for name in input_names[2:]],
+                }
+            )
+            source_tensor = tensors[source_name]
+            tensors[source_name] = replace(
+                source_tensor,
+                attributes={
+                    **dict(source_tensor.attributes),
+                    "persistent": True,
+                    "state_id": source_name,
+                    "state_buffer": source_name,
+                },
+            )
+            input_names = (input_names[0], input_names[1])
+            iteration_dims = tuple((f"d{axis}", value) for axis, value in enumerate(result_shape))
+            reduction_dims = ()
+        elif normalized_target == "stablehlo.convert":
             source_shape = input_shapes[0]
             if source_shape != result_shape:
                 raise FrontendImportError(
@@ -838,6 +941,16 @@ def _graph_from_text(text: str, *, graph_id: str) -> OperatorGraph:
                     source_node=result_tensor_name,
                     frontend_target=target,
                 ),
+                **(
+                    {
+                        "alias_of": str(operation_attributes["state_buffer"]),
+                        "persistent": True,
+                        "state_id": str(operation_attributes["state_id"]),
+                        "state_buffer": str(operation_attributes["state_buffer"]),
+                    }
+                    if operation_attributes.get("state_update")
+                    else {}
+                ),
             },
         )
         produced_by[result_tensor_name] = result_tensor_name
@@ -905,7 +1018,7 @@ class StableHLOAdapter:
             graph=graph,
             model_id=model_id,
             variant=variant,
-            shape_environment=dict(shape_environment or {}),
+            shape_environment=normalize_shape_environment(shape_environment),
             frontend=cls.kind,
             provenance={"source": "stablehlo-text", "parser": "textual-subset-v0"},
             family=ModelFamily.SYNTHETIC,

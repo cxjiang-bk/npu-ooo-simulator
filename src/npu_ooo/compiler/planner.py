@@ -13,31 +13,18 @@ import math
 from typing import Any, Mapping, Sequence
 
 from npu_ooo.arch import MachineConfig
-from npu_ooo.ir import OperatorGraph, ScheduleSpec, TensorResidency, TensorSpec, plan_uniform_tiles
-
-
-_DTYPE_BYTES = {
-    "bool": 1,
-    "int8": 1,
-    "uint8": 1,
-    "int16": 2,
-    "float16": 2,
-    "fp16": 2,
-    "f16": 2,
-    "bfloat16": 2,
-    "bf16": 2,
-    "int32": 4,
-    "float32": 4,
-    "fp32": 4,
-    "f32": 4,
-    "int64": 8,
-    "float64": 8,
-    "fp64": 8,
-}
+from npu_ooo.ir import (
+    OperatorGraph,
+    ScheduleSpec,
+    TensorResidency,
+    TensorSpec,
+    dtype_bytes,
+    plan_uniform_tiles,
+)
 
 
 def _dtype_bytes(dtype: str) -> int:
-    return _DTYPE_BYTES.get(str(dtype).lower().replace("torch.", ""), 2)
+    return dtype_bytes(dtype, default=2)
 
 
 def _memory_plan(machine: MachineConfig) -> tuple[str, str, int | None]:

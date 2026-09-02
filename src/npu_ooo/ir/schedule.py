@@ -169,7 +169,6 @@ def plan_uniform_tiles(graph: OperatorGraph, *, tile_size: int = 32) -> Schedule
         )
         full_tensor_transform = operator.normalized_type in {
             "reshape",
-            "transpose",
             "kv_cache_update",
         } and not is_broadcast
         schedules.append(

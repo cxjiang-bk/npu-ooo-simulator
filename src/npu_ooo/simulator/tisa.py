@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import heapq
 import math
-from typing import Any
+from itertools import product
+from typing import Any, Iterable
 
 from npu_ooo.arch import ExecutionUnitConfig, MachineConfig
 from npu_ooo.backend import validate_backend_capability
@@ -70,11 +71,33 @@ def _memory_accesses(
 
     accesses: set[_MemoryAccess] = set()
     if runtime_operands:
+        operands_by_name = {operand.name: operand for operand in instruction.operands}
         candidates = tuple(
             # Runtime bindings carry the concrete device address.  Use it for
             # bank selection so separate buffers with different base addresses
             # can exercise different banks even when their tile offsets match.
-            (item.physical_scope, item.address, item.size_bytes, item.access_type)
+            (
+                item.physical_scope,
+                item.address,
+                item.size_bytes,
+                item.access_type,
+                tuple(
+                    item.attributes.get("dynamic_region", {}).get("shape", ())
+                    if isinstance(item.attributes.get("dynamic_region"), dict)
+                    else operands_by_name.get(item.operand_name).tile_shape
+                    if item.operand_name in operands_by_name
+                    else ()
+                ),
+                tuple(
+                    item.attributes.get("runtime_strides_bytes")
+                    or (
+                        operands_by_name[item.operand_name].tile_mem.strides_bytes
+                        if item.operand_name in operands_by_name
+                        else ()
+                    )
+                    or ()
+                ),
+            )
             for item in runtime_operands
         )
     else:
@@ -84,18 +107,26 @@ def _memory_accesses(
                 operand.tile_mem.offset_bytes or 0,
                 operand.tile_mem.size_bytes or 1,
                 operand.normalized_access,
+                tuple(operand.tile_shape),
+                tuple(operand.tile_mem.strides_bytes or ()),
             )
             for operand in instruction.operands
         )
-    for memory, offset, size, access_type in candidates:
+    for memory, offset, size, access_type, shape, strides in candidates:
         try:
             level = machine.memory(memory)
         except KeyError:
             # ``logical`` scopes are resolved by RuntimeSubmission later.
             continue
         bank_width = level.bank_width_bytes or 1
-        first_bank = offset // bank_width
-        last_bank = (offset + max(size - 1, 0)) // bank_width
+        banks = _access_banks(
+            offset,
+            size,
+            shape,
+            strides,
+            bank_width=bank_width,
+            bank_count=level.bank_count,
+        )
         modes = (
             ("read", "write")
             if access_type == AccessType.READ_WRITE.value
@@ -103,10 +134,44 @@ def _memory_accesses(
             if access_type == AccessType.READ.value
             else ("write",)
         )
-        for bank in range(first_bank, last_bank + 1):
+        for bank in banks:
             for mode in modes:
-                accesses.add(_MemoryAccess(memory, bank % level.bank_count, mode))
+                accesses.add(_MemoryAccess(memory, bank, mode))
     return tuple(sorted(accesses, key=lambda item: (item.memory, item.bank, item.mode)))
+
+
+def _access_banks(
+    address: int,
+    size: int,
+    shape: tuple[int, ...],
+    strides: tuple[int, ...],
+    *,
+    bank_width: int,
+    bank_count: int,
+) -> tuple[int, ...]:
+    """Map strided logical elements to banks, with bounded exact expansion."""
+
+    if (
+        not shape
+        or len(shape) != len(strides)
+        or any(value <= 0 for value in shape)
+        or any(value < 0 for value in strides)
+    ):
+        first = address // bank_width
+        last = (address + max(size - 1, 0)) // bank_width
+        return tuple(sorted({bank % bank_count for bank in range(first, last + 1)}))
+    element_count = math.prod(shape)
+    if element_count > 4096:
+        first = address // bank_width
+        last = (address + max(size - 1, 0)) // bank_width
+        return tuple(sorted({bank % bank_count for bank in range(first, last + 1)}))
+    banks = {
+        (address + sum(index * stride for index, stride in zip(indices, strides)))
+        // bank_width
+        % bank_count
+        for indices in product(*(range(extent) for extent in shape))
+    }
+    return tuple(sorted(banks))
 
 
 def _memory_port_conflict(
@@ -227,17 +292,17 @@ def _overlaps(left: TISAOperand, right: TISAOperand) -> bool:
 def _address_conflict(
     active: TISAInstruction,
     candidate: TISAInstruction,
-) -> str | None:
+) -> tuple[str, TISAOperand] | None:
     for left in active.operands:
         for right in candidate.operands:
             if not _overlaps(left, right):
                 continue
             if _writes(left) and _reads(right):
-                return "RAW"
+                return "RAW", left
             if _reads(left) and _writes(right):
-                return "WAR"
+                return "WAR", left
             if _writes(left) and _writes(right):
-                return "WAW"
+                return "WAW", left
     return None
 
 
@@ -258,7 +323,7 @@ def _runtime_writes(operand: RuntimeOperandBinding) -> bool:
 def _runtime_address_conflict(
     active: tuple[RuntimeOperandBinding, ...],
     candidate: tuple[RuntimeOperandBinding, ...],
-) -> str | None:
+) -> tuple[str, RuntimeOperandBinding] | None:
     for left in active:
         for right in candidate:
             if left.physical_scope != right.physical_scope:
@@ -269,11 +334,11 @@ def _runtime_address_conflict(
             ):
                 continue
             if _runtime_writes(left) and _runtime_reads(right):
-                return "RAW"
+                return "RAW", left
             if _runtime_reads(left) and _runtime_writes(right):
-                return "WAR"
+                return "WAR", left
             if _runtime_writes(left) and _runtime_writes(right):
-                return "WAW"
+                return "WAW", left
     return None
 
 
@@ -315,6 +380,70 @@ def _payload_readiness_task(condition: str, plan: _PayloadPlan) -> _PayloadStep 
     raise ValueError(
         f"payload_ready condition references task '{task_id}' outside the source payload"
     )
+
+
+def _tisa_dependency_details(instruction: TISAInstruction) -> list[dict[str, Any]]:
+    """Expose typed dependency provenance in every TISA trace event."""
+
+    return [
+        {
+            "predecessor": dependency.source,
+            "kind": dependency.kind,
+            "condition": dependency.condition,
+            "provenance": dict(dependency.provenance),
+        }
+        for dependency in instruction.dependencies
+    ]
+
+
+def _tisa_address_observation(
+    predecessor: TISAInstruction,
+    successor: TISAInstruction,
+    kind: str,
+    region: TISAOperand | RuntimeOperandBinding,
+) -> dict[str, Any]:
+    dependency = next(
+        (
+            item
+            for item in successor.dependencies
+            if item.source == predecessor.tisa_id
+        ),
+        None,
+    )
+    if isinstance(region, RuntimeOperandBinding):
+        memory = region.physical_scope
+        tensor = region.tensor
+        address = region.address
+        size = region.size_bytes
+    else:
+        memory = region.tile_mem.scope
+        tensor = region.tile_mem.tensor or region.tile_mem.base
+        address = region.tile_mem.offset_bytes
+        size = region.tile_mem.size_bytes
+    observation: dict[str, Any] = {
+        "predecessor": predecessor.tisa_id,
+        "successor": successor.tisa_id,
+        "kind": kind,
+        "tensor": tensor,
+        "memory": memory,
+        "address": address,
+        "size_bytes": size,
+        "condition": dependency.condition if dependency else "address_overlap",
+        "provenance": {
+            "source": "address_scoreboard",
+            "dependency": dependency.to_dict() if dependency else None,
+        },
+    }
+    if isinstance(region, RuntimeOperandBinding):
+        for key in (
+            "address_source",
+            "dynamic_region",
+            "resolved_index_values",
+            "resolved_offset_bytes",
+        ):
+            if key in region.attributes:
+                observation[key] = region.attributes[key]
+    return observation
 
 
 def simulate_tisa_artifact(
@@ -470,6 +599,7 @@ def simulate_tisa_artifact(
     completion_time: dict[str, float] = {}
     payload_readiness_time: dict[tuple[str, str], float] = {}
     emitted_payload_readiness: set[tuple[str, str]] = set()
+    observed_address_hazards: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
     instruction_timings: dict[str, TaskTiming] = {}
     primitive_timings: dict[str, TaskTiming] = {}
     runtime_timings: list[TaskTiming] = []
@@ -483,6 +613,7 @@ def simulate_tisa_artifact(
                 "submission_order": chunk.submission_order,
                 "descriptor_count": len(chunk.tisa_ids),
                 "availability_cycle": chunk.availability_cycle,
+                "dynamic_indices": [item.to_dict() for item in runtime_submission.dynamic_indices],
             }
             runtime_timings.append(
                 TaskTiming(
@@ -541,9 +672,15 @@ def simulate_tisa_artifact(
             runtime_request_wait_cycles if runtime_submission is not None else 0.0
         ),
         "runtime_synchronization_cycles": synchronization_cycles,
+        "dynamic_index_bindings": [
+            item.to_dict() for item in (runtime_submission.dynamic_indices if runtime_submission is not None else ())
+        ],
         "address_scoreboard_scope": (
             "runtime_physical" if runtime_submission is not None else "compiler_logical"
         ),
+        "address_dependency_count": 0,
+        "address_hazard_count": 0,
+        "address_hazards": [],
         "primitive_reordering_scope": "instruction_local",
         "simulator_config": config.to_dict(),
         "tisa_instruction_count": len(instructions),
@@ -639,6 +776,11 @@ def simulate_tisa_artifact(
                 "unit_map": instruction.unit_map.unit,
                 "runtime_chunk_id": chunk_id,
                 "runtime_ready_cycle": ready_cycle,
+                "dependencies": _tisa_dependency_details(instruction),
+                "runtime_operands": [
+                    item.to_dict()
+                    for item in runtime_operands_by_tisa.get(tisa_id, ())
+                ],
             }
             events.append(
                 TraceEvent(
@@ -682,20 +824,24 @@ def simulate_tisa_artifact(
             return None
         return min(available, key=lambda state: state.instance)
 
-    def address_block(tisa_id: str) -> tuple[str, str] | None:
+    def address_block(tisa_id: str) -> tuple[str, dict[str, Any]] | None:
         if not config.address_scoreboard:
             return None
         candidate = instruction_by_id[tisa_id]
         for active_id in sorted(active, key=order.__getitem__):
             if runtime_submission is None:
-                kind = _address_conflict(instruction_by_id[active_id], candidate)
+                conflict = _address_conflict(instruction_by_id[active_id], candidate)
             else:
-                kind = _runtime_address_conflict(
+                conflict = _runtime_address_conflict(
                     runtime_operands_by_tisa[active_id],
                     runtime_operands_by_tisa[tisa_id],
                 )
-            if kind is not None:
-                return active_id, kind
+            if conflict is not None:
+                kind, region = conflict
+                observation = _tisa_address_observation(
+                    instruction_by_id[active_id], candidate, kind, region
+                )
+                return active_id, observation
         return None
 
     memory_accesses_by_tisa = {
@@ -739,6 +885,11 @@ def simulate_tisa_artifact(
                 "operator_id": instruction.operator_id,
                 "tile_id": instruction.tile_id,
                 "payload_task_count": len(artifact.payloads[tisa_id]),
+                "dependencies": _tisa_dependency_details(instruction),
+                "runtime_operands": [
+                    item.to_dict()
+                    for item in runtime_operands_by_tisa.get(tisa_id, ())
+                ],
             }
             events.append(
                 TraceEvent(
@@ -808,7 +959,25 @@ def simulate_tisa_artifact(
                     continue
                 conflict = address_block(tisa_id)
                 if conflict is not None:
+                    _active_id, observation = conflict
                     address_blocked = True
+                    key = (
+                        str(observation["predecessor"]),
+                        str(observation["successor"]),
+                        str(observation["kind"]),
+                        str(observation["tensor"]),
+                        str(observation["memory"]),
+                    )
+                    observed_address_hazards.setdefault(key, observation)
+                    events.append(
+                        TraceEvent(
+                            now,
+                            "TISA_ADDRESS_BLOCK",
+                            tisa_id,
+                            f"TISA/{plans[tisa_id].resource}",
+                            details={**observation, "dependency": observation["provenance"].get("dependency")},
+                        )
+                    )
                     continue
                 memory_conflict = memory_block(tisa_id)
                 if memory_conflict is not None:
@@ -888,6 +1057,11 @@ def simulate_tisa_artifact(
                 "tile_id": instruction.tile_id,
                 "unit_map": instruction.unit_map.unit,
                 "payload_task_count": len(plan.steps),
+                "dependencies": _tisa_dependency_details(instruction),
+                "runtime_operands": [
+                    item.to_dict()
+                    for item in runtime_operands_by_tisa.get(tisa_id, ())
+                ],
             }
             events.append(
                 TraceEvent(
@@ -910,6 +1084,7 @@ def simulate_tisa_artifact(
                     "tile_id": task.tile_id,
                     "parent_tisa_id": tisa_id,
                     "backend": timing_model.name,
+                    "dependencies": _tisa_dependency_details(instruction),
                 }
                 primitive_timings[task.task_id] = TaskTiming(
                     task_id=task.task_id,
@@ -1013,12 +1188,13 @@ def simulate_tisa_artifact(
         "RUNTIME_SUBMIT_START": 0,
         "RUNTIME_SUBMIT_COMPLETE": 1,
         "TISA_RECEIVE": 2,
-        "TISA_ISSUE": 3,
-        "ISSUE": 4,
-        "START": 5,
-        "COMPLETE": 6,
-        "TISA_PARTIAL_READY": 7,
-        "TISA_COMPLETE": 8,
+        "TISA_ADDRESS_BLOCK": 3,
+        "TISA_ISSUE": 4,
+        "ISSUE": 5,
+        "START": 6,
+        "COMPLETE": 7,
+        "TISA_PARTIAL_READY": 8,
+        "TISA_COMPLETE": 9,
     }
     events.sort(
         key=lambda event: (
@@ -1050,6 +1226,12 @@ def simulate_tisa_artifact(
     metrics["device_finish_cycle"] = device_finish_cycle
     metrics["device_cycles"] = device_cycles
     metrics["total_cycles_including_runtime"] = total_cycles
+    metrics["address_dependency_count"] = len(observed_address_hazards)
+    metrics["address_hazard_count"] = len(observed_address_hazards)
+    metrics["address_hazards"] = [
+        observed_address_hazards[key]
+        for key in sorted(observed_address_hazards)
+    ]
     return SimulationResult(
         backend=timing_model.name,
         policy=policy,

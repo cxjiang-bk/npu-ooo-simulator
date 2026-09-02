@@ -14,31 +14,14 @@ import math
 from typing import Any, Iterable, Mapping, Sequence
 
 from .operator import TensorSpec
+from .index import DynamicIndexBinding, resolve_dynamic_index
 from .tisa import BackendArtifact, TISAProgram
-
-
-_DTYPE_BYTES = {
-    "bool": 1,
-    "int8": 1,
-    "uint8": 1,
-    "int16": 2,
-    "float16": 2,
-    "fp16": 2,
-    "f16": 2,
-    "bfloat16": 2,
-    "bf16": 2,
-    "int32": 4,
-    "float32": 4,
-    "fp32": 4,
-    "f32": 4,
-    "int64": 8,
-    "float64": 8,
-    "fp64": 8,
-}
+from .dtype import dtype_bytes as _shared_dtype_bytes
+from .layout import resolve_layout, tensor_layout
 
 
 def _dtype_bytes(dtype: str) -> int:
-    return _DTYPE_BYTES.get(dtype.lower().replace("torch.", ""), 2)
+    return _shared_dtype_bytes(dtype, default=2)
 
 
 def _align(value: int, alignment: int) -> int:
@@ -91,6 +74,50 @@ class BufferBinding:
             "logical_scope": self.logical_scope,
             "dtype": self.dtype,
             "alignment_bytes": self.alignment_bytes,
+            "attributes": dict(self.attributes),
+        }
+
+
+@dataclass(frozen=True)
+class RuntimeLayoutBinding:
+    """Per-invocation concrete layout supplied by the runtime.
+
+    The compiler keeps symbolic/opaque layout metadata in ``TensorSpec`` and
+    ``TileMem``.  This object binds a concrete shape and byte-stride vector at
+    submission time, which is required for paged KV cache and externally
+    allocated non-contiguous tensors.
+    """
+
+    tensor: str
+    shape: tuple[int, ...]
+    strides_bytes: tuple[int, ...]
+    layout: str = "runtime"
+    offset_bytes: int = 0
+    attributes: Mapping[str, Any] = field(default_factory=dict)
+
+    def validate(self) -> tuple[str, ...]:
+        issues: list[str] = []
+        if not self.tensor:
+            issues.append("runtime layout tensor must not be empty")
+        if len(self.shape) != len(self.strides_bytes):
+            issues.append(f"runtime layout '{self.tensor}' shape and strides must have equal rank")
+        if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in self.shape):
+            issues.append(f"runtime layout '{self.tensor}' shape must contain positive integers")
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in self.strides_bytes):
+            issues.append(f"runtime layout '{self.tensor}' strides_bytes must be non-negative integers")
+        if not self.layout:
+            issues.append(f"runtime layout '{self.tensor}' layout must not be empty")
+        if isinstance(self.offset_bytes, bool) or not isinstance(self.offset_bytes, int) or self.offset_bytes < 0:
+            issues.append(f"runtime layout '{self.tensor}' offset_bytes must be non-negative")
+        return tuple(issues)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tensor": self.tensor,
+            "shape": list(self.shape),
+            "strides_bytes": list(self.strides_bytes),
+            "layout": self.layout,
+            "offset_bytes": self.offset_bytes,
             "attributes": dict(self.attributes),
         }
 
@@ -285,6 +312,8 @@ class RuntimeSubmission:
     launch_latency_cycles: float = 0.0
     synchronization_cycles: float = 0.0
     attributes: Mapping[str, Any] = field(default_factory=dict)
+    dynamic_indices: tuple[DynamicIndexBinding, ...] = ()
+    dynamic_layouts: tuple[RuntimeLayoutBinding, ...] = ()
 
     def validate(self, program: TISAProgram | None = None) -> tuple[str, ...]:
         issues: list[str] = []
@@ -299,11 +328,27 @@ class RuntimeSubmission:
             or self.synchronization_cycles < 0
         ):
             issues.append("runtime latency values must be non-negative")
+        dynamic_binding_ids = [binding.expression_id for binding in self.dynamic_indices]
+        if len(set(dynamic_binding_ids)) != len(dynamic_binding_ids):
+            issues.append("runtime dynamic index bindings must be unique by expression_id")
+        for binding in self.dynamic_indices:
+            issues.extend(binding.validate())
+        layout_ids = [binding.tensor for binding in self.dynamic_layouts]
+        if len(set(layout_ids)) != len(layout_ids):
+            issues.append("runtime layout bindings must be unique by tensor")
+        for binding in self.dynamic_layouts:
+            issues.extend(binding.validate())
         buffer_keys = {(item.tensor, item.logical_scope) for item in self.buffers}
         if len(buffer_keys) != len(self.buffers):
             issues.append("runtime buffer bindings must be unique by tensor and logical_scope")
         for item in self.buffers:
             issues.extend(item.validate())
+        buffer_tensor_names = {item.tensor for item in self.buffers}
+        for binding in self.dynamic_layouts:
+            if binding.tensor not in buffer_tensor_names:
+                issues.append(
+                    f"runtime layout binding '{binding.tensor}' does not match a runtime buffer"
+                )
         state_contract = ()
         if program is not None:
             try:
@@ -391,6 +436,37 @@ class RuntimeSubmission:
                     issues.append("runtime operand bindings are missing: " + ", ".join(map(str, missing[:8])))
                 if extra:
                     issues.append("runtime operand bindings are unknown: " + ", ".join(map(str, extra[:8])))
+            expected_dynamic_indices = {
+                str(instruction.attributes["dynamic_index"]["expression_id"])
+                for instruction in program.instructions
+                if isinstance(instruction.attributes.get("dynamic_index"), Mapping)
+                and instruction.attributes["dynamic_index"].get("expression_id")
+            }
+            actual_dynamic_indices = set(dynamic_binding_ids)
+            if actual_dynamic_indices - expected_dynamic_indices:
+                issues.append(
+                    "runtime dynamic index bindings are unknown: "
+                    + ", ".join(sorted(actual_dynamic_indices - expected_dynamic_indices))
+                )
+            if expected_dynamic_indices - actual_dynamic_indices:
+                issues.append(
+                    "runtime dynamic index bindings are missing: "
+                    + ", ".join(sorted(expected_dynamic_indices - actual_dynamic_indices))
+                )
+            dynamic_contracts = {
+                str(instruction.attributes["dynamic_index"]["expression_id"]): instruction.attributes["dynamic_index"]
+                for instruction in program.instructions
+                if isinstance(instruction.attributes.get("dynamic_index"), Mapping)
+                and instruction.attributes["dynamic_index"].get("expression_id")
+            }
+            for binding in self.dynamic_indices:
+                contract = dynamic_contracts.get(binding.expression_id)
+                if contract is not None:
+                    rank = contract.get("index_rank")
+                    if isinstance(rank, int) and len(binding.values) != rank:
+                        issues.append(
+                            f"runtime dynamic index binding '{binding.expression_id}' expects {rank} values"
+                        )
         return tuple(issues)
 
     def to_dict(self) -> dict[str, Any]:
@@ -404,6 +480,8 @@ class RuntimeSubmission:
             "commands": [item.to_dict() for item in self.commands],
             "launch_latency_cycles": self.launch_latency_cycles,
             "synchronization_cycles": self.synchronization_cycles,
+            "dynamic_indices": [item.to_dict() for item in self.dynamic_indices],
+            "dynamic_layouts": [item.to_dict() for item in self.dynamic_layouts],
             "attributes": dict(self.attributes),
         }
 
@@ -593,6 +671,24 @@ def allocate_buffer_bindings(
             if len(lifetime) != 2 or lifetime[0] < 0 or lifetime[1] < lifetime[0]:
                 raise ValueError(f"invalid lifetime for tensor '{tensor}'")
     bindings_by_name: dict[str, BufferBinding] = {}
+
+    def tensor_layout_metadata(tensor: TensorSpec) -> dict[str, Any]:
+        layout_info = tensor_layout(tensor)
+        return {
+            "shape": list(layout_info.shape),
+            "strides_bytes": (
+                list(layout_info.strides_bytes)
+                if layout_info.strides_bytes is not None
+                else None
+            ),
+            "layout": layout_info.layout,
+            "layout_source": layout_info.source,
+            "layout_encoding": layout_info.encoding,
+            "layout_resolution": (
+                "concrete" if layout_info.concrete else "opaque_conservative"
+            ),
+            "layout_offset_bytes": layout_info.offset_bytes,
+        }
     allocation_blocks: list[dict[str, Any]] = []
     cursor = base_address
     tensor_order = {tensor.name: index for index, tensor in enumerate(tensors)}
@@ -612,7 +708,7 @@ def allocate_buffer_bindings(
             raise ValueError(
                 f"tensor '{tensor.name}' must have resolved positive integer shape before runtime binding"
             )
-        size_bytes = math.prod(tensor.shape) * _dtype_bytes(tensor.dtype)
+        size_bytes = tensor_layout(tensor).allocation_size_bytes
         alias_of = tensor.attributes.get("alias_of")
         if alias_of is not None:
             if not isinstance(alias_of, str) or not alias_of:
@@ -638,6 +734,7 @@ def allocate_buffer_bindings(
                 attributes={
                     "allocation_policy": "alias",
                     "alias_of": alias_of,
+                    **tensor_layout_metadata(tensor),
                     **(
                         {
                             "persistent": True,
@@ -689,6 +786,7 @@ def allocate_buffer_bindings(
             alignment_bytes=alignment_bytes,
             attributes={
                 "allocation_policy": "lifetime_reuse" if reuse_buffers else "linear",
+                **tensor_layout_metadata(tensor),
                 **(
                     {
                         "persistent": True,
@@ -837,6 +935,146 @@ def _buffer_lookup(buffers: Sequence[BufferBinding]) -> dict[tuple[str, str], Bu
     return lookup
 
 
+def _binding_shape(binding: BufferBinding) -> tuple[int, ...]:
+    shape = binding.attributes.get("shape")
+    if not isinstance(shape, (tuple, list)) or any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in shape
+    ):
+        raise ValueError(
+            f"runtime buffer '{binding.tensor}' must carry a resolved positive shape"
+        )
+    return tuple(int(value) for value in shape)
+
+
+def _binding_strides(binding: BufferBinding, shape: tuple[int, ...]) -> tuple[int, ...]:
+    layout_info = resolve_layout(
+        shape,
+        binding.dtype,
+        layout=str(binding.attributes.get("layout", "dense")),
+        attributes=binding.attributes,
+    )
+    if layout_info.strides_bytes is None:
+        # Runtime allocation reserves the complete logical tensor when the
+        # encoding is opaque.  Dense strides provide a deterministic address
+        # fallback for APIs that require a concrete descriptor.
+        return resolve_layout(shape, binding.dtype).strides_bytes or ()
+    return layout_info.strides_bytes
+
+
+def _dynamic_operand_resolution(
+    instruction: Any,
+    operand: Any,
+    binding: BufferBinding,
+    dynamic_bindings: Mapping[str, DynamicIndexBinding],
+) -> tuple[int, int, dict[str, Any]] | None:
+    """Resolve a dynamic operand window into a physical offset and span."""
+
+    metadata = instruction.attributes.get("dynamic_index")
+    if not isinstance(metadata, Mapping):
+        return None
+    expression_id = metadata.get("expression_id")
+    runtime_binding = dynamic_bindings.get(str(expression_id))
+    if runtime_binding is None:
+        return None
+    expression_attributes = metadata.get("attributes", {})
+    operation = (
+        expression_attributes.get("operation")
+        if isinstance(expression_attributes, Mapping)
+        else None
+    )
+    source_tensor = str(metadata.get("source_tensor", ""))
+    is_state_target = False
+    if operation == "dynamic_slice":
+        if operand.tile_mem.tensor != source_tensor:
+            return None
+        raw_window = expression_attributes.get("sizes", ())
+    elif operation == "dynamic_update_slice":
+        state_buffer = str(instruction.attributes.get("state_buffer", source_tensor))
+        alias_of = binding.attributes.get("alias_of")
+        is_state_target = operand.normalized_access in {"write", "read_write"} and (
+            operand.tile_mem.tensor == state_buffer or alias_of == state_buffer
+        )
+        if not is_state_target:
+            return None
+        raw_window = expression_attributes.get("update_shape", ())
+    else:
+        return None
+    if not isinstance(raw_window, (tuple, list)):
+        return None
+    window_shape = tuple(int(value) for value in raw_window)
+    source_shape = _binding_shape(binding)
+    if len(window_shape) != len(source_shape):
+        raise ValueError(
+            f"dynamic index expression '{expression_id}' window rank does not match buffer "
+            f"'{binding.tensor}'"
+        )
+    resolved = resolve_dynamic_index(metadata, runtime_binding, source_shape, window_shape)
+    strides = _binding_strides(binding, source_shape)
+    if len(strides) != len(source_shape):
+        raise ValueError(
+            f"dynamic operand '{operand.name}' strides rank does not match source shape"
+        )
+    layout = resolve_layout(
+        source_shape,
+        binding.dtype,
+        layout=str(binding.attributes.get("layout", "dense")),
+        attributes=binding.attributes,
+    )
+    offset = layout.offset_bytes + sum(
+        index * stride for index, stride in zip(resolved, strides)
+    )
+    element_size = _dtype_bytes(binding.dtype)
+    size = element_size + sum(
+        (extent - 1) * stride for extent, stride in zip(window_shape, strides)
+    )
+    region = {
+        "tensor": source_tensor if operation == "dynamic_update_slice" else operand.tile_mem.tensor,
+        "starts": list(resolved),
+        "shape": list(window_shape),
+        "operation": operation,
+        "expression_id": expression_id,
+        "address_source": "dynamic_index_binding",
+        "resolved_index_values": list(resolved),
+        "resolved_offset_bytes": offset,
+        "strides_bytes": list(strides),
+    }
+    return offset, size, region
+
+
+def _runtime_layout_operand_resolution(
+    operand: Any,
+    binding: BufferBinding,
+) -> tuple[int, int, dict[str, Any]] | None:
+    """Project a compiled logical operand region through a runtime layout."""
+
+    dynamic_layout = binding.attributes.get("dynamic_layout")
+    starts = operand.tile_mem.logical_starts
+    shape = operand.tile_mem.logical_shape
+    if not isinstance(dynamic_layout, Mapping) or starts is None or shape is None:
+        return None
+    buffer_shape = _binding_shape(binding)
+    layout = resolve_layout(
+        buffer_shape,
+        binding.dtype,
+        layout=str(binding.attributes.get("layout", "dense")),
+        attributes=binding.attributes,
+    )
+    interval = layout.interval(starts, shape)
+    if interval is None:
+        return None
+    offset, size = interval
+    return offset, size, {
+        "tensor": binding.tensor,
+        "starts": list(starts),
+        "shape": list(shape),
+        "address_source": "runtime_layout_binding",
+        "layout": layout.layout,
+        "strides_bytes": list(layout.strides_bytes or ()),
+        "resolved_offset_bytes": offset,
+    }
+
+
 def _submission_order(
     program: TISAProgram,
     policy: str,
@@ -927,6 +1165,8 @@ def create_runtime_submission(
     descriptor_available_cycles: Mapping[str, float] | None = None,
     launch_latency_cycles: float = 0.0,
     synchronization_cycles: float = 0.0,
+    dynamic_index_bindings: Iterable[DynamicIndexBinding] = (),
+    dynamic_layout_bindings: Iterable[RuntimeLayoutBinding] = (),
 ) -> RuntimeSubmission:
     """Bind a TISA program to physical buffers and command chunks.
 
@@ -940,7 +1180,64 @@ def create_runtime_submission(
     program = artifact.program if artifact is not None else program_or_artifact
     if not isinstance(program, TISAProgram):
         raise TypeError("program_or_artifact must be a TISAProgram or BackendArtifact")
-    normalized_buffers = tuple(buffers)
+    normalized_layouts = tuple(dynamic_layout_bindings)
+    layout_by_tensor = {binding.tensor: binding for binding in normalized_layouts}
+    if len(layout_by_tensor) != len(normalized_layouts):
+        raise ValueError("runtime layout bindings must be unique by tensor")
+    for layout_binding in normalized_layouts:
+        issues = layout_binding.validate()
+        if issues:
+            raise ValueError("invalid runtime layout binding: " + "; ".join(issues))
+    supplied_buffers = tuple(buffers)
+    unknown_layout_tensors = sorted(set(layout_by_tensor) - {item.tensor for item in supplied_buffers})
+    if unknown_layout_tensors:
+        raise ValueError(
+            "runtime layout bindings reference unknown buffers: "
+            + ", ".join(unknown_layout_tensors)
+        )
+    normalized_buffers_list: list[BufferBinding] = []
+    for buffer in supplied_buffers:
+        layout_binding = layout_by_tensor.get(buffer.tensor)
+        if layout_binding is None:
+            normalized_buffers_list.append(buffer)
+            continue
+        attributes = {
+            **dict(buffer.attributes),
+            "shape": list(layout_binding.shape),
+            "strides_bytes": list(layout_binding.strides_bytes),
+            "layout": layout_binding.layout,
+            "layout_source": "runtime_binding",
+            "layout_offset_bytes": layout_binding.offset_bytes,
+            "dynamic_layout": layout_binding.to_dict(),
+        }
+        resolved_layout = resolve_layout(
+            layout_binding.shape,
+            buffer.dtype,
+            layout=layout_binding.layout,
+            attributes=attributes,
+        )
+        if resolved_layout.allocation_size_bytes > buffer.size_bytes:
+            raise ValueError(
+                f"runtime layout for '{buffer.tensor}' requires "
+                f"{resolved_layout.allocation_size_bytes} bytes, allocation has {buffer.size_bytes}"
+            )
+        normalized_buffers_list.append(
+            BufferBinding(
+                tensor=buffer.tensor,
+                base_address=buffer.base_address,
+                size_bytes=buffer.size_bytes,
+                memory=buffer.memory,
+                logical_scope=buffer.logical_scope,
+                dtype=buffer.dtype,
+                alignment_bytes=buffer.alignment_bytes,
+                attributes=attributes,
+            )
+        )
+    normalized_buffers = tuple(normalized_buffers_list)
+    normalized_dynamic_indices = tuple(dynamic_index_bindings)
+    dynamic_bindings_by_id = {
+        binding.expression_id: binding for binding in normalized_dynamic_indices
+    }
     buffer_lookup = _buffer_lookup(normalized_buffers)
     state_contract = _state_contract(program)
     for descriptor in state_contract:
@@ -984,14 +1281,32 @@ def create_runtime_submission(
                 offset = 0
             if offset < 0:
                 raise ValueError(f"runtime operand offset for {key} must be non-negative")
+            dynamic_resolution = _dynamic_operand_resolution(
+                instruction,
+                operand,
+                binding,
+                dynamic_bindings_by_id,
+            )
+            layout_resolution = _runtime_layout_operand_resolution(operand, binding)
+            if requested_offset is None:
+                if dynamic_resolution is not None:
+                    offset = dynamic_resolution[0]
+                elif layout_resolution is not None:
+                    offset = layout_resolution[0]
             size_source = "tile_mem"
             size = operand.tile_mem.size_bytes
+            requested_size = sizes.get(key)
+            if requested_size is not None:
+                size = requested_size
+                size_source = "runtime_binding"
+            elif dynamic_resolution is not None:
+                size = dynamic_resolution[1]
+                size_source = "dynamic_index_binding"
+            elif layout_resolution is not None:
+                size = layout_resolution[1]
+                size_source = "dynamic_layout_binding"
             if size is None:
-                size = sizes.get(key)
-                if size is not None:
-                    size_source = "runtime_binding"
-            if size is None:
-                requested_size = math.prod(operand.tile_shape) * _dtype_bytes(binding.dtype)
+                shape_size = math.prod(operand.tile_shape) * _dtype_bytes(binding.dtype)
                 available_size = binding.size_bytes - offset
                 if available_size <= 0:
                     raise ValueError(
@@ -1001,14 +1316,51 @@ def create_runtime_submission(
                 # dynamic shape or an operator geometry not covered by the
                 # current compiler region legalizer; record that approximation
                 # explicitly instead of presenting it as a precise tile range.
-                size = min(requested_size, available_size)
+                size = min(shape_size, available_size)
                 size_source = (
                     "tile_shape"
-                    if requested_size <= available_size
+                    if shape_size <= available_size
                     else "buffer_capacity_fallback"
                 )
             if size <= 0:
                 raise ValueError(f"runtime operand size for {key} must be positive")
+            operand_attributes = {
+                "address_source": (
+                    "runtime_binding"
+                    if requested_offset is not None
+                    else "dynamic_index_binding"
+                    if dynamic_resolution is not None
+                    else "dynamic_layout_binding"
+                    if layout_resolution is not None
+                    else "tile_mem"
+                    if operand.tile_mem.offset_bytes is not None
+                    else "runtime_binding"
+                ),
+                "size_source": size_source,
+                "dynamic_index": instruction.attributes.get("dynamic_index"),
+                "dynamic_index_values": (
+                    list(dynamic_bindings_by_id[instruction.attributes["dynamic_index"]["expression_id"]].values)
+                    if isinstance(instruction.attributes.get("dynamic_index"), Mapping)
+                    and instruction.attributes["dynamic_index"].get("expression_id") in dynamic_bindings_by_id
+                    else None
+                ),
+                "dynamic_layout": binding.attributes.get("dynamic_layout"),
+                "runtime_strides_bytes": binding.attributes.get("strides_bytes"),
+                "runtime_shape": binding.attributes.get("shape"),
+            }
+            if dynamic_resolution is not None:
+                operand_attributes["dynamic_region"] = dynamic_resolution[2]
+                operand_attributes["resolved_index_values"] = dynamic_resolution[2][
+                    "resolved_index_values"
+                ]
+                operand_attributes["resolved_offset_bytes"] = dynamic_resolution[2][
+                    "resolved_offset_bytes"
+                ]
+            elif layout_resolution is not None:
+                operand_attributes["dynamic_region"] = layout_resolution[2]
+                operand_attributes["resolved_offset_bytes"] = layout_resolution[2][
+                    "resolved_offset_bytes"
+                ]
             operand_bindings.append(
                 RuntimeOperandBinding(
                     tisa_id=instruction.tisa_id,
@@ -1020,16 +1372,7 @@ def create_runtime_submission(
                     size_bytes=size,
                     access_type=operand.normalized_access,
                     offset_bytes=offset,
-                    attributes={
-                        "address_source": (
-                            "runtime_binding"
-                            if requested_offset is not None
-                            else "tile_mem"
-                            if operand.tile_mem.offset_bytes is not None
-                            else "runtime_binding"
-                        ),
-                        "size_source": size_source,
-                    },
+                    attributes=operand_attributes,
                 )
             )
     effective_chunk_size = (
@@ -1068,6 +1411,8 @@ def create_runtime_submission(
         commands=commands,
         launch_latency_cycles=launch_latency_cycles,
         synchronization_cycles=synchronization_cycles,
+        dynamic_indices=normalized_dynamic_indices,
+        dynamic_layouts=normalized_layouts,
         attributes={
             "source": "runtime-buffer-binding",
             "device_issue_order": "independent",
@@ -1080,6 +1425,8 @@ def create_runtime_submission(
             "descriptor_availability_count": len(available_cycles),
             "state_contract": "persistent_buffer_v1" if state_contract else None,
             "state_buffers": list(state_contract),
+            "dynamic_index_binding_count": len(normalized_dynamic_indices),
+            "dynamic_layout_binding_count": len(normalized_layouts),
         },
     )
     issues = submission.validate(program)
@@ -1138,6 +1485,8 @@ def create_runtime_sequence(
     launch_latency_cycles: float = 0.0,
     synchronization_cycles: float = 0.0,
     inter_invocation_gap_cycles: float = 0.0,
+    invocation_dynamic_indices: Sequence[Iterable[DynamicIndexBinding]] | None = None,
+    invocation_dynamic_layouts: Sequence[Iterable[RuntimeLayoutBinding]] | None = None,
 ) -> RuntimeSequence:
     """Build repeated submissions sharing stable persistent state buffers.
 
@@ -1160,6 +1509,16 @@ def create_runtime_sequence(
         raise ValueError("runtime state registry validation failed: " + "; ".join(registry_issues))
     if invocation_buffers is not None and len(invocation_buffers) != invocation_count:
         raise ValueError("invocation_buffers length must equal invocation_count")
+    if (
+        invocation_dynamic_indices is not None
+        and len(invocation_dynamic_indices) != invocation_count
+    ):
+        raise ValueError("invocation_dynamic_indices length must equal invocation_count")
+    if (
+        invocation_dynamic_layouts is not None
+        and len(invocation_dynamic_layouts) != invocation_count
+    ):
+        raise ValueError("invocation_dynamic_layouts length must equal invocation_count")
     if (
         isinstance(inter_invocation_gap_cycles, bool)
         or not math.isfinite(inter_invocation_gap_cycles)
@@ -1188,6 +1547,16 @@ def create_runtime_sequence(
                 descriptor_available_cycles=descriptor_available_cycles,
                 launch_latency_cycles=launch_latency_cycles,
                 synchronization_cycles=synchronization_cycles,
+                dynamic_index_bindings=(
+                    invocation_dynamic_indices[ordinal]
+                    if invocation_dynamic_indices is not None
+                    else ()
+                ),
+                dynamic_layout_bindings=(
+                    invocation_dynamic_layouts[ordinal]
+                    if invocation_dynamic_layouts is not None
+                    else ()
+                ),
             )
         )
     dependencies = tuple(
@@ -1223,6 +1592,7 @@ def create_runtime_sequence(
 
 __all__ = [
     "BufferBinding",
+    "RuntimeLayoutBinding",
     "RuntimeCommandChunk",
     "RuntimeOperandBinding",
     "RuntimeStateDependency",

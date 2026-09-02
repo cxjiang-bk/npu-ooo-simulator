@@ -16,22 +16,9 @@ from npu_ooo.ir import (
     TileGraph,
     TileInstance,
     build_tile_graph,
+    dtype_bytes as shared_dtype_bytes,
+    tensor_layout,
 )
-
-
-_DTYPE_BYTES = {
-    "fp16": 2,
-    "f16": 2,
-    "bf16": 2,
-    "fp32": 4,
-    "f32": 4,
-    "fp64": 8,
-    "int8": 1,
-    "uint8": 1,
-    "int16": 2,
-    "int32": 4,
-    "int64": 8,
-}
 
 
 @dataclass(frozen=True)
@@ -49,7 +36,7 @@ class LoweringResult:
 
 
 def dtype_bytes(dtype: str) -> int:
-    return _DTYPE_BYTES.get(dtype.lower(), 2)
+    return shared_dtype_bytes(dtype, default=2)
 
 
 def _root_memory(machine: MachineConfig) -> str:
@@ -119,58 +106,16 @@ def _region(
     shape: tuple[int, ...],
     access: AccessType,
 ) -> BufferRegion:
-    element_size = dtype_bytes(tensor.dtype)
-    attributes = getattr(tensor, "attributes", {})
-    explicit = attributes.get("strides_bytes") if isinstance(attributes, Mapping) else None
-    layout_source = attributes.get("layout_source") if isinstance(attributes, Mapping) else None
-    if layout_source == "stablehlo_encoding" and explicit is None:
+    layout_info = tensor_layout(tensor)
+    element_size = layout_info.element_size_bytes
+    interval = layout_info.interval(starts, shape)
+    if interval is None:
         # Unknown physical encodings cannot be mapped to a precise interval;
-        # use the full allocation as a conservative scoreboard range.
+        # use the complete allocation as a conservative scoreboard range.
         offset_bytes = 0
-        size_bytes = math.prod(tensor.shape) * element_size
-        return BufferRegion(
-            tensor=tensor.name,
-            memory=memory,
-            shape=shape,
-            starts=starts,
-            dtype=tensor.dtype,
-            access=access,
-            offset_bytes=offset_bytes,
-            size_bytes=size_bytes,
-            layout=tensor.layout,
-        )
-    if explicit is not None:
-        try:
-            strides = tuple(int(value) for value in explicit)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"tensor '{tensor.name}' strides_bytes must contain integers") from exc
-        if len(strides) != len(tensor.shape) or any(value < 0 for value in strides):
-            raise ValueError(
-                f"tensor '{tensor.name}' strides_bytes rank/values do not match its shape"
-            )
-        offset_bytes = sum(start * stride for start, stride in zip(starts, strides))
-        size_bytes = element_size + sum(
-            (extent - 1) * stride for extent, stride in zip(shape, strides)
-        )
-        return BufferRegion(
-            tensor=tensor.name,
-            memory=memory,
-            shape=shape,
-            starts=starts,
-            dtype=tensor.dtype,
-            access=access,
-            offset_bytes=offset_bytes,
-            size_bytes=size_bytes,
-            layout=tensor.layout,
-        )
-    strides: list[int] = []
-    stride = 1
-    for extent in reversed(tensor.shape):
-        strides.append(stride)
-        stride *= extent
-    strides.reverse()
-    offset_elements = sum(start * stride_value for start, stride_value in zip(starts, strides))
-    elements = math.prod(shape)
+        size_bytes = layout_info.allocation_size_bytes
+    else:
+        offset_bytes, size_bytes = interval
     return BufferRegion(
         tensor=tensor.name,
         memory=memory,
@@ -178,9 +123,10 @@ def _region(
         starts=starts,
         dtype=tensor.dtype,
         access=access,
-        offset_bytes=offset_elements * element_size,
-        size_bytes=elements * element_size,
+        offset_bytes=offset_bytes,
+        size_bytes=size_bytes,
         layout=tensor.layout,
+        strides_bytes=layout_info.strides_bytes,
     )
 
 

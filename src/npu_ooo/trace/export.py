@@ -8,7 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-from typing import Any
+from typing import Any, Mapping
 
 from npu_ooo.scheduler import ScheduleResult
 
@@ -90,6 +90,9 @@ def write_csv(result: ScheduleResult, path: str | Path) -> None:
                 "ready_wait",
                 "dependency_ready",
                 "resource_ready",
+                "dependency_kinds",
+                "dependency_conditions",
+                "dependency_provenance",
             ),
         )
         writer.writeheader()
@@ -107,6 +110,31 @@ def write_csv(result: ScheduleResult, path: str | Path) -> None:
                     "tile_id": details.get("tile_id", ""),
                     "operator_id": details.get("operator_id", ""),
                     "primitive": details.get("primitive", ""),
+                    "dependency_kinds": ";".join(
+                        sorted(
+                            {
+                                str(edge.get("kind", ""))
+                                for item in details.get("dependencies", ())
+                                if isinstance(item, Mapping)
+                                for edge in item.get("edges", ())
+                                if isinstance(edge, Mapping) and edge.get("kind")
+                            }
+                        )
+                    ),
+                    "dependency_conditions": ";".join(
+                        sorted(
+                            {
+                                str(edge.get("condition", ""))
+                                for item in details.get("dependencies", ())
+                                if isinstance(item, Mapping)
+                                for edge in item.get("edges", ())
+                                if isinstance(edge, Mapping) and edge.get("condition")
+                            }
+                        )
+                    ),
+                    "dependency_provenance": json.dumps(
+                        [item for item in details.get("dependencies", ())], sort_keys=True
+                    ),
                 }
             )
     finalize_artifact(target, compatibility)
@@ -142,6 +170,9 @@ def write_instruction_csv(result: ScheduleResult, path: str | Path) -> None:
                 "ready_wait",
                 "dependency_ready",
                 "resource_ready",
+                "dependency_kinds",
+                "dependency_conditions",
+                "dependency_provenance",
             ),
         )
         writer.writeheader()
@@ -165,6 +196,16 @@ def write_instruction_csv(result: ScheduleResult, path: str | Path) -> None:
                     "ready_wait": timing.ready_wait,
                     "dependency_ready": timing.dependency_ready,
                     "resource_ready": timing.resource_ready,
+                    "dependency_kinds": ";".join(
+                        sorted({str(item.get("kind", "")) for item in details.get("dependencies", ()) if item.get("kind")})
+                    ),
+                    "dependency_conditions": ";".join(
+                        sorted({str(item.get("condition", "")) for item in details.get("dependencies", ()) if item.get("condition")})
+                    ),
+                    "dependency_provenance": json.dumps(
+                        [item.get("provenance", {}) for item in details.get("dependencies", ())],
+                        sort_keys=True,
+                    ),
                 }
             )
     finalize_artifact(target, compatibility)
@@ -199,6 +240,14 @@ def _nice_tick_step(total_cycles: float, chart_width: float) -> float:
 
 def _tick_label(value: float) -> str:
     return f"{value:g}"
+
+
+def _dependency_summary(details: Mapping[str, Any]) -> str:
+    return ";".join(
+        f"{item.get('kind', '')}:{item.get('condition', '')}"
+        for item in details.get("dependencies", ())
+        if isinstance(item, Mapping)
+    )
 
 
 def _legend_layout(primitives: tuple[str, ...], width: int) -> tuple[list[tuple[str, int, int]], int]:
@@ -353,6 +402,7 @@ def write_svg(result: ScheduleResult, path: str | Path, *, width: int = 1600, ro
         extra = (
             f" | op={details.get('op_type', '')} | tile={details.get('tile_id', '')}"
             f" | payload={details.get('payload_task_count', '')}"
+            f" | deps={_dependency_summary(details)}"
             if primitive == "tisa_instruction"
             else ""
         )

@@ -34,9 +34,13 @@ def build_compile_statistics(
     tile_incoming = {operator.op_id: 0 for operator in graph.operators}
     tile_outgoing = {operator.op_id: 0 for operator in graph.operators}
     tile_owner = {tile.tile_id: tile.operator_id for tile in tile_graph.tiles}
+    hazard_counts: dict[str, int] = {}
+    condition_counts: dict[str, int] = {}
     for dependency in tile_graph.dependencies:
         tile_outgoing[tile_owner[dependency.producer]] += 1
         tile_incoming[tile_owner[dependency.consumer]] += 1
+        hazard_counts[dependency.hazard_kind] = hazard_counts.get(dependency.hazard_kind, 0) + 1
+        condition_counts[dependency.condition] = condition_counts.get(dependency.condition, 0) + 1
 
     operator_statistics: list[dict[str, Any]] = []
     total_macs = 0
@@ -110,6 +114,8 @@ def build_compile_statistics(
             "avoided_all_to_all_dependencies": tile_graph.attributes.get(
                 "avoided_all_to_all_dependencies", 0
             ),
+            "hazard_kind_counts": hazard_counts,
+            "condition_counts": condition_counts,
         },
         "operators": operator_statistics,
     }
