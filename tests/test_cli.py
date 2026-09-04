@@ -137,11 +137,14 @@ class CliSurfaceTest(unittest.TestCase):
                 "bert-base,gpt-j-6b-oneblk",
                 "--variant",
                 "micro",
+                "--layer-count",
+                "3",
                 "--runtime-device-matrix",
             ]
         )
         self.assertEqual(args.benchmarks, "bert-base,gpt-j-6b-oneblk")
         self.assertEqual(args.variant, "micro")
+        self.assertEqual(args.layer_count, 3)
         self.assertTrue(args.runtime_device_matrix)
 
 

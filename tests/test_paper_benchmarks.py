@@ -54,6 +54,21 @@ class PaperBenchmarkRegistryTest(unittest.TestCase):
             self.assertTrue(workload.inputs)
             self.assertTrue(all(value.numel() > 0 for value in workload.inputs))
 
+    def test_transformer_depth_proxy_repeats_blocks_with_same_input_contract(self) -> None:
+        workload = build_paper_benchmark("bert-base", variant="micro", layer_count=3)
+        self.assertEqual(workload.attributes["layer_count"], 3)
+        self.assertEqual(workload.attributes["model_depth_proxy"], "repeated_independent_blocks")
+        self.assertEqual(len(workload.module.layers), 3)
+        self.assertEqual(
+            [tuple(value.shape) for value in workload.inputs],
+            [(1, 4, 8), (1, 1, 4, 4)],
+        )
+
+    def test_depth_proxy_rejects_non_transformer_rows(self) -> None:
+        with self.assertRaisesRegex(ValueError, "only supported for transformer"):
+            build_paper_benchmark("resnet50", variant="micro", layer_count=2)
+
+
 
 @unittest.skipUnless(FRONTEND_AVAILABLE, "requires PyTorch, Torch-XLA and official StableHLO")
 class PaperBenchmarkFrontendTest(unittest.TestCase):

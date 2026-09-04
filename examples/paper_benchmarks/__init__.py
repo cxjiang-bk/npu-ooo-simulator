@@ -44,18 +44,29 @@ def build_paper_benchmark(
     *,
     variant: str = "micro",
     dtype: torch.dtype | None = None,
+    layer_count: int = 1,
 ) -> PaperBenchmarkWorkload:
-    """Build a real PyTorch workload and deterministic example inputs."""
+    """Build a real PyTorch workload and deterministic example inputs.
+
+    ``layer_count`` expands transformer one-block rows into a repeated-depth
+    proxy while preserving the same input contract.  Decode KV-cache remains a
+    dedicated one-invocation workload.
+    """
+
+    if layer_count <= 0:
+        raise ValueError("layer_count must be positive")
 
     if case_id == resnet50.SPEC.case_id:
+        if layer_count != 1:
+            raise ValueError("layer_count is only supported for transformer benchmark rows")
         return resnet50.build(variant=variant, dtype=dtype)
     if case_id == bert_base.SPEC.case_id:
-        return bert_base.build(variant=variant, dtype=dtype)
+        return bert_base.build(variant=variant, dtype=dtype, layer_count=layer_count)
     if case_id == gpt_j.SPEC.case_id:
-        return gpt_j.build(variant=variant, dtype=dtype)
+        return gpt_j.build(variant=variant, dtype=dtype, layer_count=layer_count)
     if case_id == llama2.SPEC.case_id:
-        return llama2.build(variant=variant, dtype=dtype)
-    return deepseek.build(case_id, variant=variant, dtype=dtype)
+        return llama2.build(variant=variant, dtype=dtype, layer_count=layer_count)
+    return deepseek.build(case_id, variant=variant, dtype=dtype, layer_count=layer_count)
 
 
 __all__ = [

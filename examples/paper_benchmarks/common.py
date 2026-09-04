@@ -113,12 +113,43 @@ class PaperTransformerBlock(torch.nn.Module):
         return residual + self.down_proj(feedforward)
 
 
+class RepeatedTransformer(torch.nn.Module):
+    """A stack of independent transformer blocks for model-depth proxies."""
+
+    def __init__(
+        self,
+        block_type: Type[PaperTransformerBlock],
+        layer_count: int,
+    ) -> None:
+        super().__init__()
+        if layer_count <= 0:
+            raise ValueError("layer_count must be positive")
+        self.layers = torch.nn.ModuleList(block_type() for _ in range(layer_count))
+        first = self.layers[0]
+        self.layer_count = layer_count
+        self.rotary = first.rotary
+        self.head_dim = first.head_dim
+        self.num_heads = first.num_heads
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: torch.Tensor,
+        rope_cos: torch.Tensor | None = None,
+        rope_sin: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x, attention_mask, rope_cos, rope_sin)
+        return x
+
+
 def transformer_workload(
     spec: PaperBenchmarkSpec,
     module_type: Type[PaperTransformerBlock],
     *,
     variant: str,
     dtype: torch.dtype | None,
+    layer_count: int = 1,
 ) -> PaperBenchmarkWorkload:
     if spec.sequence_length is None:
         raise ValueError("transformer workloads require a sequence length")
@@ -132,7 +163,7 @@ def transformer_workload(
     requested_dtype = dtype or getattr(torch, spec.dtype)
     selected_dtype = torch.float32 if requested_dtype == torch.bfloat16 else requested_dtype
     torch.manual_seed(0)
-    module = module_type().eval().to(dtype=selected_dtype)
+    module = RepeatedTransformer(module_type, layer_count).eval().to(dtype=selected_dtype)
     inputs = (
         torch.randn(batch, sequence, hidden, dtype=selected_dtype),
         torch.zeros(batch, 1, sequence, sequence, dtype=selected_dtype),
@@ -157,6 +188,8 @@ def transformer_workload(
             "simulation_dtype": str(selected_dtype).removeprefix("torch."),
             "dtype_fallback": requested_dtype != selected_dtype,
             "full_model_materialized": False,
+            "layer_count": layer_count,
+            "model_depth_proxy": "repeated_independent_blocks",
             "compiler_route": "torch.export->torch-xla->official-stablehlo",
             "rotary_embedding": bool(getattr(module, "rotary", False)),
             "rotary_inputs": "explicit_cos_sin" if getattr(module, "rotary", False) else None,

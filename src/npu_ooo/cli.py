@@ -389,6 +389,12 @@ def _add_paper_matrix_arguments(parser: argparse.ArgumentParser) -> None:
         default="micro",
         help="benchmark workload scale; micro is the default reproducible proxy",
     )
+    parser.add_argument(
+        "--layer-count",
+        type=int,
+        default=1,
+        help="transformer depth proxy; 1 preserves the one-block benchmark rows",
+    )
     parser.add_argument("--tile-size", type=int, default=32)
     parser.add_argument(
         "--tile-size-candidates",
@@ -856,6 +862,7 @@ def run_paper_matrix(args: argparse.Namespace) -> int:
         machine,
         case_ids=_paper_case_ids(args.benchmarks),
         variant=args.variant,
+        layer_count=args.layer_count,
         tile_size=args.tile_size,
         tile_size_candidates=tile_size_candidates,
         runtime_policies=runtime_policies,
@@ -878,6 +885,7 @@ def run_paper_matrix(args: argparse.Namespace) -> int:
     manifest = {
         "schema_version": 1,
         "variant": args.variant,
+        "layer_count": args.layer_count,
         "benchmarks": [run.case_id for run in matrix.runs],
         "architecture": args.arch,
         "machine_hash": machine.stable_hash(),

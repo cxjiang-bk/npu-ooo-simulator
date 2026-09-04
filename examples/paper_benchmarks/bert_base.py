@@ -20,5 +20,16 @@ SPEC = PaperBenchmarkSpec(
 )
 
 
-def build(variant: str = "micro", dtype: torch.dtype | None = None) -> PaperBenchmarkWorkload:
-    return transformer_workload(SPEC, BertBaseOneBlock, variant=variant, dtype=dtype)
+def build(
+    variant: str = "micro",
+    dtype: torch.dtype | None = None,
+    *,
+    layer_count: int = 1,
+) -> PaperBenchmarkWorkload:
+    return transformer_workload(
+        SPEC,
+        BertBaseOneBlock,
+        variant=variant,
+        dtype=dtype,
+        layer_count=layer_count,
+    )

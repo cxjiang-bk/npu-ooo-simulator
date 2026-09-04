@@ -25,11 +25,23 @@ DECODE_SPEC = PaperBenchmarkSpec(
 )
 
 
-def build(case_id: str, variant: str = "micro", dtype: torch.dtype | None = None) -> PaperBenchmarkWorkload:
+def build(
+    case_id: str,
+    variant: str = "micro",
+    dtype: torch.dtype | None = None,
+    *,
+    layer_count: int = 1,
+) -> PaperBenchmarkWorkload:
     if case_id == PREFILL_SPEC.case_id:
         spec = PREFILL_SPEC
     elif case_id == DECODE_SPEC.case_id:
         spec = DECODE_SPEC
     else:
         raise ValueError(f"unknown DeepSeek benchmark case '{case_id}'")
-    return transformer_workload(spec, DeepSeekR1OneBlock, variant=variant, dtype=dtype)
+    return transformer_workload(
+        spec,
+        DeepSeekR1OneBlock,
+        variant=variant,
+        dtype=dtype,
+        layer_count=layer_count,
+    )

@@ -161,9 +161,9 @@ class PaperBenchmarkMatrix:
         }
 
 
-def _case_workload(case_id: str, variant: str):
+def _case_workload(case_id: str, variant: str, *, layer_count: int = 1):
     from examples.paper_benchmarks import build_paper_benchmark
-    return build_paper_benchmark(case_id, variant=variant)
+    return build_paper_benchmark(case_id, variant=variant, layer_count=layer_count)
 
 
 def run_paper_benchmark_matrix(
@@ -171,6 +171,7 @@ def run_paper_benchmark_matrix(
     *,
     case_ids: Sequence[str] | None = None,
     variant: str = "micro",
+    layer_count: int = 1,
     tile_size: int = 32,
     tile_size_candidates: Sequence[int] | None = None,
     runtime_chunk_size: int | None = None,
@@ -201,6 +202,8 @@ def run_paper_benchmark_matrix(
     )
     if not selected:
         raise ValueError("paper benchmark selection must contain at least one case")
+    if layer_count <= 0:
+        raise ValueError("layer_count must be positive")
     if len(set(selected)) != len(selected):
         raise ValueError("paper benchmark selection must not contain duplicate case ids")
     if not runtime_policies or not device_policies:
@@ -226,7 +229,7 @@ def run_paper_benchmark_matrix(
     for case_id in selected:
         workload = None
         try:
-            workload = _case_workload(case_id, variant)
+            workload = _case_workload(case_id, variant, layer_count=layer_count)
             compiled = compile_torch_module(
                 workload.module,
                 workload.inputs,
