@@ -93,6 +93,43 @@ class TileMem:
             "logical_shape": list(self.logical_shape) if self.logical_shape is not None else None,
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "TileMem":
+        if not isinstance(payload, Mapping):
+            raise ValueError("TISA TileMem payload must be an object")
+        try:
+            value = cls(
+                base=str(payload["base"]),
+                scope=str(payload.get("scope", "local")),
+                tensor=(str(payload["tensor"]) if payload.get("tensor") is not None else None),
+                offset_bytes=(int(payload["offset_bytes"]) if payload.get("offset_bytes") is not None else None),
+                size_bytes=(int(payload["size_bytes"]) if payload.get("size_bytes") is not None else None),
+                address_expr=(str(payload["address_expr"]) if payload.get("address_expr") is not None else None),
+                strides_bytes=(
+                    tuple(int(item) for item in payload["strides_bytes"])
+                    if payload.get("strides_bytes") is not None
+                    else None
+                ),
+                stride_expr=(str(payload["stride_expr"]) if payload.get("stride_expr") is not None else None),
+                layout=str(payload.get("layout", "dense")),
+                logical_starts=(
+                    tuple(int(item) for item in payload["logical_starts"])
+                    if payload.get("logical_starts") is not None
+                    else None
+                ),
+                logical_shape=(
+                    tuple(int(item) for item in payload["logical_shape"])
+                    if payload.get("logical_shape") is not None
+                    else None
+                ),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid TISA TileMem payload") from exc
+        issues = value.validate()
+        if issues:
+            raise ValueError("invalid TISA TileMem: " + "; ".join(issues))
+        return value
+
 
 @dataclass(frozen=True)
 class TISAOperand:
@@ -126,6 +163,24 @@ class TISAOperand:
             "access_type": self.normalized_access,
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "TISAOperand":
+        if not isinstance(payload, Mapping):
+            raise ValueError("TISA operand payload must be an object")
+        try:
+            value = cls(
+                name=str(payload["name"]),
+                tile_shape=tuple(int(item) for item in payload["tile_shape"]),
+                tile_mem=TileMem.from_dict(payload["tile_mem"]),
+                access_type=payload["access_type"],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid TISA operand payload") from exc
+        issues = value.validate()
+        if issues:
+            raise ValueError("invalid TISA operand: " + "; ".join(issues))
+        return value
+
 
 @dataclass(frozen=True)
 class UnitMap:
@@ -145,6 +200,23 @@ class UnitMap:
 
     def to_dict(self) -> dict[str, Any]:
         return {"unit": self.unit, "quantity": self.quantity, "affinity": self.affinity}
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "UnitMap":
+        if not isinstance(payload, Mapping):
+            raise ValueError("TISA UnitMap payload must be an object")
+        try:
+            value = cls(
+                unit=str(payload["unit"]),
+                quantity=int(payload.get("quantity", 1)),
+                affinity=(str(payload["affinity"]) if payload.get("affinity") is not None else None),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid TISA UnitMap payload") from exc
+        issues = value.validate()
+        if issues:
+            raise ValueError("invalid TISA UnitMap: " + "; ".join(issues))
+        return value
 
 
 @dataclass(frozen=True)
@@ -181,6 +253,24 @@ class TISADependency:
             "condition": self.condition,
             "provenance": dict(self.provenance),
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "TISADependency":
+        if not isinstance(payload, Mapping):
+            raise ValueError("TISA dependency payload must be an object")
+        try:
+            value = cls(
+                source=str(payload["source"]),
+                kind=str(payload.get("kind", "RAW")),
+                condition=str(payload.get("condition", "full_region_ready")),
+                provenance=payload.get("provenance", {}),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid TISA dependency payload") from exc
+        issues = value.validate()
+        if issues:
+            raise ValueError("invalid TISA dependency: " + "; ".join(issues))
+        return value
 
 
 @dataclass(frozen=True)
@@ -227,6 +317,31 @@ class TISAInstruction:
             "payload_ref": self.payload_ref,
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "TISAInstruction":
+        if not isinstance(payload, Mapping):
+            raise ValueError("TISA instruction payload must be an object")
+        try:
+            value = cls(
+                tisa_id=str(payload["tisa_id"]),
+                tile_id=str(payload["tile_id"]),
+                operator_id=str(payload["operator_id"]),
+                op_type=str(payload["op_type"]),
+                operands=tuple(TISAOperand.from_dict(item) for item in payload.get("operands", ())),
+                unit_map=UnitMap.from_dict(payload["unit_map"]),
+                dependencies=tuple(
+                    TISADependency.from_dict(item) for item in payload.get("dependencies", ())
+                ),
+                attributes=payload.get("attributes", {}),
+                payload_ref=(str(payload["payload_ref"]) if payload.get("payload_ref") is not None else None),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid TISA instruction payload") from exc
+        issues = value.validate()
+        if issues:
+            raise ValueError("invalid TISA instruction: " + "; ".join(issues))
+        return value
+
 
 @dataclass(frozen=True)
 class TISAProgram:
@@ -266,6 +381,25 @@ class TISAProgram:
             "instructions": [instruction.to_dict() for instruction in self.instructions],
             "attributes": dict(self.attributes),
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "TISAProgram":
+        if not isinstance(payload, Mapping):
+            raise ValueError("TISA program payload must be an object")
+        try:
+            value = cls(
+                program_id=str(payload["program_id"]),
+                instructions=tuple(
+                    TISAInstruction.from_dict(item) for item in payload.get("instructions", ())
+                ),
+                attributes=payload.get("attributes", {}),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid TISA program payload") from exc
+        issues = value.validate()
+        if issues:
+            raise ValueError("invalid TISA program: " + "; ".join(issues))
+        return value
 
 
 @dataclass(frozen=True)
@@ -414,3 +548,26 @@ class BackendArtifact:
             "backend": self.backend,
             "attributes": dict(self.attributes),
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "BackendArtifact":
+        if not isinstance(payload, Mapping):
+            raise ValueError("backend artifact payload must be an object")
+        try:
+            value = cls(
+                artifact_id=str(payload["artifact_id"]),
+                program=TISAProgram.from_dict(payload["program"]),
+                execution_graph=ExecutionGraph.from_dict(payload["execution_graph"]),
+                payloads={
+                    str(key): tuple(str(item) for item in items)
+                    for key, items in payload.get("payloads", {}).items()
+                },
+                backend=str(payload.get("backend", "analytical")),
+                attributes=payload.get("attributes", {}),
+            )
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise ValueError("invalid backend artifact payload") from exc
+        issues = value.validate()
+        if issues:
+            raise ValueError("invalid backend artifact: " + "; ".join(issues))
+        return value

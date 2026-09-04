@@ -94,7 +94,7 @@ PYTHONPATH=src:. python3 -m npu_ooo.cli import-rtl-trace \
 将生成 profile 用作 timing config：
 
 ```bash
-PYTHONPATH=src:. python3 -m npu_ooo.cli compile-model \
+PYTHONPATH=src:. python3 -m npu_ooo.cli compile-and-sim \
   --torch-module examples.torch_models:TwoMatmul \
   --input-shape 8,8 --input-shape 8,8 --input-shape 8,8 \
   --tile-size 4 \

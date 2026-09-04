@@ -30,6 +30,10 @@ from npu_ooo.backend import (
 from npu_ooo.compiler import compile_torch_module
 from npu_ooo.experiments import run_paper_benchmark_matrix, run_runtime_device_matrix
 from npu_ooo.ir import (
+    BackendArtifact,
+    DynamicIndexBinding,
+    OperatorGraph,
+    RuntimeLayoutBinding,
     allocate_buffer_bindings,
     create_runtime_sequence,
     create_runtime_state_registry,
@@ -119,7 +123,89 @@ def _descriptor_availability(path: Path | None) -> dict[str, float]:
     return result
 
 
-def _add_compile_arguments(parser: argparse.ArgumentParser) -> None:
+def _read_json_object(path: Path, *, description: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"{description} does not exist: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid {description} JSON '{path}': {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{description} must contain a JSON object")
+    return payload
+
+
+def _runtime_bindings(
+    payload: dict[str, Any],
+) -> tuple[
+    tuple[DynamicIndexBinding, ...],
+    tuple[RuntimeLayoutBinding, ...],
+]:
+    """Decode invocation-level dynamic bindings from a simulation manifest."""
+
+    raw_indices = payload.get("dynamic_indices", ())
+    if isinstance(raw_indices, dict):
+        raw_indices = [
+            {"expression_id": expression_id, "values": values}
+            for expression_id, values in raw_indices.items()
+        ]
+    if not isinstance(raw_indices, (list, tuple)):
+        raise ValueError("runtime_config.dynamic_indices must be a list or object")
+    indices: list[DynamicIndexBinding] = []
+    for item in raw_indices:
+        if not isinstance(item, dict) or "expression_id" not in item or "values" not in item:
+            raise ValueError("each dynamic index binding needs expression_id and values")
+        try:
+            binding = DynamicIndexBinding(
+                str(item["expression_id"]),
+                tuple(int(value) for value in item["values"]),
+                attributes=item.get("attributes", {}),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid dynamic index binding") from exc
+        issues = binding.validate()
+        if issues:
+            raise ValueError("invalid dynamic index binding: " + "; ".join(issues))
+        indices.append(binding)
+
+    raw_layouts = payload.get("dynamic_layouts", ())
+    if isinstance(raw_layouts, dict):
+        raw_layouts = [
+            {"tensor": tensor, **spec} if isinstance(spec, dict) else {"tensor": tensor}
+            for tensor, spec in raw_layouts.items()
+        ]
+    if not isinstance(raw_layouts, (list, tuple)):
+        raise ValueError("runtime_config.dynamic_layouts must be a list or object")
+    layouts: list[RuntimeLayoutBinding] = []
+    for item in raw_layouts:
+        if not isinstance(item, dict):
+            raise ValueError("each dynamic layout binding must be an object")
+        required = ("tensor", "shape", "strides_bytes")
+        if any(key not in item for key in required):
+            raise ValueError("each dynamic layout binding needs tensor, shape and strides_bytes")
+        try:
+            binding = RuntimeLayoutBinding(
+                tensor=str(item["tensor"]),
+                shape=tuple(int(value) for value in item["shape"]),
+                strides_bytes=tuple(int(value) for value in item["strides_bytes"]),
+                layout=str(item.get("layout", "runtime")),
+                offset_bytes=int(item.get("offset_bytes", 0)),
+                attributes=item.get("attributes", {}),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid dynamic layout binding") from exc
+        issues = binding.validate()
+        if issues:
+            raise ValueError("invalid dynamic layout binding: " + "; ".join(issues))
+        layouts.append(binding)
+    return tuple(indices), tuple(layouts)
+
+
+def _add_compile_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    default_output_dir: str = "out/compile",
+) -> None:
     parser.add_argument(
         "--torch-module",
         required=True,
@@ -155,6 +241,27 @@ def _add_compile_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
     parser.add_argument("--machine-config", type=Path)
+    parser.add_argument(
+        "--codegen-backend",
+        choices=default_codegen_backend_registry().names(),
+        default="analytical",
+    )
+    parser.add_argument("--output-dir", type=Path, default=Path(default_output_dir))
+
+
+def _add_simulation_options(
+    parser: argparse.ArgumentParser,
+    *,
+    include_architecture: bool,
+    include_output_dir: bool,
+    include_runtime_device_matrix: bool = False,
+    manifest_overrides: bool = False,
+) -> None:
+    """Add options consumed after compilation by runtime/device simulation."""
+
+    if include_architecture:
+        parser.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"))
+        parser.add_argument("--machine-config", type=Path)
     parser.add_argument("--timing-config", type=Path)
     parser.add_argument(
         "--timing-provider",
@@ -167,16 +274,12 @@ def _add_compile_arguments(parser: argparse.ArgumentParser) -> None:
         default="analytical_event",
     )
     parser.add_argument(
-        "--codegen-backend",
-        choices=default_codegen_backend_registry().names(),
-        default="analytical",
-    )
-    parser.add_argument(
         "--policy",
         choices=tuple(policy.value for policy in SchedulerPolicy),
         default=SchedulerPolicy.STATIC_PIPELINE.value,
     )
-    parser.add_argument("--output-dir", type=Path, default=Path("out/compile-model"))
+    if include_output_dir:
+        parser.add_argument("--output-dir", type=Path, default=Path("out/simulate"))
     parser.add_argument("--instruction-queue-depth", type=int)
     parser.add_argument("--rob-entries", type=int)
     parser.add_argument("--max-inflight-tiles", type=int)
@@ -196,39 +299,81 @@ def _add_compile_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--runtime-policy",
         choices=("static", "dynamic_ready_queue"),
-        default="static",
+        default=None if manifest_overrides else "static",
     )
     parser.add_argument("--runtime-chunk-size", type=int)
     parser.add_argument(
         "--runtime-base-address",
         type=lambda value: int(value, 0),
-        default=0x10000000,
+        default=None if manifest_overrides else 0x10000000,
     )
-    parser.add_argument("--runtime-alignment", type=int, default=256)
+    parser.add_argument(
+        "--runtime-alignment",
+        type=int,
+        default=None if manifest_overrides else 256,
+    )
     parser.add_argument(
         "--runtime-buffer-policy",
         choices=("linear", "lifetime_reuse"),
-        default="linear",
+        default=None if manifest_overrides else "linear",
     )
     parser.add_argument("--runtime-availability-config", type=Path)
-    parser.add_argument("--runtime-launch-latency", type=float, default=0.0)
-    parser.add_argument("--runtime-synchronization-cycles", type=float, default=0.0)
+    parser.add_argument(
+        "--runtime-launch-latency",
+        type=float,
+        default=None if manifest_overrides else 0.0,
+    )
+    parser.add_argument(
+        "--runtime-synchronization-cycles",
+        type=float,
+        default=None if manifest_overrides else 0.0,
+    )
     parser.add_argument(
         "--runtime-invocations",
         type=int,
-        default=1,
+        default=None if manifest_overrides else 1,
         help="number of repeated invocations sharing persistent runtime state",
     )
     parser.add_argument(
         "--runtime-inter-invocation-gap",
         type=float,
-        default=0.0,
+        default=None if manifest_overrides else 0.0,
         help="cycles between state completion and the next invocation",
     )
-    parser.add_argument(
-        "--runtime-device-matrix",
-        action="store_true",
-        help="run the four runtime/device static-dynamic policy combinations",
+    if include_runtime_device_matrix:
+        parser.add_argument(
+            "--runtime-device-matrix",
+            action="store_true",
+            help="run the four runtime/device static-dynamic policy combinations",
+        )
+
+
+def _add_compile_and_sim_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    default_output_dir: str = "out/compile-and-sim",
+) -> None:
+    """Compose compile inputs with runtime/device options for the one-shot flow."""
+
+    _add_compile_arguments(parser, default_output_dir=default_output_dir)
+    _add_simulation_options(
+        parser,
+        include_architecture=False,
+        include_output_dir=False,
+        include_runtime_device_matrix=True,
+    )
+
+
+def _add_simulation_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add options that affect runtime submission or device simulation only."""
+
+    parser.add_argument("--compile-dir", type=Path, required=True)
+    parser.add_argument("--runtime-config", type=Path)
+    _add_simulation_options(
+        parser,
+        include_architecture=True,
+        include_output_dir=True,
+        manifest_overrides=True,
     )
 
 
@@ -319,11 +464,26 @@ def build_parser() -> argparse.ArgumentParser:
         description="Compile PyTorch modules to TISA and run scheduling experiments"
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    compile_model = commands.add_parser(
-        "compile-model",
-        help="PyTorch -> torch.export -> Torch-XLA -> StableHLO -> TISA -> simulator",
+    compile_only = commands.add_parser(
+        "compile",
+        help="PyTorch -> torch.export -> Torch-XLA -> StableHLO -> TISA/backend compile package",
     )
-    _add_compile_arguments(compile_model)
+    _add_compile_arguments(compile_only, default_output_dir="out/compile")
+
+    compile_and_sim = commands.add_parser(
+        "compile-and-sim",
+        help="compile a PyTorch module and immediately run the simulator",
+    )
+    _add_compile_and_sim_arguments(
+        compile_and_sim,
+        default_output_dir="out/compile-and-sim",
+    )
+
+    simulate = commands.add_parser(
+        "simulate",
+        help="load a compile package, bind runtime values, and run the simulator",
+    )
+    _add_simulation_arguments(simulate)
 
     paper_matrix = commands.add_parser(
         "paper-matrix",
@@ -362,7 +522,12 @@ def run_import_rtl_trace(args: argparse.Namespace) -> int:
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(profile, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    print(json.dumps({"output": str(args.output), "shape_count": len(profile["matmul_profiles"])}, sort_keys=True))
+    print(
+        json.dumps(
+            {"output": str(args.output), "shape_count": len(profile["matmul_profiles"])},
+            sort_keys=True,
+        )
+    )
     return 0
 
 
@@ -394,7 +559,7 @@ def _load_torch_module(specification: str, input_shapes: list[str], dtype_name: 
     try:
         import torch
     except ModuleNotFoundError as exc:
-        raise ValueError("compile-model requires PyTorch") from exc
+        raise ValueError("compile/compile-and-sim requires PyTorch") from exc
     try:
         module = constructor()
     except Exception as exc:
@@ -746,7 +911,7 @@ def run_paper_matrix(args: argparse.Namespace) -> int:
     return 1 if manifest["failed_cases"] else 0
 
 
-def run_compile_model(args: argparse.Namespace) -> int:
+def _compile_from_args(args: argparse.Namespace):
     module, example_inputs, factory_name = _load_torch_module(
         args.torch_module,
         args.input_shape,
@@ -777,42 +942,93 @@ def run_compile_model(args: argparse.Namespace) -> int:
         codegen_backend=codegen_backend,
     )
 
-    ensure_output_layout(args.output_dir)
-    write_artifact_json(compiled.source_frontend, args.output_dir / "source_frontend_import.json")
-    write_artifact_json(compiled.stablehlo, args.output_dir / "stablehlo_module.json")
-    (args.output_dir / "00_frontend" / "generated.mlir").write_text(
+    return compiled, machine, factory_name
+
+
+def _write_compile_artifacts(compiled, machine, output_dir: Path) -> None:
+    """Persist the compiler-owned stages used by both CLI execution modes."""
+
+    ensure_output_layout(output_dir)
+    write_artifact_json(compiled.source_frontend, output_dir / "source_frontend_import.json")
+    write_artifact_json(compiled.stablehlo, output_dir / "stablehlo_module.json")
+    (output_dir / "00_frontend" / "generated.mlir").write_text(
         compiled.stablehlo.text,
         encoding="utf-8",
     )
-    write_artifact_json(compiled.frontend, args.output_dir / "frontend_import.json")
-    write_artifact_json(compiled.graph, args.output_dir / "canonical_graph.json")
+    write_artifact_json(compiled.frontend, output_dir / "frontend_import.json")
+    write_artifact_json(compiled.graph, output_dir / "canonical_graph.json")
     if compiled.gc_artifact is not None:
-        write_artifact_json(compiled.gc_artifact, args.output_dir / "gc_artifact.json")
-        pass_dump_dir = args.output_dir / "01_gc" / "pass_dumps"
+        write_artifact_json(compiled.gc_artifact, output_dir / "gc_artifact.json")
+        pass_dump_dir = output_dir / "01_gc" / "pass_dumps"
         for snapshot in compiled.gc_artifact.pass_dumps:
             filename = f"{snapshot.pass_index:02d}_{snapshot.pass_name}.json"
             write_artifact_json(snapshot, pass_dump_dir / filename)
-    write_artifact_json(compiled.schedule, args.output_dir / "schedule.json")
+    write_artifact_json(compiled.schedule, output_dir / "schedule.json")
     write_artifact_json(
         compiled.attributes["compile_statistics"],
-        args.output_dir / "compile_statistics.json",
+        output_dir / "compile_statistics.json",
     )
-    write_artifact_json(compiled.tile_graph, args.output_dir / "tile_graph.json")
+    write_artifact_json(compiled.tile_graph, output_dir / "tile_graph.json")
     if compiled.tisa_dialect is not None:
-        write_artifact_json(compiled.tisa_dialect, args.output_dir / "tisa_dialect.json")
+        write_artifact_json(compiled.tisa_dialect, output_dir / "tisa_dialect.json")
         write_artifact_json(
             compiled.tisa_dialect.attributes,
-            args.output_dir / "fc_diagnostics.json",
+            output_dir / "fc_diagnostics.json",
         )
-    write_artifact_json(compiled.tisa_program, args.output_dir / "tisa_program.json")
-    write_artifact_json(compiled, args.output_dir / "compiled_artifact.json")
-    write_artifact_json(compiled.backend_artifact, args.output_dir / "backend_artifact.json")
-    write_artifact_json(compiled.backend_artifact.execution_graph, args.output_dir / "execution_graph.json")
-    write_artifact_json(machine, args.output_dir / "machine.json")
-    write_operator_graph_dot(compiled.graph, args.output_dir / "operator_graph.dot")
-    write_operator_graph_svg(compiled.graph, args.output_dir / "operator_graph.svg")
-    write_tile_graph_dot(compiled.tile_graph, args.output_dir / "tile_graph.dot")
-    write_execution_graph_dot(compiled.backend_artifact.execution_graph, args.output_dir / "execution_graph.dot")
+    write_artifact_json(compiled.tisa_program, output_dir / "tisa_program.json")
+    write_artifact_json(compiled, output_dir / "compiled_artifact.json")
+    write_artifact_json(compiled.backend_artifact, output_dir / "backend_artifact.json")
+    write_artifact_json(compiled.backend_artifact.execution_graph, output_dir / "execution_graph.json")
+    write_artifact_json(machine, output_dir / "machine.json")
+    write_operator_graph_dot(compiled.graph, output_dir / "operator_graph.dot")
+    write_operator_graph_svg(compiled.graph, output_dir / "operator_graph.svg")
+    write_tile_graph_dot(compiled.tile_graph, output_dir / "tile_graph.dot")
+    write_execution_graph_dot(compiled.backend_artifact.execution_graph, output_dir / "execution_graph.dot")
+
+
+def _compile_manifest(compiled, machine) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "artifact_kind": "compile_package",
+        "compiler_pipeline": compiled.attributes["compiler_pipeline"],
+        "frontend_path": compiled.attributes["frontend_path"],
+        "model_id": compiled.source_frontend.model_id,
+        "stablehlo_exporter": "torch-xla",
+        "stablehlo_exporter_version": compiled.attributes["stablehlo_exporter_version"],
+        "stablehlo_verified": True,
+        "stablehlo_version": compiled.attributes["stablehlo_version"],
+        "architecture": machine.config_id,
+        "machine_hash": machine.stable_hash(),
+        "codegen_backend": compiled.attributes["codegen_backend"],
+        "tisa_program_id": compiled.tisa_program.program_id,
+        "artifact_id": compiled.backend_artifact.artifact_id,
+        "compile_artifacts": {
+            "backend_artifact": "04_backend/backend_artifact.json",
+            "canonical_graph": "01_gc/canonical_graph.json",
+            "machine": "04_backend/machine.json",
+            "tisa_program": "03_tisa/tisa_program.json",
+        },
+    }
+
+
+def run_compile(args: argparse.Namespace) -> int:
+    compiled, machine, _factory_name = _compile_from_args(args)
+    _write_compile_artifacts(compiled, machine, args.output_dir)
+    manifest = _compile_manifest(compiled, machine)
+    write_artifact_json(manifest, args.output_dir / "manifest.json")
+    write_artifact_index(args.output_dir)
+    print(json.dumps({
+        "artifact_id": compiled.backend_artifact.artifact_id,
+        "model_id": compiled.source_frontend.model_id,
+        "tisa_instructions": len(compiled.tisa_program.instructions),
+        "output_dir": str(args.output_dir),
+    }, sort_keys=True))
+    return 0
+
+
+def run_compile_and_sim(args: argparse.Namespace) -> int:
+    compiled, machine, _factory_name = _compile_from_args(args)
+    _write_compile_artifacts(compiled, machine, args.output_dir)
 
     lifetimes = derive_tensor_lifetimes(compiled.tisa_program)
     reuse_pairs = derive_tensor_reuse_pairs(compiled.tisa_program)
@@ -907,7 +1123,10 @@ def run_compile_model(args: argparse.Namespace) -> int:
     write_svg(result, args.output_dir / "swimlane.svg")
     write_png(result, args.output_dir / "swimlane.png")
     write_artifact_json(result.perfetto_trace(), args.output_dir / "perfetto.json")
-    write_artifact_json(result.metrics.get("address_hazards", []), args.output_dir / "address_dependencies.json")
+    write_artifact_json(
+        result.metrics.get("address_hazards", []),
+        args.output_dir / "address_dependencies.json",
+    )
 
     allocation_span = (
         max(buffer.end_address for buffer in runtime_buffers)
@@ -917,6 +1136,7 @@ def run_compile_model(args: argparse.Namespace) -> int:
     )
     manifest = {
         "schema_version": 1,
+        "artifact_kind": "simulation_result",
         "compiler_pipeline": compiled.attributes["compiler_pipeline"],
         "frontend_path": compiled.attributes["frontend_path"],
         "model_id": compiled.source_frontend.model_id,
@@ -924,7 +1144,7 @@ def run_compile_model(args: argparse.Namespace) -> int:
         "stablehlo_exporter_version": compiled.attributes["stablehlo_exporter_version"],
         "stablehlo_verified": True,
         "stablehlo_version": compiled.attributes["stablehlo_version"],
-        "architecture": args.arch,
+        "architecture": machine.config_id,
         "softmax_algorithm": machine.attributes.get("softmax_algorithm", "materialized"),
         "machine_hash": machine.stable_hash(),
         "codegen_backend": compiled.attributes["codegen_backend"],
@@ -995,10 +1215,249 @@ def run_compile_model(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_compile_package(root: Path):
+    """Load the portable compiler-owned files without importing PyTorch."""
+
+    root = root.expanduser().resolve()
+    backend_path = root / "04_backend" / "backend_artifact.json"
+    graph_path = root / "01_gc" / "canonical_graph.json"
+    machine_path = root / "04_backend" / "machine.json"
+    for path in (backend_path, graph_path, machine_path):
+        if not path.is_file():
+            raise ValueError(f"compile package is missing required artifact: {path}")
+    backend = BackendArtifact.from_dict(_read_json_object(backend_path, description="backend artifact"))
+    graph = OperatorGraph.from_dict(_read_json_object(graph_path, description="canonical graph"))
+    from npu_ooo.arch import MachineConfig
+
+    machine = MachineConfig.from_dict(_read_json_object(machine_path, description="machine config"))
+    manifest_path = root / "manifest.json"
+    manifest = (
+        _read_json_object(manifest_path, description="compile manifest")
+        if manifest_path.is_file()
+        else {}
+    )
+    if manifest.get("artifact_kind") not in {None, "compile_package", "simulation_result"}:
+        raise ValueError(f"'{manifest_path}' is not a compatible compile/simulation manifest")
+    manifest_artifact_id = manifest.get("artifact_id", manifest.get("compile_artifact_id"))
+    if manifest_artifact_id not in {None, backend.artifact_id}:
+        raise ValueError("compile manifest artifact_id does not match backend artifact")
+    return root, backend, graph, machine, manifest
+
+
+def _simulation_config(args: argparse.Namespace) -> SimulatorConfig:
+    return SimulatorConfig(
+        instruction_queue_depth=args.instruction_queue_depth,
+        rob_entries=args.rob_entries,
+        max_inflight_tiles=args.max_inflight_tiles,
+        dependency_window=args.dependency_window,
+        ready_queue_depth=args.ready_queue_depth,
+        address_scoreboard=args.address_scoreboard,
+        memory_bank_scoreboard=args.memory_bank_scoreboard,
+        dynamic_priority=args.dynamic_priority,
+    )
+
+
+def run_simulate(args: argparse.Namespace) -> int:
+    compile_root, artifact, graph, compiled_machine, compile_manifest = _load_compile_package(
+        args.compile_dir
+    )
+    runtime_payload = (
+        _read_json_object(args.runtime_config, description="runtime config")
+        if args.runtime_config is not None
+        else {}
+    )
+    machine = (
+        _machine(args.arch, args.machine_config)
+        if args.arch is not None or args.machine_config is not None
+        else compiled_machine
+    )
+    runtime_policy = args.runtime_policy or str(runtime_payload.get("runtime_policy", "static"))
+    chunk_size = args.runtime_chunk_size
+    if chunk_size is None and runtime_payload.get("runtime_chunk_size") is not None:
+        chunk_size = int(runtime_payload["runtime_chunk_size"])
+    base_address = args.runtime_base_address
+    if base_address is None:
+        base_address = int(runtime_payload.get("runtime_base_address", 0x10000000))
+    alignment = args.runtime_alignment
+    if alignment is None:
+        alignment = int(runtime_payload.get("runtime_alignment", 256))
+    buffer_policy = args.runtime_buffer_policy or str(
+        runtime_payload.get("runtime_buffer_policy", "linear")
+    )
+    launch_latency = args.runtime_launch_latency
+    if launch_latency is None:
+        launch_latency = float(runtime_payload.get("runtime_launch_latency", 0.0))
+    synchronization = args.runtime_synchronization_cycles
+    if synchronization is None:
+        synchronization = float(runtime_payload.get("runtime_synchronization_cycles", 0.0))
+    gap = args.runtime_inter_invocation_gap
+    if gap is None:
+        gap = float(runtime_payload.get("runtime_inter_invocation_gap", 0.0))
+    invocation_count = args.runtime_invocations
+    if invocation_count is None:
+        invocation_count = int(runtime_payload.get("runtime_invocations", 1))
+    if invocation_count <= 0:
+        raise ValueError("runtime invocation count must be positive")
+    availability_path = args.runtime_availability_config
+    if availability_path is None and runtime_payload.get("runtime_availability_config"):
+        availability_path = (
+            args.runtime_config.parent
+            / str(runtime_payload["runtime_availability_config"])
+        ).resolve()
+    if availability_path is not None:
+        descriptor_availability = _descriptor_availability(availability_path)
+    else:
+        inline_availability = runtime_payload.get("descriptor_available_cycles", {})
+        if not isinstance(inline_availability, dict):
+            raise ValueError("runtime_config.descriptor_available_cycles must be an object")
+        descriptor_availability = {}
+        for tisa_id, cycle in inline_availability.items():
+            if not isinstance(tisa_id, str) or not tisa_id:
+                raise ValueError("descriptor availability TISA ids must be non-empty strings")
+            if (
+                isinstance(cycle, bool)
+                or not isinstance(cycle, (int, float))
+                or not math.isfinite(cycle)
+                or cycle < 0
+            ):
+                raise ValueError(f"descriptor availability for '{tisa_id}' must be non-negative")
+            descriptor_availability[tisa_id] = float(cycle)
+    lifetimes = derive_tensor_lifetimes(artifact.program)
+    reuse_pairs = derive_tensor_reuse_pairs(artifact.program)
+    buffers = allocate_buffer_bindings(
+        graph.tensors,
+        base_address=base_address,
+        alignment_bytes=alignment,
+        lifetimes=lifetimes,
+        reuse_buffers=buffer_policy == "lifetime_reuse",
+        reuse_pairs=reuse_pairs,
+    )
+
+    invocation_payloads = runtime_payload.get("invocations")
+    if invocation_payloads is not None:
+        if not isinstance(invocation_payloads, list) or len(invocation_payloads) != invocation_count:
+            raise ValueError("runtime_config.invocations length must equal runtime invocation count")
+    else:
+        invocation_payloads = [runtime_payload] * invocation_count
+    invocation_indices: list[tuple[DynamicIndexBinding, ...]] = []
+    invocation_layouts: list[tuple[RuntimeLayoutBinding, ...]] = []
+    for item in invocation_payloads:
+        if not isinstance(item, dict):
+            raise ValueError("each runtime invocation must be an object")
+        indices, layouts = _runtime_bindings(item)
+        invocation_indices.append(indices)
+        invocation_layouts.append(layouts)
+
+    runtime_sequence = None
+    if invocation_count > 1:
+        state_registry = create_runtime_state_registry(artifact, buffers)
+        if not state_registry.state_ids():
+            raise ValueError("multiple runtime invocations require a persistent state contract")
+        runtime_sequence = create_runtime_sequence(
+            artifact,
+            state_registry,
+            invocation_count=invocation_count,
+            sequence_id=f"sequence.{artifact.program.program_id}",
+            policy=runtime_policy,
+            chunk_size=chunk_size,
+            launch_latency_cycles=launch_latency,
+            synchronization_cycles=synchronization,
+            descriptor_available_cycles=descriptor_availability,
+            inter_invocation_gap_cycles=gap,
+            invocation_dynamic_indices=invocation_indices,
+            invocation_dynamic_layouts=invocation_layouts,
+        )
+        runtime_submission = runtime_sequence.invocations[0]
+    else:
+        runtime_submission = create_runtime_submission(
+            artifact,
+            buffers,
+            submission_id=f"submission.{artifact.program.program_id}",
+            policy=runtime_policy,
+            chunk_size=chunk_size,
+            launch_latency_cycles=launch_latency,
+            synchronization_cycles=synchronization,
+            descriptor_available_cycles=descriptor_availability,
+            dynamic_index_bindings=invocation_indices[0],
+            dynamic_layout_bindings=invocation_layouts[0],
+        )
+
+    timing_model = _timing_model(args.timing_config, args.timing_provider)
+    event_backend = default_event_backend_registry().create(args.event_backend)
+    simulator_config = _simulation_config(args)
+    if runtime_sequence is not None:
+        result = schedule_tisa_sequence(
+            artifact,
+            runtime_sequence,
+            machine,
+            args.policy,
+            timing_model=timing_model,
+            simulator_config=simulator_config,
+            event_backend=event_backend,
+        )
+    else:
+        result = schedule_tisa_program(
+            artifact,
+            machine,
+            args.policy,
+            timing_model=timing_model,
+            simulator_config=simulator_config,
+            runtime_submission=runtime_submission,
+            event_backend=event_backend,
+        )
+
+    ensure_output_layout(args.output_dir)
+    write_artifact_json(runtime_submission, args.output_dir / "runtime_submission.json")
+    if runtime_sequence is not None:
+        write_artifact_json(runtime_sequence, args.output_dir / "runtime_sequence.json")
+    write_json(result, args.output_dir / "summary.json")
+    write_csv(result, args.output_dir / "tasks.csv")
+    write_instruction_csv(result, args.output_dir / "tisa_instructions.csv")
+    write_svg(result, args.output_dir / "swimlane.svg")
+    write_png(result, args.output_dir / "swimlane.png")
+    write_artifact_json(result.perfetto_trace(), args.output_dir / "perfetto.json")
+    write_artifact_json(
+        result.metrics.get("address_hazards", []),
+        args.output_dir / "address_dependencies.json",
+    )
+    manifest = {
+        "schema_version": 1,
+        "artifact_kind": "simulation_result",
+        "compile_package": str(compile_root),
+        "compile_artifact_id": artifact.artifact_id,
+        "compile_program_id": artifact.program.program_id,
+        "compile_manifest": compile_manifest,
+        "architecture": machine.config_id,
+        "machine_hash": machine.stable_hash(),
+        "timing_provider": getattr(timing_model, "name", "analytical"),
+        "event_backend": event_backend.name,
+        "policy": result.policy,
+        "runtime_policy": runtime_submission.policy,
+        "runtime_invocation_count": invocation_count,
+        "dynamic_index_binding_count": sum(len(item) for item in invocation_indices),
+        "dynamic_layout_binding_count": sum(len(item) for item in invocation_layouts),
+        "total_cycles": result.total_cycles,
+        "total_cycles_including_runtime": result.metrics.get(
+            "total_cycles_including_runtime", result.total_cycles
+        ),
+        "simulator_config": simulator_config.to_dict(),
+    }
+    write_artifact_json(manifest, args.output_dir / "manifest.json")
+    write_artifact_index(args.output_dir)
+    print(json.dumps({
+        "compile_artifact_id": artifact.artifact_id,
+        "total_cycles": result.total_cycles,
+        "output_dir": str(args.output_dir),
+    }, sort_keys=True))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     runners = {
-        "compile-model": run_compile_model,
+        "compile": run_compile,
+        "compile-and-sim": run_compile_and_sim,
+        "simulate": run_simulate,
         "paper-matrix": run_paper_matrix,
         "import-rtl-trace": run_import_rtl_trace,
         "import-rtl-log": run_import_rtl_log,

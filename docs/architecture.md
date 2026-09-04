@@ -67,7 +67,7 @@ CLI 入口位于 `src/npu_ooo/cli.py`：
 
 ```text
 main
-  -> run_compile_model
+  -> run_compile / run_simulate / run_compile_and_sim
   -> compile_torch_module
        -> TorchExportAdapter
        -> Torch-XLA exporter
@@ -83,7 +83,8 @@ main
 ```
 
 `compile_operator_graph()` 接受已经导入的 Canonical graph，用于单独验证 GC、FC 和
-backend 契约。用户 CLI 以 `compile-model --torch-module MODULE:CLASS` 为统一入口。
+backend 契约。用户 CLI 提供 `compile`、`simulate` 和 `compile-and-sim` 三个入口：前者
+生成 compile package，第二个只消费 package，第三个串联两者。
 
 ## 3. Frontend
 
@@ -324,6 +325,26 @@ descriptor available cycle
 launch latency
 synchronization cost
 ```
+
+Runtime 可以和编译阶段分开执行。`compile` 将以下文件组成可复用的 compile package：
+
+```text
+01_gc/canonical_graph.json
+03_tisa/tisa_program.json
+04_backend/backend_artifact.json
+04_backend/machine.json
+manifest.json
+```
+
+`simulate --compile-dir <package>` 只读取这些编译产物，然后在本次 invocation 中重新完成
+buffer 分配、dynamic index/layout binding、descriptor 提交和 device/backend timing。它不
+导入 PyTorch，也不重新执行 Torch-XLA、GC 或 FC。多个 `simulate` 命令可以复用同一个
+package，对比不同 MachineConfig、timing provider、runtime policy 和 device policy。
+
+命令参数遵循同一边界：`compile` 只接受前端、shape、tile/GC 和 codegen 选项；`simulate`
+接受 runtime、scheduler、MachineConfig 覆盖和 timing/event backend；`compile-and-sim` 将
+两组参数组合为一次端到端执行。编译包因此不携带某次仿真的运行时地址、descriptor 顺序
+或调度结果。
 
 Runtime policy 表示 descriptor 的生成和提交顺序；device policy 表示已到达 TISA
 instruction 的 issue 选择。四种组合由 `--runtime-device-matrix` 一次编译后运行。

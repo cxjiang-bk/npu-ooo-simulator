@@ -82,7 +82,7 @@ OpenXLA StableHLO wheel 1.12.1
 ```bash
 cd /home/lora/OpenTPU/npu-ooo-simulator
 
-PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-model \
+PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-and-sim \
   --torch-module examples.torch_models:MultiHeadAttentionBlock \
   --input-shape 1,4,8 --input-shape 1,1,4,4 \
   --tile-size 4 \
@@ -94,7 +94,7 @@ PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-model \
 timing provider，实验变量设为 `--policy` 与输出目录：
 
 ```bash
-PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-model \
+PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-and-sim \
   --torch-module examples.torch_models:MultiHeadAttentionBlock \
   --input-shape 1,4,8 --input-shape 1,1,4,4 \
   --tile-size 4 --policy static_pipeline \
@@ -104,10 +104,129 @@ PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-model \
 `--runtime-device-matrix` 在一次编译后运行 runtime/device 四种组合，保证所有策略行
 共享 `artifact_id`、`program_id` 和 buffer binding。
 
+### 分离编译与仿真
+
+需要重复比较多个硬件或调度配置时，先生成 compile package，再独立运行仿真：
+
+```bash
+# 只执行前端、GC、FC、TISA 和 backend lowering
+PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile \
+  --torch-module examples.torch_models:MultiHeadAttentionBlock \
+  --input-shape 1,4,8 --input-shape 1,1,4,4 \
+  --tile-size 4 \
+  --output-dir out/attention-compile
+
+# 仿真阶段不需要 PyTorch；只读取 compile package
+PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli simulate \
+  --compile-dir out/attention-compile \
+  --policy dynamic_ready_queue \
+  --arch wide-mxu \
+  --output-dir out/attention-wide-dynamic
+```
+
+`compile` 的输出包含 `01_gc/canonical_graph.json`、`03_tisa/tisa_program.json`、
+`04_backend/backend_artifact.json` 和 `04_backend/machine.json`。`simulate` 从这些文件
+恢复编译结果，只重新执行 runtime 地址绑定、动态参数解析和 device/backend timing。
+同一 compile package 可以被多个 `simulate` 命令复用。
+
+`compile` 的参数只描述输入、shape specialization、tile/GC 选项和 backend codegen；它不
+接受 `--policy`、`--runtime-*` 或 timing/event 选项。`simulate` 才选择 device policy、
+runtime policy、机器覆盖、timing provider 和输出目录。这样同一个编译包可以在多个硬件与
+运行时配置上重复实验。
+
+运行时动态参数使用 JSON manifest 传入：
+
+```json
+{
+  "runtime_policy": "dynamic_ready_queue",
+  "runtime_invocations": 1,
+  "dynamic_indices": {
+    "cache_update.index": [12, 0]
+  },
+  "dynamic_layouts": {
+    "kv_cache": {
+      "shape": [1, 4096, 8, 64],
+      "strides_bytes": [4194304, 1024, 128, 2],
+      "layout": "paged_kv",
+      "offset_bytes": 65536
+    }
+  }
+}
+```
+
+使用 `simulate --runtime-config runtime.json` 传入。`dynamic_indices` 的 key 必须是
+编译产物中 TISA instruction 的 `dynamic_index.expression_id`；`dynamic_layouts` 的 key
+必须是已分配的 tensor 名称。改变实际 tensor shape 仍然需要重新 `compile`，而改变
+`position`、cache window 或 page offset 可以复用同一 compile package。
+
+### 编译、runtime 与仿真边界
+
+`compile-and-sim` 是一个端到端实验入口，因此一次命令会依次完成编译、runtime buffer
+分配、descriptor 提交和仿真，并把产物写入 `00_frontend` 到 `07_trace`。概念上这仍然
+是三个独立阶段：
+
+```text
+compile_torch_module(...)
+  -> TISAProgram / BackendArtifact       # 编译期，保持不变
+allocate_buffer_bindings(...)
+  -> RuntimeSubmission                   # invocation，绑定地址和动态参数
+schedule_tisa_program(...)
+  -> SimulationResult                    # device scheduler + backend timing
+```
+
+`--input-shape` 是 `torch.export` 的示例输入和 shape-specialization 参数，不是仿真时
+可以任意改变的 `seqlen`。`--policy` 选择 device scheduler，`--runtime-policy` 选择
+descriptor 的提交顺序；两者都可以使用同一份编译产物。
+
+### 动态参数
+
+编译期保存符号和约束，运行期提供每次 invocation 的具体值：
+
+| 参数 | 绑定阶段 | 当前语义 |
+| --- | --- | --- |
+| `position`、dynamic slice 起点、KV-cache 写入位置 | runtime | 通过 `DynamicIndexBinding` 传入，按 StableHLO clamp 规则解析为物理 offset/span |
+| KV-cache 的 page、stride、base offset | runtime | 通过 `RuntimeLayoutBinding` 传入，更新 operand 的 concrete layout 和 bank 映射 |
+| `seqlen` 作为固定 cache/window 内的有效长度 | runtime | 作为 index/window 控制值使用，编译产物保持不变 |
+| `seqlen` 改变输入 tensor 的实际 shape | compile specialization | 需要重新执行 `compile` 或生成对应 shape variant |
+
+动态 binding 目前通过 Python runtime API 提供；CLI 已支持 `--runtime-invocations`、
+`--runtime-availability-config`、`--runtime-launch-latency` 等提交参数，但尚未提供把
+任意模型参数自动转换为 `DynamicIndexBinding` 的命令行语法。一个动态 cache invocation
+的最小示例：
+
+```python
+from npu_ooo.ir import (
+    DynamicIndexBinding,
+    RuntimeLayoutBinding,
+    allocate_buffer_bindings,
+    create_runtime_submission,
+)
+
+buffers = allocate_buffer_bindings(compiled.graph.tensors)
+submission = create_runtime_submission(
+    compiled.backend_artifact,
+    buffers,
+    policy="dynamic_ready_queue",
+    dynamic_index_bindings=(
+        # expression_id 来自 TISA instruction 的 dynamic_index metadata
+        DynamicIndexBinding("cache_update.index", (position, 0)),
+    ),
+    dynamic_layout_bindings=(
+        RuntimeLayoutBinding(
+            "kv_cache", cache_shape, cache_strides_bytes,
+            layout="paged_kv", offset_bytes=page_base_offset,
+        ),
+    ),
+)
+```
+
+`RuntimeSequence` 可以为每个 invocation 传入不同的 index/layout binding，同时复用同一份
+`BackendArtifact`。这就是 decode 中 `position` 逐步变化而无需重复编译的路径。
+
 真实 pre-norm decoder block：
 
 ```bash
-PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-model \
+PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-and-sim \
   --torch-module examples.torch_models:PreNormDecoderBlock \
   --input-shape 1,4,8 --input-shape 1,1,4,4 \
   --tile-size 4 --policy dynamic_ready_queue \
@@ -166,7 +285,7 @@ class MyOperator(torch.nn.Module):
 运行编译：
 
 ```bash
-PYTHONPATH=src:/path/to/module /usr/bin/python3.12 -m npu_ooo.cli compile-model \
+PYTHONPATH=src:/path/to/module /usr/bin/python3.12 -m npu_ooo.cli compile \
   --torch-module my_module:MyOperator \
   --input-shape 32,64 --input-shape 64,128 \
   --output-dir out/my-operator

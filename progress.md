@@ -24,7 +24,8 @@ PyTorch nn.Module
 
 ### 前端与编译
 
-- 统一入口 `compile-model --torch-module MODULE:CLASS`；
+- 统一入口 `compile-and-sim --torch-module MODULE:CLASS`；分离执行使用 `compile` 和
+  `simulate`；
 - torch.export 源图 provenance、Torch-XLA StableHLO 导出和官方 MLIR parse/verify；
 - StableHLO operation capability registry、semantic fusion/recovery registry；
 - GC pass pipeline、固定点规范化、tile planner、candidate cost model；
@@ -205,6 +206,41 @@ GC typed dependency 已完成，下一项转入 symbolic shape、dynamic index �
   大型 region 使用 bounded conservative fallback。
 - 新增 layout、transpose、slice、runtime layout 回归；全量回归 134 项通过，`compileall`
   与 `git diff --check` 通过。
+
+## 2026-09-02：动态参数入口文档化
+
+- README 新增 compile/runtime/simulation 边界说明，明确 `compile-and-sim` 是端到端编排入口，
+  但 `TISAProgram/BackendArtifact`、`RuntimeSubmission` 和 `SimulationResult` 在语义上
+  仍然分层，可被独立 API 调用。
+- README 增加 `position`、KV-cache index、`seqlen` 和动态 layout 的 binding 表，说明
+  `--input-shape` 属于 compile-time specialization；当前动态 index/layout 通过 Python
+  runtime API 传入，CLI 的 runtime 参数暂不自动映射到模型输入。
+
+## 2026-09-04：compile 与 simulation 分离
+
+- 新增 `compile` CLI，只执行 PyTorch -> torch.export -> Torch-XLA/StableHLO -> GC/FC ->
+  TISA/backend，并将 `BackendArtifact`、Canonical Graph、TISA program、MachineConfig
+  和阶段产物保存为可复用 compile package。
+- 新增 `simulate --compile-dir` CLI。它从 `01_gc/canonical_graph.json`、
+  `04_backend/backend_artifact.json` 和 `04_backend/machine.json` 恢复对象，不导入
+  PyTorch、不重复编译，只执行 runtime buffer/address binding、dynamic index/layout
+  解析、descriptor 提交和 device/backend timing。
+- 新增 `compile-and-sim`，替代旧的 `compile-model`，保留原有一站式行为；旧命令显式
+  拒绝，文档和测试已同步。
+- 为 `TensorSpec`、`OperatorGraph`、`BufferRegion`、`ExecutionTask`、`ExecutionGraph`
+  以及全部 TISA/BackendArtifact 对象增加严格 `from_dict()` 校验，确保跨进程/跨命令
+  的 artifact 恢复后仍满足原有 IR contract。
+- `simulate --runtime-config runtime.json` 支持每次 invocation 的
+  `dynamic_indices`、`dynamic_layouts`、runtime policy、chunk、launch latency、
+  descriptor availability 等配置；同一 compile package 可复用到不同 machine、timing
+  provider、runtime policy 和 device policy。
+- 用已有 decoder compile package 完成独立仿真 smoke：284 条 TISA、329 个 backend task、
+  2953 cycles；新增 BackendArtifact JSON round-trip 回归。
+- CLI 参数边界已拆分：`compile` 只暴露编译输入和 codegen 选项；`simulate` 暴露 runtime、
+  device scheduler、机器覆盖和 timing/event backend；`compile-and-sim` 组合两组参数。
+- 新增无前端依赖的 compile package -> `simulate` 集成回归，确认仿真入口从 JSON 恢复
+  `OperatorGraph`、`BackendArtifact`、`MachineConfig`，并只生成 runtime、simulation、trace
+  产物。定向 CLI/TISA 回归为 24 项通过。
 
 ## 2026-08-31：GC typed dependency 语义对齐与实现
 

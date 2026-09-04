@@ -75,6 +75,34 @@ class BufferRegion:
             "strides_bytes": list(self.strides_bytes) if self.strides_bytes is not None else None,
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "BufferRegion":
+        if not isinstance(payload, Mapping):
+            raise ValueError("buffer region payload must be an object")
+        try:
+            region = cls(
+                tensor=str(payload["tensor"]),
+                memory=str(payload["memory"]),
+                shape=tuple(int(value) for value in payload["shape"]),
+                starts=tuple(int(value) for value in payload["starts"]),
+                dtype=str(payload.get("dtype", "fp16")),
+                access=payload.get("access", AccessType.READ.value),
+                offset_bytes=int(payload.get("offset_bytes", 0)),
+                size_bytes=int(payload.get("size_bytes", 0)),
+                layout=str(payload.get("layout", "dense")),
+                strides_bytes=(
+                    tuple(int(value) for value in payload["strides_bytes"])
+                    if payload.get("strides_bytes") is not None
+                    else None
+                ),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid buffer region payload") from exc
+        issues = region.validate()
+        if issues:
+            raise ValueError("invalid buffer region: " + "; ".join(issues))
+        return region
+
 
 @dataclass(frozen=True)
 class ExecutionTask:
@@ -144,6 +172,33 @@ class ExecutionTask:
             "attributes": dict(self.attributes),
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "ExecutionTask":
+        if not isinstance(payload, Mapping):
+            raise ValueError("execution task payload must be an object")
+        try:
+            task = cls(
+                task_id=str(payload["task_id"]),
+                tile_id=str(payload["tile_id"]),
+                operator_id=str(payload["operator_id"]),
+                primitive=str(payload["primitive"]),
+                resource=str(payload["resource"]),
+                reads=tuple(BufferRegion.from_dict(item) for item in payload.get("reads", ())),
+                writes=tuple(BufferRegion.from_dict(item) for item in payload.get("writes", ())),
+                predecessors=tuple(str(item) for item in payload.get("predecessors", ())),
+                duration_cycles=payload.get("duration_cycles"),
+                initiation_interval_cycles=payload.get("initiation_interval_cycles"),
+                stage_id=int(payload.get("stage_id", 0)),
+                program_order=int(payload.get("program_order", 0)),
+                attributes=payload.get("attributes", {}),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid execution task payload") from exc
+        issues = task.validate()
+        if issues:
+            raise ValueError("invalid execution task: " + "; ".join(issues))
+        return task
+
 
 @dataclass(frozen=True)
 class ExecutionGraph:
@@ -205,3 +260,20 @@ class ExecutionGraph:
             "tasks": [task.to_dict() for task in self.tasks],
             "attributes": dict(self.attributes),
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "ExecutionGraph":
+        if not isinstance(payload, Mapping):
+            raise ValueError("execution graph payload must be an object")
+        try:
+            graph = cls(
+                graph_id=str(payload["graph_id"]),
+                tasks=tuple(ExecutionTask.from_dict(item) for item in payload.get("tasks", ())),
+                attributes=payload.get("attributes", {}),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid execution graph payload") from exc
+        issues = graph.validate()
+        if issues:
+            raise ValueError("invalid execution graph: " + "; ".join(issues))
+        return graph

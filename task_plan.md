@@ -20,7 +20,8 @@
 - [x] 固定窗口 KV-cache 与多步 RuntimeSequence；
 - [x] 六个论文 benchmark 的 micro/representative proxy registry 与 paper-matrix 入口。
 
-生产入口统一使用 compile-model --torch-module MODULE:CLASS。测试 fixture 可以直接
+生产入口使用 compile-and-sim --torch-module MODULE:CLASS；分离流程使用 compile 和
+simulate。测试 fixture 可以直接
 构造所属层 IR，用于隔离验证接口契约。
 
 ## 阶段 1：模型与前端语义
@@ -116,10 +117,40 @@ model / shape / phase
 
 ## 当前执行顺序
 
-1. DeepSeek 与完整模型 repetition；
+1. compile/simulation 分离与可复用 artifact package；
+2. DeepSeek 与完整模型 repetition；
 3. scheduler 微结构和控制开销校准；
 4. 外部 timing/memory/RTL backend；
 5. 论文规模 source-derived/RTL-observed 矩阵。
+
+## 阶段 5：Compile-only 与独立仿真
+
+### 已完成
+
+- [x] 新增 `compile` compile-only package 入口；
+- [x] 新增 `simulate --compile-dir` 独立仿真入口；
+- [x] 一站式入口改名为 `compile-and-sim`；
+- [x] 为跨命令恢复补齐 IR `from_dict()` 和 schema 校验；
+- [x] runtime JSON 支持 dynamic index/layout 与 invocation 配置。
+
+### 目标
+
+- `compile` 只执行 PyTorch -> StableHLO -> GC/FC -> TISA/backend，并输出可持久化
+  的 compile package；
+- `simulate` 只读取 package，根据 invocation manifest 绑定 buffer、dynamic index/layout，
+  再选择 machine、runtime policy、device policy 和 timing backend；
+- `compile-and-sim` 保留为一站式入口；`compile` 与 `simulate` 用于分离执行。
+
+### 验收标准
+
+- `BackendArtifact`、`ExecutionGraph`、TISA IR 可以从 JSON 严格恢复并通过原有 validate；
+- compile package 不依赖 PyTorch 即可被 simulator 消费；
+- 同一 package 使用不同 runtime manifest 和 scheduler 参数生成不同 simulation trace；
+- dynamic index/layout 只影响 runtime binding 与地址/时序，不修改编译期 program；
+- 端到端 CLI 与原有测试保持兼容。
+
+当前验收状态：JSON package 独立仿真已通过，CLI 参数边界和 staged simulation 输出已通过；
+完整前端端到端测试需要安装官方 StableHLO 的 `mlir` Python binding。
 
 ## 验证命令
 

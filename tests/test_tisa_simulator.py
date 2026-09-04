@@ -137,6 +137,16 @@ class TISADeviceSimulatorTest(unittest.TestCase):
         self.assertEqual(dynamic.metrics["payload_task_count"], 3)
         self.assertEqual(dynamic.metrics["event_backend"], "analytical_event")
 
+    def test_backend_artifact_round_trip_preserves_scheduler_contract(self) -> None:
+        artifact = self._critical_path_artifact()
+        restored = BackendArtifact.from_dict(artifact.to_dict())
+        self.assertEqual(restored.validate(), ())
+        self.assertEqual(restored.artifact_id, artifact.artifact_id)
+        self.assertEqual(restored.program.to_dict(), artifact.program.to_dict())
+        self.assertEqual(
+            restored.execution_graph.to_dict(), artifact.execution_graph.to_dict()
+        )
+
     def test_memory_bank_scoreboard_is_opt_in(self) -> None:
         instructions = (
             _instruction("dma", "tile_dma", "dma"),

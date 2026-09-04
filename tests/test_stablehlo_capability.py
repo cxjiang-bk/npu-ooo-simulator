@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from npu_ooo.frontend import FrontendImportError
+from npu_ooo.frontend import FrontendImportError, official_stablehlo_available
 from npu_ooo.frontend.stablehlo import StableHLOAdapter
 from npu_ooo.frontend.stablehlo_official import _project_module
 
@@ -154,6 +154,10 @@ class StableHLOCapabilityBoundaryTest(unittest.TestCase):
                 """
             )
 
+    @unittest.skipUnless(
+        official_stablehlo_available(),
+        "requires the official StableHLO mlir binding",
+    )
     def test_dynamic_slice_is_preserved_until_specialization_boundary(self) -> None:
         from npu_ooo.frontend.stablehlo_official import OfficialStableHLOAdapter
 
@@ -172,6 +176,10 @@ class StableHLOCapabilityBoundaryTest(unittest.TestCase):
         self.assertEqual(dynamic_index["clamp_rule"], "stablehlo_dynamic_slice_clamp")
         self.assertEqual(dynamic_index["index_operands"], ["arg1", "arg2"])
 
+    @unittest.skipUnless(
+        official_stablehlo_available(),
+        "requires the official StableHLO mlir binding",
+    )
     def test_dynamic_update_slice_records_state_and_index_contract(self) -> None:
         text = """
         module {

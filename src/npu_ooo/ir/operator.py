@@ -105,6 +105,28 @@ class TensorSpec:
             "attributes": dict(self.attributes),
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "TensorSpec":
+        if not isinstance(payload, Mapping):
+            raise ValueError("tensor spec payload must be an object")
+        try:
+            value = cls(
+                name=str(payload["name"]),
+                shape=tuple(
+                    int(item) if isinstance(item, int) else str(item)
+                    for item in payload["shape"]
+                ),
+                dtype=str(payload.get("dtype", "fp16")),
+                layout=str(payload.get("layout", "dense")),
+                attributes=payload.get("attributes", {}),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid tensor spec payload") from exc
+        issues = value.validate()
+        if issues:
+            raise ValueError("invalid tensor spec: " + "; ".join(issues))
+        return value
+
 
 @dataclass(frozen=True)
 class DataEdge:
@@ -118,6 +140,22 @@ class DataEdge:
             "consumer": self.consumer,
             "tensor": self.tensor,
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "DataEdge":
+        if not isinstance(payload, Mapping):
+            raise ValueError("data edge payload must be an object")
+        try:
+            value = cls(
+                producer=str(payload["producer"]),
+                consumer=str(payload["consumer"]),
+                tensor=str(payload["tensor"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid data edge payload") from exc
+        if not value.producer or not value.consumer or not value.tensor:
+            raise ValueError("data edge identifiers must not be empty")
+        return value
 
 
 @dataclass(frozen=True)
@@ -199,6 +237,31 @@ class OperatorSpec:
             "attributes": dict(self.attributes),
             "provenance": dict(self.provenance),
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "OperatorSpec":
+        if not isinstance(payload, Mapping):
+            raise ValueError("operator spec payload must be an object")
+        try:
+            value = cls(
+                op_id=str(payload["op_id"]),
+                op_type=str(payload["op_type"]),
+                inputs=tuple(str(item) for item in payload.get("inputs", ())),
+                outputs=tuple(str(item) for item in payload.get("outputs", ())),
+                iteration_dims=tuple(
+                    (str(item[0]), int(item[1]) if isinstance(item[1], int) else str(item[1]))
+                    for item in payload.get("iteration_dims", ())
+                ),
+                reduction_dims=tuple(
+                    (str(item[0]), int(item[1]) if isinstance(item[1], int) else str(item[1]))
+                    for item in payload.get("reduction_dims", ())
+                ),
+                attributes=payload.get("attributes", {}),
+                provenance=payload.get("provenance", {}),
+            )
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise ValueError("invalid operator spec payload") from exc
+        return value
 
 
 @dataclass(frozen=True)
@@ -296,3 +359,22 @@ class OperatorGraph:
             "edges": [edge.to_dict() for edge in self.edges],
             "attributes": dict(self.attributes),
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "OperatorGraph":
+        if not isinstance(payload, Mapping):
+            raise ValueError("operator graph payload must be an object")
+        try:
+            value = cls(
+                graph_id=str(payload["graph_id"]),
+                tensors=tuple(TensorSpec.from_dict(item) for item in payload.get("tensors", ())),
+                operators=tuple(OperatorSpec.from_dict(item) for item in payload.get("operators", ())),
+                edges=tuple(DataEdge.from_dict(item) for item in payload.get("edges", ())),
+                attributes=payload.get("attributes", {}),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid operator graph payload") from exc
+        issues = value.validate()
+        if issues:
+            raise ValueError("invalid operator graph: " + "; ".join(issues))
+        return value

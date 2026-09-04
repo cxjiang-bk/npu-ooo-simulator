@@ -3,6 +3,7 @@ import unittest
 from npu_ooo.frontend import (
     FrontendImportError,
     OfficialStableHLOAdapter,
+    official_stablehlo_available,
     normalize_shape_environment,
 )
 from npu_ooo.frontend.shape_specialization import specialize_stablehlo
@@ -74,6 +75,10 @@ class ShapeSpecializationTest(unittest.TestCase):
         self.assertIn("stablehlo.dynamic_update_slice", result.text)
         self.assertIn("%start", result.text)
 
+    @unittest.skipUnless(
+        official_stablehlo_available(),
+        "requires the official StableHLO mlir binding",
+    )
     def test_constant_dynamic_slice_is_clamped_and_staticized(self) -> None:
         text = """
         module {
@@ -97,6 +102,10 @@ class ShapeSpecializationTest(unittest.TestCase):
         self.assertIn("stablehlo.dynamic_slice", result.dynamic_operations)
         self.assertTrue(OfficialStableHLOAdapter.parse_text(result.text).verified)
 
+    @unittest.skipUnless(
+        official_stablehlo_available(),
+        "requires the official StableHLO mlir binding",
+    )
     def test_constant_dynamic_reshape_is_staticized(self) -> None:
         text = """
         module {

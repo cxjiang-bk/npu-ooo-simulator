@@ -77,7 +77,7 @@ PY
 ```bash
 cd /home/lora/OpenTPU/npu-ooo-simulator
 
-PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-model \
+PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-and-sim \
   --torch-module examples.torch_models:AttentionMicrograph \
   --input-shape 1,4,8 --input-shape 1,4,8 --input-shape 1,4,8 \
   --tile-size 4 --policy dynamic_ready_queue \
