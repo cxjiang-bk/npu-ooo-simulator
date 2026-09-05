@@ -1,0 +1,573 @@
+"""Tile-level semantic instruction contracts used by the compiler/backend boundary.
+
+The objects in this module deliberately sit between :class:`TileInstance` and
+backend-specific :class:`ExecutionTask`.  A TISA instruction is one semantic
+tile operation; its backend payload may contain several primitive operations,
+but the device scheduler observes the instruction as one run-to-complete unit.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Mapping
+
+from .execution import AccessType, ExecutionGraph
+
+
+@dataclass(frozen=True)
+class TileMem:
+    """Logical memory descriptor used by TISA dependency checks.
+
+    ``address_expr`` keeps the compiler's logical slice visible even when a
+    runtime later binds it to a physical base address.  The concrete byte
+    range remains authoritative for the current analytical scoreboard.
+    """
+
+    base: str
+    scope: str = "local"
+    tensor: str | None = None
+    offset_bytes: int | None = None
+    size_bytes: int | None = None
+    address_expr: str | None = None
+    strides_bytes: tuple[int, ...] | None = None
+    stride_expr: str | None = None
+    layout: str = "dense"
+    logical_starts: tuple[int, ...] | None = None
+    logical_shape: tuple[int, ...] | None = None
+
+    def validate(self) -> tuple[str, ...]:
+        issues: list[str] = []
+        if not self.base:
+            issues.append("TISA TileMem base must not be empty")
+        if not self.scope:
+            issues.append("TISA TileMem scope must not be empty")
+        if self.offset_bytes is not None and self.offset_bytes < 0:
+            issues.append("TISA TileMem offset_bytes must be non-negative")
+        if self.size_bytes is not None and self.size_bytes <= 0:
+            issues.append("TISA TileMem size_bytes must be positive")
+        if self.address_expr is not None and not self.address_expr.strip():
+            issues.append("TISA TileMem address_expr must not be blank")
+        if not self.layout or not self.layout.strip():
+            issues.append("TISA TileMem layout must not be blank")
+        if self.strides_bytes is not None:
+            # A rank-0 tensor has no stride axes; ``()`` is its complete
+            # concrete stride metadata and is distinct from missing metadata.
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                for value in self.strides_bytes
+            ):
+                issues.append("TISA TileMem strides_bytes must contain non-negative integers")
+        if self.stride_expr is not None and not self.stride_expr.strip():
+            issues.append("TISA TileMem stride_expr must not be blank")
+        if (self.logical_starts is None) != (self.logical_shape is None):
+            issues.append("TISA TileMem logical starts and shape must be provided together")
+        if self.logical_starts is not None and self.logical_shape is not None:
+            if len(self.logical_starts) != len(self.logical_shape):
+                issues.append("TISA TileMem logical starts and shape must have equal rank")
+            if any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in self.logical_starts
+            ):
+                issues.append("TISA TileMem logical starts must be non-negative integers")
+            if any(
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                for value in self.logical_shape
+            ):
+                issues.append("TISA TileMem logical shape must contain positive integers")
+        return tuple(issues)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "base": self.base,
+            "scope": self.scope,
+            "tensor": self.tensor,
+            "offset_bytes": self.offset_bytes,
+            "size_bytes": self.size_bytes,
+            "address_expr": self.address_expr,
+            "strides_bytes": list(self.strides_bytes) if self.strides_bytes is not None else None,
+            "stride_expr": self.stride_expr,
+            "layout": self.layout,
+            "logical_starts": list(self.logical_starts) if self.logical_starts is not None else None,
+            "logical_shape": list(self.logical_shape) if self.logical_shape is not None else None,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "TileMem":
+        if not isinstance(payload, Mapping):
+            raise ValueError("TISA TileMem payload must be an object")
+        try:
+            value = cls(
+                base=str(payload["base"]),
+                scope=str(payload.get("scope", "local")),
+                tensor=(str(payload["tensor"]) if payload.get("tensor") is not None else None),
+                offset_bytes=(int(payload["offset_bytes"]) if payload.get("offset_bytes") is not None else None),
+                size_bytes=(int(payload["size_bytes"]) if payload.get("size_bytes") is not None else None),
+                address_expr=(str(payload["address_expr"]) if payload.get("address_expr") is not None else None),
+                strides_bytes=(
+                    tuple(int(item) for item in payload["strides_bytes"])
+                    if payload.get("strides_bytes") is not None
+                    else None
+                ),
+                stride_expr=(str(payload["stride_expr"]) if payload.get("stride_expr") is not None else None),
+                layout=str(payload.get("layout", "dense")),
+                logical_starts=(
+                    tuple(int(item) for item in payload["logical_starts"])
+                    if payload.get("logical_starts") is not None
+                    else None
+                ),
+                logical_shape=(
+                    tuple(int(item) for item in payload["logical_shape"])
+                    if payload.get("logical_shape") is not None
+                    else None
+                ),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid TISA TileMem payload") from exc
+        issues = value.validate()
+        if issues:
+            raise ValueError("invalid TISA TileMem: " + "; ".join(issues))
+        return value
+
+
+@dataclass(frozen=True)
+class TISAOperand:
+    """A tile operand: shape, memory range and access mode."""
+
+    name: str
+    tile_shape: tuple[int, ...]
+    tile_mem: TileMem
+    access_type: AccessType | str
+
+    @property
+    def normalized_access(self) -> str:
+        return self.access_type.value if isinstance(self.access_type, AccessType) else str(self.access_type)
+
+    def validate(self) -> tuple[str, ...]:
+        issues: list[str] = []
+        if not self.name:
+            issues.append("TISA operand name must not be empty")
+        if any(value <= 0 for value in self.tile_shape):
+            issues.append(f"TISA operand '{self.name}' tile_shape values must be positive")
+        if self.normalized_access not in {item.value for item in AccessType}:
+            issues.append(f"TISA operand '{self.name}' has invalid access type '{self.normalized_access}'")
+        issues.extend(self.tile_mem.validate())
+        return tuple(issues)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "tile_shape": list(self.tile_shape),
+            "tile_mem": self.tile_mem.to_dict(),
+            "access_type": self.normalized_access,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "TISAOperand":
+        if not isinstance(payload, Mapping):
+            raise ValueError("TISA operand payload must be an object")
+        try:
+            value = cls(
+                name=str(payload["name"]),
+                tile_shape=tuple(int(item) for item in payload["tile_shape"]),
+                tile_mem=TileMem.from_dict(payload["tile_mem"]),
+                access_type=payload["access_type"],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid TISA operand payload") from exc
+        issues = value.validate()
+        if issues:
+            raise ValueError("invalid TISA operand: " + "; ".join(issues))
+        return value
+
+
+@dataclass(frozen=True)
+class UnitMap:
+    """Resource class requested by one semantic tile instruction."""
+
+    unit: str
+    quantity: int = 1
+    affinity: str | None = None
+
+    def validate(self) -> tuple[str, ...]:
+        issues: list[str] = []
+        if not self.unit:
+            issues.append("TISA UnitMap unit must not be empty")
+        if isinstance(self.quantity, bool) or self.quantity <= 0:
+            issues.append("TISA UnitMap quantity must be positive")
+        return tuple(issues)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"unit": self.unit, "quantity": self.quantity, "affinity": self.affinity}
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "UnitMap":
+        if not isinstance(payload, Mapping):
+            raise ValueError("TISA UnitMap payload must be an object")
+        try:
+            value = cls(
+                unit=str(payload["unit"]),
+                quantity=int(payload.get("quantity", 1)),
+                affinity=(str(payload["affinity"]) if payload.get("affinity") is not None else None),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid TISA UnitMap payload") from exc
+        issues = value.validate()
+        if issues:
+            raise ValueError("invalid TISA UnitMap: " + "; ".join(issues))
+        return value
+
+
+@dataclass(frozen=True)
+class TISADependency:
+    """Typed dependency between semantic tile instructions."""
+
+    source: str
+    kind: str = "RAW"
+    condition: str = "full_region_ready"
+    provenance: Mapping[str, Any] = field(default_factory=dict)
+
+    def validate(self) -> tuple[str, ...]:
+        issues: list[str] = []
+        if not self.source:
+            issues.append("TISA dependency source must not be empty")
+        if self.kind not in {
+            "RAW",
+            "WAR",
+            "WAW",
+            "STATE",
+            "ACCUMULATE",
+            "BUFFER_REUSE",
+            "CONTROL",
+        }:
+            issues.append(f"TISA dependency kind '{self.kind}' is unsupported")
+        if not self.condition:
+            issues.append("TISA dependency condition must not be empty")
+        return tuple(issues)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "kind": self.kind,
+            "condition": self.condition,
+            "provenance": dict(self.provenance),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "TISADependency":
+        if not isinstance(payload, Mapping):
+            raise ValueError("TISA dependency payload must be an object")
+        try:
+            value = cls(
+                source=str(payload["source"]),
+                kind=str(payload.get("kind", "RAW")),
+                condition=str(payload.get("condition", "full_region_ready")),
+                provenance=payload.get("provenance", {}),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid TISA dependency payload") from exc
+        issues = value.validate()
+        if issues:
+            raise ValueError("invalid TISA dependency: " + "; ".join(issues))
+        return value
+
+
+@dataclass(frozen=True)
+class TISAInstruction:
+    """One scheduler-visible semantic tile instruction."""
+
+    tisa_id: str
+    tile_id: str
+    operator_id: str
+    op_type: str
+    operands: tuple[TISAOperand, ...]
+    unit_map: UnitMap
+    dependencies: tuple[TISADependency, ...] = ()
+    attributes: Mapping[str, Any] = field(default_factory=dict)
+    payload_ref: str | None = None
+
+    def validate(self) -> tuple[str, ...]:
+        issues: list[str] = []
+        if not self.tisa_id or not self.tile_id or not self.operator_id or not self.op_type:
+            issues.append("TISA instruction identifiers and op_type must not be empty")
+        if not self.operands:
+            issues.append(f"TISA instruction '{self.tisa_id}' must have operands")
+        for operand in self.operands:
+            issues.extend(operand.validate())
+        issues.extend(self.unit_map.validate())
+        for dependency in self.dependencies:
+            issues.extend(dependency.validate())
+            if dependency.source == self.tisa_id:
+                issues.append(f"TISA instruction '{self.tisa_id}' cannot depend on itself")
+        if len({dependency.source for dependency in self.dependencies}) != len(self.dependencies):
+            issues.append(f"TISA instruction '{self.tisa_id}' dependencies must be unique by source")
+        return tuple(issues)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tisa_id": self.tisa_id,
+            "tile_id": self.tile_id,
+            "operator_id": self.operator_id,
+            "op_type": self.op_type,
+            "operands": [operand.to_dict() for operand in self.operands],
+            "unit_map": self.unit_map.to_dict(),
+            "dependencies": [dependency.to_dict() for dependency in self.dependencies],
+            "attributes": dict(self.attributes),
+            "payload_ref": self.payload_ref,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "TISAInstruction":
+        if not isinstance(payload, Mapping):
+            raise ValueError("TISA instruction payload must be an object")
+        try:
+            value = cls(
+                tisa_id=str(payload["tisa_id"]),
+                tile_id=str(payload["tile_id"]),
+                operator_id=str(payload["operator_id"]),
+                op_type=str(payload["op_type"]),
+                operands=tuple(TISAOperand.from_dict(item) for item in payload.get("operands", ())),
+                unit_map=UnitMap.from_dict(payload["unit_map"]),
+                dependencies=tuple(
+                    TISADependency.from_dict(item) for item in payload.get("dependencies", ())
+                ),
+                attributes=payload.get("attributes", {}),
+                payload_ref=(str(payload["payload_ref"]) if payload.get("payload_ref") is not None else None),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid TISA instruction payload") from exc
+        issues = value.validate()
+        if issues:
+            raise ValueError("invalid TISA instruction: " + "; ".join(issues))
+        return value
+
+
+@dataclass(frozen=True)
+class TISAProgram:
+    """A deterministic stream of semantic tile descriptors."""
+
+    program_id: str
+    instructions: tuple[TISAInstruction, ...]
+    attributes: Mapping[str, Any] = field(default_factory=dict)
+
+    def validate(self) -> tuple[str, ...]:
+        issues: list[str] = []
+        if not self.program_id:
+            issues.append("TISA program id must not be empty")
+        ids = {instruction.tisa_id for instruction in self.instructions}
+        instruction_index = {
+            instruction.tisa_id: index for index, instruction in enumerate(self.instructions)
+        }
+        if len(ids) != len(self.instructions):
+            issues.append("TISA instruction ids must be unique")
+        for instruction in self.instructions:
+            issues.extend(instruction.validate())
+            for dependency in instruction.dependencies:
+                if dependency.source not in ids:
+                    issues.append(
+                        f"TISA instruction '{instruction.tisa_id}' references unknown dependency '{dependency.source}'"
+                    )
+                elif instruction_index[dependency.source] >= instruction_index[instruction.tisa_id]:
+                    issues.append(
+                        f"TISA instruction '{instruction.tisa_id}' dependency '{dependency.source}' "
+                        "must precede it in program order"
+                    )
+        return tuple(issues)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "program_id": self.program_id,
+            "instructions": [instruction.to_dict() for instruction in self.instructions],
+            "attributes": dict(self.attributes),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "TISAProgram":
+        if not isinstance(payload, Mapping):
+            raise ValueError("TISA program payload must be an object")
+        try:
+            value = cls(
+                program_id=str(payload["program_id"]),
+                instructions=tuple(
+                    TISAInstruction.from_dict(item) for item in payload.get("instructions", ())
+                ),
+                attributes=payload.get("attributes", {}),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid TISA program payload") from exc
+        issues = value.validate()
+        if issues:
+            raise ValueError("invalid TISA program: " + "; ".join(issues))
+        return value
+
+
+@dataclass(frozen=True)
+class BackendArtifact:
+    """TISA descriptors plus backend payload association.
+
+    ``execution_graph`` is intentionally retained for the current analytical
+    simulator.  A future device backend can replace it with native binary or
+    a cycle model without changing the TISA program contract.
+    """
+
+    artifact_id: str
+    program: TISAProgram
+    execution_graph: ExecutionGraph
+    payloads: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    backend: str = "analytical"
+    attributes: Mapping[str, Any] = field(default_factory=dict)
+
+    def validate(self) -> tuple[str, ...]:
+        issues = list(self.program.validate())
+        issues.extend(self.execution_graph.validate())
+        instructions = {
+            instruction.tisa_id: instruction for instruction in self.program.instructions
+        }
+        instruction_ids = set(instructions)
+        task_owners: dict[str, str] = {}
+        for tisa_id, task_ids in self.payloads.items():
+            if tisa_id not in instruction_ids:
+                issues.append(f"backend payload references unknown TISA instruction '{tisa_id}'")
+                continue
+            if not task_ids:
+                issues.append(f"backend payload for TISA instruction '{tisa_id}' must not be empty")
+                continue
+            payload_resources: set[str] = set()
+            for task_id in task_ids:
+                previous_owner = task_owners.get(task_id)
+                if previous_owner is not None:
+                    issues.append(
+                        f"backend task '{task_id}' belongs to both '{previous_owner}' and '{tisa_id}'"
+                    )
+                else:
+                    task_owners[task_id] = tisa_id
+                try:
+                    task = self.execution_graph.task(task_id)
+                except KeyError:
+                    issues.append(f"backend payload references unknown task '{task_id}'")
+                    continue
+                payload_resources.add(task.resource)
+                if task.tile_id != instructions[tisa_id].tile_id:
+                    issues.append(f"backend payload task '{task_id}' is attached to the wrong TISA tile")
+            if len(payload_resources) > 1:
+                issues.append(
+                    f"backend payload for TISA instruction '{tisa_id}' spans multiple resources: "
+                    + ", ".join(sorted(payload_resources))
+                )
+        for instruction in self.program.instructions:
+            if instruction.payload_ref is not None and instruction.tisa_id not in self.payloads:
+                issues.append(
+                    f"TISA instruction '{instruction.tisa_id}' has no backend payload"
+                )
+        for task in self.execution_graph.tasks:
+            if task.task_id not in task_owners:
+                issues.append(f"backend task '{task.task_id}' is not owned by a TISA payload")
+
+        dependency_sources = {
+            instruction.tisa_id: {
+                dependency.source for dependency in instruction.dependencies
+            }
+            for instruction in self.program.instructions
+        }
+        task_by_id = {task.task_id: task for task in self.execution_graph.tasks}
+        composite_types = {"softmax", "rmsnorm", "layernorm"}
+
+        # A primitive payload may expose an edge that skips one or more
+        # semantic stages.  Validation checks that the owner-to-owner ordering
+        # is reachable in the TISA dependency DAG, rather than requiring every
+        # backend-internal edge to be repeated as a direct TISA edge.
+        dependency_closure: dict[str, set[str]] = {}
+
+        def ancestors(tisa_id: str, active: set[str] | None = None) -> set[str]:
+            cached = dependency_closure.get(tisa_id)
+            if cached is not None:
+                return set(cached)
+            visiting = set() if active is None else active
+            if tisa_id in visiting:
+                return set()
+            visiting.add(tisa_id)
+            result: set[str] = set()
+            for source in dependency_sources.get(tisa_id, set()):
+                if source not in instructions:
+                    continue
+                result.add(source)
+                result.update(ancestors(source, visiting))
+            visiting.remove(tisa_id)
+            dependency_closure[tisa_id] = set(result)
+            return result
+
+        for tisa_id in instructions:
+            ancestors(tisa_id)
+        for task in self.execution_graph.tasks:
+            owner = task_owners.get(task.task_id)
+            if owner is None:
+                continue
+            for predecessor_id in task.predecessors:
+                predecessor_owner = task_owners.get(predecessor_id)
+                if predecessor_owner is None or predecessor_owner == owner:
+                    continue
+
+                # Composite lowering may keep a materialized primitive DAG
+                # across tiles (for example, row-wise softmax's max and sum
+                # finalization).  Those edges are implementation details of
+                # the payload and are intentionally not promoted to global
+                # TISA dependencies.  The semantic instruction is still
+                # ordered at the tile boundary; cross-operator edges remain
+                # subject to the strict check below.
+                predecessor_task = task_by_id.get(predecessor_id)
+                owner_instruction = instructions[owner]
+                predecessor_instruction = instructions[predecessor_owner]
+                same_operator = (
+                    predecessor_task is not None
+                    and predecessor_task.operator_id == task.operator_id
+                    and task.operator_id == owner_instruction.operator_id
+                )
+                same_composite_operator = (
+                    owner_instruction.attributes.get("semantic_op_type")
+                    in composite_types
+                    and predecessor_instruction.attributes.get("semantic_op_type")
+                    == owner_instruction.attributes.get("semantic_op_type")
+                    and same_operator
+                )
+                if same_composite_operator:
+                    continue
+                if predecessor_owner not in dependency_closure.get(owner, set()):
+                    issues.append(
+                        f"backend task edge '{predecessor_id}' -> '{task.task_id}' is not "
+                        f"ordered by TISA dependency '{predecessor_owner}' -> '{owner}'"
+                    )
+        return tuple(issues)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "artifact_id": self.artifact_id,
+            "program": self.program.to_dict(),
+            "execution_graph": self.execution_graph.to_dict(),
+            "payloads": {key: list(value) for key, value in self.payloads.items()},
+            "backend": self.backend,
+            "attributes": dict(self.attributes),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "BackendArtifact":
+        if not isinstance(payload, Mapping):
+            raise ValueError("backend artifact payload must be an object")
+        try:
+            value = cls(
+                artifact_id=str(payload["artifact_id"]),
+                program=TISAProgram.from_dict(payload["program"]),
+                execution_graph=ExecutionGraph.from_dict(payload["execution_graph"]),
+                payloads={
+                    str(key): tuple(str(item) for item in items)
+                    for key, items in payload.get("payloads", {}).items()
+                },
+                backend=str(payload.get("backend", "analytical")),
+                attributes=payload.get("attributes", {}),
+            )
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise ValueError("invalid backend artifact payload") from exc
+        issues = value.validate()
+        if issues:
+            raise ValueError("invalid backend artifact: " + "; ".join(issues))
+        return value

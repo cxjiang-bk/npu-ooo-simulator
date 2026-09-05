@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "npu-ooo-simulator"
+version = "0.1.0"
+description = "Configurable NPU tile scheduling and cycle simulation research stack"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+torch = ["torch==2.9.1"]
+torch-xla = ["torch==2.9.1", "torch-xla==2.9.0"]
+
+[project.scripts]
+npu-ooo = "npu_ooo.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
