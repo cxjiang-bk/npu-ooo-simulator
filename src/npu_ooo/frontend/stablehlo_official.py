@@ -324,6 +324,31 @@ def _project_module(module: Any) -> str:
                 f"({', '.join(operand_types)}) -> {result_type}"
             )
             continue
+        if name == "stablehlo.gather":
+            dimension_numbers = str(operation.attributes["dimension_numbers"])
+
+            def gather_values(attribute: str) -> tuple[int, ...]:
+                match = re.search(rf"{attribute}\s*=\s*\[([^]]*)\]", dimension_numbers)
+                return _ints(match.group(1)) if match else ()
+
+            index_vector_match = re.search(
+                r"index_vector_dim\s*=\s*(-?\d+)", dimension_numbers
+            )
+            if index_vector_match is None:
+                raise FrontendImportError(
+                    "official StableHLO gather projection is missing index_vector_dim"
+                )
+            slice_sizes = _attribute_ints(operation.attributes["slice_sizes"])
+            lines.append(
+                f"    %{result_name} = stablehlo.gather %{operands[0]}, %{operands[1]} "
+                f"offset_dims = [{', '.join(map(str, gather_values('offset_dims')))}] "
+                f"collapsed_slice_dims = [{', '.join(map(str, gather_values('collapsed_slice_dims')))}] "
+                f"start_index_map = [{', '.join(map(str, gather_values('start_index_map')))}] "
+                f"index_vector_dim = {index_vector_match.group(1)} "
+                f"slice_sizes = [{', '.join(map(str, slice_sizes))}] : "
+                f"({', '.join(operand_types)}) -> {result_type}"
+            )
+            continue
         if name == "stablehlo.concatenate":
             dimension = _attribute_int(operation.attributes["dimension"])
             lines.append(

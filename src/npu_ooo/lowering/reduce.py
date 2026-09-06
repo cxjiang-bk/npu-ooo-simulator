@@ -39,18 +39,29 @@ def _reduce_regions(operator, tensors: dict[str, Any], tile: TileInstance, memor
         raise ValueError(f"reduce operator '{operator.op_id}' requires one input and one output")
     iteration = tuple(name for name, _ in operator.iteration_dims)
     reduction = tuple(name for name, _ in operator.reduction_dims)
-    if len(iteration) != 1 or len(reduction) != 1:
-        raise ValueError(f"reduce operator '{operator.op_id}' currently requires one iteration and one reduction dimension")
+    if not reduction:
+        raise ValueError(f"reduce operator '{operator.op_id}' requires at least one reduction dimension")
     input_tensor = tensors[operator.inputs[0]]
     output_tensor = tensors[operator.outputs[0]]
     bounds = tile.bound_map
-    input_starts = (bounds[iteration[0]][0], bounds[reduction[0]][0])
-    input_shape = (
-        bounds[iteration[0]][1] - bounds[iteration[0]][0],
-        bounds[reduction[0]][1] - bounds[reduction[0]][0],
-    )
-    output_starts = (bounds[iteration[0]][0],)
-    output_shape = (bounds[iteration[0]][1] - bounds[iteration[0]][0],)
+    logical_dimensions = (*iteration, *reduction)
+    axis_by_dimension: dict[str, int] = {}
+    for name in logical_dimensions:
+        if name.startswith("d") and name[1:].isdigit():
+            axis_by_dimension[name] = int(name[1:])
+    if (
+        len(axis_by_dimension) == len(logical_dimensions)
+        and set(axis_by_dimension.values()) == set(range(len(logical_dimensions)))
+    ):
+        input_dimensions = tuple(
+            name for name, _axis in sorted(axis_by_dimension.items(), key=lambda item: item[1])
+        )
+    else:
+        input_dimensions = logical_dimensions
+    input_starts = tuple(bounds[name][0] for name in input_dimensions)
+    input_shape = tuple(bounds[name][1] - bounds[name][0] for name in input_dimensions)
+    output_starts = tuple(bounds[name][0] for name in iteration)
+    output_shape = tuple(bounds[name][1] - bounds[name][0] for name in iteration)
     return (
         _region(input_tensor, memory, input_starts, input_shape, AccessType.READ),
         _region(output_tensor, memory, output_starts, output_shape, AccessType.WRITE),
@@ -62,7 +73,7 @@ def lower_reduce_graph(
     schedule: ScheduleSpec,
     machine: MachineConfig,
 ) -> LoweringResult:
-    """Lower one-dimensional reductions into load -> ARU reduce -> store tasks."""
+    """Lower resolved reductions into load -> ARU reduce -> store tasks."""
 
     graph_issues = graph.validate()
     schedule_issues = schedule.validate(graph)
@@ -86,15 +97,16 @@ def lower_reduce_graph(
         from npu_ooo.ir.tile import enumerate_operator_tiles
 
         tiles = enumerate_operator_tiles(operator, op_schedule)
-        reduction_name = operator.reduction_dims[0][0]
-        reduction_extent = dict(operator.reduction_dims)[reduction_name]
+        reduction_names = tuple(name for name, _ in operator.reduction_dims)
+        reduction_extents = dict(operator.reduction_dims)
         partials: dict[tuple[int, ...], str] = {}
         for tile in tiles:
             input_global, output_global = _reduce_regions(operator, tensors, tile, root)
             input_local, output_local_write = _reduce_regions(operator, tensors, tile, local)
             input_local = BufferRegion(**{**input_local.__dict__, "access": AccessType.READ})
             output_local_read = BufferRegion(**{**output_local_write.__dict__, "access": AccessType.READ})
-            output_local_access = AccessType.READ_WRITE if tile.bound_map[reduction_name][0] > 0 else AccessType.WRITE
+            first_partial = all(tile.bound_map[name][0] == 0 for name in reduction_names)
+            output_local_access = AccessType.WRITE if first_partial else AccessType.READ_WRITE
             output_local_write = BufferRegion(**{**output_local_write.__dict__, "access": output_local_access})
             load_id = f"{tile.tile_id}.load"
             predecessors = {
@@ -147,8 +159,12 @@ def lower_reduce_graph(
                     program_order=task_order,
                     attributes={
                         "elements": elements,
-                        "reduction_start": tile.bound_map[reduction_name][0],
-                        "reduction_stop": tile.bound_map[reduction_name][1],
+                        "reduction_starts": {
+                            name: tile.bound_map[name][0] for name in reduction_names
+                        },
+                        "reduction_stops": {
+                            name: tile.bound_map[name][1] for name in reduction_names
+                        },
                         "iteration": tile.ordinal,
                     },
                 )
@@ -157,7 +173,10 @@ def lower_reduce_graph(
             partials[output_key] = reduce_id
             input_elements += elements
             transfer_bytes += input_global.size_bytes
-            if tile.bound_map[reduction_name][1] == reduction_extent:
+            if all(
+                tile.bound_map[name][1] == reduction_extents[name]
+                for name in reduction_names
+            ):
                 store_id = f"{tile.tile_id}.store"
                 store_duration, store_ii, store_unit = _transfer_timing(machine, local, root, output_global.size_bytes)
                 tasks.append(

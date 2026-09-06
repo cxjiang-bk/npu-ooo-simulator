@@ -178,6 +178,7 @@ SoftmaxFusionPass
 RotaryEmbeddingRegionPass
 AttentionRegionPass
 SwiGLUFusionPass
+MoEDispatchRegionPass
 ```
 
 GC 通过 fixed-point recovery 处理同一图中的多个规范化节点。复合语义以 region metadata
@@ -189,6 +190,8 @@ GC 通过 fixed-point recovery 处理同一图中的多个规范化节点。复�
   继续可见；
 - SwiGLU semantic operator 收敛 `logistic -> silu multiply -> gate multiply`，内部
   primitive 由同一 vector payload 承担；
+- MoE dispatch region 保留 router softmax、top-k mask、per-expert dispatch weight、
+  expert output 和 combine 角色；成员继续生成独立 TISA，以暴露 expert 分支并行；
 - KV-cache recovery 识别固定窗口 `slice(cache) + concatenate(update)`，生成带
   `state_id/state_buffer` 的 `kv_cache_update`。
 
@@ -308,6 +311,7 @@ elementwise / residual_add
 reduce / softmax / rmsnorm / layernorm
 reshape / transpose / conv2d / pooling
 dtype_convert / kv_cache_update
+embedding gather
 ```
 
 backend 通过 `TimingProvider` 提供 duration 和 initiation interval；`EventBackend`
@@ -369,6 +373,11 @@ sequence simulator 合并每个 invocation 的事件和 timing，输出
 stride、固定窗口和顺序 decode；动态 position、paged cache、跨 request ownership 和
 完整 cache layout 作为后续 runtime capability。
 
+`RuntimeSequence` 同时承担 paper-matrix 的 request replay。Stateful request 使用相邻
+`state_complete` 边；stateless request 使用相同 compile package 和 buffer contract，按
+配置的 inter-request gap 顺序重放。sequence 汇总对所有 invocation 的 runtime submit、
+device 和 synchronization 周期求和。
+
 ## 9. Device Scheduler
 
 `schedule_tisa_program()` 消费 BackendArtifact、MachineConfig、RuntimeSubmission、
@@ -423,6 +432,8 @@ policy、TISA instruction count、cycle 和 calibration status。
 - Matmul、batched Matmul、GEMV、elementwise、reduce、Softmax、LayerNorm、RMSNorm；
 - Attention、SwiGLU、RoPE、Conv2D、BatchNorm inference、max/avg pooling；
 - reshape/transpose、slice、静态 broadcast、scalar tensor、dtype convert；
+- token/position/type embedding gather、causal mask、重复 Transformer/ResNet block；
+- DeepSeek dense 与外部 top-k mask 驱动的 MoE dispatch region；
 - 固定窗口 KV-cache、dynamic_update_slice state contract 与多步 RuntimeSequence；
 - analytical、timing table、systolic MXU profile 和 RTL completion trace importer。
 
@@ -430,9 +441,9 @@ policy、TISA instruction count、cycle 和 calibration status。
 
 1. 更复杂 StableHLO layout dialect 的扩展与 bank-aware memory timing 校准；
 2. online Softmax 的数值 rescale、最终 normalization 与 workspace 生命周期；
-3. 完整 ResNet/BERT/GPT-J/LLaMA2 模型 repetition、DeepSeek MoE routing；
-4. 论文 WQ/IQ/Fu 容量、dispatch/wake-up/issue/completion 控制开销的硬件校准；
-5. SCALE-Sim、Ramulator2/DRAMSys、RTL/Verilator 和 system simulator adapter。
+3. 论文 WQ/IQ/Fu 容量、dispatch/wake-up/issue/completion 控制开销的硬件校准；
+4. SCALE-Sim、Ramulator2/DRAMSys、RTL/Verilator 和 system simulator adapter；
+5. 动态 top-k、token compaction/expert capacity 与精确论文模型拓扑。
 
 当前结果标签为 `TISA instruction-level analytical scheduling baseline`。加载相应
 profile 后，结果标签随 manifest 的 calibration status 变化；trace schema 和编译产物

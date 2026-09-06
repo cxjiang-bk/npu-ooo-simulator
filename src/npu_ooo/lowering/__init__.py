@@ -12,6 +12,7 @@ from .conv2d import lower_conv2d_graph
 from .batch_norm import lower_batch_norm_graph
 from .pool import lower_pool_graph
 from .transform import lower_transform_graph
+from .embedding import lower_embedding_graph
 from .registry import (
     LoweringRegistry,
     default_lowering_registry,
@@ -31,6 +32,7 @@ __all__ = [
     "lower_batch_norm_graph",
     "lower_pool_graph",
     "lower_transform_graph",
+    "lower_embedding_graph",
     "lower_matmul_graph",
     "LoweringRegistry",
     "default_lowering_registry",

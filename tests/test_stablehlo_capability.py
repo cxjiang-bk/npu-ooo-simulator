@@ -7,6 +7,118 @@ from npu_ooo.frontend.stablehlo_official import _project_module
 
 
 class StableHLOCapabilityBoundaryTest(unittest.TestCase):
+    def test_embedding_gather_preserves_table_and_runtime_indices(self) -> None:
+        imported = StableHLOAdapter.from_text(
+            """
+            module {
+              func.func @main(%table: tensor<16x8xf32>, %indices: tensor<2x3xi64>) -> tensor<2x3x8xf32> {
+                %0 = stablehlo.gather %table, %indices offset_dims = [2] collapsed_slice_dims = [0] start_index_map = [0] index_vector_dim = 2 slice_sizes = [1, 8] : (tensor<16x8xf32>, tensor<2x3xi64>) -> tensor<2x3x8xf32>
+                return %0 : tensor<2x3x8xf32>
+              }
+            }
+            """,
+            model_id="embedding-gather",
+        )
+
+        operator = imported.graph.operators[0]
+        self.assertEqual(operator.normalized_type, "embedding")
+        self.assertEqual(operator.inputs, ("table", "indices"))
+        self.assertEqual(operator.attributes["gather_kind"], "embedding_lookup")
+        self.assertEqual(operator.attributes["vocabulary_size"], 16)
+        self.assertEqual(operator.attributes["embedding_dim"], 8)
+        self.assertEqual(operator.attributes["index_region"], "runtime_values")
+
+    def test_embedding_gather_accepts_torch_xla_unsigned_flattened_indices(self) -> None:
+        imported = StableHLOAdapter.from_text(
+            """
+            module {
+              func.func @main(%table: tensor<16x8xf32>, %indices: tensor<6xui32>) -> tensor<6x8xf32> {
+                %0 = stablehlo.gather %table, %indices offset_dims = [1] collapsed_slice_dims = [0] start_index_map = [0] index_vector_dim = 1 slice_sizes = [1, 8] : (tensor<16x8xf32>, tensor<6xui32>) -> tensor<6x8xf32>
+                return %0 : tensor<6x8xf32>
+              }
+            }
+            """,
+            model_id="torch-xla-embedding-gather",
+        )
+
+        operator = imported.graph.operators[0]
+        self.assertEqual(operator.normalized_type, "embedding")
+        self.assertEqual(operator.attributes["offset_dims"], [1])
+        self.assertEqual(operator.attributes["index_vector_dim"], 1)
+
+    def test_official_projection_preserves_torch_xla_gather_dimension_numbers(self) -> None:
+        class Value:
+            def __init__(self, type_name):
+                self.type = type_name
+
+        class Operation:
+            def __init__(self, name, *, results=(), operands=(), attributes=None):
+                self.name = name
+                self.operation = self
+                self.results = list(results)
+                self.operands = list(operands)
+                self.attributes = dict(attributes or {})
+                self.regions = []
+
+        class Block:
+            def __init__(self, arguments, operations):
+                self.arguments = arguments
+                self._operations = operations
+
+            def __iter__(self):
+                return iter(self._operations)
+
+        table = Value("tensor<16x8xf32>")
+        indices = Value("tensor<6xui32>")
+        result = Value("tensor<6x8xf32>")
+        gather = Operation(
+            "stablehlo.gather",
+            results=(result,),
+            operands=(table, indices),
+            attributes={
+                "dimension_numbers": (
+                    "#stablehlo.gather<offset_dims = [1], collapsed_slice_dims = [0], "
+                    "start_index_map = [0], index_vector_dim = 1>"
+                ),
+                "slice_sizes": "array<i64: 1, 8>",
+            },
+        )
+        returned = Operation("func.return", operands=(result,))
+        function = Operation("func.func")
+        function.attributes = {
+            "function_type": (
+                "(tensor<16x8xf32>, tensor<6xui32>) -> tensor<6x8xf32>"
+            )
+        }
+        function.regions = [
+            SimpleNamespace(blocks=[Block((table, indices), (gather, returned))])
+        ]
+        module = SimpleNamespace(
+            operation=SimpleNamespace(
+                regions=[SimpleNamespace(blocks=[Block((), (function,))])]
+            )
+        )
+
+        projected = _project_module(module)
+        imported = StableHLOAdapter.from_text(projected)
+        operator = imported.graph.operators[0]
+        self.assertIn("offset_dims = [1]", projected)
+        self.assertEqual(operator.normalized_type, "embedding")
+        self.assertEqual(operator.attributes["slice_sizes"], [1, 8])
+
+    def test_embedding_gather_rejects_non_row_lookup(self) -> None:
+        with self.assertRaisesRegex(FrontendImportError, "row lookup"):
+            StableHLOAdapter.from_text(
+                """
+                module {
+                  func.func @main(%table: tensor<16x8xf32>, %indices: tensor<2x3xi64>) -> tensor<2x3x8xf32> {
+                    %0 = stablehlo.gather %table, %indices offset_dims = [2] collapsed_slice_dims = [1] start_index_map = [0] index_vector_dim = 2 slice_sizes = [1, 8] : (tensor<16x8xf32>, tensor<2x3xi64>) -> tensor<2x3x8xf32>
+                    return %0 : tensor<2x3x8xf32>
+                  }
+                }
+                """
+            )
+
     def test_broadcast_in_dim_preserves_shape_and_dimension_mapping(self) -> None:
         imported = StableHLOAdapter.from_text(
             """

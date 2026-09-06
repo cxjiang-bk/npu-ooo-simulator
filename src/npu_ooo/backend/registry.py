@@ -41,6 +41,7 @@ _ANALYTICAL_PRIMITIVES = frozenset(
         "conv2d",
         "batch_norm",
         "pool",
+        "gather",
     }
 )
 

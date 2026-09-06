@@ -17,6 +17,7 @@ SPEC = PaperBenchmarkSpec(
     "bert-base", "BERT-Base", "encoder_transformer", "inference", "float16", 64, 128, None,
     768, 12, 3072, 7.5, 9.8, 1.31, "transformer_one_block",
     ("token_embedding", "position_embedding", "full_model_depth", "exact_gelu"),
+    "full_model", 12,
 )
 
 
@@ -25,6 +26,7 @@ def build(
     dtype: torch.dtype | None = None,
     *,
     layer_count: int = 1,
+    model_scope: str = "one_block",
 ) -> PaperBenchmarkWorkload:
     return transformer_workload(
         SPEC,
@@ -32,4 +34,5 @@ def build(
         variant=variant,
         dtype=dtype,
         layer_count=layer_count,
+        model_scope=model_scope,
     )

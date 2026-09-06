@@ -34,6 +34,7 @@ from npu_ooo.ir import (
     DynamicIndexBinding,
     OperatorGraph,
     RuntimeLayoutBinding,
+    RuntimeSequence,
     allocate_buffer_bindings,
     create_runtime_sequence,
     create_runtime_state_registry,
@@ -393,7 +394,19 @@ def _add_paper_matrix_arguments(parser: argparse.ArgumentParser) -> None:
         "--layer-count",
         type=int,
         default=1,
-        help="transformer depth proxy; 1 preserves the one-block benchmark rows",
+        help="materialized block count; 1 preserves the one-block benchmark rows",
+    )
+    parser.add_argument(
+        "--model-scope",
+        choices=("one_block", "model_proxy"),
+        default="one_block",
+        help="one_block preserves the baseline; model_proxy adds embeddings and model shell",
+    )
+    parser.add_argument(
+        "--deepseek-mode",
+        choices=("dense", "moe_proxy"),
+        default="dense",
+        help="DeepSeek feed-forward path; moe_proxy consumes explicit sparse routing weights",
     )
     parser.add_argument("--tile-size", type=int, default=32)
     parser.add_argument(
@@ -449,6 +462,13 @@ def _add_paper_matrix_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--runtime-chunk-size", type=int)
     parser.add_argument("--runtime-launch-latency", type=float, default=0.0)
     parser.add_argument("--runtime-synchronization-cycles", type=float, default=0.0)
+    parser.add_argument(
+        "--request-count",
+        type=int,
+        default=1,
+        help="sequential request replays that reuse the same compiled artifact",
+    )
+    parser.add_argument("--inter-request-gap", type=float, default=0.0)
     parser.add_argument("--runtime-availability-config", type=Path)
     parser.add_argument("--runtime-base-address", type=lambda value: int(value, 0), default=0x10000000)
     parser.add_argument("--runtime-alignment", type=int, default=256)
@@ -705,7 +725,12 @@ def _write_paper_policy_artifacts(case_dir: Path, case) -> None:
     (policy_dir / "05_runtime").mkdir(parents=True, exist_ok=True)
     (policy_dir / "06_simulation").mkdir(parents=True, exist_ok=True)
     (policy_dir / "07_trace").mkdir(parents=True, exist_ok=True)
-    write_artifact_json(case.submission, policy_dir / "05_runtime" / "runtime_submission.json")
+    runtime_name = (
+        "runtime_sequence.json"
+        if isinstance(case.submission, RuntimeSequence)
+        else "runtime_submission.json"
+    )
+    write_artifact_json(case.submission, policy_dir / "05_runtime" / runtime_name)
     write_json(case.result, policy_dir / "06_simulation" / "summary.json")
     write_csv(case.result, policy_dir / "06_simulation" / "tasks.csv")
     write_instruction_csv(case.result, policy_dir / "06_simulation" / "tisa_instructions.csv")
@@ -714,12 +739,38 @@ def _write_paper_policy_artifacts(case_dir: Path, case) -> None:
     write_artifact_json(case.result.perfetto_trace(), policy_dir / "07_trace" / "perfetto.json")
 
 
+def _paper_profile_name(run) -> str:
+    if (
+        run.model_scope == "one_block"
+        and run.layer_count == 1
+        and run.deepseek_mode in {"dense", "not_applicable"}
+        and run.request_count == 1
+        and run.inter_request_gap_cycles == 0
+    ):
+        return run.variant
+    fields = [
+        run.variant,
+        f"scope-{run.model_scope}",
+        f"layers-{run.layer_count}",
+    ]
+    if run.deepseek_mode != "not_applicable":
+        fields.append(f"deepseek-{run.deepseek_mode}")
+    fields.extend(
+        (
+            f"requests-{run.request_count}",
+            f"gap-{run.inter_request_gap_cycles:g}",
+        )
+    )
+    return "__".join(fields)
+
+
 def _write_paper_matrix(root: Path, matrix, machine) -> list[dict[str, Any]]:
     root.mkdir(parents=True, exist_ok=True)
     records: list[dict[str, Any]] = []
     index_entries: list[dict[str, Any]] = []
     for run in matrix.runs:
-        case_dir = root / run.case_id / run.variant
+        profile = _paper_profile_name(run)
+        case_dir = root / run.case_id / profile
         case_dir.mkdir(parents=True, exist_ok=True)
         if run.compiled is not None:
             _write_compiled_case_artifacts(run.compiled, case_dir, machine)
@@ -742,6 +793,10 @@ def _write_paper_matrix(root: Path, matrix, machine) -> list[dict[str, Any]]:
                     "schema_version": 1,
                     "benchmark_id": run.case_id,
                     "variant": run.variant,
+                    "profile": profile,
+                    "layer_count": run.layer_count,
+                    "model_scope": run.model_scope,
+                    "deepseek_mode": run.deepseek_mode,
                     "spec": dict(run.spec),
                     "status": "error" if run.error else "ok",
                     "error": run.error,
@@ -763,6 +818,10 @@ def _write_paper_matrix(root: Path, matrix, machine) -> list[dict[str, Any]]:
             {
                 "benchmark_id": run.case_id,
                 "variant": run.variant,
+                "profile": profile,
+                "layer_count": run.layer_count,
+                "model_scope": run.model_scope,
+                "deepseek_mode": run.deepseek_mode,
                 "status": "error" if run.error else "ok",
                 "case_output_dir": str(case_dir.relative_to(root)),
                 "policy_output_dirs": [
@@ -794,6 +853,11 @@ def _write_paper_matrix(root: Path, matrix, machine) -> list[dict[str, Any]]:
             {
                 "schema_version": 1,
                 "variant": matrix.variant,
+                "layer_count": matrix.layer_count,
+                "model_scope": matrix.model_scope,
+                "deepseek_mode": matrix.deepseek_mode,
+                "request_count": matrix.request_count,
+                "inter_request_gap_cycles": matrix.inter_request_gap_cycles,
                 "case_count": len(index_entries),
                 "cases": index_entries,
             },
@@ -808,7 +872,7 @@ def _write_paper_matrix(root: Path, matrix, machine) -> list[dict[str, Any]]:
         "# 论文模型矩阵\n\n"
         "每个 benchmark 只编译一次，然后在同一份 TISA/backend artifact 和 buffer binding 上比较设备调度策略。"
         "默认 runtime 固定为 static，只改变 device policy；使用 `--runtime-device-matrix` 才会展开四组合。\n\n"
-        "`sweep.csv/json` 是跨 case 汇总；每个 `<benchmark>/<variant>/` 目录保存该 case 的汇总和 manifest。"
+        "`sweep.csv/json` 是跨 case 汇总；默认实验写入 `<benchmark>/<variant>/`，扩展模型/请求实验使用带 scope、层数和请求数的 profile 目录。"
         "`matrix_index.json` 是本次运行实际 case 的权威索引；复用 output 目录时，旧 case 目录可能仍存在，"
         "应以该索引而不是目录枚举为准。当前 workload 是 scaled micro 或 representative paper_shape proxy，"
         "reference 字段来自论文，不能与 analytical cycle 混为绝对性能。\n",
@@ -863,6 +927,8 @@ def run_paper_matrix(args: argparse.Namespace) -> int:
         case_ids=_paper_case_ids(args.benchmarks),
         variant=args.variant,
         layer_count=args.layer_count,
+        model_scope=args.model_scope,
+        deepseek_mode=args.deepseek_mode,
         tile_size=args.tile_size,
         tile_size_candidates=tile_size_candidates,
         runtime_policies=runtime_policies,
@@ -880,12 +946,18 @@ def run_paper_matrix(args: argparse.Namespace) -> int:
         event_backend=event_backend,
         codegen_backend=codegen_backend,
         continue_on_error=args.continue_on_error,
+        request_count=args.request_count,
+        inter_request_gap_cycles=args.inter_request_gap,
     )
     records = _write_paper_matrix(args.output_dir, matrix, machine)
     manifest = {
         "schema_version": 1,
         "variant": args.variant,
         "layer_count": args.layer_count,
+        "model_scope": args.model_scope,
+        "deepseek_mode": args.deepseek_mode,
+        "request_count": args.request_count,
+        "inter_request_gap_cycles": args.inter_request_gap,
         "benchmarks": [run.case_id for run in matrix.runs],
         "architecture": args.arch,
         "machine_hash": machine.stable_hash(),

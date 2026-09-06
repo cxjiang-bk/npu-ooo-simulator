@@ -142,6 +142,13 @@ _CAPABILITIES = {
             backend_capability_key="concatenate",
         ),
         StableHLOOpCapability(
+            op_name="stablehlo.gather",
+            semantic_family=SemanticOpType.EMBEDDING.value,
+            min_operands=2,
+            max_operands=2,
+            backend_capability_key="embedding",
+        ),
+        StableHLOOpCapability(
             op_name="stablehlo.batch_norm_training",
             semantic_family="stablehlo.batch_norm_training",
             min_operands=3,

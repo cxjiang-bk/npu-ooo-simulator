@@ -5,9 +5,22 @@ from typing import Iterable, Mapping, Sequence
 
 from npu_ooo.arch import MachineConfig
 from npu_ooo.backend import EventBackend
-from npu_ooo.ir import BackendArtifact, BufferBinding, RuntimeSubmission, create_runtime_submission
-from npu_ooo.scheduler import SchedulerPolicy, schedule_tisa_program
-from npu_ooo.simulator import SimulationResult, SimulatorConfig, TimingModel
+from npu_ooo.ir import (
+    BackendArtifact,
+    BufferBinding,
+    RuntimeSequence,
+    RuntimeSubmission,
+    create_runtime_sequence,
+    create_runtime_state_registry,
+    create_runtime_submission,
+)
+from npu_ooo.scheduler import SchedulerPolicy, schedule_tisa_program, schedule_tisa_sequence
+from npu_ooo.simulator import (
+    RuntimeSequenceSimulationResult,
+    SimulationResult,
+    SimulatorConfig,
+    TimingModel,
+)
 
 
 @dataclass(frozen=True)
@@ -16,21 +29,32 @@ class RuntimeDeviceCase:
 
     runtime_policy: str
     device_policy: str
-    submission: RuntimeSubmission
-    result: SimulationResult
+    submission: RuntimeSubmission | RuntimeSequence
+    result: SimulationResult | RuntimeSequenceSimulationResult
 
     @property
     def case_id(self) -> str:
         return f"runtime-{self.runtime_policy}__device-{self.device_policy}"
 
     def to_dict(self) -> dict[str, object]:
+        if isinstance(self.submission, RuntimeSequence):
+            invocations = self.submission.invocations
+            program_id = self.submission.program_id
+            artifact_id = self.submission.artifact_id
+            command_count = sum(len(item.commands) for item in invocations)
+        else:
+            invocations = (self.submission,)
+            program_id = self.submission.program_id
+            artifact_id = self.submission.artifact_id
+            command_count = len(self.submission.commands)
         return {
             "case_id": self.case_id,
             "runtime_policy": self.runtime_policy,
             "device_policy": self.device_policy,
-            "program_id": self.submission.program_id,
-            "artifact_id": self.submission.artifact_id,
-            "runtime_command_chunk_count": len(self.submission.commands),
+            "program_id": program_id,
+            "artifact_id": artifact_id,
+            "request_count": len(invocations),
+            "runtime_command_chunk_count": command_count,
             "runtime_submit_cycles": self.result.metrics.get("runtime_submit_cycles", 0.0),
             "runtime_submit_busy_cycles": self.result.metrics.get(
                 "runtime_submit_busy_cycles", 0.0
@@ -69,32 +93,64 @@ def run_runtime_device_matrix(
     timing_model: TimingModel | None = None,
     simulator_config: SimulatorConfig | None = None,
     event_backend: EventBackend | None = None,
+    request_count: int = 1,
+    inter_request_gap_cycles: float = 0.0,
 ) -> tuple[RuntimeDeviceCase, ...]:
     """Run policy combinations without recompiling or reallocating buffers."""
 
     normalized_buffers = tuple(buffers)
+    if isinstance(request_count, bool) or not isinstance(request_count, int) or request_count <= 0:
+        raise ValueError("request_count must be a positive integer")
+    if inter_request_gap_cycles < 0:
+        raise ValueError("inter_request_gap_cycles must be non-negative")
     cases: list[RuntimeDeviceCase] = []
     for runtime_policy in runtime_policies:
-        submission = create_runtime_submission(
-            artifact,
-            normalized_buffers,
-            submission_id=f"submission.{artifact.program.program_id}.{runtime_policy}",
-            policy=runtime_policy,
-            chunk_size=chunk_size,
-            launch_latency_cycles=launch_latency_cycles,
-            synchronization_cycles=synchronization_cycles,
-            descriptor_available_cycles=descriptor_available_cycles,
-        )
-        for device_policy in device_policies:
-            result = schedule_tisa_program(
+        if request_count == 1:
+            submission: RuntimeSubmission | RuntimeSequence = create_runtime_submission(
                 artifact,
-                machine,
-                device_policy,
-                timing_model=timing_model,
-                simulator_config=simulator_config,
-                runtime_submission=submission,
-                event_backend=event_backend,
+                normalized_buffers,
+                submission_id=f"submission.{artifact.program.program_id}.{runtime_policy}",
+                policy=runtime_policy,
+                chunk_size=chunk_size,
+                launch_latency_cycles=launch_latency_cycles,
+                synchronization_cycles=synchronization_cycles,
+                descriptor_available_cycles=descriptor_available_cycles,
             )
+        else:
+            state_registry = create_runtime_state_registry(artifact, normalized_buffers)
+            submission = create_runtime_sequence(
+                artifact,
+                state_registry,
+                invocation_count=request_count,
+                sequence_id=f"requests.{artifact.program.program_id}.{runtime_policy}",
+                policy=runtime_policy,
+                chunk_size=chunk_size,
+                launch_latency_cycles=launch_latency_cycles,
+                synchronization_cycles=synchronization_cycles,
+                descriptor_available_cycles=descriptor_available_cycles,
+                inter_invocation_gap_cycles=inter_request_gap_cycles,
+            )
+        for device_policy in device_policies:
+            if isinstance(submission, RuntimeSequence):
+                result = schedule_tisa_sequence(
+                    artifact,
+                    submission,
+                    machine,
+                    device_policy,
+                    timing_model=timing_model,
+                    simulator_config=simulator_config,
+                    event_backend=event_backend,
+                )
+            else:
+                result = schedule_tisa_program(
+                    artifact,
+                    machine,
+                    device_policy,
+                    timing_model=timing_model,
+                    simulator_config=simulator_config,
+                    runtime_submission=submission,
+                    event_backend=event_backend,
+                )
             cases.append(
                 RuntimeDeviceCase(
                     runtime_policy=runtime_policy,

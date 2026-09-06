@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 import heapq
 import math
 from itertools import product
-from typing import Any, Iterable
+from typing import Any
 
 from npu_ooo.arch import ExecutionUnitConfig, MachineConfig
 from npu_ooo.backend import validate_backend_capability
@@ -1420,6 +1420,13 @@ def simulate_tisa_sequence(
         )
     )
     metrics: dict[str, Any] = dict(invocation_results[-1].metrics)
+    aggregate_fields = (
+        "runtime_submit_cycles",
+        "runtime_submit_busy_cycles",
+        "runtime_request_wait_cycles",
+        "runtime_synchronization_cycles",
+        "device_cycles",
+    )
     metrics.update(
         {
             "sequence_id": sequence.sequence_id,
@@ -1432,9 +1439,17 @@ def simulate_tisa_sequence(
             "state_dependency_count": len(sequence.dependencies),
             "state_wait_cycles": sequence.inter_invocation_gap_cycles * len(sequence.dependencies),
             "inter_invocation_gap_cycles": sequence.inter_invocation_gap_cycles,
+            "inter_invocation_gap_total_cycles": (
+                sequence.inter_invocation_gap_cycles
+                * max(0, len(invocation_results) - 1)
+            ),
             "runtime_sequence": True,
             "compiled_program_reused": True,
             "total_cycles_including_runtime": cursor,
+            **{
+                field: sum(float(result.metrics.get(field, 0.0)) for result in invocation_results)
+                for field in aggregate_fields
+            },
         }
     )
     return RuntimeSequenceSimulationResult(

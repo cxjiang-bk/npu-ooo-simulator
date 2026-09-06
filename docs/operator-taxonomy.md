@@ -130,6 +130,17 @@ P1-B: pooling, SwiGLU, optional MoE routing
 P2: quantization and distributed communication
 ```
 
+当前 P1 模型 proxy 契约：
+
+- embedding：StableHLO row-gather，索引值在 runtime 可变，TileMem 对表使用安全的完整
+  read region，timing 按实际输出字节估算；
+- position：BERT model proxy 使用 learned position/type embedding；GPT-J、LLaMA2、
+  DeepSeek 使用 RoPE；
+- causal mask：decoder proxy 使用 additive upper-triangle mask，decode 使用 past/current
+  cache-window mask；
+- MoE：router softmax 位于图内，request 提供 top-k mask，expert GEMM 与 weighted combine
+  保持独立 TISA；动态 top-k、token compaction 与 capacity 是后续精确路由能力。
+
 新增算子从真实 PyTorch module 经 Torch-XLA 导入，semantic taxonomy 保持模型无关。
 模型专用名称归属于 provenance 和 benchmark registry。
 

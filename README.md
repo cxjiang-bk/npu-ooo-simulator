@@ -51,8 +51,12 @@ ATen 到 StableHLO 的转换，项目维护 StableHLO semantic family 到 Canoni
   负责 queue、ROB、依赖、资源和 OOO issue；
 - 支持 Matmul、batched Matmul、GEMV、elementwise、reduce、Softmax、LayerNorm、
   RMSNorm、Attention region、SwiGLU、RoPE、Conv2D、BatchNorm inference、pooling、
-  reshape/transpose、固定窗口 KV-cache；
+  reshape/transpose、embedding gather、固定窗口 KV-cache；
+- 论文模型 registry 同时提供稳定的 `one_block` 基线和带 embedding、position、causal
+  mask、重复 block、输出 head 的 `model_proxy`；DeepSeek 提供 dense 与 MoE proxy；
 - `RuntimeStateRegistry` 和 `RuntimeSequence` 支持固定窗口 decode 的多次 invocation；
+- `paper-matrix` 支持顺序 request replay，并为 scope、层数、DeepSeek 模式和请求数生成
+  独立实验身份；
 - symbolic shape 使用 normalized shape environment 完成 Canonical resolve 与 specialization；
 - 输出分阶段 artifact、周期与 stall 统计、SVG/PNG 泳道图和 Perfetto JSON；
 - 支持 analytical、timing table、systolic MXU profile 以及 RTL completion trace
@@ -241,10 +245,40 @@ PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli paper-matrix \
   --tile-size 4 --output-dir out/paper-matrix
 ```
 
+模型覆盖实验显式选择模型 shell、层数和请求数：
+
+```bash
+PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli paper-matrix \
+  --benchmarks bert-base \
+  --variant micro \
+  --model-scope model_proxy \
+  --layer-count 12 \
+  --request-count 2 \
+  --inter-request-gap 4 \
+  --tile-size 4 \
+  --output-dir out/bert-model-proxy
+
+PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli paper-matrix \
+  --benchmarks deepseek-r1-16b-prefill \
+  --model-scope model_proxy \
+  --deepseek-mode moe_proxy \
+  --layer-count 2 \
+  --output-dir out/deepseek-moe-proxy
+```
+
+`model_proxy` 使用缩小的 hidden/channel 维度，但保留模型组件和重复深度。DeepSeek
+MoE proxy 在图内计算 router softmax，top-k mask 作为 request 输入；各 expert GEMM、
+weighted dispatch 和 combine 保持 scheduler-visible。动态 top-k 选择、token compaction
+和 expert capacity 属于下一版 MoE 数据流能力。
+
 registry 当前包含：`resnet50`、`bert-base`、`gpt-j-6b-oneblk`、`llama2-13b-oneblk`、
 `deepseek-r1-16b-prefill`、`deepseek-r1-16b-decode`。这些 case 以真实 PyTorch block
 构成 scaled micro 或 representative proxy，用于比较编译语义和调度趋势。`micro`
 提供小尺寸确定性输入；`paper_shape` 使用接近论文的形状并记录更高的资源需求。
+
+DeepSeek decode registry 行使用一 token 输入和显式 K/V fixed-window state；
+`--request-count` 通过同一 `BackendArtifact` 重放 invocation，stateful case 由
+`state_complete` 串联，stateless case 按 `--inter-request-gap` 顺序重放。
 
 `paper-matrix` 的目录结构：
 
@@ -254,7 +288,7 @@ out/paper-matrix/
 ├── matrix_index.json
 ├── sweep.csv
 ├── sweep.json
-└── <case-id>/<variant>/
+└── <case-id>/<profile>/
     ├── 00_frontend/ ... 04_backend/   # 共享编译产物
     ├── artifact_index.json
     ├── manifest.json
@@ -268,7 +302,8 @@ out/paper-matrix/
 
 矩阵根目录保存 case 清单和跨 case 汇总；每个 case 保存一份共享编译产物；策略目录
 保存 runtime、simulation 和 trace。实验开始前使用新的输出目录，并以
-`matrix_index.json` 作为本次结果清单。
+`matrix_index.json` 作为本次结果清单。默认 profile 等于 variant；扩展实验的 profile
+编码 `model_scope/layer_count/deepseek_mode/request_count/gap`，避免覆盖 one-block 基线。
 
 ## 添加 PyTorch 算子或模型
 
@@ -401,6 +436,7 @@ src/npu_ooo/compiler/fusion_patterns.py  semantic recovery/fusion registry
 src/npu_ooo/compiler/fusion_compiler.py  论文 FC：TileGraph 到 TISA 方言
 src/npu_ooo/compiler/tisa_generator.py   TISA 方言到 TISAProgram
 src/npu_ooo/compiler/tisa_dialect.py     TISA stage、metadata 和 payload recipe
+src/npu_ooo/lowering/embedding.py        embedding gather 的 region 与 analytical payload
 src/npu_ooo/backend/                     可替换 backend 与 timing provider
 src/npu_ooo/simulator/tisa.py            TISA device scheduler simulator
 ```

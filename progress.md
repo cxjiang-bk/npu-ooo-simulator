@@ -2,7 +2,8 @@
 
 ## 当前快照
 
-项目处于“模型到 TISA 语义稳定、后端校准扩展”的阶段。生产链路和实验目录已经固定：
+项目已完成 model/benchmark proxy 覆盖扩展，下一阶段进入 Device scheduler 微结构对齐。
+生产链路和实验目录已经固定：
 
 ```text
 PyTorch nn.Module
@@ -18,7 +19,7 @@ PyTorch nn.Module
   -> cycles、stall、swimlane、Perfetto
 ```
 
-当前回归：129 tests passed，`compileall` 与 `git diff --check` clean。
+当前回归状态以本文件末尾的模型覆盖验收记录为准。
 
 ## 已交付能力
 
@@ -40,6 +41,9 @@ PyTorch nn.Module
 - 两头 multi-head Attention；
 - pre-norm decoder block：RMSNorm、Attention、residual、SwiGLU/MLP；
 - BERT、GPT-J、LLaMA2、DeepSeek dense one-block；
+- BERT/GPT-J/LLaMA2/DeepSeek Transformer repetition 与 embedding/model shell；
+- DeepSeek MoE proxy：router、top-k mask、expert GEMM、weighted dispatch/combine；
+- DeepSeek one-token fixed-window decode 与多 request state replay；
 - LLaMA2 RoPE、固定窗口 KV-cache、prefill/decode micro；
 - ResNet bottleneck micro：Conv2D、BatchNorm inference、ReLU、MaxPool；
 - registry 六个 case 与 paper-matrix 批处理。
@@ -56,12 +60,13 @@ PyTorch nn.Module
 
 ## 当前能力边界
 
-以下能力已定义为后续扩展项，并在编译或运行时保留清晰的语义入口：
+以下能力已定义为后续精确扩展项，并在编译或运行时保留清晰的语义入口：
 
 - 更复杂 dynamic shape/index/layout dialect：扩展符号约束、paged layout 和可校准 memory
   timing；
 - online Softmax 数值实现：扩展 rescale、最终 normalization 和 workspace 生命周期；
-- 完整 ResNet/BERT/GPT-J/LLaMA2 repetition 与 DeepSeek MoE routing；
+- 动态 top-k、token compaction/expert capacity、完整多层 decode cache；
+- 论文 channel/hidden width、完整 stage topology 和数值等价 backend；
 - 论文 WQ/IQ/Fu 容量、dispatch/wake-up/issue/completion 控制开销校准；
 - SCALE-Sim、Ramulator2/DRAMSys、RTL/Verilator 和 system simulator backend。
 
@@ -102,11 +107,10 @@ StableHLO verify；scalar tensor、layout encoding、dtype policy 和 multi-resu
 
 按以下顺序推进：
 
-1. symbolic shape、dynamic index 和 layout binding；
-2. DeepSeek capability 与完整模型 repetition；
-3. scheduler 微结构和控制开销校准；
-4. 外部 timing/memory/RTL backend；
-5. source-derived 与 RTL-observed 论文矩阵。
+1. scheduler 微结构和控制开销校准；
+2. 外部 timing/memory/RTL backend；
+3. source-derived 与 RTL-observed 论文矩阵；
+4. 动态 MoE token 数据流和精确 full-model 扩展。
 
 ## 2026-08-31：进度盘点与执行顺序确认
 
@@ -255,3 +259,25 @@ GC typed dependency 已完成，下一项转入 symbolic shape、dynamic index �
   类别，论文正式 TISA 类型仍以 RAW/WAR/WAW 为核心。
 - 完成 GC 边的 hazard relation、region、condition 和 provenance 字段，并让 FC 与
   device scheduler 审计每条依赖的来源和满足条件。
+
+## 2026-09-04：模型与 benchmark proxy 覆盖完成
+
+- `paper-matrix` 增加 `model_scope`、`layer_count`、`deepseek_mode`、`request_count` 和
+  inter-request gap；非默认组合使用独立 profile 路径和编译 model id。
+- `model_proxy` 为 Transformer 加入 token embedding、BERT position/type embedding、
+  decoder causal mask、RoPE、重复 block 和 output head；ResNet proxy 加入 stem、重复
+  bottleneck、global average 和 classifier。
+- 新增 StableHLO embedding row-gather capability、official projection、TileGraph/TISA
+  operand region 和 analytical gather payload。真实 Torch-XLA 产物使用扁平 `ui32`
+  indices，已纳入 dtype/shape 契约。
+- DeepSeek MoE proxy 在图内计算 router softmax，以 request top-k mask 驱动四个 expert，
+  GC 标注 scheduler-visible `moe_dispatch` region；动态 top-k、token compaction 和 capacity
+  保持为显式精确路由边界。
+- DeepSeek decode 改为一 token + 两份 fixed-window KV state；`request_count` 复用同一
+  BackendArtifact，stateful invocation 使用 `state_complete`，stateless invocation 顺序重放。
+- reduce lowering 支持多个 iteration/reduction 维度，解决 batch/sequence router reduction
+  与 spatial global reduction 的通用 region/partial accumulation 问题。
+- BERT 两层/两请求真实 paper-matrix smoke：static 34053 cycles、dynamic 30999 cycles；
+  这些数值属于 analytical proxy，只用于验证完整实验链和相对调度趋势。
+- 本地回归发现 161 项，127 项执行通过、34 项因缺少 Torch-XLA/MLIR 跳过；9980X-new
+  的完整前端环境执行全部 161 项并全部通过。两端 `compileall` 与 `git diff --check` 通过。

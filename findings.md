@@ -103,6 +103,23 @@ TISA payload。
 TISA lane 与 backend payload lane，便于定位 dependency wait、resource busy、
 memory conflict 和 completion feedback。
 
+## 模型覆盖阶段决策
+
+- 默认 `one_block` 保持已有编译基线；`model_proxy` 显式加入 embedding、position、mask、
+  block repetition 和 head。两类 scope 使用不同的 model id 和输出 profile。
+- StableHLO embedding 采用已验证的 row-gather 子集。索引值来自 invocation，table
+  TileMem 使用完整只读 region 保证依赖安全；analytical timing 按选中输出和 index bytes
+  估算，不把完整表容量当成每次流量。
+- DeepSeek MoE proxy 的 router softmax 位于编译图内，top-k mask 由 request 提供。GC
+  `moe_dispatch` region 保留 router、mask、dispatch weight、expert output 和 combine 角色，
+  每个 expert 成员继续独立生成 TISA。
+- 当前 MoE proxy 执行所有 expert 后按 mask 加权。动态 top-k、token compaction、capacity、
+  load balance 和 all-to-all 属于精确 MoE 数据流扩展，实验 metadata 明确记录该边界。
+- DeepSeek decode 使用一 token 与固定 K/V window；多层 decode 需要每层独立 state，因此
+  当前接口拒绝用单一 cache 扩展 `layer_count`。
+- `RuntimeSequence` 同时支持 stateful decode 与 stateless request replay；sequence 汇总字段
+  对全部 invocation 的 runtime/device/synchronization 开销求和。
+
 ## 2026-08-31：GC typed dependency 语义
 
 论文在 TISA 层定义：

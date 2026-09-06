@@ -24,6 +24,109 @@ def _stable_frontend(graph: OperatorGraph) -> tuple[FrontendImport, OfficialStab
 
 
 class CompilerStageContractTest(unittest.TestCase):
+    def test_reduce_lowering_supports_multiple_iteration_and_reduction_dimensions(self) -> None:
+        graphs = (
+            OperatorGraph(
+                "batched-reduce",
+                (TensorSpec("x", (2, 3, 4)), TensorSpec("y", (2, 3))),
+                (
+                    OperatorSpec(
+                        "reduce",
+                        "reduce",
+                        ("x",),
+                        ("y",),
+                        (("d0", 2), ("d1", 3)),
+                        (("d2", 4),),
+                    ),
+                ),
+            ),
+            OperatorGraph(
+                "spatial-reduce",
+                (TensorSpec("x", (2, 3, 4, 4)), TensorSpec("y", (2, 3))),
+                (
+                    OperatorSpec(
+                        "reduce",
+                        "reduce",
+                        ("x",),
+                        ("y",),
+                        (("d0", 2), ("d1", 3)),
+                        (("d2", 4), ("d3", 4)),
+                    ),
+                ),
+            ),
+        )
+        for graph in graphs:
+            with self.subTest(graph=graph.graph_id):
+                frontend, stablehlo = _stable_frontend(graph)
+                compiled = compile_operator_graph(
+                    graph,
+                    minimal_machine_config(),
+                    frontend=frontend,
+                    source_frontend=frontend,
+                    stablehlo=stablehlo,
+                    tile_size=2,
+                )
+                tasks = compiled.backend_artifact.execution_graph.tasks
+                stores = [task for task in tasks if task.primitive == "store"]
+                self.assertTrue(stores)
+                self.assertTrue(
+                    all(len(task.writes[0].shape) == 2 for task in stores)
+                )
+                self.assertTrue(
+                    any(
+                        dependency.kind == "STATE"
+                        for instruction in compiled.tisa_program.instructions
+                        for dependency in instruction.dependencies
+                    )
+                )
+                self.assertEqual(compiled.validate(), ())
+
+    def test_embedding_gather_reaches_one_dma_tisa_stage_per_output_tile(self) -> None:
+        graph = OperatorGraph(
+            graph_id="embedding-stage-test",
+            tensors=(
+                TensorSpec("table", (16, 8), "f32"),
+                TensorSpec("indices", (2, 3), "i64"),
+                TensorSpec("embedded", (2, 3, 8), "f32"),
+            ),
+            operators=(
+                OperatorSpec(
+                    op_id="lookup",
+                    op_type="embedding",
+                    inputs=("table", "indices"),
+                    outputs=("embedded",),
+                    iteration_dims=(("d0", 2), ("d1", 3), ("d2", 8)),
+                    attributes={
+                        "semantic_family": "embedding",
+                        "gather_kind": "embedding_lookup",
+                        "table_tensor": "table",
+                        "indices_tensor": "indices",
+                    },
+                ),
+            ),
+        )
+        frontend, stablehlo = _stable_frontend(graph)
+        compiled = compile_operator_graph(
+            graph,
+            minimal_machine_config(),
+            frontend=frontend,
+            source_frontend=frontend,
+            stablehlo=stablehlo,
+            tile_size=4,
+        )
+
+        instructions = compiled.tisa_program.instructions
+        self.assertTrue(instructions)
+        self.assertTrue(all(item.op_type == "gather" for item in instructions))
+        self.assertTrue(all(item.unit_map.unit == "dma" for item in instructions))
+        tasks = compiled.backend_artifact.execution_graph.tasks
+        self.assertEqual(len(tasks), len(instructions))
+        self.assertTrue(all(task.primitive == "gather" for task in tasks))
+        self.assertTrue(
+            all(task.attributes["table_region_policy"] == "conservative_full_table" for task in tasks)
+        )
+        self.assertEqual(compiled.validate(), ())
+
     def test_gc_keeps_pass_snapshots_and_memory_plan_metadata(self) -> None:
         graph = OperatorGraph(
             graph_id="gc-metadata-test",

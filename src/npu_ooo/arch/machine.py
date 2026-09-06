@@ -279,10 +279,11 @@ def minimal_machine_config() -> MachineConfig:
         execution_units=(
             ExecutionUnitConfig(
                 "DMA",
-                supported_ops=("load", "store", "copy", "transpose"),
+                supported_ops=("load", "store", "copy", "transpose", "gather"),
                 queue_depth=8,
                 latency_cycles=2,
                 initiation_interval_cycles=1,
+                attributes={"gather_timing": "root_bandwidth_proxy"},
             ),
             ExecutionUnitConfig(
                 "MXU",
@@ -341,7 +342,17 @@ def lpu_like_machine_config() -> MachineConfig:
             MemoryLevelConfig("ARB", "UB", 2 * 1024, 8, 8, read_latency_cycles=1, write_latency_cycles=1),
         ),
         execution_units=(
-            ExecutionUnitConfig("GDMA", supported_ops=("load", "store", "copy"), queue_depth=8, latency_cycles=4, initiation_interval_cycles=1),
+            ExecutionUnitConfig(
+                "GDMA",
+                supported_ops=("load", "store", "copy", "gather"),
+                queue_depth=8,
+                latency_cycles=4,
+                initiation_interval_cycles=1,
+                attributes={
+                    "gather_timing": "root_bandwidth_proxy",
+                    "hardware_mapping": "unvalidated",
+                },
+            ),
             ExecutionUnitConfig("LDMA", supported_ops=("load", "store", "transpose"), queue_depth=8, latency_cycles=4, initiation_interval_cycles=1),
             ExecutionUnitConfig("MXU", supported_ops=("matmul", "batched_matmul", "gemv", "conv2d"), queue_depth=8, pipeline_depth=4, latency_cycles=32, initiation_interval_cycles=4, attributes={"rows": 16, "cols": 8, "k": 8}),
             ExecutionUnitConfig("ARU", supported_ops=("softmax", "layernorm", "rmsnorm", "reduce", "elementwise", "kv_cache_update", "batch_norm", "pool"), queue_depth=8, latency_cycles=8, initiation_interval_cycles=2),

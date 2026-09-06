@@ -122,6 +122,7 @@ Backend Timing/Event
 
 - PyTorch -> Torch-XLA -> official StableHLO -> GC/FC/TISA；
 - semantic Softmax/Norm、Attention、SwiGLU、RoPE 和 KV-cache region；
+- embedding gather 与 scheduler-visible MoE dispatch region；
 - instruction-level static/dynamic scheduler；
 - descriptor arrival、queue/ROB/window、resource、completion feedback analytical model；
 - analytical、timing table、systolic MXU profile 和 RTL importer；

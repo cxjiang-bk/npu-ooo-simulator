@@ -252,6 +252,8 @@ def enumerate_operator_tiles(operator: OperatorSpec, schedule: OperatorSchedule)
                 ),
                 ("rotary_algorithm", operator.attributes.get("rotary_algorithm")),
                 ("rotary_embedding", operator.attributes.get("rotary_embedding")),
+                ("moe_routing_contract", operator.attributes.get("moe_routing_contract")),
+                ("moe_dispatch_contract", operator.attributes.get("moe_dispatch_contract")),
                 ("stateful", operator.attributes.get("stateful")),
                 ("state_id", operator.attributes.get("state_id")),
                 ("state_buffer", operator.attributes.get("state_buffer")),
@@ -370,6 +372,20 @@ def _tile_tensor_region(
             )
         return (0,) * len(tensor_shape), tensor_shape
 
+    if op_type == "embedding":
+        if len(operator.inputs) != 2 or len(operator.outputs) != 1:
+            return None
+        if tensor_name == operator.outputs[0]:
+            return _dimension_region(tile, iteration)
+        if tensor_name == operator.inputs[0]:
+            return (0,) * len(tensor_shape), tensor_shape
+        if tensor_name == operator.inputs[1]:
+            output_starts, output_shape = _dimension_region(tile, iteration)
+            if len(tensor_shape) > len(output_shape):
+                return None
+            return output_starts[: len(tensor_shape)], output_shape[: len(tensor_shape)]
+        return None
+
     if op_type == "kv_cache_update":
         update_name = operator.attributes.get("update_tensor")
         dynamic_index = operator.attributes.get("dynamic_index")
@@ -378,8 +394,13 @@ def _tile_tensor_region(
             and tensor_name == update_name
             and len(operator.inputs) > 1
         ):
-            update_shape = _resolved_tensor_shape(tensors[operator.inputs[1]])
-            if update_shape is not None:
+            metadata = dynamic_index.get("attributes", {})
+            raw_shape = metadata.get("update_shape") if isinstance(metadata, Mapping) else None
+            if isinstance(raw_shape, (tuple, list)) and all(
+                isinstance(value, int) and not isinstance(value, bool) and value > 0
+                for value in raw_shape
+            ):
+                update_shape = tuple(raw_shape)
                 return (0,) * len(update_shape), update_shape
         return (0,) * len(tensor_shape), tensor_shape
 

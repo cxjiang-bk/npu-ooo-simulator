@@ -17,6 +17,7 @@ from .passes import (
     AttentionRegionPass,
     GraphPass,
     LayerNormFusionPass,
+    MoEDispatchRegionPass,
     RecoverStableHLOLayerNormPass,
     RecoverStableHLOKVCachePass,
     RotaryEmbeddingRegionPass,
@@ -150,6 +151,12 @@ def default_semantic_fusion_registry() -> SemanticFusionPatternRegistry:
                 semantic_family="swiglu",
                 graph_pass=SwiGLUFusionPass(),
                 priority=90,
+            ),
+            SemanticFusionPattern(
+                name="recover_moe_dispatch_region",
+                semantic_family="moe_dispatch",
+                graph_pass=MoEDispatchRegionPass(),
+                priority=95,
             ),
         )
     )

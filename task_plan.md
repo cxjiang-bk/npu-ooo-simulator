@@ -35,11 +35,16 @@ simulate。测试 fixture 可以直接
 - [x] StableHLO operation capability registry 与 semantic fusion registry；
 - [x] 常量 dynamic broadcast、dynamic_slice、dynamic_reshape specialization。
 
-### 进行中
+### 模型 proxy 扩展（已完成）
 
-- [ ] DeepSeek dense/MoE capability 清单；
-- [ ] embedding、position embedding、causal mask 和 layout 变体；
-- [ ] 完整模型 repetition 与论文形状 proxy 的输入规模验证。
+- [x] DeepSeek dense/MoE proxy capability 与显式精确路由边界；
+- [x] embedding、position/type embedding、RoPE 和 causal mask；
+- [x] Transformer/ResNet repetition、model proxy 与论文形状输入规模记录；
+- [x] DeepSeek one-token fixed-window decode 与 request replay。
+
+当前模型阶段交付的是 scheduler research proxy：hidden/channel 维度可缩放，模型组件、
+层重复、phase、state 和请求数显式进入实验身份。动态 top-k、token compaction、expert
+capacity、完整多层 decode cache 和精确论文拓扑进入后续数值/数据流扩展。
 
 每个新增能力沿以下契约交付：
 
@@ -62,7 +67,7 @@ StableHLO capability
 - [x] candidate cost model、residency/ping-pong intent、per-pass dump；
 - [x] materialized 与 online Softmax payload 属性。
 
-### 进行中
+### 动态地址与审计扩展（已完成）
 
 - [x] symbolic shape 统一 binding（环境校验、Canonical resolve、shape specialization provenance）；
 - [x] DynamicIndexExpr/Binding、dynamic_slice 和 dynamic_update_slice state metadata；
@@ -70,7 +75,7 @@ StableHLO capability
 - [x] dynamic update state window alias/address contract；
 - [x] dynamic layout 和 stride-aware transform；
 - [x] GC typed dependency 显式保存 hazard relation、logical region 和 readiness condition；
-- [ ] 完整模型 proxy 的 tile/MAC/traffic 对账样例。
+- [x] model proxy 的 component、parameter/input bytes 与编译 tile/MAC/traffic 统计入口。
 
 阶段 1 的 trace/address provenance 已贯通：ExecutionGraph、TISA、Perfetto、CSV 和
 address scoreboard 共享同一依赖来源；Matmul、broadcast、reduce、Conv2D、pooling 和
@@ -112,16 +117,15 @@ model / shape / phase
 
 - [x] paper-matrix 单次编译、共享 artifact 和 policy matrix；
 - [x] case/variant staged output、matrix_index、sweep 汇总；
-- [ ] full-model repetition、request-level runtime；
+- [x] model-proxy repetition 与顺序 request-level RuntimeSequence；
 - [ ] source-derived 与 RTL-observed 分组统计。
 
 ## 当前执行顺序
 
-1. compile/simulation 分离与可复用 artifact package；
-2. DeepSeek 与完整模型 repetition；
-3. scheduler 微结构和控制开销校准；
-4. 外部 timing/memory/RTL backend；
-5. 论文规模 source-derived/RTL-observed 矩阵。
+1. scheduler 微结构和控制开销校准；
+2. 外部 timing/memory/RTL backend；
+3. 论文规模 source-derived/RTL-observed 矩阵；
+4. 动态 top-k/token compaction 与精确 full-model 数据流。
 
 ## 阶段 5：Compile-only 与独立仿真
 
@@ -150,7 +154,8 @@ model / shape / phase
 - 端到端 CLI 与原有测试保持兼容。
 
 当前验收状态：JSON package 独立仿真已通过，CLI 参数边界和 staged simulation 输出已通过；
-完整前端端到端测试需要安装官方 StableHLO 的 `mlir` Python binding。
+本地无前端依赖环境执行 126 项并跳过 34 项；9980X-new 的 Torch-XLA/StableHLO 环境执行
+全部 161 项并通过。
 
 ## 验证命令
 

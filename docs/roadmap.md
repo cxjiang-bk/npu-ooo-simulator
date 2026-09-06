@@ -37,11 +37,16 @@ FC -> TISA 链路进入 simulator。
 - ResNet bottleneck micro 的 Conv2D、BatchNorm inference、ReLU、pooling；
 - StableHLO capability registry 与 semantic fusion registry。
 
-当前工作项：
+已交付的 model-proxy 扩展：
 
-1. 完成 DeepSeek dense/MoE 结构的 capability 清单；
-2. 扩展完整 ResNet50、BERT、GPT-J、LLaMA2 的层重复与论文形状 proxy；
-3. 将 embedding、position embedding、causal mask 和更多 layout 变体纳入统一 registry。
+1. ResNet、BERT、GPT-J、LLaMA2、DeepSeek 的显式 block repetition 与模型 shell；
+2. token/position/type embedding gather、RoPE、causal mask 和 output head；
+3. DeepSeek router、外部 top-k mask、expert GEMM、weighted dispatch/combine region；
+4. DeepSeek one-token fixed-window decode 和 stateful/stateless request replay；
+5. model component、parameter/input bytes、scope、层数、模式和请求数 manifest。
+
+精确模型扩展项包括动态 top-k、token compaction、expert capacity、多层 decode cache、
+论文 channel/hidden width 和完整 stage topology。
 
 每个新能力遵循：
 
@@ -73,11 +78,11 @@ Torch-XLA StableHLO operation
   invocation binding；
 - readiness condition、state/accumulate/buffer-reuse dependency。
 
-当前工作项：
+后续精确数据流工作项：
 
-1. 扩展完整模型 repetition 与 DeepSeek MoE routing；
-2. 为每类 layout、transpose、broadcast、reduction 建立更多可验证的 region rule；
-3. 为完整模型 proxy 增加 shape/traffic 对账样例。
+1. 为动态 expert token region 建立 index/address contract；
+2. 为更多 layout、transpose、broadcast、reduction 建立可校准 region rule；
+3. 将 model-proxy 统计与外部硬件 traffic 计数对账。
 
 验收标准：同一 module、shape、tile、MachineConfig 和 backend 产生稳定 artifact hash；
 static/dynamic 的差异来自 policy；小图的 tile、MAC、traffic 和 dependency 可手算核对。
@@ -146,7 +151,7 @@ registry case：
 
 下一阶段优先级：
 
-1. A 阶段 DeepSeek 与完整模型 repetition；
-2. C 阶段 scheduler 微结构校准；
-3. D 阶段外部 timing/memory/RTL backend；
-4. E 阶段 source-derived 与 RTL-observed 论文矩阵。
+1. C 阶段 scheduler 微结构校准；
+2. D 阶段外部 timing/memory/RTL backend；
+3. E 阶段 source-derived 与 RTL-observed 论文矩阵；
+4. 动态 MoE token 数据流与精确 full-model 扩展。

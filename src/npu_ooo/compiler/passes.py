@@ -2528,6 +2528,301 @@ class SwiGLUFusionPass:
         )
 
 
+class MoEDispatchRegionPass:
+    """Annotate external-top-k MoE routing without hiding expert TISA ops.
+
+    The supported proxy shape is router softmax -> top-k mask multiply -> one
+    slice per expert -> weighted expert output -> additive combine.  The pass
+    requires at least two expert branches and leaves every member operation in
+    the graph so scheduling experiments can still observe branch parallelism.
+    """
+
+    name = "recover_moe_dispatch_region"
+
+    @staticmethod
+    def _softmax_members(
+        operation: OperatorSpec,
+        producer: dict[str, OperatorSpec],
+    ) -> tuple[OperatorSpec, ...] | None:
+        if operation.normalized_type == "softmax":
+            return (operation,)
+        if not _is_elementwise(operation, "stablehlo.divide") or len(operation.inputs) != 2:
+            return None
+        exponential = producer.get(operation.inputs[0])
+        total_tensor, total_reshapes = _unwrap_reshape(operation.inputs[1], producer)
+        total = producer.get(total_tensor)
+        if (
+            exponential is None
+            or not _is_elementwise(exponential, "stablehlo.exponential")
+            or total is None
+            or total.normalized_type != "reduce"
+            or total.attributes.get("reducer") != "add"
+            or total.inputs != exponential.outputs
+        ):
+            return None
+        shifted = producer.get(exponential.inputs[0]) if exponential.inputs else None
+        if shifted is None or not _is_elementwise(shifted, "stablehlo.subtract"):
+            return None
+        maximum_tensor, maximum_reshapes = _unwrap_reshape(shifted.inputs[1], producer)
+        maximum = producer.get(maximum_tensor)
+        if (
+            maximum is None
+            or maximum.normalized_type != "reduce"
+            or maximum.attributes.get("reducer") != "maximum"
+            or maximum.inputs != (shifted.inputs[0],)
+            or maximum.reduction_dims != total.reduction_dims
+        ):
+            return None
+        return (
+            maximum,
+            *tuple(reversed(maximum_reshapes)),
+            shifted,
+            exponential,
+            total,
+            *tuple(reversed(total_reshapes)),
+            operation,
+        )
+
+    @staticmethod
+    def _weighted_consumer(
+        start: OperatorSpec,
+        consumers: dict[str, list[OperatorSpec]],
+    ) -> tuple[tuple[OperatorSpec, ...], OperatorSpec] | None:
+        path: list[OperatorSpec] = [start]
+        current = start
+        for _ in range(4):
+            next_ops = consumers.get(_single_output(current), ())
+            weighted = [operation for operation in next_ops if _is_elementwise_mul(operation)]
+            if len(weighted) == 1:
+                return tuple(path), weighted[0]
+            passthrough = [
+                operation
+                for operation in next_ops
+                if operation.normalized_type in {"reshape", "transpose"}
+            ]
+            if len(passthrough) != 1:
+                return None
+            current = passthrough[0]
+            path.append(current)
+        return None
+
+    def run(self, graph: OperatorGraph) -> PassResult:
+        operators = list(graph.operators)
+        producer = _producer_map(operators)
+        consumers = _consumer_map(operators)
+        roles_by_operator: dict[str, tuple[str, str]] = {}
+        regions: list[dict[str, object]] = []
+        claimed: set[str] = set()
+
+        def upstream_matmul(tensor: str, depth: int = 0) -> OperatorSpec | None:
+            if depth > 6:
+                return None
+            operation = producer.get(tensor)
+            if operation is None:
+                return None
+            if operation.normalized_type in {"matmul", "batched_matmul", "gemv"}:
+                return operation
+            if operation.normalized_type in {"reshape", "transpose"} and len(operation.inputs) == 1:
+                return upstream_matmul(operation.inputs[0], depth + 1)
+            if _is_elementwise_add(operation):
+                candidates = [
+                    candidate
+                    for input_tensor in operation.inputs
+                    if (candidate := upstream_matmul(input_tensor, depth + 1)) is not None
+                ]
+                unique = {candidate.op_id: candidate for candidate in candidates}
+                if len(unique) == 1:
+                    return next(iter(unique.values()))
+            return None
+
+        for router in operators:
+            router_members = self._softmax_members(router, producer)
+            if router_members is None or len(router.outputs) != 1:
+                continue
+            mask_candidates = [
+                operation
+                for operation in consumers.get(_single_output(router), ())
+                if _is_elementwise_mul(operation)
+            ]
+            if len(mask_candidates) != 1:
+                continue
+            mask_apply = mask_candidates[0]
+            slices = [
+                operation
+                for operation in consumers.get(_single_output(mask_apply), ())
+                if operation.normalized_type == "slice"
+            ]
+            if len(slices) < 2:
+                continue
+            branch_paths: list[tuple[tuple[OperatorSpec, ...], OperatorSpec]] = []
+            for slice_op in slices:
+                branch = self._weighted_consumer(slice_op, consumers)
+                if branch is not None:
+                    branch_paths.append(branch)
+            if len(branch_paths) < 2:
+                continue
+
+            weighted_ops = [weighted for _path, weighted in branch_paths]
+            expert_outputs: list[OperatorSpec] = []
+            for path, weighted in branch_paths:
+                path_tensors = {_single_output(operation) for operation in path}
+                other_inputs = [
+                    tensor for tensor in weighted.inputs if tensor not in path_tensors
+                ]
+                for tensor in other_inputs:
+                    current = upstream_matmul(tensor)
+                    if current is not None:
+                        expert_outputs.append(current)
+                        break
+
+            combine_ops: list[OperatorSpec] = []
+            frontier = [_single_output(operation) for operation in weighted_ops]
+            visited_tensors: set[str] = set()
+            while frontier:
+                tensor = frontier.pop(0)
+                if tensor in visited_tensors:
+                    continue
+                visited_tensors.add(tensor)
+                for operation in consumers.get(tensor, ()):
+                    if _is_elementwise_add(operation) and operation not in combine_ops:
+                        combine_ops.append(operation)
+                        frontier.extend(operation.outputs)
+
+            members = [
+                *router_members,
+                mask_apply,
+                *(operation for path, _weighted in branch_paths for operation in path),
+                *expert_outputs,
+                *weighted_ops,
+                *combine_ops,
+            ]
+            member_by_id = {operation.op_id: operation for operation in members}
+            member_ids = [
+                operation.op_id
+                for operation in operators
+                if operation.op_id in member_by_id
+            ]
+            if claimed.intersection(member_ids):
+                continue
+            region_id = f"moe_dispatch_region_{len(regions):04d}"
+            claimed.update(member_ids)
+            roles_by_operator[router.op_id] = (region_id, "router_softmax")
+            for operation in router_members[:-1]:
+                roles_by_operator[operation.op_id] = (
+                    region_id,
+                    "router_softmax_primitive",
+                )
+            roles_by_operator[mask_apply.op_id] = (region_id, "topk_mask")
+            for path, weighted in branch_paths:
+                for operation in path:
+                    roles_by_operator[operation.op_id] = (region_id, "dispatch_weight")
+                roles_by_operator[weighted.op_id] = (region_id, "expert_weight")
+            for operation in expert_outputs:
+                roles_by_operator[operation.op_id] = (region_id, "expert_output")
+            for operation in combine_ops:
+                roles_by_operator[operation.op_id] = (region_id, "combine")
+
+            member_set = set(member_ids)
+            external_inputs = tuple(
+                dict.fromkeys(
+                    tensor
+                    for operation in members
+                    for tensor in operation.inputs
+                    if producer.get(tensor) is None
+                    or producer[tensor].op_id not in member_set
+                )
+            )
+            terminal_combine = [
+                operation
+                for operation in combine_ops
+                if not any(
+                    consumer.op_id in {item.op_id for item in combine_ops}
+                    for consumer in consumers.get(_single_output(operation), ())
+                )
+            ]
+            regions.append(
+                {
+                    "region_id": region_id,
+                    "semantic_family": "moe_dispatch",
+                    "members": member_ids,
+                    "roles": {
+                        "router_softmax": router.op_id,
+                        "topk_mask": mask_apply.op_id,
+                        "dispatch_weights": [operation.op_id for operation in slices],
+                        "expert_outputs": [operation.op_id for operation in expert_outputs],
+                        "expert_weights": [operation.op_id for operation in weighted_ops],
+                        "combine": [operation.op_id for operation in combine_ops],
+                    },
+                    "inputs": list(external_inputs),
+                    "outputs": [
+                        output
+                        for operation in (terminal_combine or weighted_ops)
+                        for output in operation.outputs
+                    ],
+                    "routing_contract": "internal_softmax+external_topk_mask",
+                    "dispatch_contract": "mask_weighted_all_experts",
+                    "scheduler_visibility": "member_tisa_instructions",
+                    "opaque": False,
+                }
+            )
+
+        if not regions:
+            return PassResult(
+                graph,
+                (PassDiagnostic("info", self.name, "no supported MoE dispatch region found"),),
+            )
+        annotated = tuple(
+            replace(
+                operation,
+                attributes={
+                    **dict(operation.attributes),
+                    "semantic_region_id": roles_by_operator[operation.op_id][0],
+                    "semantic_region_family": "moe_dispatch",
+                    "semantic_region_role": roles_by_operator[operation.op_id][1],
+                    "semantic_region_opaque": False,
+                    "moe_routing_contract": "internal_softmax+external_topk_mask",
+                    "moe_dispatch_contract": "mask_weighted_all_experts",
+                },
+            )
+            if operation.op_id in roles_by_operator
+            else operation
+            for operation in operators
+        )
+        result = OperatorGraph(
+            graph_id=graph.graph_id,
+            tensors=graph.tensors,
+            operators=annotated,
+            edges=graph.edges,
+            attributes={
+                **dict(graph.attributes),
+                "canonical_passes": [
+                    *dict(graph.attributes).get("canonical_passes", ()),
+                    self.name,
+                ],
+                "semantic_regions": [
+                    *dict(graph.attributes).get("semantic_regions", ()),
+                    *regions,
+                ],
+            },
+        )
+        issues = result.validate()
+        if issues:
+            raise ValueError(
+                "recover_moe_dispatch_region produced an invalid graph: "
+                + "; ".join(issues)
+            )
+        return PassResult(
+            result,
+            (
+                PassDiagnostic(
+                    "info",
+                    self.name,
+                    f"recovered {len(regions)} observable MoE dispatch region(s)",
+                ),
+            ),
+        )
+
+
 class PassManager:
     """Run ordered graph passes with stable per-pass diagnostics."""
 
@@ -2620,6 +2915,7 @@ __all__ = [
     "RecoverStableHLOKVCachePass",
     "RotaryEmbeddingRegionPass",
     "LayerNormFusionPass",
+    "MoEDispatchRegionPass",
     "RMSNormFusionPass",
     "SoftmaxFusionPass",
     "SwiGLUFusionPass",

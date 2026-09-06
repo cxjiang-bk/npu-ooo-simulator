@@ -25,6 +25,7 @@ from .conv2d import lower_conv2d_graph
 from .batch_norm import lower_batch_norm_graph
 from .pool import lower_pool_graph
 from .transform import lower_transform_graph
+from .embedding import lower_embedding_graph
 
 
 GraphLowerer = Callable[[OperatorGraph, ScheduleSpec, MachineConfig], LoweringResult]
@@ -71,6 +72,7 @@ def default_lowering_registry() -> LoweringRegistry:
     registry.register(("batch_norm",), lower_batch_norm_graph)
     registry.register(("pool",), lower_pool_graph)
     registry.register(("reshape", "transpose", "slice"), lower_transform_graph)
+    registry.register(("embedding",), lower_embedding_graph)
     return registry
 
 

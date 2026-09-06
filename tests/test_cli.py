@@ -5,9 +5,10 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 from npu_ooo.arch import minimal_machine_config
-from npu_ooo.cli import build_parser, main
+from npu_ooo.cli import _paper_profile_name, build_parser, main
 from npu_ooo.frontend import official_stablehlo_available, torch_xla_available
 from npu_ooo.ir import (
     AccessType,
@@ -35,6 +36,29 @@ FRONTEND_AVAILABLE = bool(
 
 
 class CliSurfaceTest(unittest.TestCase):
+    def test_paper_profile_name_keeps_default_path_and_disambiguates_expansion(self) -> None:
+        baseline = SimpleNamespace(
+            variant="micro",
+            model_scope="one_block",
+            layer_count=1,
+            deepseek_mode="not_applicable",
+            request_count=1,
+            inter_request_gap_cycles=0.0,
+        )
+        expanded = SimpleNamespace(
+            variant="micro",
+            model_scope="model_proxy",
+            layer_count=12,
+            deepseek_mode="moe_proxy",
+            request_count=3,
+            inter_request_gap_cycles=2.0,
+        )
+        self.assertEqual(_paper_profile_name(baseline), "micro")
+        self.assertEqual(
+            _paper_profile_name(expanded),
+            "micro__scope-model_proxy__layers-12__deepseek-moe_proxy__requests-3__gap-2",
+        )
+
     def test_only_current_commands_are_registered(self) -> None:
         parser = build_parser()
         subparsers = next(
@@ -139,12 +163,24 @@ class CliSurfaceTest(unittest.TestCase):
                 "micro",
                 "--layer-count",
                 "3",
+                "--model-scope",
+                "model_proxy",
+                "--deepseek-mode",
+                "moe_proxy",
+                "--request-count",
+                "3",
+                "--inter-request-gap",
+                "2",
                 "--runtime-device-matrix",
             ]
         )
         self.assertEqual(args.benchmarks, "bert-base,gpt-j-6b-oneblk")
         self.assertEqual(args.variant, "micro")
         self.assertEqual(args.layer_count, 3)
+        self.assertEqual(args.model_scope, "model_proxy")
+        self.assertEqual(args.deepseek_mode, "moe_proxy")
+        self.assertEqual(args.request_count, 3)
+        self.assertEqual(args.inter_request_gap, 2)
         self.assertTrue(args.runtime_device_matrix)
 
 

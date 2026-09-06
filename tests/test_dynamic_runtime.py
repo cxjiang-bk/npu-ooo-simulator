@@ -6,10 +6,16 @@ from npu_ooo.frontend.stablehlo import StableHLOAdapter
 from npu_ooo.frontend.stablehlo_official import OfficialStableHLOModule
 from npu_ooo.ir import (
     DynamicIndexBinding,
+    DataEdge,
+    OperatorGraph,
+    OperatorSpec,
+    TensorSpec,
     allocate_buffer_bindings,
+    build_tile_graph,
     create_runtime_sequence,
     create_runtime_state_registry,
     create_runtime_submission,
+    plan_uniform_tiles,
 )
 from npu_ooo.scheduler import SchedulerPolicy, SimulatorConfig, schedule_tisa_program
 
@@ -32,6 +38,57 @@ def _compile(text: str, model_id: str, tile_size: int):
 
 
 class DynamicRuntimeContractTest(unittest.TestCase):
+    def test_dynamic_update_dependency_uses_metadata_window_shape(self) -> None:
+        graph = OperatorGraph(
+            "dynamic-update-edge",
+            (
+                TensorSpec("source", (1, 1)),
+                TensorSpec("update", (1, 1)),
+                TensorSpec("cache", (1, 4)),
+                TensorSpec("updated_cache", (1, 4)),
+            ),
+            (
+                OperatorSpec(
+                    "produce",
+                    "elementwise",
+                    ("source",),
+                    ("update",),
+                    (("d0", 1), ("d1", 1)),
+                ),
+                OperatorSpec(
+                    "update_cache",
+                    "kv_cache_update",
+                    ("cache", "update"),
+                    ("updated_cache",),
+                    (("d0", 1), ("d1", 4)),
+                    attributes={
+                        "update_tensor": "update",
+                        "dynamic_index": {
+                            "expression_id": "cache.index",
+                            "index_operands": ["row", "column"],
+                            "index_rank": 2,
+                            "clamp_bounds": [[0, 0], [0, 3]],
+                            "attributes": {"update_shape": [1, 1]},
+                        },
+                    },
+                ),
+            ),
+            (DataEdge("produce", "update_cache", "update"),),
+        )
+
+        tile_graph = build_tile_graph(graph, plan_uniform_tiles(graph, tile_size=2))
+
+        dependencies = [
+            dependency
+            for dependency in tile_graph.dependencies
+            if dependency.tensor == "update"
+        ]
+        self.assertTrue(dependencies)
+        self.assertEqual(
+            {dependency.consumer_region for dependency in dependencies},
+            {((0, 0), (1, 1))},
+        )
+
     def test_dynamic_slice_resolves_clamped_strided_window(self) -> None:
         text = """
         module {

@@ -45,6 +45,8 @@ def build_paper_benchmark(
     variant: str = "micro",
     dtype: torch.dtype | None = None,
     layer_count: int = 1,
+    model_scope: str = "one_block",
+    deepseek_mode: str = "dense",
 ) -> PaperBenchmarkWorkload:
     """Build a real PyTorch workload and deterministic example inputs.
 
@@ -55,18 +57,47 @@ def build_paper_benchmark(
 
     if layer_count <= 0:
         raise ValueError("layer_count must be positive")
+    if model_scope not in {"one_block", "model_proxy"}:
+        raise ValueError("model_scope must be 'one_block' or 'model_proxy'")
+    if deepseek_mode not in {"dense", "moe_proxy"}:
+        raise ValueError("deepseek_mode must be 'dense' or 'moe_proxy'")
 
     if case_id == resnet50.SPEC.case_id:
-        if layer_count != 1:
-            raise ValueError("layer_count is only supported for transformer benchmark rows")
-        return resnet50.build(variant=variant, dtype=dtype)
+        return resnet50.build(
+            variant=variant,
+            dtype=dtype,
+            layer_count=layer_count,
+            model_scope=model_scope,
+        )
     if case_id == bert_base.SPEC.case_id:
-        return bert_base.build(variant=variant, dtype=dtype, layer_count=layer_count)
+        return bert_base.build(
+            variant=variant,
+            dtype=dtype,
+            layer_count=layer_count,
+            model_scope=model_scope,
+        )
     if case_id == gpt_j.SPEC.case_id:
-        return gpt_j.build(variant=variant, dtype=dtype, layer_count=layer_count)
+        return gpt_j.build(
+            variant=variant,
+            dtype=dtype,
+            layer_count=layer_count,
+            model_scope=model_scope,
+        )
     if case_id == llama2.SPEC.case_id:
-        return llama2.build(variant=variant, dtype=dtype, layer_count=layer_count)
-    return deepseek.build(case_id, variant=variant, dtype=dtype, layer_count=layer_count)
+        return llama2.build(
+            variant=variant,
+            dtype=dtype,
+            layer_count=layer_count,
+            model_scope=model_scope,
+        )
+    return deepseek.build(
+        case_id,
+        variant=variant,
+        dtype=dtype,
+        layer_count=layer_count,
+        model_scope=model_scope,
+        mode=deepseek_mode,
+    )
 
 
 __all__ = [

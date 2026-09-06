@@ -510,6 +510,72 @@ def _graph_from_text(text: str, *, graph_id: str) -> OperatorGraph:
             input_names = (input_names[0], input_names[1])
             iteration_dims = tuple((f"d{axis}", value) for axis, value in enumerate(result_shape))
             reduction_dims = ()
+        elif normalized_target == "stablehlo.gather":
+            if len(input_shapes) != 2:
+                raise FrontendImportError(
+                    f"StableHLO gather '{result_name}' requires table and indices operands"
+                )
+            table_shape, indices_shape = input_shapes
+            if len(table_shape) != 2 or len(indices_shape) < 1:
+                raise FrontendImportError(
+                    f"StableHLO gather '{result_name}' embedding contract requires a rank-2 table "
+                    "and rank-1-or-greater indices"
+                )
+            slice_sizes = _named_integer_list(body, "slice_sizes")
+            offset_dims = _named_integer_list(body, "offset_dims")
+            collapsed_slice_dims = _named_integer_list(body, "collapsed_slice_dims")
+            start_index_map = _named_integer_list(body, "start_index_map")
+            index_vector_dim = _named_integer(body, "index_vector_dim")
+            expected_result = (*indices_shape, table_shape[1])
+            if tuple(result_shape) != expected_result:
+                raise FrontendImportError(
+                    f"StableHLO gather '{result_name}' result shape {result_shape} does not match "
+                    f"embedding lookup shape {expected_result}"
+                )
+            if slice_sizes != (1, table_shape[1]):
+                raise FrontendImportError(
+                    f"StableHLO gather '{result_name}' requires slice_sizes [1, embedding_dim]"
+                )
+            if collapsed_slice_dims != (0,) or start_index_map != (0,):
+                raise FrontendImportError(
+                    f"StableHLO gather '{result_name}' only supports row lookup of table dimension 0"
+                )
+            if offset_dims != (len(indices_shape),) or index_vector_dim != len(indices_shape):
+                raise FrontendImportError(
+                    f"StableHLO gather '{result_name}' has unsupported embedding dimension numbers"
+                )
+            if tensors[input_names[1]].dtype not in {
+                "i32",
+                "i64",
+                "ui32",
+                "ui64",
+                "int32",
+                "int64",
+                "uint32",
+                "uint64",
+            }:
+                raise FrontendImportError(
+                    f"StableHLO gather '{result_name}' indices must use a 32-bit or 64-bit integer"
+                )
+            operation_attributes.update(
+                {
+                    "gather_kind": "embedding_lookup",
+                    "table_tensor": input_names[0],
+                    "indices_tensor": input_names[1],
+                    "vocabulary_size": table_shape[0],
+                    "embedding_dim": table_shape[1],
+                    "slice_sizes": list(slice_sizes),
+                    "offset_dims": list(offset_dims),
+                    "collapsed_slice_dims": list(collapsed_slice_dims),
+                    "start_index_map": list(start_index_map),
+                    "index_vector_dim": index_vector_dim,
+                    "index_region": "runtime_values",
+                }
+            )
+            iteration_dims = tuple(
+                (f"d{axis}", value) for axis, value in enumerate(result_shape)
+            )
+            reduction_dims = ()
         elif normalized_target == "stablehlo.convert":
             source_shape = input_shapes[0]
             if source_shape != result_shape:

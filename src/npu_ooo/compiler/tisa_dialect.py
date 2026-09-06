@@ -58,7 +58,7 @@ def _tile_region_to_dict(
 
 
 def _unit_map(primitive: str) -> UnitMap:
-    if primitive in {"load", "load_transpose", "store", "copy", "transpose"}:
+    if primitive in {"load", "load_transpose", "store", "copy", "transpose", "gather"}:
         return UnitMap("dma", affinity="data")
     if primitive in {"matmul", "conv2d"}:
         return UnitMap("tensor", affinity="matrix")
@@ -74,32 +74,32 @@ def _operator_tiles(tile_graph: TileGraph, operator_id: str) -> tuple[TileInstan
     )
 
 
-def _reduction_name(operator: Any) -> str | None:
-    return operator.reduction_dims[0][0] if operator.reduction_dims else None
+def _reduction_names(operator: Any) -> tuple[str, ...]:
+    return tuple(name for name, _ in operator.reduction_dims)
 
 
 def _row_key(tile: TileInstance, operator: Any) -> tuple[int, ...]:
-    reduction = _reduction_name(operator)
+    reductions = set(_reduction_names(operator))
     return tuple(
         tile.bound_map[name][0]
         for name, _ in operator.iteration_dims
-        if name != reduction
+        if name not in reductions
     )
 
 
 def _is_first_reduction_tile(tile: TileInstance, operator: Any) -> bool:
-    reduction = _reduction_name(operator)
-    if reduction is None:
+    reductions = _reduction_names(operator)
+    if not reductions:
         return True
-    return tile.bound_map[reduction][0] == 0
+    return all(tile.bound_map[name][0] == 0 for name in reductions)
 
 
 def _is_last_reduction_tile(tile: TileInstance, operator: Any) -> bool:
-    reduction = _reduction_name(operator)
-    if reduction is None:
+    reductions = _reduction_names(operator)
+    if not reductions:
         return True
-    extent = dict(operator.reduction_dims)[reduction]
-    return tile.bound_map[reduction][1] == extent
+    extents = dict(operator.reduction_dims)
+    return all(tile.bound_map[name][1] == extents[name] for name in reductions)
 
 
 def _stages_for_tile(operator: Any, tile: TileInstance) -> tuple[TISAStage, ...]:
@@ -141,6 +141,8 @@ def _stages_for_tile(operator: Any, tile: TileInstance) -> tuple[TISAStage, ...]
         if op_type == "slice":
             primitive = "copy"
         stages = [("transform", primitive)]
+    elif op_type == "embedding":
+        stages = [("gather", "gather")]
     else:
         raise NotImplementedError(
             f"FC semantic builder does not support operator '{op_type}'"
@@ -263,6 +265,7 @@ def _readiness_condition(stage: TISAStage) -> str:
         "kv_cache_update",
         "batch_norm",
         "pool",
+        "gather",
     }:
         return "semantic_tile_ready"
     return "operand_regions_ready"
@@ -443,6 +446,20 @@ def _operand_geometry(
                     tuple(int(limit) - int(start) for start, limit in zip(starts, limits)),
                 )
             return (0,) * len(full_shape), full_shape
+        return None
+    if op_type == "embedding":
+        full_shape = _resolved_tensor_shape(tensor)
+        if full_shape is None or len(operator.inputs) != 2 or len(operator.outputs) != 1:
+            return None
+        if name == operator.outputs[0]:
+            return _dim_geometry(bounds, iteration)
+        if name == operator.inputs[0]:
+            return (0,) * len(full_shape), full_shape
+        if name == operator.inputs[1]:
+            output_starts, output_shape = _dim_geometry(bounds, iteration)
+            if len(full_shape) > len(output_shape):
+                return None
+            return output_starts[: len(full_shape)], output_shape[: len(full_shape)]
         return None
     if op_type in {"matmul", "batched_matmul", "gemv"}:
         if len(operator.inputs) < 2 or not operator.outputs:
@@ -854,21 +871,31 @@ class TISASemanticBuilder:
             rows: dict[tuple[int, ...], list[TileInstance]] = {}
             for tile in op_tiles:
                 rows.setdefault(_row_key(tile, operator), []).append(tile)
-            reduction = _reduction_name(operator)
+            reductions = _reduction_names(operator)
             for row_tiles in rows.values():
                 ordered = sorted(
                     row_tiles,
-                    key=lambda tile: tile.bound_map[reduction][0] if reduction else tile.ordinal,
+                    key=lambda tile: (
+                        tuple(tile.bound_map[name][0] for name in reductions)
+                        if reductions
+                        else (tile.ordinal,)
+                    ),
                 )
-                if op_type in {"matmul", "batched_matmul", "gemv", "conv2d"} and reduction:
-                    output_dims = tuple(name for name, _ in operator.iteration_dims if name != reduction)
+                if op_type in {"matmul", "batched_matmul", "gemv", "conv2d"} and reductions:
+                    output_dims = tuple(
+                        name for name, _ in operator.iteration_dims if name not in reductions
+                    )
                     groups: dict[tuple[int, ...], list[TileInstance]] = {}
                     for tile in ordered:
                         groups.setdefault(
                             tuple(tile.bound_map[name][0] for name in output_dims), []
                         ).append(tile)
                     for output_tiles in groups.values():
-                        output_tiles.sort(key=lambda tile: tile.bound_map[reduction][0])
+                        output_tiles.sort(
+                            key=lambda tile: tuple(
+                                tile.bound_map[name][0] for name in reductions
+                            )
+                        )
                         for previous, current in zip(output_tiles, output_tiles[1:]):
                             add_dependency(
                                 instruction_id(current.tile_id, "compute"),
@@ -885,7 +912,7 @@ class TISASemanticBuilder:
                     "rmsnorm": "compute",
                     "layernorm": "compute",
                 }.get(op_type)
-                if barrier_stage and reduction:
+                if barrier_stage and reductions:
                     for previous, current in zip(ordered, ordered[1:]):
                         add_dependency(
                             instruction_id(current.tile_id, barrier_stage),
@@ -902,7 +929,7 @@ class TISASemanticBuilder:
                                     "stage": barrier_stage,
                                 },
                         )
-                if op_type == "softmax" and reduction:
+                if op_type == "softmax" and reductions:
                     if operator.attributes.get("softmax_algorithm", "materialized") == "online":
                         for previous, current in zip(ordered, ordered[1:]):
                             add_dependency(

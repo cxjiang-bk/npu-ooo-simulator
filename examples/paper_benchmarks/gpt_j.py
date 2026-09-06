@@ -10,13 +10,19 @@ from .types import PaperBenchmarkSpec, PaperBenchmarkWorkload
 
 class GPTJ6BOneBlock(PaperTransformerBlock):
     def __init__(self) -> None:
-        super().__init__(norm="layernorm", activation="gelu_tanh", gated=False)
+        super().__init__(
+            norm="layernorm",
+            activation="gelu_tanh",
+            gated=False,
+            rotary=True,
+        )
 
 
 SPEC = PaperBenchmarkSpec(
     "gpt-j-6b-oneblk", "GPT-J-6B", "decoder_transformer", "prefill", "float16", 1, 512, None,
     4096, 16, 16384, 29.9, 37.3, 1.25, "transformer_one_block",
-    ("token_embedding", "rotary_embedding", "full_model_depth", "exact_gelu"),
+    ("token_embedding", "full_model_depth", "exact_gelu"),
+    "one_block", 1,
 )
 
 
@@ -25,6 +31,7 @@ def build(
     dtype: torch.dtype | None = None,
     *,
     layer_count: int = 1,
+    model_scope: str = "one_block",
 ) -> PaperBenchmarkWorkload:
     return transformer_workload(
         SPEC,
@@ -32,4 +39,5 @@ def build(
         variant=variant,
         dtype=dtype,
         layer_count=layer_count,
+        model_scope=model_scope,
     )

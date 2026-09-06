@@ -106,6 +106,7 @@ SPEC = PaperBenchmarkSpec(
     "llama2-13b-oneblk", "LLaMA2-13B", "decoder_transformer", "prefill", "float16", 1, 512, None,
     5120, 40, 13824, 54.0, 77.1, 1.43, "transformer_one_block",
     ("token_embedding", "kv_cache", "full_model_depth"),
+    "one_block", 1,
 )
 
 
@@ -114,6 +115,7 @@ def build(
     dtype: torch.dtype | None = None,
     *,
     layer_count: int = 1,
+    model_scope: str = "one_block",
 ) -> PaperBenchmarkWorkload:
     return transformer_workload(
         SPEC,
@@ -121,6 +123,7 @@ def build(
         variant=variant,
         dtype=dtype,
         layer_count=layer_count,
+        model_scope=model_scope,
     )
 
 

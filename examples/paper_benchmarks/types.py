@@ -28,6 +28,8 @@ class PaperBenchmarkSpec:
     reference_speedup: float
     workload_kind: str
     unsupported_features: tuple[str, ...] = ()
+    paper_evaluation_scope: str = "full_model"
+    reference_layer_count: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -50,6 +52,8 @@ class PaperBenchmarkSpec:
             },
             "workload_kind": self.workload_kind,
             "unsupported_features": list(self.unsupported_features),
+            "paper_evaluation_scope": self.paper_evaluation_scope,
+            "reference_layer_count": self.reference_layer_count,
         }
 
 

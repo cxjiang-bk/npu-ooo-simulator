@@ -27,6 +27,11 @@ class PaperBenchmarkRun:
 
     case_id: str
     variant: str
+    layer_count: int
+    model_scope: str
+    deepseek_mode: str
+    request_count: int
+    inter_request_gap_cycles: float
     spec: Mapping[str, Any]
     input_shapes: tuple[tuple[int, ...], ...]
     input_dtypes: tuple[str, ...]
@@ -53,6 +58,11 @@ class PaperBenchmarkRun:
                 "benchmark_id": self.case_id,
                 "policy_case_id": policy_record.pop("case_id"),
                 "variant": self.variant,
+                "layer_count": self.layer_count,
+                "model_scope": self.model_scope,
+                "deepseek_mode": self.deepseek_mode,
+                "request_count": self.request_count,
+                "inter_request_gap_cycles": self.inter_request_gap_cycles,
                 "status": "ok",
                 "artifact_id": self.artifact_id,
                 "program_id": self.program_id,
@@ -69,8 +79,14 @@ class PaperBenchmarkRun:
                 "phase": self.spec.get("phase"),
                 "dtype": self.spec.get("dtype"),
                 "workload_kind": self.spec.get("workload_kind"),
-                "unsupported_features": self.spec.get("unsupported_features", []),
+                "unsupported_features": self.workload_attributes.get(
+                    "remaining_features",
+                    self.spec.get("unsupported_features", []),
+                ),
                 "simulation_dimensions": self.workload_attributes.get("simulation_dimensions"),
+                "model_components": self.workload_attributes.get("model_components", {}),
+                "model_statistics": self.workload_attributes.get("model_statistics", {}),
+                "moe": self.workload_attributes.get("moe", {}),
                 "reference": reference,
                 **policy_record,
             }
@@ -82,6 +98,11 @@ class PaperBenchmarkRun:
                     "benchmark_id": self.case_id,
                     "policy_case_id": None,
                     "variant": self.variant,
+                    "layer_count": self.layer_count,
+                    "model_scope": self.model_scope,
+                    "deepseek_mode": self.deepseek_mode,
+                    "request_count": self.request_count,
+                    "inter_request_gap_cycles": self.inter_request_gap_cycles,
                     "status": "error" if self.error else "empty",
                     "error": self.error,
                     "artifact_id": self.artifact_id,
@@ -99,8 +120,14 @@ class PaperBenchmarkRun:
                     "phase": self.spec.get("phase"),
                     "dtype": self.spec.get("dtype"),
                     "workload_kind": self.spec.get("workload_kind"),
-                    "unsupported_features": self.spec.get("unsupported_features", []),
+                    "unsupported_features": self.workload_attributes.get(
+                        "remaining_features",
+                        self.spec.get("unsupported_features", []),
+                    ),
                     "simulation_dimensions": self.workload_attributes.get("simulation_dimensions"),
+                    "model_components": self.workload_attributes.get("model_components", {}),
+                    "model_statistics": self.workload_attributes.get("model_statistics", {}),
+                    "moe": self.workload_attributes.get("moe", {}),
                     "reference": reference,
                 }
             )
@@ -132,6 +159,11 @@ class PaperBenchmarkMatrix:
     """Stable result container for a batch of paper benchmark cases."""
 
     variant: str
+    layer_count: int
+    model_scope: str
+    deepseek_mode: str
+    request_count: int
+    inter_request_gap_cycles: float
     runs: tuple[PaperBenchmarkRun, ...]
 
     def records(self) -> tuple[dict[str, Any], ...]:
@@ -141,11 +173,21 @@ class PaperBenchmarkMatrix:
         return {
             "schema_version": 1,
             "variant": self.variant,
+            "layer_count": self.layer_count,
+            "model_scope": self.model_scope,
+            "deepseek_mode": self.deepseek_mode,
+            "request_count": self.request_count,
+            "inter_request_gap_cycles": self.inter_request_gap_cycles,
             "case_count": len(self.runs),
             "runs": [
                 {
                     "case_id": run.case_id,
                     "variant": run.variant,
+                    "layer_count": run.layer_count,
+                    "model_scope": run.model_scope,
+                    "deepseek_mode": run.deepseek_mode,
+                    "request_count": run.request_count,
+                    "inter_request_gap_cycles": run.inter_request_gap_cycles,
                     "spec": dict(run.spec),
                     "status": "error" if run.error else "ok",
                     "error": run.error,
@@ -161,9 +203,41 @@ class PaperBenchmarkMatrix:
         }
 
 
-def _case_workload(case_id: str, variant: str, *, layer_count: int = 1):
+def _case_workload(
+    case_id: str,
+    variant: str,
+    *,
+    layer_count: int = 1,
+    model_scope: str = "one_block",
+    deepseek_mode: str = "dense",
+):
     from examples.paper_benchmarks import build_paper_benchmark
-    return build_paper_benchmark(case_id, variant=variant, layer_count=layer_count)
+    return build_paper_benchmark(
+        case_id,
+        variant=variant,
+        layer_count=layer_count,
+        model_scope=model_scope,
+        deepseek_mode=deepseek_mode,
+    )
+
+
+def _compiled_model_id(
+    case_id: str,
+    variant: str,
+    model_scope: str,
+    layer_count: int,
+    deepseek_mode: str,
+) -> str:
+    if (
+        model_scope == "one_block"
+        and layer_count == 1
+        and deepseek_mode in {"dense", "not_applicable"}
+    ):
+        return case_id
+    return (
+        f"{case_id}.{variant}.{model_scope}.layers{layer_count}."
+        f"{deepseek_mode}"
+    )
 
 
 def run_paper_benchmark_matrix(
@@ -172,6 +246,8 @@ def run_paper_benchmark_matrix(
     case_ids: Sequence[str] | None = None,
     variant: str = "micro",
     layer_count: int = 1,
+    model_scope: str = "one_block",
+    deepseek_mode: str = "dense",
     tile_size: int = 32,
     tile_size_candidates: Sequence[int] | None = None,
     runtime_chunk_size: int | None = None,
@@ -192,6 +268,8 @@ def run_paper_benchmark_matrix(
     codegen_backend: CodegenBackend | None = None,
     softmax_algorithm: str | None = None,
     continue_on_error: bool = False,
+    request_count: int = 1,
+    inter_request_gap_cycles: float = 0.0,
 ) -> PaperBenchmarkMatrix:
     """Compile each selected registry case once and run policy combinations."""
 
@@ -204,6 +282,14 @@ def run_paper_benchmark_matrix(
         raise ValueError("paper benchmark selection must contain at least one case")
     if layer_count <= 0:
         raise ValueError("layer_count must be positive")
+    if model_scope not in {"one_block", "model_proxy"}:
+        raise ValueError("model_scope must be 'one_block' or 'model_proxy'")
+    if deepseek_mode not in {"dense", "moe_proxy"}:
+        raise ValueError("deepseek_mode must be 'dense' or 'moe_proxy'")
+    if isinstance(request_count, bool) or not isinstance(request_count, int) or request_count <= 0:
+        raise ValueError("request_count must be a positive integer")
+    if inter_request_gap_cycles < 0:
+        raise ValueError("inter_request_gap_cycles must be non-negative")
     if len(set(selected)) != len(selected):
         raise ValueError("paper benchmark selection must not contain duplicate case ids")
     if not runtime_policies or not device_policies:
@@ -228,13 +314,28 @@ def run_paper_benchmark_matrix(
     runs: list[PaperBenchmarkRun] = []
     for case_id in selected:
         workload = None
+        effective_deepseek_mode = (
+            deepseek_mode if case_id.startswith("deepseek-") else "not_applicable"
+        )
         try:
-            workload = _case_workload(case_id, variant, layer_count=layer_count)
+            workload = _case_workload(
+                case_id,
+                variant,
+                layer_count=layer_count,
+                model_scope=model_scope,
+                deepseek_mode=deepseek_mode,
+            )
             compiled = compile_torch_module(
                 workload.module,
                 workload.inputs,
                 compile_machine,
-                model_id=case_id,
+                model_id=_compiled_model_id(
+                    case_id,
+                    variant,
+                    model_scope,
+                    layer_count,
+                    effective_deepseek_mode,
+                ),
                 tile_size=tile_size,
                 tile_size_candidates=tile_size_candidates,
                 codegen_backend=codegen_backend,
@@ -262,11 +363,18 @@ def run_paper_benchmark_matrix(
                 timing_model=timing_model,
                 simulator_config=simulator_config,
                 event_backend=event_backend,
+                request_count=request_count,
+                inter_request_gap_cycles=inter_request_gap_cycles,
             )
             runs.append(
                 PaperBenchmarkRun(
                     case_id=case_id,
                     variant=variant,
+                    layer_count=layer_count,
+                    model_scope=model_scope,
+                    deepseek_mode=effective_deepseek_mode,
+                    request_count=request_count,
+                    inter_request_gap_cycles=inter_request_gap_cycles,
                     spec=workload.spec.to_dict(),
                     input_shapes=tuple(tuple(int(item) for item in value.shape) for value in workload.inputs),
                     input_dtypes=tuple(str(value.dtype).removeprefix("torch.") for value in workload.inputs),
@@ -291,6 +399,11 @@ def run_paper_benchmark_matrix(
                 PaperBenchmarkRun(
                     case_id=case_id,
                     variant=variant,
+                    layer_count=layer_count,
+                    model_scope=model_scope,
+                    deepseek_mode=effective_deepseek_mode,
+                    request_count=request_count,
+                    inter_request_gap_cycles=inter_request_gap_cycles,
                     spec=spec,
                     input_shapes=(),
                     input_dtypes=(),
@@ -301,7 +414,15 @@ def run_paper_benchmark_matrix(
                     error=f"{type(exc).__name__}: {exc}",
                 )
             )
-    return PaperBenchmarkMatrix(variant=variant, runs=tuple(runs))
+    return PaperBenchmarkMatrix(
+        variant=variant,
+        layer_count=layer_count,
+        model_scope=model_scope,
+        deepseek_mode=deepseek_mode,
+        request_count=request_count,
+        inter_request_gap_cycles=inter_request_gap_cycles,
+        runs=tuple(runs),
+    )
 
 
 __all__ = ["PaperBenchmarkMatrix", "PaperBenchmarkRun", "run_paper_benchmark_matrix"]

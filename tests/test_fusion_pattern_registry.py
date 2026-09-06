@@ -3,13 +3,77 @@ import unittest
 from npu_ooo.compiler import (
     SemanticFusionPattern,
     SemanticFusionPatternRegistry,
+    MoEDispatchRegionPass,
     SoftmaxFusionPass,
     default_pass_manager,
     default_semantic_fusion_registry,
 )
+from npu_ooo.ir import DataEdge, OperatorGraph, OperatorSpec, TensorSpec
 
 
 class SemanticFusionPatternRegistryTest(unittest.TestCase):
+    def test_moe_region_keeps_router_expert_and_combine_members_visible(self) -> None:
+        tensor_shapes = {
+            "router_logits": (2, 4),
+            "routing_mask": (2, 4),
+            "router_probs": (2, 4),
+            "routed": (2, 4),
+            "weight0": (2, 1),
+            "weight1": (2, 1),
+            "x": (2, 8),
+            "expert_weight0": (8, 8),
+            "expert_weight1": (8, 8),
+            "expert0": (2, 8),
+            "expert1": (2, 8),
+            "weighted0": (2, 8),
+            "weighted1": (2, 8),
+            "combined": (2, 8),
+        }
+        operators = (
+            OperatorSpec("router", "softmax", ("router_logits",), ("router_probs",), (("d0", 2),), (("d1", 4),)),
+            OperatorSpec("mask", "elementwise", ("router_probs", "routing_mask"), ("routed",), (("d0", 2), ("d1", 4)), attributes={"frontend_target": "stablehlo.multiply"}),
+            OperatorSpec("slice0", "slice", ("routed",), ("weight0",), (("d0", 2), ("d1", 1))),
+            OperatorSpec("slice1", "slice", ("routed",), ("weight1",), (("d0", 2), ("d1", 1))),
+            OperatorSpec("expert0", "matmul", ("x", "expert_weight0"), ("expert0",), (("M", 2), ("N", 8)), (("K", 8),)),
+            OperatorSpec("expert1", "matmul", ("x", "expert_weight1"), ("expert1",), (("M", 2), ("N", 8)), (("K", 8),)),
+            OperatorSpec("weighted0", "elementwise", ("weight0", "expert0"), ("weighted0",), (("d0", 2), ("d1", 8)), attributes={"frontend_target": "stablehlo.multiply"}),
+            OperatorSpec("weighted1", "elementwise", ("weight1", "expert1"), ("weighted1",), (("d0", 2), ("d1", 8)), attributes={"frontend_target": "stablehlo.multiply"}),
+            OperatorSpec("combine", "elementwise", ("weighted0", "weighted1"), ("combined",), (("d0", 2), ("d1", 8)), attributes={"frontend_target": "stablehlo.add"}),
+        )
+        producer = {
+            output: operation.op_id
+            for operation in operators
+            for output in operation.outputs
+        }
+        edges = tuple(
+            DataEdge(producer[tensor], operation.op_id, tensor)
+            for operation in operators
+            for tensor in operation.inputs
+            if tensor in producer
+        )
+        graph = OperatorGraph(
+            "moe-region-test",
+            tuple(TensorSpec(name, shape, "f32") for name, shape in tensor_shapes.items()),
+            operators,
+            edges,
+        )
+
+        result = MoEDispatchRegionPass().run(graph)
+
+        regions = result.graph.attributes["semantic_regions"]
+        self.assertEqual(len(regions), 1)
+        self.assertEqual(regions[0]["semantic_family"], "moe_dispatch")
+        self.assertEqual(set(regions[0]["roles"]["expert_outputs"]), {"expert0", "expert1"})
+        roles = {
+            operation.op_id: operation.attributes.get("semantic_region_role")
+            for operation in result.graph.operators
+        }
+        self.assertEqual(roles["router"], "router_softmax")
+        self.assertEqual(roles["mask"], "topk_mask")
+        self.assertEqual(roles["weighted0"], "expert_weight")
+        self.assertEqual(roles["combine"], "combine")
+        self.assertEqual(len(result.graph.operators), len(graph.operators))
+
     def test_default_registry_exposes_existing_semantic_patterns(self) -> None:
         patterns = default_semantic_fusion_registry().patterns()
 
@@ -24,6 +88,7 @@ class SemanticFusionPatternRegistryTest(unittest.TestCase):
                 "recover_rotary_embedding",
                 "recover_attention_region",
                 "fuse_swiglu",
+                "recover_moe_dispatch_region",
             ],
         )
         self.assertEqual(
@@ -37,6 +102,7 @@ class SemanticFusionPatternRegistryTest(unittest.TestCase):
                 "rotary_embedding",
                 "attention",
                 "swiglu",
+                "moe_dispatch",
             ],
         )
         self.assertEqual(
@@ -98,6 +164,7 @@ class SemanticFusionPatternRegistryTest(unittest.TestCase):
                 "recover_rotary_embedding",
                 "recover_attention_region",
                 "fuse_swiglu",
+                "recover_moe_dispatch_region",
             ],
         )
 
