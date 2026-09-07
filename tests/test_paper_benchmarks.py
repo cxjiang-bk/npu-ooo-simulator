@@ -9,7 +9,7 @@ from npu_ooo.frontend import official_stablehlo_available, torch_xla_available
 from npu_ooo.experiments import run_runtime_device_matrix
 from npu_ooo.ir import (
     RuntimeSequence,
-    allocate_buffer_bindings,
+    allocate_memory_plan_bindings,
     create_runtime_sequence,
     create_runtime_state_registry,
 )
@@ -189,7 +189,9 @@ class PaperBenchmarkFrontendTest(unittest.TestCase):
             if operator.normalized_type == "kv_cache_update"
         ]
         self.assertEqual(len(cache_updates), 2)
-        buffers = allocate_buffer_bindings(compiled.graph.tensors)
+        buffers = allocate_memory_plan_bindings(
+            compiled.backend_artifact.memory_plan, minimal_machine_config()
+        )
         cases = run_runtime_device_matrix(
             compiled.backend_artifact,
             buffers,
@@ -488,7 +490,9 @@ class PaperBenchmarkFrontendTest(unittest.TestCase):
             {operator.attributes["state_transition"] for operator in cache_updates},
             {"drop_oldest_append_new"},
         )
-        bindings = allocate_buffer_bindings(compiled.graph.tensors)
+        bindings = allocate_memory_plan_bindings(
+            compiled.backend_artifact.memory_plan, minimal_machine_config()
+        )
         registry = create_runtime_state_registry(compiled.backend_artifact, bindings)
         self.assertEqual(registry.state_ids(), ("arg11", "arg18"))
         sequence = create_runtime_sequence(

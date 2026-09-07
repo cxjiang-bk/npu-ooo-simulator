@@ -17,7 +17,7 @@ from npu_ooo.ir import (
     TISAProgram,
     TileMem,
     UnitMap,
-    allocate_buffer_bindings,
+    allocate_memory_plan_bindings,
 )
 
 
@@ -101,7 +101,9 @@ class RuntimeDeviceMatrixTest(unittest.TestCase):
             model_id="runtime-matrix",
             tile_size=4,
         )
-        buffers = allocate_buffer_bindings(compiled.graph.tensors)
+        buffers = allocate_memory_plan_bindings(
+            compiled.backend_artifact.memory_plan, machine
+        )
         cases = run_runtime_device_matrix(
             compiled.backend_artifact,
             buffers,

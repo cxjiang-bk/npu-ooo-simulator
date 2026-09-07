@@ -10,7 +10,7 @@ from npu_ooo.ir import (
     OperatorGraph,
     OperatorSpec,
     TensorSpec,
-    allocate_buffer_bindings,
+    allocate_memory_plan_bindings,
     build_tile_graph,
     create_runtime_sequence,
     create_runtime_state_registry,
@@ -34,6 +34,13 @@ def _compile(text: str, model_id: str, tile_size: int):
         source_frontend=frontend,
         stablehlo=stablehlo,
         tile_size=tile_size,
+    )
+
+
+def _bindings(compiled):
+    return allocate_memory_plan_bindings(
+        compiled.backend_artifact.memory_plan,
+        minimal_machine_config(),
     )
 
 
@@ -99,7 +106,7 @@ class DynamicRuntimeContractTest(unittest.TestCase):
         }
         """
         compiled = _compile(text, "dynamic-slice-runtime", tile_size=2)
-        bindings = allocate_buffer_bindings(compiled.graph.tensors)
+        bindings = _bindings(compiled)
         submission = create_runtime_submission(
             compiled.backend_artifact,
             bindings,
@@ -162,7 +169,7 @@ class DynamicRuntimeContractTest(unittest.TestCase):
         }
         """
         compiled = _compile(text, "dynamic-slice-signed", tile_size=2)
-        bindings = allocate_buffer_bindings(compiled.graph.tensors)
+        bindings = _bindings(compiled)
         submission = create_runtime_submission(
             compiled.backend_artifact,
             bindings,
@@ -189,7 +196,7 @@ class DynamicRuntimeContractTest(unittest.TestCase):
             compiled.tisa_program.instructions[1].attributes["state_region"]["window_shape"],
             [1, 2],
         )
-        bindings = allocate_buffer_bindings(compiled.graph.tensors)
+        bindings = _bindings(compiled)
         registry = create_runtime_state_registry(compiled.backend_artifact, bindings)
         sequence = create_runtime_sequence(
             compiled.backend_artifact,

@@ -306,3 +306,33 @@ GC typed dependency 已完成，下一项转入 symbolic shape、dynamic index �
   `out/scheduler-cycle-20260906/`（实验输出目录不纳入 Git）。
 - 接口及设计边界见 `docs/device-scheduler.md`。scheduler 时序状态为 uncalibrated；
   实际 Epoch 7–9 cycle dispatch、partial-ready 子区域协议、在线优先级和多核路由需独立校准。
+
+## 2026-09-07：目标存储规划与 Runtime binding 根因修复
+
+- 根因确认：FC/TISA、backend payload 与 Runtime 原先分别维护逻辑 TileMem、局部访存和
+  DRAM tensor allocation，没有共享 allocation identity。现由 CodegenBackend 统一输出
+  最终目标 TISA、ExecutionTask payload 和 `MemoryPlan` v2；Runtime 只绑定地址空间基址。
+- `MachineConfig.operation_placements` 显式描述 Matmul 的 operand role、目标 memory、EU 和
+  transfer route。minimal 为 DRAM↔SRAM；lpu-like 为
+  `GM→UB→LMB/RMB→MXU→PSB→UB→GM`，跨 GDMA/LDMA/MXU/ARU 的边界均是独立 TISA stage。
+- `buffer_id/allocation_id` 已贯通 BufferRegion、TileMem、MemoryPlan、BufferBinding 和
+  RuntimeOperandBinding。最终 TISA 对 payload 的 memory/access/range 做严格覆盖校验；
+  scheduler 在无 Runtime 时按 allocation identity 检查，在有 submission 时按物理地址检查。
+- 局部 tile 使用 packed span，外部 strided source 保留 bounding span；`valid_bytes` 独立表示
+  有效数据/traffic。4×4 f32、row stride 32 的验收值为 64-byte valid、112-byte source
+  span、64-byte packed local span。
+- allocator 按 memory capacity/alignment 分配 slot，通过 RAW/WAR/WAW 与
+  `BUFFER_REUSE/allocation_released` 保护复用；alias/view 保留独立 buffer identity 和显式
+  alias。容量不足直接报告 memory、需求和容量。
+- compile package 增加 `04_backend/memory_plan.json` 和 topology hash。simulate 可覆盖容量、
+  带宽、latency、bank/port、unit count（仍需满足容量），改变 topology/placement/alignment
+  时拒绝复用；旧 package 明确要求重新编译。
+- 验证：本地 `151 passed, 35 skipped, 51 subtests passed`；9980X-new 正式
+  PyTorch/Torch-XLA/StableHLO 环境运行 186 项，全部通过。正式 Attention 使用同一份
+  lpu-like compile package 运行 cycle_event static/dynamic，均退休 21 条最终 TISA，
+  compile package hash 同为 `edae32af27f3ca5820bbbca1450c74fef8297ed2e47f2d4b3435004e1b716237`；
+  本次小图两种 device policy 均为 560 cycles，说明新增约束下没有可利用的额外 ready 并行。
+  新产物位于 `out/target-memory-20260907/`。
+- 兼容边界：Matmul 已具备专用 role placement；其他 operation 目前由 backend 通用
+  root/local materialization 保证 TISA/payload/runtime 一致，尚未逐类加入专用多级 route。
+  bank-aware placement、eviction/fragmentation、跨 core routing 和真实 memory timing 仍属后续。

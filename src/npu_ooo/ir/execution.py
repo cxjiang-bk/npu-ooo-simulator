@@ -25,6 +25,9 @@ class BufferRegion:
     size_bytes: int = 0
     layout: str = "dense"
     strides_bytes: tuple[int, ...] | None = None
+    buffer_id: str | None = None
+    valid_bytes: int | None = None
+    attributes: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def normalized_access(self) -> str:
@@ -51,6 +54,12 @@ class BufferRegion:
             issues.append(f"buffer region '{self.tensor}' offset_bytes must be non-negative")
         if self.size_bytes < 0:
             issues.append(f"buffer region '{self.tensor}' size_bytes must be non-negative")
+        if self.buffer_id is not None and not self.buffer_id:
+            issues.append(f"buffer region '{self.tensor}' buffer_id must not be blank")
+        if self.valid_bytes is not None and (
+            self.valid_bytes <= 0 or (self.size_bytes and self.valid_bytes > self.size_bytes)
+        ):
+            issues.append(f"buffer region '{self.tensor}' valid_bytes is invalid")
         if self.strides_bytes is not None:
             if len(self.strides_bytes) != len(self.shape):
                 issues.append(f"buffer region '{self.tensor}' strides and shape must have equal rank")
@@ -73,6 +82,9 @@ class BufferRegion:
             "size_bytes": self.size_bytes,
             "layout": self.layout,
             "strides_bytes": list(self.strides_bytes) if self.strides_bytes is not None else None,
+            "buffer_id": self.buffer_id,
+            "valid_bytes": self.valid_bytes,
+            "attributes": dict(self.attributes),
         }
 
     @classmethod
@@ -95,6 +107,9 @@ class BufferRegion:
                     if payload.get("strides_bytes") is not None
                     else None
                 ),
+                buffer_id=(str(payload["buffer_id"]) if payload.get("buffer_id") is not None else None),
+                valid_bytes=(int(payload["valid_bytes"]) if payload.get("valid_bytes") is not None else None),
+                attributes=payload.get("attributes", {}),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("invalid buffer region payload") from exc

@@ -18,6 +18,8 @@ from npu_ooo.ir import (
     BufferBinding,
     ExecutionGraph,
     ExecutionTask,
+    MemoryBuffer,
+    MemoryPlan,
     OperatorGraph,
     TensorSpec,
     TISADependency,
@@ -553,7 +555,42 @@ class CycleSchedulerTest(unittest.TestCase):
         program = replace(
             program,
             program=replace(
-                program.program, instructions=(replace(inst, operands=(operand,)),)
+                program.program,
+                instructions=(
+                    replace(
+                        inst,
+                        operands=(
+                            replace(
+                                operand,
+                                tile_mem=replace(
+                                    operand.tile_mem,
+                                    scope="SRAM",
+                                    buffer_id="a@SRAM",
+                                    allocation_id="SRAM.alloc0000",
+                                    valid_bytes=8,
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            memory_plan=MemoryPlan(
+                "micro.memory",
+                "minimal",
+                minimal_machine_config().topology_hash(),
+                (
+                    MemoryBuffer(
+                        "a@SRAM",
+                        "SRAM.alloc0000",
+                        "a",
+                        "SRAM",
+                        0,
+                        8,
+                        8,
+                        1,
+                        "dense",
+                    ),
+                ),
             ),
         )
         graph = OperatorGraph("micro", (TensorSpec("a", (4,)),), ())

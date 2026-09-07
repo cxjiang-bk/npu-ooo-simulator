@@ -8,6 +8,7 @@ from npu_ooo.ir import (
     BufferBinding,
     RuntimeSubmission,
     allocate_buffer_bindings,
+    allocate_memory_plan_bindings,
     create_runtime_submission,
     derive_tensor_lifetimes,
     derive_tensor_reuse_pairs,
@@ -23,6 +24,13 @@ FRONTEND_AVAILABLE = bool(
 
 @unittest.skipUnless(FRONTEND_AVAILABLE, "requires the production PyTorch frontend")
 class RuntimeSubmissionTest(unittest.TestCase):
+    def _planned_bindings(self, *, base_address=0x10000000):
+        return allocate_memory_plan_bindings(
+            self.compiled.backend_artifact.memory_plan,
+            minimal_machine_config(),
+            base_address=base_address,
+        )
+
     @classmethod
     def setUpClass(cls) -> None:
         import torch
@@ -49,7 +57,7 @@ class RuntimeSubmissionTest(unittest.TestCase):
             self.assertLessEqual(left.end_address, right.base_address)
 
     def test_submission_binds_operands_and_chunks_without_changing_program(self) -> None:
-        buffers = allocate_buffer_bindings(self.compiled.graph.tensors, base_address=0x100000)
+        buffers = self._planned_bindings(base_address=0x100000)
         submission = create_runtime_submission(
             self.compiled.backend_artifact,
             buffers,
@@ -67,7 +75,7 @@ class RuntimeSubmissionTest(unittest.TestCase):
                 self.assertLess(submitted_index[dependency.source], submitted_index[instruction.tisa_id])
 
     def test_submission_rejects_out_of_range_explicit_operand_offset(self) -> None:
-        buffers = allocate_buffer_bindings(self.compiled.graph.tensors, base_address=0x100000)
+        buffers = self._planned_bindings(base_address=0x100000)
         instruction = self.compiled.tisa_program.instructions[0]
         operand = instruction.operands[0]
         with self.assertRaisesRegex(ValueError, "offset exceeds buffer"):
@@ -89,7 +97,9 @@ class RuntimeSubmissionTest(unittest.TestCase):
         reused = [binding for binding in bindings if binding.attributes.get("reused_from")]
         self.assertEqual(reuse_pairs, frozenset())
         self.assertFalse(reused)
-        submission = create_runtime_submission(self.compiled.backend_artifact, bindings)
+        submission = create_runtime_submission(
+            self.compiled.backend_artifact, self._planned_bindings()
+        )
         self.assertEqual(submission.validate(self.compiled.tisa_program), ())
 
     def test_lifetime_allocator_requires_dependency_proof_for_reuse(self) -> None:

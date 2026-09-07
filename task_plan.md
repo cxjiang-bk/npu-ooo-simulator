@@ -99,6 +99,17 @@ static/dynamic 的差异来自 policy；小图数据可以逐项核对。
 - [x] completion 与 retirement 分离、队列/Fu/tile 反压和逐周期 stall taxonomy；
 - [x] 较老未 issue 地址冲突保护、hand-derived micro-tests 和同 artifact 策略比较。
 
+### 目标存储映射根因修复（已完成）
+
+- [x] `MachineConfig` 按 operation/operand role 定义 EU、目标 memory 与合法 transfer route；
+- [x] minimal Matmul 映射到 DRAM/SRAM，lpu-like 映射到 LMB/RMB/PSB；
+- [x] 多 EU 搬运在 FC 形成独立 TISA stage，最终 TISA 与 BackendArtifact.program 一致；
+- [x] `MemoryPlan` v2 保存 buffer/allocation、memory、alignment、layout/stride、slot、
+      lifetime、alias 与 dependency-guarded reuse；
+- [x] Runtime 只按编译计划绑定基址，旧 package 诊断与 MachineConfig topology guard；
+- [x] 多 K/边界/strided Matmul、容量溢出、JSON round-trip、dynamic index/KV sequence、
+      Attention 正式前端与 static/dynamic 同包验收。
+
 ### 进行中
 
 - [ ] 用实际 scheduler RTL/profile 校准控制开销、在线仲裁及多核行为；
@@ -145,7 +156,8 @@ model / shape / phase
 
 - `compile` 只执行 PyTorch -> StableHLO -> GC/FC -> TISA/backend，并输出可持久化
   的 compile package；
-- `simulate` 只读取 package，根据 invocation manifest 绑定 buffer、dynamic index/layout，
+- `simulate` 只读取 package，根据 invocation manifest 为编译期 MemoryPlan 绑定基址、
+  dynamic index/layout，
   再选择 machine、runtime policy、device policy 和 timing backend；
 - `compile-and-sim` 保留为一站式入口；`compile` 与 `simulate` 用于分离执行。
 
@@ -157,9 +169,9 @@ model / shape / phase
 - dynamic index/layout 只影响 runtime binding 与地址/时序，不修改编译期 program；
 - 端到端 CLI 与原有测试保持兼容。
 
-当前验收状态：JSON package 独立仿真已通过，CLI 参数边界和 staged simulation 输出已通过；
-本地无前端依赖环境执行 126 项并跳过 34 项；9980X-new 的 Torch-XLA/StableHLO 环境执行
-全部 161 项并通过。
+当前验收状态：MemoryPlan v2 JSON package 独立仿真、拓扑校验和 staged output 已通过；
+本地无前端依赖环境 151 项通过、35 项跳过；9980X-new 的 Torch-XLA/StableHLO 环境
+186 项全部通过。
 
 ## 验证命令
 

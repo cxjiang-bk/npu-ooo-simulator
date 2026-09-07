@@ -10,7 +10,6 @@ primitive belongs to exactly one stage.
 """
 
 from dataclasses import dataclass, replace
-import math
 from typing import Any, Mapping
 
 from npu_ooo.arch import MachineConfig
@@ -102,10 +101,132 @@ def _is_last_reduction_tile(tile: TileInstance, operator: Any) -> bool:
     return all(tile.bound_map[name][1] == extents[name] for name in reductions)
 
 
-def _stages_for_tile(operator: Any, tile: TileInstance) -> tuple[TISAStage, ...]:
+def _matmul_target_stages(
+    operator: Any,
+    tile: TileInstance,
+    machine: MachineConfig,
+) -> tuple[TISAStage, ...] | None:
+    """Create target transfer boundaries from the placement contract.
+
+    These boundaries are derived before payload lowering.  In particular, a
+    multi-hop route that changes execution unit becomes multiple TISA stages;
+    the backend never has to infer a scheduler-visible boundary from tasks.
+    """
+
+    try:
+        placement = machine.placement("matmul")
+        roles = {
+            "lhs": placement.operand("lhs"),
+            "rhs": placement.operand("rhs"),
+            "output": placement.operand("output"),
+        }
+    except KeyError:
+        return None
+
+    stages: list[TISAStage] = []
+
+    def append_route_stages(direction: str, role_names: tuple[str, ...]) -> None:
+        route_edges = {
+            role: tuple(zip(roles[role].route, roles[role].route[1:]))
+            for role in role_names
+        }
+        maximum_hops = max((len(edges) for edges in route_edges.values()), default=0)
+        for hop in range(maximum_hops):
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            for role in role_names:
+                edges = route_edges[role]
+                if hop >= len(edges):
+                    continue
+                source, target = edges[hop]
+                path = next(
+                    item
+                    for item in machine.transfer_paths
+                    if item.source == source and item.target == target
+                )
+                grouped.setdefault(path.engine, []).append(
+                    {
+                        "role": role,
+                        "source": source,
+                        "target": target,
+                        "transform": path.transform,
+                    }
+                )
+            for group_index, (engine, transfers) in enumerate(sorted(grouped.items())):
+                key = f"{direction}_hop_{hop:02d}_{group_index:02d}"
+                primitive = (
+                    str(transfers[0]["transform"])
+                    if len(transfers) == 1 and transfers[0]["transform"]
+                    else "load" if direction == "input" else "store"
+                )
+                stages.append(
+                    TISAStage(
+                        key=key,
+                        primitive=primitive,
+                        unit_map=UnitMap(engine, affinity="data"),
+                        ordinal=len(stages),
+                        attributes={
+                            "tisa_stage": key,
+                            "primitive": primitive,
+                            "semantic_op": operator.normalized_type,
+                            "transfer_direction": direction,
+                            "transfers": transfers,
+                            "payload_primitives": sorted(
+                                {
+                                    str(item["transform"])
+                                    if item["transform"]
+                                    else "load" if direction == "input" else "store"
+                                    for item in transfers
+                                }
+                            ),
+                        },
+                        payload_primitives=tuple(
+                            sorted(
+                                {
+                                    str(item["transform"])
+                                    if item["transform"]
+                                    else "load" if direction == "input" else "store"
+                                    for item in transfers
+                                }
+                            )
+                        ),
+                    )
+                )
+
+    append_route_stages("input", ("lhs", "rhs"))
+    stages.append(
+        TISAStage(
+            key="compute",
+            primitive="matmul",
+            unit_map=UnitMap(placement.unit, affinity="matrix"),
+            ordinal=len(stages),
+            attributes={
+                "tisa_stage": "compute",
+                "primitive": "matmul",
+                "semantic_op": operator.normalized_type,
+                "operand_placement": {
+                    role: roles[role].memory for role in ("lhs", "rhs", "output")
+                },
+                "payload_primitives": ["matmul"],
+            },
+            payload_primitives=("matmul",),
+        )
+    )
+    if _is_last_reduction_tile(tile, operator):
+        append_route_stages("output", ("output",))
+    return tuple(stages)
+
+
+def _stages_for_tile(
+    operator: Any,
+    tile: TileInstance,
+    machine: MachineConfig,
+) -> tuple[TISAStage, ...]:
     op_type = operator.normalized_type
     stages: list[tuple[str, str]] = []
     if op_type in {"matmul", "batched_matmul", "gemv"}:
+        target_stages = _matmul_target_stages(operator, tile, machine)
+        if target_stages is not None:
+            return target_stages
         stages.append(("load", "load"))
         if operator.attributes.get("rhs_transposed"):
             stages.append(("load_transpose", "load_transpose"))
@@ -248,9 +369,9 @@ def _stages_for_tile(operator: Any, tile: TileInstance) -> tuple[TISAStage, ...]
 def _readiness_condition(stage: TISAStage) -> str:
     """Name the semantic event that makes a stage eligible to issue."""
 
-    if stage.key == "load":
+    if stage.attributes.get("transfer_direction") == "input" or stage.key == "load":
         return "input_region_ready"
-    if stage.key == "store":
+    if stage.attributes.get("transfer_direction") == "output" or stage.key == "store":
         return "output_region_ready"
     if stage.key == "transform":
         return "full_region_ready"
@@ -725,7 +846,7 @@ class TISASemanticBuilder:
         for order, tile_id in enumerate(tile_graph.topological_order()):
             tile = tiles[tile_id]
             operator = operators[tile.operator_id]
-            for stage in _stages_for_tile(operator, tile):
+            for stage in _stages_for_tile(operator, tile, machine):
                 tisa_id = f"tisa.{tile_id}.s{stage.ordinal:02d}"
                 stage_map[(tile_id, stage.key)] = stage
                 source_order[tisa_id] = order * 100 + stage.ordinal
@@ -807,7 +928,7 @@ class TISASemanticBuilder:
             return f"tisa.{tile_id}.s{stage.ordinal:02d}"
 
         for tile in tile_graph.tiles:
-            stages = _stages_for_tile(operators[tile.operator_id], tile)
+            stages = _stages_for_tile(operators[tile.operator_id], tile, machine)
             for previous, current in zip(stages, stages[1:]):
                 add_dependency(
                     instruction_id(tile.tile_id, current.key),
@@ -826,8 +947,8 @@ class TISASemanticBuilder:
         for dependency in tile_graph.dependencies:
             producer = tiles[dependency.producer]
             consumer = tiles[dependency.consumer]
-            producer_stages = _stages_for_tile(operators[producer.operator_id], producer)
-            consumer_stages = _stages_for_tile(operators[consumer.operator_id], consumer)
+            producer_stages = _stages_for_tile(operators[producer.operator_id], producer, machine)
+            consumer_stages = _stages_for_tile(operators[consumer.operator_id], consumer, machine)
             if dependency.kind in {"state", "accumulate"}:
                 producer_stage = next(
                     (stage for stage in producer_stages if stage.key == "compute"),
@@ -1037,8 +1158,12 @@ class AnalyticalBackendCodegen:
             tile_graph=tile_graph,
         )
         tasks_by_stage: dict[tuple[str, str], list[ExecutionTask]] = {}
+        tasks_by_explicit_stage: dict[tuple[str, str], list[ExecutionTask]] = {}
         for task in lowering.execution_graph.tasks:
             tasks_by_stage.setdefault((task.tile_id, task.primitive), []).append(task)
+            stage_key = task.attributes.get("tisa_stage_key")
+            if isinstance(stage_key, str) and stage_key:
+                tasks_by_explicit_stage.setdefault((task.tile_id, stage_key), []).append(task)
         payloads: dict[str, tuple[str, ...]] = {}
         consumed: set[str] = set()
         original_tasks = {task.task_id: task for task in lowering.execution_graph.tasks}
@@ -1047,6 +1172,23 @@ class AnalyticalBackendCodegen:
         for instruction in program.instructions:
             stage = str(instruction.attributes.get("tisa_stage", ""))
             semantic_op = str(instruction.attributes.get("semantic_op_type", ""))
+            explicit_candidates = tuple(
+                task
+                for task in tasks_by_explicit_stage.get((instruction.tile_id, stage), ())
+                if task.task_id not in consumed
+            )
+            if explicit_candidates:
+                resources = {task.resource for task in explicit_candidates}
+                if len(resources) != 1:
+                    raise ValueError(
+                        f"target TISA stage '{instruction.tisa_id}' spans resources: "
+                        + ", ".join(sorted(resources))
+                    )
+                payloads[instruction.tisa_id] = tuple(
+                    task.task_id for task in explicit_candidates
+                )
+                consumed.update(payloads[instruction.tisa_id])
+                continue
             if semantic_op in composite_ops:
                 if stage == "load":
                     primitive_names = {"load", "load_transpose", "copy", "transpose"}
@@ -1116,4 +1258,6 @@ class AnalyticalBackendCodegen:
         issues = artifact.validate()
         if issues:
             raise ValueError("FC backend artifact is invalid: " + "; ".join(issues))
-        return artifact
+        from npu_ooo.backend.memory import materialize_target_memory
+
+        return materialize_target_memory(graph, machine, artifact)

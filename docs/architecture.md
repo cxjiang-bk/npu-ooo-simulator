@@ -14,13 +14,13 @@ flowchart TB
         D --> E[GC: Canonical IR、tiling、依赖]
         E --> F[Semantic TileGraph]
         F --> G[FC: TISA 方言]
-        G --> H[TISAProgram]
-        H --> I[CodegenBackend]
-        I --> J[BackendArtifact]
+        G --> H[逻辑 TISAProgram]
+        H --> I[CodegenBackend: target placement]
+        I --> J[最终 TISA + BackendArtifact + MemoryPlan]
     end
 
     subgraph Runtime[Runtime]
-        J --> K[地址绑定、command chunk、descriptor arrival]
+        J --> K[基址/动态参数绑定、command chunk、descriptor arrival]
     end
 
     subgraph Device[Device scheduler]
@@ -52,10 +52,10 @@ flowchart TB
 | --- | --- | --- | --- |
 | Frontend | module + example tensors | ExportedProgram、StableHLO module、provenance | 捕获 PyTorch 语义并完成官方 StableHLO 验证 |
 | GC | StableHLO projection | `GCArtifact` | canonicalization、semantic recovery、tiling、region/state dependency |
-| FC | `GCArtifact` | `TISADialectProgram` | 把 tile stage 具体化为 TISA operands、UnitMap 和 typed deps |
-| TISA Generator | TISA 方言 | `TISAProgram` | 规范化 scheduler-visible descriptor |
-| CodegenBackend | `TISAProgram` + `MachineConfig` | `BackendArtifact` | 生成 execution graph、payload 和 timing contract |
-| Runtime | `BackendArtifact` + bindings | `RuntimeSubmission` | 物理地址、command chunk、到达时间和同步 |
+| FC | `GCArtifact` + `MachineConfig` | `TISADialectProgram` | 保留逻辑 operand；按目标 EU/route 建立 scheduler-visible stage 边界 |
+| TISA Generator | TISA 方言 | 逻辑 `TISAProgram` | 规范化 descriptor，不负责物理分配 |
+| CodegenBackend | 逻辑 TISA + `MachineConfig` | `BackendArtifact` | 生成最终目标 TISA、payload 与有限容量 `MemoryPlan` |
+| Runtime | `BackendArtifact.memory_plan` + invocation bindings | `RuntimeSubmission` | 绑定地址空间基址、动态参数、command chunk、到达时间和同步 |
 | Device scheduler | submission + policy | schedule result | 处理 queue/ROB、依赖、资源和 issue |
 | Event backend | issued instruction + payload | events、cycles、trace | 计算执行时序并输出可视化 |
 
@@ -213,8 +213,9 @@ stage_id = operator topological order
 traffic 和 local working-set 计算候选分数，选择分数最低的候选并记录
 `candidate_costs` 与 `selected_tile_size`。
 
-`MachineConfig` 提供 memory capacity 时，planner 生成 residency intent 和双缓冲
-ping-pong metadata。该 metadata 描述编译期 locality，runtime 负责实际 buffer binding。
+`MachineConfig.operation_placements` 按 operation/operand role 描述执行单元、目标存储和
+逐跳 route。planner 将其写入 residency/ping-pong intent；CodegenBackend 才负责实际
+allocation 与复用，Runtime 不重新选择 placement。
 
 `build_tile_graph()` 为每个 `TileInstance` 记录 tile id、operator id、coordinates、
 bounds 和 semantic metadata。跨算子边使用 `logical_tensor_region_v1`：producer 与
@@ -250,20 +251,16 @@ backend payload recipe
 
 1. 验证 `GCArtifact`；
 2. 按 TileGraph 拓扑顺序选择 operator family 的 stage 模板；
-3. 将 tile bounds 投影到输入输出 tensor，构造 `TISAOperand`；
+3. 将 tile bounds 投影到输入输出 tensor，构造逻辑 `TISAOperand`；
 4. 写入 UnitMap、semantic metadata、readiness condition 和 payload recipe；
 5. 投影 region/state/accumulate/buffer-reuse 边，并补齐同一 tile 的 stage 顺序；
 6. 稳定拓扑排序得到 `program_order`，生成 `TISADialectProgram`。
 
-典型 Attention tile：
+当 placement 指定跨不同 EU 的多跳 route 时，FC 在展开 payload 之前就建立独立 stage。
+例如 LPU Matmul 的边界是：
 
 ```text
-tisa.load             DE
-tisa.load_transpose   DE
-tisa.matmul            ME
-tisa.softmax           VE
-tisa.matmul            ME
-tisa.store             DE
+GM --GDMA--> UB --LDMA--> LMB/RMB --MXU--> PSB --ARU--> UB --GDMA--> GM
 ```
 
 每条 TISA operation 绑定一个主要 execution unit。Softmax 的
@@ -272,8 +269,8 @@ instruction 的整体依赖和完成边界。
 
 ## 6. TISA Generator 与 TISAProgram
 
-`TISAGenerator` 将 TISA 方言规范化为 `TISAProgram`，保留 FC 已确定的 descriptor
-语义。每条 `TISAInstruction` 包含：
+`TISAGenerator` 将 TISA 方言规范化为逻辑 `TISAProgram`，保留 FC 已确定的 stage
+边界。每条 `TISAInstruction` 包含：
 
 ```text
 tisa_id / tile_id / operator_id
@@ -284,6 +281,9 @@ typed dependency: kind、condition、provenance
 semantic metadata
 payload_ref
 ```
+
+此时 TileMem 仍可为符号/逻辑描述。CodegenBackend 物化后，对外暴露的
+`CompiledArtifact.tisa_program` 与 `BackendArtifact.program` 是同一个最终目标程序。
 
 `ExecutionTask` 属于 backend payload，表示同一 TISA issue 后在目标 execution unit
 内执行的步骤。全局 scheduler 以 TISA instruction 为唯一调度单位；payload lane 事件
@@ -297,11 +297,32 @@ payload_ref
 
 ```text
 BackendArtifact {
-  program: TISAProgram
+  program: final target TISAProgram
   execution_graph: ExecutionGraph
   payloads: tisa_id -> ExecutionTask ids
+  memory_plan: MemoryPlan
 }
 ```
+
+目标存储物化遵循同一来源：
+
+```text
+FC logical operand
+  -> MachineConfig operand placement / transfer route
+  -> backend BufferRegion(buffer_id, memory, range)
+  -> final TileMem(buffer_id, allocation_id, memory, range)
+  -> MemoryPlan(allocation, offset, lifetime, slot, alias)
+```
+
+Backend 不从 primitive graph 猜测 TISA 边界；边界来自 FC 的语义 stage，payload 只在该
+边界内绑定。最终 TISA operands 必须覆盖 payload 的每个 read/write region，artifact
+校验会检查 buffer identity、memory、allocation 和范围。局部 packed tile 使用
+`valid_bytes` 表示有效数据/搬运量，`size_bytes` 表示地址包围跨度；二者不会再混用。
+
+分配器按 memory space 检查对齐和容量。不同逻辑 buffer 可以通过显式 `allocation_id`
+复用同一物理 slot；编译器同时加入 RAW/WAR/WAW 或 `BUFFER_REUSE/allocation_released`
+依赖，避免动态 issue 提前覆盖。Tensor alias/view 使用独立 `buffer_id` 和显式 `alias_of`，
+而不是靠 tensor 名推断。
 
 默认 lowering registry 覆盖：
 
@@ -322,8 +343,8 @@ backend 通过 `TimingProvider` 提供 duration 和 initiation interval；`Event
 `RuntimeSubmission` 完成：
 
 ```text
-logical tensor -> physical buffer address
-TISA operand -> physical range
+MemoryPlan allocation -> 本次执行的地址空间基址
+TISA buffer_id -> physical range
 command chunk
 descriptor available cycle
 launch latency
@@ -336,14 +357,19 @@ Runtime 可以和编译阶段分开执行。`compile` 将以下文件组成可�
 01_gc/canonical_graph.json
 03_tisa/tisa_program.json
 04_backend/backend_artifact.json
+04_backend/memory_plan.json
 04_backend/machine.json
 manifest.json
 ```
 
-`simulate --compile-dir <package>` 只读取这些编译产物，然后在本次 invocation 中重新完成
-buffer 分配、dynamic index/layout binding、descriptor 提交和 device/backend timing。它不
+`simulate --compile-dir <package>` 只读取这些编译产物，然后在本次 invocation 中完成
+编译计划的基址绑定、dynamic index/layout binding、descriptor 提交和 device/backend timing。它不
 导入 PyTorch，也不重新执行 Torch-XLA、GC 或 FC。多个 `simulate` 命令可以复用同一个
-package，对比不同 MachineConfig、timing provider、runtime policy 和 device policy。
+package，对比兼容的 MachineConfig 参数、timing provider、runtime policy 和 device policy。
+容量、带宽、latency、port/bank 和 unit 数量可以覆盖（新容量仍须容纳原计划）；改变
+memory identity/parent、alignment、transfer connectivity/engine/transform 或 operand
+placement 会改变 topology hash，因此必须重新编译。旧 package 若没有 MemoryPlan v2，
+独立 simulate 会明确拒绝，避免把逻辑 TISA 默认为 DRAM。
 
 命令参数遵循同一边界：`compile` 只接受前端、shape、tile/GC 和 codegen 选项；`simulate`
 接受 runtime、scheduler、MachineConfig 覆盖和 timing/event backend；`compile-and-sim` 将
@@ -356,9 +382,9 @@ instruction 的 issue 选择。四种组合由 `--runtime-device-matrix` 一次�
 Runtime submission 还携带 `DynamicIndexBinding`。binding 的 expression id 必须匹配
 TISA 的 `dynamic_index` metadata，值的 rank 按 expression contract 校验。runtime 为每个
 operand 记录 clamp 后的索引、dynamic region、physical offset/span 和 provenance；TISA
-address scoreboard 直接消费这些范围。`RuntimeLayoutBinding` 可以在每个 invocation 绑定
-具体 shape、byte strides、layout 和 offset，并沿同一 resolver 更新 operand 的 physical
-region；bank-aware 映射使用这些 resolved 地址。
+address scoreboard 直接消费这些范围。`RuntimeLayoutBinding` 可以在每个 invocation 为
+外部/runtime-owned buffer 绑定具体 shape、byte strides、layout 和 offset；目标局部副本
+仍保持编译期 packed layout。bank-aware 映射使用这些 resolved 地址。
 
 固定窗口 KV-cache 携带 `state_id/state_buffer`。`RuntimeStateRegistry` 绑定稳定的
 persistent address、memory scope 和容量；`RuntimeSequence` 为同一 `BackendArtifact`

@@ -19,6 +19,7 @@ from .execution import AccessType, BufferRegion, ExecutionGraph, ExecutionTask
 from .index import DynamicIndexBinding, DynamicIndexExpr, IndexValue, resolve_dynamic_index
 from .dtype import canonical_dtype, dtype_bytes, is_known_dtype, known_dtype_names, normalize_dtype
 from .layout import LayoutInfo, resolve_layout, tensor_layout
+from .memory import MEMORY_PLAN_SCHEMA_VERSION, MemoryBuffer, MemoryPlan
 from .tisa import (
     BackendArtifact,
     TISADependency,
@@ -38,6 +39,7 @@ from .runtime import (
     RuntimeStateRegistry,
     RuntimeSubmission,
     allocate_buffer_bindings,
+    allocate_memory_plan_bindings,
     create_runtime_submission,
     create_runtime_sequence,
     create_runtime_state_registry,
@@ -67,6 +69,9 @@ __all__ = [
     "known_dtype_names",
     "normalize_dtype",
     "LayoutInfo",
+    "MEMORY_PLAN_SCHEMA_VERSION",
+    "MemoryBuffer",
+    "MemoryPlan",
     "resolve_layout",
     "tensor_layout",
     "BackendArtifact",
@@ -85,6 +90,7 @@ __all__ = [
     "RuntimeStateRegistry",
     "RuntimeSubmission",
     "allocate_buffer_bindings",
+    "allocate_memory_plan_bindings",
     "create_runtime_submission",
     "create_runtime_sequence",
     "create_runtime_state_registry",

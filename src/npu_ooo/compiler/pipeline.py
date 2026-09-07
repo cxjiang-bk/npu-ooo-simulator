@@ -205,6 +205,10 @@ def compile_operator_graph(
         machine,
         program=program,
     )
+    # Codegen owns target-memory materialization.  The public program must be
+    # the exact scheduler-visible descriptor embedded in BackendArtifact, not
+    # the preceding logical generator output.
+    program = backend_artifact.program
     compile_statistics = build_compile_statistics(
         graph,
         tile_graph,

@@ -9,7 +9,7 @@ from npu_ooo.frontend import FrontendImportError, official_stablehlo_available, 
 from npu_ooo.frontend.stablehlo import StableHLOAdapter
 from npu_ooo.frontend.stablehlo_official import OfficialStableHLOModule
 from npu_ooo.ir import (
-    allocate_buffer_bindings,
+    allocate_memory_plan_bindings,
     create_runtime_sequence,
     create_runtime_state_registry,
     create_runtime_submission,
@@ -60,6 +60,13 @@ def _compile_text(text: str):
 
 
 class KVCacheContractTest(unittest.TestCase):
+    @staticmethod
+    def _bindings(compiled):
+        return allocate_memory_plan_bindings(
+            compiled.backend_artifact.memory_plan,
+            minimal_machine_config(),
+        )
+
     def test_importer_preserves_slice_and_concatenate_attributes(self) -> None:
         imported = StableHLOAdapter.from_text(_KV_TEXT, model_id="kv-import")
         self.assertEqual(
@@ -111,7 +118,7 @@ class KVCacheContractTest(unittest.TestCase):
 
     def test_runtime_binds_alias_and_exports_state_contract(self) -> None:
         compiled = _compile_text(_KV_TEXT)
-        bindings = allocate_buffer_bindings(compiled.graph.tensors)
+        bindings = self._bindings(compiled)
         cache = next(item for item in bindings if item.tensor == "cache")
         output = next(item for item in bindings if item.tensor == "output")
         self.assertEqual(cache.base_address, output.base_address)
@@ -128,7 +135,7 @@ class KVCacheContractTest(unittest.TestCase):
 
     def test_runtime_rejects_nonpersistent_state_binding(self) -> None:
         compiled = _compile_text(_KV_TEXT)
-        bindings = list(allocate_buffer_bindings(compiled.graph.tensors))
+        bindings = list(self._bindings(compiled))
         index = next(index for index, item in enumerate(bindings) if item.tensor == "cache")
         bindings[index] = replace(
             bindings[index],
@@ -139,7 +146,7 @@ class KVCacheContractTest(unittest.TestCase):
 
     def test_state_registry_keeps_full_bindings_and_stable_address(self) -> None:
         compiled = _compile_text(_KV_TEXT)
-        bindings = allocate_buffer_bindings(compiled.graph.tensors)
+        bindings = self._bindings(compiled)
         registry = create_runtime_state_registry(compiled.backend_artifact, bindings)
         self.assertEqual(registry.state_ids(), ("cache",))
         self.assertEqual(
@@ -153,7 +160,7 @@ class KVCacheContractTest(unittest.TestCase):
 
     def test_two_invocation_sequence_preserves_state_and_records_dependency(self) -> None:
         compiled = _compile_text(_KV_TEXT)
-        bindings = allocate_buffer_bindings(compiled.graph.tensors)
+        bindings = self._bindings(compiled)
         registry = create_runtime_state_registry(compiled.backend_artifact, bindings)
         sequence = create_runtime_sequence(
             compiled.backend_artifact,
@@ -196,7 +203,7 @@ class KVCacheContractTest(unittest.TestCase):
         compiled = _compile_text(_KV_TEXT)
         self.assertEqual(
             [item.unit_map.unit for item in compiled.tisa_program.instructions],
-            ["dma", "vector", "dma"],
+            ["DMA", "ARU", "DMA"],
         )
         result = schedule_tisa_program(
             compiled.backend_artifact,
@@ -257,7 +264,7 @@ class KVCacheContractTest(unittest.TestCase):
             {"drop_oldest_append_new"},
         )
 
-        bindings = allocate_buffer_bindings(compiled.graph.tensors)
+        bindings = self._bindings(compiled)
         submission = create_runtime_submission(
             compiled.backend_artifact,
             bindings,

@@ -13,8 +13,7 @@ from typing import Any, Mapping, Sequence
 from npu_ooo.arch import MachineConfig
 from npu_ooo.backend import CodegenBackend, EventBackend
 from npu_ooo.compiler import compile_torch_module
-from npu_ooo.ir import allocate_buffer_bindings
-from npu_ooo.ir import derive_tensor_lifetimes, derive_tensor_reuse_pairs
+from npu_ooo.ir import allocate_memory_plan_bindings
 from npu_ooo.scheduler import SchedulerPolicy
 from npu_ooo.simulator import SimulatorConfig, TimingModel
 
@@ -340,15 +339,12 @@ def run_paper_benchmark_matrix(
                 tile_size_candidates=tile_size_candidates,
                 codegen_backend=codegen_backend,
             )
-            lifetimes = derive_tensor_lifetimes(compiled.tisa_program)
-            reuse_pairs = derive_tensor_reuse_pairs(compiled.tisa_program)
-            buffers = allocate_buffer_bindings(
-                compiled.graph.tensors,
+            if compiled.backend_artifact.memory_plan is None:
+                raise ValueError("compiled benchmark has no target memory plan")
+            buffers = allocate_memory_plan_bindings(
+                compiled.backend_artifact.memory_plan,
+                compile_machine,
                 base_address=runtime_base_address,
-                alignment_bytes=runtime_alignment,
-                lifetimes=lifetimes,
-                reuse_buffers=runtime_buffer_policy == "lifetime_reuse",
-                reuse_pairs=reuse_pairs,
             )
             cases = run_runtime_device_matrix(
                 compiled.backend_artifact,

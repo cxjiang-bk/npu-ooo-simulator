@@ -274,8 +274,18 @@ def _writes(operand: TISAOperand) -> bool:
 def _overlaps(left: TISAOperand, right: TISAOperand) -> bool:
     left_mem = left.tile_mem
     right_mem = right.tile_mem
-    left_base = left_mem.tensor or left_mem.base
-    right_base = right_mem.tensor or right_mem.base
+    left_base = (
+        left_mem.allocation_id
+        or left_mem.buffer_id
+        or left_mem.tensor
+        or left_mem.base
+    )
+    right_base = (
+        right_mem.allocation_id
+        or right_mem.buffer_id
+        or right_mem.tensor
+        or right_mem.base
+    )
     if left_base != right_base or left_mem.scope != right_mem.scope:
         return False
     if (

@@ -10,7 +10,7 @@ benchmark-specific ``default_*_schedule`` calls to the frontend path.
 
 from dataclasses import replace
 import math
-from typing import Any, Mapping, Sequence
+from typing import Any, Sequence
 
 from npu_ooo.arch import MachineConfig
 from npu_ooo.ir import (
@@ -61,7 +61,18 @@ def _attach_machine_metadata(
     updated = []
     for operator_schedule in schedule.operator_schedules:
         operator = next(item for item in graph.operators if item.op_id == operator_schedule.operator_id)
-        used_bytes = 0
+        target_memory_by_tensor: dict[str, str] = {}
+        if operator.normalized_type in {"matmul", "batched_matmul", "gemv"}:
+            try:
+                placement = machine.placement("matmul")
+                target_memory_by_tensor = {
+                    operator.inputs[0]: placement.operand("lhs").memory,
+                    operator.inputs[1]: placement.operand("rhs").memory,
+                    operator.outputs[0]: placement.operand("output").memory,
+                }
+            except (KeyError, IndexError):
+                target_memory_by_tensor = {}
+        used_bytes_by_memory: dict[str, int] = {}
         residency = []
         overflow: list[str] = []
         residency_bytes: dict[str, int] = {}
@@ -71,16 +82,19 @@ def _attach_machine_metadata(
                 continue
             seen_tensors.add(tensor_name)
             size_bytes = _tensor_bytes(tensors[tensor_name])
+            target_memory = target_memory_by_tensor.get(tensor_name, local_memory)
+            target_capacity = machine.memory(target_memory).capacity_bytes
+            used_bytes = used_bytes_by_memory.get(target_memory, 0)
             if (
-                local_capacity is None
+                target_capacity is None
                 or (
                     size_bytes is not None
-                    and used_bytes + size_bytes <= local_capacity
+                    and used_bytes + size_bytes <= target_capacity
                 )
             ):
-                residency.append((tensor_name, local_memory))
+                residency.append((tensor_name, target_memory))
                 residency_bytes[tensor_name] = size_bytes
-                used_bytes += size_bytes
+                used_bytes_by_memory[target_memory] = used_bytes + size_bytes
             else:
                 overflow.append(tensor_name)
 
@@ -91,7 +105,9 @@ def _attach_machine_metadata(
         ping_pong = {
             "enabled": ping_pong_enabled,
             "buffer_count": 2 if ping_pong_enabled else 1,
-            "scope": local_memory,
+            "scope": (
+                target_memory_by_tensor if target_memory_by_tensor else local_memory
+            ),
             "tile_count": tile_count,
             "planned_only": True,
             "policy": "alternate_tile_slots" if ping_pong_enabled else "single_slot",
@@ -112,6 +128,7 @@ def _attach_machine_metadata(
                     "residency_root_memory": root_memory,
                     "residency_local_memory": local_memory,
                     "residency_capacity_bytes": local_capacity,
+                    "target_operand_memories": target_memory_by_tensor,
                     "residency_bytes": residency_bytes,
                     "residency_overflow_tensors": overflow,
                     "ping_pong": ping_pong,

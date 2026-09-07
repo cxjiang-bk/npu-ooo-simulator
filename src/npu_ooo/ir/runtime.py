@@ -1,10 +1,10 @@
-"""Runtime binding contracts between compiled TISA and device submission.
+"""Runtime binding contracts between target TISA and device submission.
 
-The compiler deliberately leaves ``TileMem`` logical.  This module owns the
-one execution-specific step that follows code generation: assigning physical
-buffer ranges and packaging TISA ids into software command-buffer chunks.
-Device scheduling is intentionally outside this module; a submission records
-software order but does not prescribe device issue order.
+Codegen owns placement, allocation and reuse in ``MemoryPlan``.  Runtime binds
+those allocations to invocation-specific address-space bases, resolves dynamic
+indices/layouts for external buffers, and packages TISA ids into software
+command chunks.  A submission records software order but does not prescribe
+device issue order.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from .index import DynamicIndexBinding, resolve_dynamic_index
 from .tisa import BackendArtifact, TISAProgram
 from .dtype import dtype_bytes as _shared_dtype_bytes
 from .layout import resolve_layout, tensor_layout
+from .memory import MemoryPlan
 
 
 def _dtype_bytes(dtype: str) -> int:
@@ -40,6 +41,7 @@ class BufferBinding:
     dtype: str = "fp16"
     alignment_bytes: int = 1
     attributes: Mapping[str, Any] = field(default_factory=dict)
+    buffer_id: str | None = None
 
     def validate(self) -> tuple[str, ...]:
         issues: list[str] = []
@@ -75,6 +77,7 @@ class BufferBinding:
             "dtype": self.dtype,
             "alignment_bytes": self.alignment_bytes,
             "attributes": dict(self.attributes),
+            "buffer_id": self.buffer_id,
         }
 
 
@@ -229,6 +232,7 @@ class RuntimeOperandBinding:
     access_type: str
     offset_bytes: int
     attributes: Mapping[str, Any] = field(default_factory=dict)
+    buffer_id: str | None = None
 
     def validate(self) -> tuple[str, ...]:
         issues: list[str] = []
@@ -259,6 +263,7 @@ class RuntimeOperandBinding:
             "access_type": self.access_type,
             "offset_bytes": self.offset_bytes,
             "attributes": dict(self.attributes),
+            "buffer_id": self.buffer_id,
         }
 
 
@@ -338,7 +343,12 @@ class RuntimeSubmission:
             issues.append("runtime layout bindings must be unique by tensor")
         for binding in self.dynamic_layouts:
             issues.extend(binding.validate())
-        buffer_keys = {(item.tensor, item.logical_scope) for item in self.buffers}
+        buffer_keys = {
+            ("buffer_id", item.buffer_id)
+            if item.buffer_id is not None
+            else (item.tensor, item.logical_scope)
+            for item in self.buffers
+        }
         if len(buffer_keys) != len(self.buffers):
             issues.append("runtime buffer bindings must be unique by tensor and logical_scope")
         for item in self.buffers:
@@ -380,8 +390,12 @@ class RuntimeSubmission:
             matches = [
                 buffer
                 for buffer in self.buffers
-                if buffer.tensor == item.tensor
-                and buffer.logical_scope == item.logical_scope
+                if (
+                    buffer.buffer_id == item.buffer_id
+                    if item.buffer_id is not None
+                    else buffer.tensor == item.tensor
+                    and buffer.logical_scope == item.logical_scope
+                )
                 and buffer.memory == item.physical_scope
             ]
             if len(matches) != 1:
@@ -634,6 +648,81 @@ class RuntimeSequence:
             "inter_invocation_gap_cycles": self.inter_invocation_gap_cycles,
             "attributes": dict(self.attributes),
         }
+
+
+def allocate_memory_plan_bindings(
+    plan: MemoryPlan,
+    machine: Any,
+    *,
+    base_address: int = 0x10000000,
+) -> tuple[BufferBinding, ...]:
+    """Bind compiler-owned allocations to concrete per-space arena bases.
+
+    The runtime does not choose placement or reuse.  It only supplies the
+    external/root arena base (and optional per-memory ``address_base`` values)
+    while preserving allocation identities and offsets from ``MemoryPlan``.
+    """
+
+    if plan.machine_topology_hash != machine.topology_hash():
+        raise ValueError(
+            "runtime machine topology/operand placement differs from the compile package; "
+            "recompile for the selected MachineConfig"
+        )
+    issues = plan.validate(machine)
+    if issues:
+        raise ValueError("runtime memory plan is invalid: " + "; ".join(issues))
+    roots = {level.name for level in machine.memory_levels if level.parent is None}
+    arena_bases: dict[str, int] = {}
+    for level in machine.memory_levels:
+        configured = level.attributes.get("address_base")
+        if configured is not None:
+            if isinstance(configured, bool) or not isinstance(configured, int) or configured < 0:
+                raise ValueError(
+                    f"memory '{level.name}' address_base must be a non-negative integer"
+                )
+            arena_bases[level.name] = configured
+        else:
+            arena_bases[level.name] = base_address if level.name in roots else 0
+    bindings = tuple(
+        BufferBinding(
+            tensor=buffer.tensor,
+            base_address=arena_bases[buffer.memory] + buffer.offset_bytes,
+            size_bytes=buffer.allocation_bytes,
+            memory=buffer.memory,
+            logical_scope=buffer.memory,
+            dtype=buffer.dtype,
+            alignment_bytes=buffer.alignment_bytes,
+            buffer_id=buffer.buffer_id,
+            attributes={
+                "memory_plan_id": plan.plan_id,
+                "memory_plan_schema": plan.schema_version,
+                "allocation_id": buffer.allocation_id,
+                "allocation_offset_bytes": buffer.offset_bytes,
+                "valid_bytes": buffer.valid_bytes,
+                "layout": buffer.layout,
+                "strides_bytes": (
+                    list(buffer.strides_bytes)
+                    if buffer.strides_bytes is not None
+                    else None
+                ),
+                "tile_id": buffer.tile_id,
+                "operand_role": buffer.role,
+                "slot": buffer.slot,
+                "external": buffer.external,
+                "lifetime_start": buffer.lifetime_start,
+                "lifetime_end": buffer.lifetime_end,
+                "alias_of": buffer.alias_of,
+                **dict(buffer.attributes),
+            },
+        )
+        for buffer in plan.buffers
+    )
+    binding_issues = tuple(
+        issue for binding in bindings for issue in binding.validate()
+    )
+    if binding_issues:
+        raise ValueError("runtime memory binding is invalid: " + "; ".join(binding_issues))
+    return bindings
 
 
 def allocate_buffer_bindings(
@@ -973,6 +1062,13 @@ def _dynamic_operand_resolution(
     metadata = instruction.attributes.get("dynamic_index")
     if not isinstance(metadata, Mapping):
         return None
+    # Dynamic indices select a window in an external/runtime-owned tensor.
+    # Target-local copies are packed at offset zero after that selection.
+    if (
+        binding.attributes.get("memory_plan_id") is not None
+        and not binding.attributes.get("external", False)
+    ):
+        return None
     expression_id = metadata.get("expression_id")
     runtime_binding = dynamic_bindings.get(str(expression_id))
     if runtime_binding is None:
@@ -991,7 +1087,7 @@ def _dynamic_operand_resolution(
         raw_window = expression_attributes.get("sizes", ())
     elif operation == "dynamic_update_slice":
         state_buffer = str(instruction.attributes.get("state_buffer", source_tensor))
-        alias_of = binding.attributes.get("alias_of")
+        alias_of = binding.attributes.get("logical_alias_of")
         is_state_target = operand.normalized_access in {"write", "read_write"} and (
             operand.tile_mem.tensor == state_buffer or alias_of == state_buffer
         )
@@ -1198,7 +1294,11 @@ def create_runtime_submission(
     normalized_buffers_list: list[BufferBinding] = []
     for buffer in supplied_buffers:
         layout_binding = layout_by_tensor.get(buffer.tensor)
-        if layout_binding is None:
+        if layout_binding is None or (
+            artifact is not None
+            and artifact.memory_plan is not None
+            and not buffer.attributes.get("external")
+        ):
             normalized_buffers_list.append(buffer)
             continue
         attributes = {
@@ -1231,6 +1331,7 @@ def create_runtime_submission(
                 dtype=buffer.dtype,
                 alignment_bytes=buffer.alignment_bytes,
                 attributes=attributes,
+                buffer_id=buffer.buffer_id,
             )
         )
     normalized_buffers = tuple(normalized_buffers_list)
@@ -1238,7 +1339,36 @@ def create_runtime_submission(
     dynamic_bindings_by_id = {
         binding.expression_id: binding for binding in normalized_dynamic_indices
     }
-    buffer_lookup = _buffer_lookup(normalized_buffers)
+    planned_buffer_lookup: dict[str, BufferBinding] = {}
+    if artifact is not None and artifact.memory_plan is not None:
+        for binding in normalized_buffers:
+            if binding.buffer_id is None:
+                raise ValueError(
+                    "target memory plan bindings must carry buffer_id"
+                )
+            if binding.buffer_id in planned_buffer_lookup:
+                raise ValueError(
+                    f"duplicate runtime buffer binding for '{binding.buffer_id}'"
+                )
+            planned_buffer_lookup[binding.buffer_id] = binding
+        expected_buffer_ids = {
+            item.buffer_id for item in artifact.memory_plan.buffers
+        }
+        actual_buffer_ids = set(planned_buffer_lookup)
+        if expected_buffer_ids != actual_buffer_ids:
+            missing = sorted(expected_buffer_ids - actual_buffer_ids)
+            extra = sorted(actual_buffer_ids - expected_buffer_ids)
+            details = []
+            if missing:
+                details.append("missing " + ", ".join(missing[:8]))
+            if extra:
+                details.append("unknown " + ", ".join(extra[:8]))
+            raise ValueError(
+                "runtime bindings do not match compiled memory plan: " + "; ".join(details)
+            )
+        buffer_lookup: dict[tuple[str, str], BufferBinding] = {}
+    else:
+        buffer_lookup = _buffer_lookup(normalized_buffers)
     state_contract = _state_contract(program)
     for descriptor in state_contract:
         state_binding = next(
@@ -1262,11 +1392,23 @@ def create_runtime_submission(
         for operand in instruction.operands:
             tensor = operand.tile_mem.tensor or operand.tile_mem.base
             logical_scope = operand.tile_mem.scope
-            binding = buffer_lookup.get((tensor, logical_scope))
-            if binding is None:
-                candidates = [item for item in normalized_buffers if item.tensor == tensor]
-                if len(candidates) == 1:
-                    binding = candidates[0]
+            if artifact is not None and artifact.memory_plan is not None:
+                if operand.tile_mem.buffer_id is None:
+                    raise ValueError(
+                        f"target operand '{instruction.tisa_id}:{operand.name}' has no buffer_id"
+                    )
+                binding = planned_buffer_lookup.get(operand.tile_mem.buffer_id)
+                if binding is not None and binding.memory != logical_scope:
+                    raise ValueError(
+                        f"compiled operand '{instruction.tisa_id}:{operand.name}' expects "
+                        f"memory '{logical_scope}', binding uses '{binding.memory}'"
+                    )
+            else:
+                binding = buffer_lookup.get((tensor, logical_scope))
+                if binding is None:
+                    candidates = [item for item in normalized_buffers if item.tensor == tensor]
+                    if len(candidates) == 1:
+                        binding = candidates[0]
             if binding is None:
                 raise ValueError(
                     f"no runtime buffer binding for operand '{operand.name}' "
@@ -1373,6 +1515,7 @@ def create_runtime_submission(
                     access_type=operand.normalized_access,
                     offset_bytes=offset,
                     attributes=operand_attributes,
+                    buffer_id=operand.tile_mem.buffer_id,
                 )
             )
     effective_chunk_size = (
@@ -1427,6 +1570,16 @@ def create_runtime_submission(
             "state_buffers": list(state_contract),
             "dynamic_index_binding_count": len(normalized_dynamic_indices),
             "dynamic_layout_binding_count": len(normalized_layouts),
+            "memory_plan_id": (
+                artifact.memory_plan.plan_id
+                if artifact is not None and artifact.memory_plan is not None
+                else None
+            ),
+            "memory_plan_schema": (
+                artifact.memory_plan.schema_version
+                if artifact is not None and artifact.memory_plan is not None
+                else None
+            ),
         },
     )
     issues = submission.validate(program)

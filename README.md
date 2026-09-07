@@ -7,8 +7,8 @@ flowchart LR
     A[PyTorch nn.Module] --> B[torch.export + Torch-XLA + StableHLO]
     B --> C[GC: Canonical IR 与 TileGraph]
     C --> D[FC: TISA 方言]
-    D --> E[TISAProgram 与 BackendArtifact]
-    E --> F[Runtime 地址绑定与提交]
+    D --> E[目标 TISA、BackendArtifact 与 MemoryPlan]
+    E --> F[Runtime 基址绑定与提交]
     F --> G[Static / Dynamic device scheduler]
     G --> H[周期、stall、泳道图、Perfetto]
 ```
@@ -25,8 +25,8 @@ PyTorch nn.Module
   -> Canonical OperatorGraph / Semantic TileGraph
   -> Fusion Compiler (FC)
   -> TISA 方言
-  -> TISAProgram
-  -> BackendArtifact
+  -> 逻辑 TISAProgram
+  -> 目标存储规划 / 最终 TISAProgram / BackendArtifact
   -> RuntimeSubmission
   -> TISA device scheduler
   -> 周期、泳道图和 Perfetto trace
@@ -42,12 +42,14 @@ ATen 到 StableHLO 的转换，项目维护 StableHLO semantic family 到 Canoni
 - Torch-XLA 生成 StableHLO，OpenXLA 官方 bindings 完成 MLIR parse/verify；
 - GC 完成 canonicalization、复合语义恢复、tile 切分、region/state 依赖和 locality
   metadata；
-- FC 输出带有 operand、TileMem、UnitMap、typed dependency 和 payload recipe 的
-  TISA 方言；TISA Generator 生成 scheduler 消费的 `TISAProgram`；
-- `AnalyticalCodegenBackend` 生成 `BackendArtifact`，backend、timing provider 和
-  event backend 均可替换；
+- FC 输出带逻辑 operand、符号 TileMem、UnitMap、typed dependency 和 payload recipe 的
+  TISA 方言；TISA Generator 完成规范化，CodegenBackend 输出 scheduler 最终消费的
+  目标 `TISAProgram`；
+- `AnalyticalCodegenBackend` 依据 `MachineConfig` 将存储位置、搬运路径和有限容量落实为
+  最终 TISA、payload 与 `MemoryPlan`；
 - static 和 dynamic device policy 共享同一份编译产物、地址绑定和 timing source；
-- runtime 负责物理地址、command chunk、descriptor arrival 和同步；device scheduler
+- runtime 消费编译期 `MemoryPlan`，只绑定各地址空间基址、动态参数、command chunk、
+  descriptor arrival 和同步；device scheduler
   负责 queue、ROB、依赖、资源和 OOO issue；
 - 支持 Matmul、batched Matmul、GEMV、elementwise、reduce、Softmax、LayerNorm、
   RMSNorm、Attention region、SwiGLU、RoPE、Conv2D、BatchNorm inference、pooling、
@@ -130,14 +132,16 @@ PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli simulate \
 ```
 
 `compile` 的输出包含 `01_gc/canonical_graph.json`、`03_tisa/tisa_program.json`、
-`04_backend/backend_artifact.json` 和 `04_backend/machine.json`。`simulate` 从这些文件
+`04_backend/backend_artifact.json`、`04_backend/memory_plan.json` 和
+`04_backend/machine.json`。`simulate` 从这些文件
 恢复编译结果，只重新执行 runtime 地址绑定、动态参数解析和 device/backend timing。
 同一 compile package 可以被多个 `simulate` 命令复用。
 
 `compile` 的参数只描述输入、shape specialization、tile/GC 选项和 backend codegen；它不
 接受 `--policy`、`--runtime-*` 或 timing/event 选项。`simulate` 才选择 device policy、
-runtime policy、机器覆盖、timing provider 和输出目录。这样同一个编译包可以在多个硬件与
-运行时配置上重复实验。
+runtime policy、机器覆盖、timing provider 和输出目录。容量、带宽、时延和执行单元数量
+可以在兼容范围内覆盖；改变存储拓扑、搬运引擎、对齐或 operand placement 必须重新编译。
+缺少 `MemoryPlan` v2 的旧编译包会得到明确的重新编译诊断。
 
 运行时动态参数使用 JSON manifest 传入：
 
@@ -172,9 +176,9 @@ runtime policy、机器覆盖、timing provider 和输出目录。这样同一�
 
 ```text
 compile_torch_module(...)
-  -> TISAProgram / BackendArtifact       # 编译期，保持不变
-allocate_buffer_bindings(...)
-  -> RuntimeSubmission                   # invocation，绑定地址和动态参数
+  -> TISAProgram / BackendArtifact / MemoryPlan  # 编译期，保持不变
+allocate_memory_plan_bindings(...)
+  -> RuntimeSubmission                   # invocation，绑定基址和动态参数
 schedule_tisa_program(...)
   -> SimulationResult                    # device scheduler + backend timing
 ```
@@ -182,6 +186,18 @@ schedule_tisa_program(...)
 `--input-shape` 是 `torch.export` 的示例输入和 shape-specialization 参数，不是仿真时
 可以任意改变的 `seqlen`。`--policy` 选择 device scheduler，`--runtime-policy` 选择
 descriptor 的提交顺序；两者都可以使用同一份编译产物。
+
+当前 Runtime 是 host 侧的静态提交模型：它在仿真前确定物理地址、动态参数、command
+chunk 和 descriptor 顺序，Scheduler 按这个固定输入流接收任务。`runtime-policy` 的两种
+选择都会生成确定的提交顺序，其中 `dynamic_ready_queue` 表示 host 侧预排序。
+
+设备运行过程中的动态决策由 device scheduler 完成。它从已经到达的 TISA 指令中，根据
+依赖和资源状态选择下一条 issue：
+
+```text
+Runtime：预先生成固定提交流
+  -> Device scheduler：运行时动态 issue
+```
 
 ### 动态参数
 
@@ -203,11 +219,14 @@ descriptor 的提交顺序；两者都可以使用同一份编译产物。
 from npu_ooo.ir import (
     DynamicIndexBinding,
     RuntimeLayoutBinding,
-    allocate_buffer_bindings,
+    allocate_memory_plan_bindings,
     create_runtime_submission,
 )
 
-buffers = allocate_buffer_bindings(compiled.graph.tensors)
+buffers = allocate_memory_plan_bindings(
+    compiled.backend_artifact.memory_plan,
+    machine,
+)
 submission = create_runtime_submission(
     compiled.backend_artifact,
     buffers,
@@ -375,6 +394,7 @@ out/<run>/
 │   └── compiled_artifact.json
 ├── 04_backend/
 │   ├── backend_artifact.json
+│   ├── memory_plan.json
 │   ├── execution_graph.{json,dot}
 │   └── machine.json
 ├── 05_runtime/
@@ -392,7 +412,8 @@ out/<run>/
 `generated.mlir` 展示 Torch-XLA 输出；`01_gc/pass_dumps/` 展示每个 GC pass 的输入、
 输出和诊断；`02_fc/tisa_dialect.json` 展示 FC 语义 op；`03_tisa/tisa_program.json`
 是 device scheduler 输入；`04_backend/backend_artifact.json` 展示每条 TISA instruction
-的 backend payload。复合算子的内部 primitive 保留在 payload 和 lane trace 中。
+的 backend payload，`memory_plan.json` 保存各 memory space 的 buffer、allocation、slot、
+生命周期和复用关系。复合算子的内部 primitive 保留在 payload 和 lane trace 中。
 
 Softmax 默认使用 materialized row-wise payload。`--softmax-algorithm online` 选择
 分析版 online state-chain：相邻 reduction tile 传递 `(max, sum)` 状态，TISA 语义边界
@@ -402,8 +423,8 @@ workspace 生命周期属于后续数值 backend 扩展。
 ## 调度边界
 
 ```text
-编译期 SchedulePlanner：tile size、loop order、residency intent
-runtime：物理地址、command chunk、descriptor arrival、同步
+编译器/backend：tile、operand placement、搬运路径、buffer allocation/reuse
+runtime：地址空间基址、动态 binding、command chunk、descriptor arrival、同步
 device scheduler：依赖、ROB、queue、资源状态与 TISA issue
 backend：ExecutionTask 时序、completion event、泳道图
 ```
@@ -443,24 +464,34 @@ manifest 会保留该区间标签。
 
 ## 代码导航
 
+`src/npu_ooo` 按整体流程拆分：
+
+| 路径 | 主要职责 |
+| --- | --- |
+| `cli.py` | 命令行入口，串联编译、Runtime 和仿真 |
+| `frontend/` | 将 PyTorch 转换并导入为 StableHLO/Canonical IR |
+| `compiler/` | 执行 GC、FC 和 TISA 生成 |
+| `ir/` | 定义各阶段共享的数据结构 |
+| `lowering/` | 将 TISA 对应的计算展开为 backend 执行任务 |
+| `arch/` | 描述存储、执行单元和 scheduler 配置 |
+| `backend/` | 提供可替换的代码生成和时序来源 |
+| `scheduler/` | 提供 static/dynamic 调度公共入口 |
+| `simulator/` | 模拟 device scheduler 和硬件执行时序 |
+| `experiments/` | 运行模型、策略和硬件配置实验矩阵 |
+| `trace/` | 输出阶段产物、统计、泳道图和 Perfetto trace |
+
+整体调用关系是：
+
 ```text
-src/npu_ooo/cli.py                       用户入口和实验输出
-src/npu_ooo/compiler/pipeline.py         PyTorch-to-TISA 主流程
-src/npu_ooo/frontend/bridge.py           torch.export 捕获与 provenance
-src/npu_ooo/frontend/torch_xla_export.py Torch-XLA StableHLO 导出
-src/npu_ooo/frontend/stablehlo_official.py 官方 verifier 与导入边界
-src/npu_ooo/compiler/graph_compiler.py   论文 GC：图优化、切 tile、依赖
-src/npu_ooo/compiler/fusion_patterns.py  semantic recovery/fusion registry
-src/npu_ooo/compiler/fusion_compiler.py  论文 FC：TileGraph 到 TISA 方言
-src/npu_ooo/compiler/tisa_generator.py   TISA 方言到 TISAProgram
-src/npu_ooo/compiler/tisa_dialect.py     TISA stage、metadata 和 payload recipe
-src/npu_ooo/lowering/embedding.py        embedding gather 的 region 与 analytical payload
-src/npu_ooo/backend/                     可替换 backend 与 timing provider
-src/npu_ooo/simulator/tisa.py            TISA device scheduler simulator
+frontend -> compiler -> TISA/backend artifact
+         -> Runtime submission
+         -> scheduler + simulator
+         -> trace / statistics
 ```
 
 完整分层说明见 [docs/architecture.md](docs/architecture.md)，论文语义映射见
-[docs/tisa-alignment.md](docs/tisa-alignment.md)。
+[docs/tisa-alignment.md](docs/tisa-alignment.md)，逐周期调度细节见
+[docs/device-scheduler.md](docs/device-scheduler.md)。
 
 ## 验证
 

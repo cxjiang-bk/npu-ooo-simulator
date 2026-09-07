@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .scheduler import SchedulerPipelineConfig
+from .placement import OperandPlacementConfig, OperationPlacementConfig
 
 
 @dataclass(frozen=True)
@@ -198,6 +199,7 @@ class MachineConfig:
     execution_units: tuple[ExecutionUnitConfig, ...]
     transfer_paths: tuple[TransferPathConfig, ...]
     scheduler: SchedulerCapacityConfig = field(default_factory=SchedulerCapacityConfig)
+    operation_placements: tuple[OperationPlacementConfig, ...] = ()
     attributes: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -231,6 +233,45 @@ class MachineConfig:
             if path.engine not in unit_names:
                 issues.append(f"transfer path references unknown engine '{path.engine}'")
         issues.extend(self.scheduler.validate())
+        placements = {item.operation: item for item in self.operation_placements}
+        if len(placements) != len(self.operation_placements):
+            issues.append("operation placement operation names must be unique")
+        paths = {(item.source, item.target): item for item in self.transfer_paths}
+        roots = {level.name for level in self.memory_levels if level.parent is None}
+        for placement in self.operation_placements:
+            issues.extend(placement.validate())
+            if placement.unit not in unit_names:
+                issues.append(
+                    f"operation placement '{placement.operation}' references unknown unit "
+                    f"'{placement.unit}'"
+                )
+            elif placement.operation not in self.unit(placement.unit).supported_ops:
+                issues.append(
+                    f"unit '{placement.unit}' does not support placed operation "
+                    f"'{placement.operation}'"
+                )
+            for operand in placement.operands:
+                if operand.memory not in memory_names:
+                    issues.append(
+                        f"operand placement '{placement.operation}.{operand.role}' references "
+                        f"unknown memory '{operand.memory}'"
+                    )
+                for source, target in zip(operand.route, operand.route[1:]):
+                    if (source, target) not in paths:
+                        issues.append(
+                            f"operand placement '{placement.operation}.{operand.role}' has no "
+                            f"transfer path {source}->{target}"
+                        )
+                if operand.direction == "input" and operand.route and operand.route[0] not in roots:
+                    issues.append(
+                        f"input placement '{placement.operation}.{operand.role}' route must "
+                        "start at a root memory"
+                    )
+                if operand.direction in {"output", "state"} and operand.route and operand.route[-1] not in roots:
+                    issues.append(
+                        f"{operand.direction} placement '{placement.operation}.{operand.role}' "
+                        "route must end at a root memory"
+                    )
         return tuple(issues)
 
     def _validate_memory_acyclic(self) -> tuple[str, ...]:
@@ -257,6 +298,12 @@ class MachineConfig:
                 return unit
         raise KeyError(name)
 
+    def placement(self, operation: str) -> OperationPlacementConfig:
+        for item in self.operation_placements:
+            if item.operation == operation:
+                return item
+        raise KeyError(operation)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "config_id": self.config_id,
@@ -264,11 +311,58 @@ class MachineConfig:
             "execution_units": [unit.to_dict() for unit in self.execution_units],
             "transfer_paths": [path.to_dict() for path in self.transfer_paths],
             "scheduler": self.scheduler.to_dict(),
+            "operation_placements": [
+                item.to_dict() for item in self.operation_placements
+            ],
             "attributes": dict(self.attributes),
         }
 
     def stable_hash(self) -> str:
         encoded = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def topology_hash(self) -> str:
+        """Hash the parts of the machine that determine compiled placement.
+
+        Capacity, bandwidth, latency and unit counts are simulation parameters:
+        they may be changed when replaying an existing compile package.  Memory
+        identities/parentage, transfer connectivity, operation placement and
+        supported operation families change the meaning of the generated
+        payload and therefore require recompilation.
+        """
+
+        payload = {
+            "memory_levels": [
+                {
+                    "name": level.name,
+                    "parent": level.parent,
+                    "alignment_bytes": level.alignment_bytes,
+                }
+                for level in self.memory_levels
+            ],
+            "execution_units": [
+                {
+                    "name": unit.name,
+                    "supported_ops": list(unit.supported_ops),
+                }
+                for unit in self.execution_units
+            ],
+            "transfer_paths": [
+                {
+                    "source": path.source,
+                    "target": path.target,
+                    "engine": path.engine,
+                    "transform": path.transform,
+                }
+                for path in self.transfer_paths
+            ],
+            "operation_placements": [
+                placement.to_dict() for placement in self.operation_placements
+            ],
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        )
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
@@ -310,6 +404,17 @@ def minimal_machine_config() -> MachineConfig:
             TransferPathConfig("SRAM", "RF", "DMA", bandwidth_bytes_per_cycle=64, setup_latency_cycles=1),
             TransferPathConfig("RF", "SRAM", "DMA", bandwidth_bytes_per_cycle=64, setup_latency_cycles=1),
             TransferPathConfig("SRAM", "DRAM", "DMA", bandwidth_bytes_per_cycle=16, setup_latency_cycles=2),
+        ),
+        operation_placements=(
+            OperationPlacementConfig(
+                "matmul",
+                "MXU",
+                (
+                    OperandPlacementConfig("lhs", "SRAM", ("DRAM", "SRAM"), "input"),
+                    OperandPlacementConfig("rhs", "SRAM", ("DRAM", "SRAM"), "input"),
+                    OperandPlacementConfig("output", "SRAM", ("SRAM", "DRAM"), "output"),
+                ),
+            ),
         ),
         attributes={"source": "hand-written", "calibration_status": "analytical"},
     )
@@ -367,6 +472,17 @@ def lpu_like_machine_config() -> MachineConfig:
             TransferPathConfig("UB", "RMB", "LDMA", bandwidth_bytes_per_cycle=16, setup_latency_cycles=4, transform="transpose", transform_latency_cycles=4),
             TransferPathConfig("PSB", "UB", "ARU", bandwidth_bytes_per_cycle=8, setup_latency_cycles=2),
             TransferPathConfig("UB", "GM", "GDMA", bandwidth_bytes_per_cycle=16, setup_latency_cycles=4),
+        ),
+        operation_placements=(
+            OperationPlacementConfig(
+                "matmul",
+                "MXU",
+                (
+                    OperandPlacementConfig("lhs", "LMB", ("GM", "UB", "LMB"), "input"),
+                    OperandPlacementConfig("rhs", "RMB", ("GM", "UB", "RMB"), "input"),
+                    OperandPlacementConfig("output", "PSB", ("PSB", "UB", "GM"), "output"),
+                ),
+            ),
         ),
         scheduler=SchedulerCapacityConfig(instruction_queue_depth=32, rob_entries=8, max_inflight_tiles=8, dependency_window=8),
         attributes={"source": "analytical-lpu-like", "calibration_status": "analytical"},
@@ -448,6 +564,10 @@ def machine_config_from_dict(payload: Mapping[str, Any]) -> MachineConfig:
             execution_units=execution_units,
             transfer_paths=transfer_paths,
             scheduler=scheduler,
+            operation_placements=tuple(
+                OperationPlacementConfig.from_dict(item)
+                for item in payload.get("operation_placements", ())
+            ),
             attributes=payload.get("attributes", {}),
         )
     except (KeyError, TypeError, AttributeError) as exc:

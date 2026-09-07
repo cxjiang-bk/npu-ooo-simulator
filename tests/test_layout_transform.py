@@ -9,7 +9,7 @@ from npu_ooo.ir import (
     RuntimeLayoutBinding,
     TensorSpec,
     resolve_layout,
-    allocate_buffer_bindings,
+    allocate_memory_plan_bindings,
     create_runtime_submission,
 )
 
@@ -154,9 +154,19 @@ class RuntimeLayoutBindingTest(unittest.TestCase):
             stablehlo=stablehlo,
             tile_size=2,
         )
-        buffers = list(allocate_buffer_bindings(compiled.graph.tensors))
-        buffers[0] = buffers[0].__class__(
-            **{**buffers[0].__dict__, "size_bytes": 60}
+        buffers = list(
+            allocate_memory_plan_bindings(
+                compiled.backend_artifact.memory_plan,
+                minimal_machine_config(),
+            )
+        )
+        root_index = next(
+            index
+            for index, buffer in enumerate(buffers)
+            if buffer.tensor == "x" and buffer.attributes.get("external")
+        )
+        buffers[root_index] = buffers[root_index].__class__(
+            **{**buffers[root_index].__dict__, "size_bytes": 60}
         )
         submission = create_runtime_submission(
             compiled.backend_artifact,

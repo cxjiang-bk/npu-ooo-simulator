@@ -40,6 +40,11 @@ backend ExecutionTask payload    DMA/MXU/Vector 单元内部执行
 TISA instruction，并用 typed dependency 串联。每条 instruction 绑定一个主要 UnitMap；
 payload 可以包含该 execution unit 内部的多个步骤。
 
+论文明确给出 TISA operand、GC/FC/TISA generator 的抽象关系以及硬件 scheduler 的调度
+粒度，但没有公开 Epoch generator/backend 内部由谁完成全部 buffer allocation。本项目将
+目标 placement 与有限容量 allocation 放在 CodegenBackend 边界，是为保证契约可审计而作
+的实现选择，不把它表述为 Epoch 的已证实内部实现。
+
 ## 2. 字段对应
 
 | 论文概念 | 当前实现 | 说明 |
@@ -47,15 +52,15 @@ payload 可以包含该 execution unit 内部的多个步骤。
 | tile bounds | `TileInstance.bounds` | 静态 shape、边界 tile 和 logical region |
 | OpType | `TISAInstruction.op_type`、`semantic_family` | 复合语义保持 semantic op，stage 按 EU 划分 |
 | TileShape | `TISAOperand.tile_shape` | resolved shape；symbolic binding 使用 normalized shape environment |
-| TileMem | `TISAOperand.tile_mem` | scope、logical address expression、offset/size、stride/layout metadata |
+| TileMem | `TISAOperand.tile_mem` | FC 保留符号描述；最终程序保存 buffer/allocation id、memory、offset/span、valid bytes、stride/layout |
 | AccessType | operand/buffer access | read、write、read-write |
 | Attributes | `TISAInstruction.attributes` | readiness、region、state、fusion 和 reorder |
 | UnitMap | `TISAInstruction.unit_map` | execution unit 类别与数量 |
 | typed Deps | `TISADependency` | kind、condition、provenance；GC 同时保存 logical region |
 | WQ/IQ/Fu | `cycle_event` 的 per-EU 队列和 operand tracking | 时钟边界与容量显式可配；ROB 为项目扩展 |
 
-memory bank scoreboard 读取 MachineConfig 的 bank、width、read/write port，形成
-analytical structural reservation，独立记录 memory conflict stall。
+memory bank scoreboard 读取最终 Runtime operand 的 physical scope/address，并结合
+MachineConfig 的 bank、width、read/write port 形成 analytical structural reservation。
 
 ## 3. 编译路径
 
@@ -66,8 +71,9 @@ PyTorch nn.Module
   -> official StableHLO parse/verify
   -> GCArtifact / Semantic TileGraph
   -> TISADialectProgram
-  -> TISAProgram
-  -> BackendArtifact
+  -> logical TISAProgram
+  -> target lowering / MemoryPlan
+  -> final TISAProgram + BackendArtifact
 ```
 
 Torch-XLA 负责 ATen 到 StableHLO。项目维护 semantic family 到 Canonical/TISA/backend
@@ -90,11 +96,25 @@ TISA ready
   -> completion 唤醒后继 TISA
 ```
 
-Attention tile 形成：
+在 minimal profile 上，Matmul tile 形成：
 
 ```text
-TISA load-A -> TISA load-B -> TISA matmul -> TISA store
+TISA DMA(DRAM -> SRAM) -> TISA MXU(SRAM) -> TISA DMA(SRAM -> DRAM)
 ```
+
+在 lpu-like profile 上，显式 placement 为：
+
+```text
+lhs:    GM -> UB -> LMB
+rhs:    GM -> UB -> RMB
+output: PSB -> UB -> GM
+
+TISA GDMA -> TISA LDMA -> TISA MXU(LMB,RMB -> PSB)
+          -> TISA ARU -> TISA GDMA
+```
+
+多跳 route 在 FC 阶段按 EU 边界拆成 TISA stage，Backend 再为每个 stage 生成 payload，
+不会从已经展开的 task graph 反推边界。
 
 Softmax 的 `reduce_max/exp/reduce_sum/normalize` 属于同一 VE payload。payload lane
 事件进入 timing 和泳道图，TISA 依赖保持全局可见。
@@ -103,7 +123,7 @@ Softmax 的 `reduce_max/exp/reduce_sum/normalize` 属于同一 VE payload。payl
 
 ```text
 Host Runtime
-  物理地址、command chunk、descriptor arrival、同步
+  消费 MemoryPlan，绑定地址空间基址、动态参数、command chunk、descriptor arrival、同步
 
 TISA Device Scheduler
   reception、WQ/IQ、依赖检查、资源检查、OOO issue、completion
@@ -131,6 +151,10 @@ Backend Timing/Event
 - `payload_ready:<task_id>` partial-ready 原型和 memory bank scoreboard。
 - GC `TileDependency` 的 hazard kind、logical region、condition 和 provenance，并向
   TISA dependency 与 compile statistics 贯通。
+- `MachineConfig.operation_placements`、多跳 transfer stage 和 target `MemoryPlan`；
+- TISA、payload 与 RuntimeSubmission 共享 `buffer_id/allocation_id`，局部 slot 的复用由
+  RAW/WAR/WAW/BUFFER_REUSE 依赖保护；
+- compile package schema v2 与 topology hash 检查。
 
 扩展项：
 
@@ -139,6 +163,9 @@ Backend Timing/Event
 - 论文 WQ/IQ/Fu 容量、dispatch/wake-up/issue/completion 控制开销；
 - 完整 RTL 与真实芯片 timing calibration；
 - online Softmax 数值 rescale、最终 normalization 和 workspace 生命周期。
+- Matmul 之外各 operation 的专用 operand-role placement（当前使用通用 root/local
+  target materialization）；
+- bank-aware placement 优化、fragmentation/eviction、跨 core memory routing；
 
 当前结果标签为 `TISA instruction-level analytical scheduling baseline`。profile 加载后，
 manifest 记录对应 calibration status，trace schema 保持一致。

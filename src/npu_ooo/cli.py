@@ -36,12 +36,10 @@ from npu_ooo.ir import (
     OperatorGraph,
     RuntimeLayoutBinding,
     RuntimeSequence,
-    allocate_buffer_bindings,
+    allocate_memory_plan_bindings,
     create_runtime_sequence,
     create_runtime_state_registry,
     create_runtime_submission,
-    derive_tensor_lifetimes,
-    derive_tensor_reuse_pairs,
 )
 from npu_ooo.scheduler import (
     SchedulerPolicy,
@@ -1052,6 +1050,12 @@ def _write_compile_artifacts(compiled, machine, output_dir: Path) -> None:
     write_artifact_json(compiled.tisa_program, output_dir / "tisa_program.json")
     write_artifact_json(compiled, output_dir / "compiled_artifact.json")
     write_artifact_json(compiled.backend_artifact, output_dir / "backend_artifact.json")
+    if compiled.backend_artifact.memory_plan is None:
+        raise ValueError("codegen backend did not produce a target memory plan")
+    write_artifact_json(
+        compiled.backend_artifact.memory_plan,
+        output_dir / "memory_plan.json",
+    )
     write_artifact_json(compiled.backend_artifact.execution_graph, output_dir / "execution_graph.json")
     write_artifact_json(machine, output_dir / "machine.json")
     write_operator_graph_dot(compiled.graph, output_dir / "operator_graph.dot")
@@ -1062,7 +1066,7 @@ def _write_compile_artifacts(compiled, machine, output_dir: Path) -> None:
 
 def _compile_manifest(compiled, machine) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "artifact_kind": "compile_package",
         "compiler_pipeline": compiled.attributes["compiler_pipeline"],
         "frontend_path": compiled.attributes["frontend_path"],
@@ -1073,6 +1077,8 @@ def _compile_manifest(compiled, machine) -> dict[str, Any]:
         "stablehlo_version": compiled.attributes["stablehlo_version"],
         "architecture": machine.config_id,
         "machine_hash": machine.stable_hash(),
+        "machine_topology_hash": machine.topology_hash(),
+        "memory_plan_schema": compiled.backend_artifact.memory_plan.schema_version,
         "codegen_backend": compiled.attributes["codegen_backend"],
         "tisa_program_id": compiled.tisa_program.program_id,
         "artifact_id": compiled.backend_artifact.artifact_id,
@@ -1081,6 +1087,7 @@ def _compile_manifest(compiled, machine) -> dict[str, Any]:
             "canonical_graph": "01_gc/canonical_graph.json",
             "machine": "04_backend/machine.json",
             "tisa_program": "03_tisa/tisa_program.json",
+            "memory_plan": "04_backend/memory_plan.json",
         },
     }
 
@@ -1104,15 +1111,12 @@ def run_compile_and_sim(args: argparse.Namespace) -> int:
     compiled, machine, _factory_name = _compile_from_args(args)
     _write_compile_artifacts(compiled, machine, args.output_dir)
 
-    lifetimes = derive_tensor_lifetimes(compiled.tisa_program)
-    reuse_pairs = derive_tensor_reuse_pairs(compiled.tisa_program)
-    runtime_buffers = allocate_buffer_bindings(
-        compiled.graph.tensors,
+    if compiled.backend_artifact.memory_plan is None:
+        raise ValueError("compiled artifact is missing target memory plan")
+    runtime_buffers = allocate_memory_plan_bindings(
+        compiled.backend_artifact.memory_plan,
+        machine,
         base_address=args.runtime_base_address,
-        alignment_bytes=args.runtime_alignment,
-        lifetimes=lifetimes,
-        reuse_buffers=args.runtime_buffer_policy == "lifetime_reuse",
-        reuse_pairs=reuse_pairs,
     )
     descriptor_availability = _descriptor_availability(args.runtime_availability_config)
     if args.runtime_invocations <= 0:
@@ -1216,7 +1220,8 @@ def run_compile_and_sim(args: argparse.Namespace) -> int:
         "timing_provider": getattr(timing_model, "name", "analytical"),
         "event_backend": event_backend.name,
         "runtime_policy": runtime_submission.policy,
-        "runtime_buffer_policy": args.runtime_buffer_policy,
+        "runtime_buffer_policy": "compiled_memory_plan",
+        "requested_legacy_runtime_buffer_policy": args.runtime_buffer_policy,
         "runtime_command_chunk_count": len(runtime_submission.commands),
         "runtime_buffer_count": len(runtime_submission.buffers),
         "runtime_invocation_count": (
@@ -1291,6 +1296,11 @@ def _load_compile_package(root: Path):
         if not path.is_file():
             raise ValueError(f"compile package is missing required artifact: {path}")
     backend = BackendArtifact.from_dict(_read_json_object(backend_path, description="backend artifact"))
+    if backend.memory_plan is None:
+        raise ValueError(
+            "legacy compile package lacks target memory plan schema v2; recompile it "
+            "before independent simulation"
+        )
     graph = OperatorGraph.from_dict(_read_json_object(graph_path, description="canonical graph"))
     from npu_ooo.arch import MachineConfig
 
@@ -1344,6 +1354,11 @@ def run_simulate(args: argparse.Namespace) -> int:
         if args.arch is not None or args.machine_config is not None
         else compiled_machine
     )
+    if machine.topology_hash() != artifact.memory_plan.machine_topology_hash:
+        raise ValueError(
+            "simulate MachineConfig changes storage topology, transfer engines, or operand "
+            "placement; target lowering must be rerun"
+        )
     runtime_policy = args.runtime_policy or str(runtime_payload.get("runtime_policy", "static"))
     chunk_size = args.runtime_chunk_size
     if chunk_size is None and runtime_payload.get("runtime_chunk_size") is not None:
@@ -1351,10 +1366,10 @@ def run_simulate(args: argparse.Namespace) -> int:
     base_address = args.runtime_base_address
     if base_address is None:
         base_address = int(runtime_payload.get("runtime_base_address", 0x10000000))
-    alignment = args.runtime_alignment
-    if alignment is None:
-        alignment = int(runtime_payload.get("runtime_alignment", 256))
-    buffer_policy = args.runtime_buffer_policy or str(
+    _requested_alignment = args.runtime_alignment
+    if _requested_alignment is None:
+        _requested_alignment = int(runtime_payload.get("runtime_alignment", 256))
+    _requested_buffer_policy = args.runtime_buffer_policy or str(
         runtime_payload.get("runtime_buffer_policy", "linear")
     )
     launch_latency = args.runtime_launch_latency
@@ -1395,15 +1410,10 @@ def run_simulate(args: argparse.Namespace) -> int:
             ):
                 raise ValueError(f"descriptor availability for '{tisa_id}' must be non-negative")
             descriptor_availability[tisa_id] = float(cycle)
-    lifetimes = derive_tensor_lifetimes(artifact.program)
-    reuse_pairs = derive_tensor_reuse_pairs(artifact.program)
-    buffers = allocate_buffer_bindings(
-        graph.tensors,
+    buffers = allocate_memory_plan_bindings(
+        artifact.memory_plan,
+        machine,
         base_address=base_address,
-        alignment_bytes=alignment,
-        lifetimes=lifetimes,
-        reuse_buffers=buffer_policy == "lifetime_reuse",
-        reuse_pairs=reuse_pairs,
     )
 
     invocation_payloads = runtime_payload.get("invocations")

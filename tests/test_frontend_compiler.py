@@ -25,7 +25,7 @@ class PyTorchFrontendTest(unittest.TestCase):
         import torch
         from examples.torch_models import MultiHeadAttentionBlock
         from npu_ooo.backend import CycleEventBackend
-        from npu_ooo.ir import allocate_buffer_bindings, create_runtime_submission
+        from npu_ooo.ir import allocate_memory_plan_bindings, create_runtime_submission
         from npu_ooo.simulator import SimulatorConfig
 
         machine = minimal_machine_config()
@@ -35,7 +35,10 @@ class PyTorchFrontendTest(unittest.TestCase):
         )
         artifact = compiled.backend_artifact
         before = artifact.to_dict()
-        submission = create_runtime_submission(artifact, allocate_buffer_bindings(compiled.graph.tensors))
+        submission = create_runtime_submission(
+            artifact,
+            allocate_memory_plan_bindings(artifact.memory_plan, machine),
+        )
         results = [schedule_tisa_program(
             artifact, machine, policy, runtime_submission=submission,
             event_backend=CycleEventBackend(), simulator_config=SimulatorConfig(address_scoreboard=True),
@@ -137,7 +140,9 @@ class PyTorchFrontendTest(unittest.TestCase):
         ]
         self.assertTrue(all(item.strides_bytes for item in stride_metadata))
         self.assertTrue(all(item.stride_expr for item in stride_metadata))
-        self.assertTrue(all(item.layout == "dense" for item in stride_metadata))
+        self.assertTrue(
+            all(item.layout in {"dense", "packed"} for item in stride_metadata)
+        )
         self.assertIsNotNone(compiled.gc_artifact)
         self.assertIsNotNone(compiled.tisa_dialect)
         self.assertEqual(compiled.validate(), ())

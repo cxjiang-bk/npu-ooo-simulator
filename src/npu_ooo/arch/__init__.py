@@ -1,6 +1,7 @@
 """Configurable machine descriptions."""
 
 from .scheduler import SchedulerPipelineConfig
+from .placement import OperandPlacementConfig, OperationPlacementConfig
 
 from .machine import (
     ExecutionUnitConfig,
@@ -23,6 +24,8 @@ __all__ = [
     "MemoryLevelConfig",
     "SchedulerCapacityConfig",
     "SchedulerPipelineConfig",
+    "OperandPlacementConfig",
+    "OperationPlacementConfig",
     "TransferPathConfig",
     "lpu_like_machine_config",
     "minimal_machine_config",

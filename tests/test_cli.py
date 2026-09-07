@@ -8,6 +8,7 @@ import unittest
 from types import SimpleNamespace
 
 from npu_ooo.arch import minimal_machine_config
+from npu_ooo.backend.memory import materialize_target_memory
 from npu_ooo.cli import _paper_profile_name, build_parser, main
 from npu_ooo.frontend import official_stablehlo_available, torch_xla_available
 from npu_ooo.ir import (
@@ -254,12 +255,15 @@ class CompileAndSimCliTest(unittest.TestCase):
             execution_graph=ExecutionGraph("cli.test.execution", (task,)),
             payloads={"copy.t0000": ("copy.task",)},
         )
+        machine = minimal_machine_config()
+        backend = materialize_target_memory(graph, machine, backend)
         write_artifact_json(graph, root / "01_gc" / "canonical_graph.json")
         write_artifact_json(backend, root / "04_backend" / "backend_artifact.json")
-        write_artifact_json(minimal_machine_config(), root / "04_backend" / "machine.json")
+        write_artifact_json(backend.memory_plan, root / "04_backend" / "memory_plan.json")
+        write_artifact_json(machine, root / "04_backend" / "machine.json")
         write_artifact_json(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "artifact_kind": "compile_package",
                 "artifact_id": backend.artifact_id,
                 "compile_artifact_id": backend.artifact_id,

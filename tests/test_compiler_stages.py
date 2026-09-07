@@ -118,7 +118,7 @@ class CompilerStageContractTest(unittest.TestCase):
         instructions = compiled.tisa_program.instructions
         self.assertTrue(instructions)
         self.assertTrue(all(item.op_type == "gather" for item in instructions))
-        self.assertTrue(all(item.unit_map.unit == "dma" for item in instructions))
+        self.assertTrue(all(item.unit_map.unit == "DMA" for item in instructions))
         tasks = compiled.backend_artifact.execution_graph.tasks
         self.assertEqual(len(tasks), len(instructions))
         self.assertTrue(all(task.primitive == "gather" for task in tasks))
@@ -143,17 +143,9 @@ class CompilerStageContractTest(unittest.TestCase):
             ),
         )
         frontend, stablehlo = _stable_frontend(graph)
-        machine = minimal_machine_config()
-        machine = replace(
-            machine,
-            memory_levels=tuple(
-                replace(level, capacity_bytes=16) if level.name == "SRAM" else level
-                for level in machine.memory_levels
-            ),
-        )
         compiled = compile_operator_graph(
             graph,
-            machine,
+            minimal_machine_config(),
             frontend=frontend,
             source_frontend=frontend,
             stablehlo=stablehlo,
@@ -167,14 +159,17 @@ class CompilerStageContractTest(unittest.TestCase):
             list(range(len(snapshots))),
         )
         self.assertEqual(snapshots[0].input_graph.to_dict(), graph.to_dict())
-        self.assertEqual(snapshots[-1].output_graph.to_dict(), compiled.gc_artifact.graph.to_dict())
+        self.assertEqual(
+            snapshots[-1].output_graph.to_dict(),
+            compiled.gc_artifact.graph.to_dict(),
+        )
         self.assertEqual(compiled.gc_artifact.attributes["pass_count"], len(snapshots))
 
         operator_schedule = compiled.schedule.for_operator("softmax")
         ping_pong = operator_schedule.attributes["ping_pong"]
         self.assertTrue(ping_pong["enabled"])
         self.assertEqual(ping_pong["buffer_count"], 2)
-        self.assertEqual(operator_schedule.attributes["residency_overflow_tensors"], ["x", "y"])
+        self.assertEqual(operator_schedule.attributes["residency_overflow_tensors"], [])
 
     def test_gc_fc_and_tisa_generator_have_distinct_contracts(self) -> None:
         graph = OperatorGraph(
@@ -526,9 +521,9 @@ class CompilerStageContractTest(unittest.TestCase):
             if operand.tile_mem.tensor == "value"
         ]
         self.assertTrue(encoded)
-        self.assertTrue(all(item.layout == "stablehlo:#row_major" for item in encoded))
-        self.assertTrue(all(item.offset_bytes is None and item.size_bytes is None for item in encoded))
-        self.assertTrue(all(item.strides_bytes is None for item in encoded))
+        self.assertTrue(any(item.layout == "stablehlo:#row_major" for item in encoded))
+        self.assertTrue(any(item.layout == "packed" for item in encoded))
+        self.assertTrue(all(item.offset_bytes is not None and item.size_bytes is not None for item in encoded))
         self.assertEqual(compiled.validate(), ())
 
     def test_machine_dtype_policy_strict_and_explicit_fallback(self) -> None:

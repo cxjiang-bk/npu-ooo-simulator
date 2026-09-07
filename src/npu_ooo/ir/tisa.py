@@ -12,15 +12,16 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from .execution import AccessType, ExecutionGraph
+from .memory import MemoryPlan
 
 
 @dataclass(frozen=True)
 class TileMem:
-    """Logical memory descriptor used by TISA dependency checks.
+    """Symbolic or target-materialized memory descriptor.
 
-    ``address_expr`` keeps the compiler's logical slice visible even when a
-    runtime later binds it to a physical base address.  The concrete byte
-    range remains authoritative for the current analytical scoreboard.
+    FC uses the logical fields; Codegen adds ``buffer_id``, ``allocation_id``
+    and a concrete memory scope. ``address_expr`` keeps the logical slice
+    auditable after target materialization.
     """
 
     base: str
@@ -34,6 +35,9 @@ class TileMem:
     layout: str = "dense"
     logical_starts: tuple[int, ...] | None = None
     logical_shape: tuple[int, ...] | None = None
+    buffer_id: str | None = None
+    allocation_id: str | None = None
+    valid_bytes: int | None = None
 
     def validate(self) -> tuple[str, ...]:
         issues: list[str] = []
@@ -45,6 +49,15 @@ class TileMem:
             issues.append("TISA TileMem offset_bytes must be non-negative")
         if self.size_bytes is not None and self.size_bytes <= 0:
             issues.append("TISA TileMem size_bytes must be positive")
+        if self.buffer_id is not None and not self.buffer_id:
+            issues.append("TISA TileMem buffer_id must not be blank")
+        if self.allocation_id is not None and not self.allocation_id:
+            issues.append("TISA TileMem allocation_id must not be blank")
+        if self.valid_bytes is not None and (
+            self.valid_bytes <= 0
+            or (self.size_bytes is not None and self.valid_bytes > self.size_bytes)
+        ):
+            issues.append("TISA TileMem valid_bytes is invalid")
         if self.address_expr is not None and not self.address_expr.strip():
             issues.append("TISA TileMem address_expr must not be blank")
         if not self.layout or not self.layout.strip():
@@ -91,6 +104,9 @@ class TileMem:
             "layout": self.layout,
             "logical_starts": list(self.logical_starts) if self.logical_starts is not None else None,
             "logical_shape": list(self.logical_shape) if self.logical_shape is not None else None,
+            "buffer_id": self.buffer_id,
+            "allocation_id": self.allocation_id,
+            "valid_bytes": self.valid_bytes,
         }
 
     @classmethod
@@ -122,6 +138,9 @@ class TileMem:
                     if payload.get("logical_shape") is not None
                     else None
                 ),
+                buffer_id=(str(payload["buffer_id"]) if payload.get("buffer_id") is not None else None),
+                allocation_id=(str(payload["allocation_id"]) if payload.get("allocation_id") is not None else None),
+                valid_bytes=(int(payload["valid_bytes"]) if payload.get("valid_bytes") is not None else None),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("invalid TISA TileMem payload") from exc
@@ -417,6 +436,7 @@ class BackendArtifact:
     payloads: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     backend: str = "analytical"
     attributes: Mapping[str, Any] = field(default_factory=dict)
+    memory_plan: MemoryPlan | None = None
 
     def validate(self) -> tuple[str, ...]:
         issues = list(self.program.validate())
@@ -536,7 +556,76 @@ class BackendArtifact:
                     issues.append(
                         f"backend task edge '{predecessor_id}' -> '{task.task_id}' is not "
                         f"ordered by TISA dependency '{predecessor_owner}' -> '{owner}'"
-                    )
+                )
+        if self.memory_plan is not None:
+            issues.extend(self.memory_plan.validate())
+            planned = {item.buffer_id: item for item in self.memory_plan.buffers}
+            for instruction in self.program.instructions:
+                for operand in instruction.operands:
+                    memory = operand.tile_mem
+                    if memory.buffer_id not in planned:
+                        issues.append(
+                            f"TISA operand '{instruction.tisa_id}:{operand.name}' has no planned buffer"
+                        )
+                        continue
+                    target = planned[memory.buffer_id]
+                    if memory.scope != target.memory:
+                        issues.append(
+                            f"TISA operand '{instruction.tisa_id}:{operand.name}' memory "
+                            f"'{memory.scope}' differs from plan '{target.memory}'"
+                        )
+                    if memory.allocation_id != target.allocation_id:
+                        issues.append(
+                            f"TISA operand '{instruction.tisa_id}:{operand.name}' allocation id "
+                            "differs from memory plan"
+                        )
+                    if (
+                        memory.offset_bytes is None
+                        or memory.size_bytes is None
+                        or memory.offset_bytes + memory.size_bytes > target.allocation_bytes
+                    ):
+                        issues.append(
+                            f"TISA operand '{instruction.tisa_id}:{operand.name}' exceeds planned allocation"
+                        )
+            for task in self.execution_graph.tasks:
+                for region in (*task.reads, *task.writes):
+                    if region.buffer_id not in planned:
+                        issues.append(
+                            f"backend region '{task.task_id}:{region.tensor}' has no planned buffer"
+                        )
+                    elif region.memory != planned[region.buffer_id].memory:
+                        issues.append(
+                            f"backend region '{task.task_id}:{region.tensor}' memory differs from plan"
+                        )
+            readable = {"read", "read_write"}
+            writable = {"write", "read_write"}
+            for instruction in self.program.instructions:
+                operands = instruction.operands
+                for task_id in self.payloads.get(instruction.tisa_id, ()):
+                    task = task_by_id.get(task_id)
+                    if task is None:
+                        continue
+                    for regions, allowed in (
+                        (task.reads, readable),
+                        (task.writes, writable),
+                    ):
+                        for region in regions:
+                            covered = any(
+                                operand.tile_mem.buffer_id == region.buffer_id
+                                and operand.tile_mem.scope == region.memory
+                                and operand.tile_mem.offset_bytes is not None
+                                and operand.tile_mem.size_bytes is not None
+                                and operand.tile_mem.offset_bytes <= region.offset_bytes
+                                and operand.tile_mem.offset_bytes + operand.tile_mem.size_bytes
+                                >= region.offset_bytes + region.size_bytes
+                                and operand.normalized_access in allowed
+                                for operand in operands
+                            )
+                            if not covered:
+                                issues.append(
+                                    f"TISA instruction '{instruction.tisa_id}' does not cover "
+                                    f"payload access '{task_id}:{region.buffer_id}'"
+                                )
         return tuple(issues)
 
     def to_dict(self) -> dict[str, Any]:
@@ -547,6 +636,7 @@ class BackendArtifact:
             "payloads": {key: list(value) for key, value in self.payloads.items()},
             "backend": self.backend,
             "attributes": dict(self.attributes),
+            "memory_plan": self.memory_plan.to_dict() if self.memory_plan is not None else None,
         }
 
     @classmethod
@@ -564,6 +654,11 @@ class BackendArtifact:
                 },
                 backend=str(payload.get("backend", "analytical")),
                 attributes=payload.get("attributes", {}),
+                memory_plan=(
+                    MemoryPlan.from_dict(payload["memory_plan"])
+                    if payload.get("memory_plan") is not None
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             raise ValueError("invalid backend artifact payload") from exc
