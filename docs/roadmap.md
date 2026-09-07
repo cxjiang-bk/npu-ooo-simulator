@@ -101,10 +101,12 @@ static/dynamic 的差异来自 policy；小图的 tile、MAC、traffic 和 depen
 
 当前工作项：
 
-1. 根据论文和 NPU ISA 参数化 dispatch、wake-up、issue、completion 控制开销；
-2. 校准 WQ/IQ/Fu 容量、dispatch width、in-flight tile 和 queue backpressure；
-3. 让 partial-ready 从 backend calibration contract 进入 GC 语义；
-4. 增加逐 cycle micro-test 对账和稳定的 stall taxonomy。
+`cycle_event` 已实现独立 WQ/IQ/Fu、ROB 退休、控制延迟/带宽参数、队列反压、逐周期
+stall taxonomy 和 micro-test 对账。配置与语义见 [device-scheduler.md](device-scheduler.md)。
+
+1. 使用真实 scheduler profile 校准上述参数；
+2. 扩展 partial-ready 子区域协议、在线优先级更新与多核路由；
+3. 通过阶段 D 的硬件 timing 进一步验证控制和执行时序。
 
 ## 阶段 D：可插拔硬件 backend
 

@@ -59,6 +59,7 @@ ATen 到 StableHLO 的转换，项目维护 StableHLO semantic family 到 Canoni
   独立实验身份；
 - symbolic shape 使用 normalized shape environment 完成 Canonical resolve 与 specialization；
 - 输出分阶段 artifact、周期与 stall 统计、SVG/PNG 泳道图和 Perfetto JSON；
+- `cycle_event` 提供显式 reception/WQ/IQ/Fu/ROB、逐周期控制延迟、完成带宽与退休反压；
 - 支持 analytical、timing table、systolic MXU profile 以及 RTL completion trace
   importer。
 
@@ -414,9 +415,26 @@ backend：ExecutionTask 时序、completion event、泳道图
 
 ```text
 CodegenBackend: analytical
-EventBackend: analytical_event
+EventBackend: analytical_event | cycle_event
 TimingProvider: analytical | timing_table | systolic_mxu_profile
 ```
+
+逐周期调度可以直接消费已有编译包：
+
+```bash
+PYTHONPATH=src python3.12 -m npu_ooo.cli simulate \
+  --compile-dir out/attention-compile \
+  --event-backend cycle_event \
+  --scheduler-config configs/scheduler/cycle_baseline.json \
+  --address-scoreboard --policy dynamic_ready_queue \
+  --output-dir out/attention-cycle
+```
+
+配置文件控制 receive/dispatch/select/issue/completion/retire 带宽、阶段延迟、IQ/Fu
+容量；指令 CSV 增加阶段周期，summary 保存逐周期队列占用和 stall 原因。
+阶段顺序、容量单位、static/dynamic 策略边界和统计口径见
+[docs/device-scheduler.md](docs/device-scheduler.md)。当前控制时序是可配置研究模型，
+校准状态单独记录为 `scheduler_calibration_status=uncalibrated`。
 
 RTL completion trace 的 JSON/CSV schema、VCS console log 转换和 interval 选择见
 [docs/rtl-calibration.md](docs/rtl-calibration.md)。`compute_start_to_compute_done`

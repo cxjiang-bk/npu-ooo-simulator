@@ -34,7 +34,7 @@ class BackendContractTest(unittest.TestCase):
 
     def test_default_event_registry_exposes_analytical_backend(self) -> None:
         registry = default_event_backend_registry()
-        self.assertEqual(registry.names(), ("analytical_event",))
+        self.assertEqual(registry.names(), ("analytical_event", "cycle_event"))
         backend = registry.create("analytical_event")
         self.assertIsInstance(backend, AnalyticalEventBackend)
         self.assertEqual(backend.capabilities.calibration_status, "analytical")

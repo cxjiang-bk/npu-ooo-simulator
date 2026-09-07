@@ -151,26 +151,28 @@ def _access_banks(
 ) -> tuple[int, ...]:
     """Map strided logical elements to banks, with bounded exact expansion."""
 
+    def span_banks(start, byte_count):
+        first = start // bank_width
+        last = (start + max(byte_count - 1, 0)) // bank_width
+        return {(first + index) % bank_count for index in range(min(last - first + 1, bank_count))}
+
     if (
         not shape
         or len(shape) != len(strides)
         or any(value <= 0 for value in shape)
         or any(value < 0 for value in strides)
     ):
-        first = address // bank_width
-        last = (address + max(size - 1, 0)) // bank_width
-        return tuple(sorted({bank % bank_count for bank in range(first, last + 1)}))
+        return tuple(sorted(span_banks(address, size)))
     element_count = math.prod(shape)
     if element_count > 4096:
-        first = address // bank_width
-        last = (address + max(size - 1, 0)) // bank_width
-        return tuple(sorted({bank % bank_count for bank in range(first, last + 1)}))
-    banks = {
-        (address + sum(index * stride for index, stride in zip(indices, strides)))
-        // bank_width
-        % bank_count
-        for indices in product(*(range(extent) for extent in shape))
-    }
+        return tuple(sorted(span_banks(address, size)))
+    element_bytes = size - sum((extent - 1) * stride for extent, stride in zip(shape, strides))
+    if element_bytes <= 0:
+        return tuple(sorted(span_banks(address, size)))
+    banks = set()
+    for indices in product(*(range(extent) for extent in shape)):
+        start = address + sum(index * stride for index, stride in zip(indices, strides))
+        banks.update(span_banks(start, element_bytes))
     return tuple(sorted(banks))
 
 
@@ -1412,7 +1414,7 @@ def simulate_tisa_sequence(
         "TISA_COMPLETE": 11,
     }
     merged_events.sort(
-        key=lambda event: (
+        key=lambda event: (event.timestamp,) if event_backend.name == "cycle_event" else (
             event.timestamp,
             event_order.get(event.event, len(event_order)),
             event.task_id,
@@ -1452,6 +1454,38 @@ def simulate_tisa_sequence(
             },
         }
     )
+    if event_backend.name == "cycle_event":
+        offset = 0.0
+        pipeline = {}
+        occupancy = []
+        for ordinal, (invocation, result) in enumerate(zip(sequence.invocations, invocation_results)):
+            if ordinal:
+                offset += sequence.inter_invocation_gap_cycles
+            for tid, stages in result.metrics["instruction_pipeline"].items():
+                pipeline[f"{invocation.submission_id}/{tid}"] = {
+                    key: cycle + offset for key, cycle in stages.items()
+                }
+            occupancy.extend({**row, "timestamp": row["timestamp"] + offset,
+                              "invocation_id": invocation.submission_id}
+                             for row in result.metrics["queue_occupancy_timeline"])
+            offset += result.total_cycles
+        metrics["instruction_pipeline"] = pipeline
+        metrics["queue_occupancy_timeline"] = occupancy
+        for field in ("stall_cycles", "stall_instruction_cycles"):
+            keys = {key for result in invocation_results for key in result.metrics[field]}
+            metrics[field] = {key: sum(result.metrics[field].get(key, 0) for result in invocation_results) for key in keys}
+        metrics["device_start_cycle"] = min((timing.issue for timing in merged_instruction_timings), default=0.0)
+        metrics["device_finish_cycle"] = cursor - sequence.invocations[-1].synchronization_cycles
+        metrics["completion_finish_cycle"] = max((timing.finish for timing in merged_instruction_timings), default=0.0)
+        metrics["retirement_drain_cycles"] = metrics["device_finish_cycle"] - metrics["completion_finish_cycle"]
+        for field in ("retired_instruction_count", "issued_instruction_count", "completed_instruction_count",
+                      "tisa_decision_count", "issued_task_count", "completed_task_count", "partial_ready_event_count"):
+            metrics[field] = sum(result.metrics[field] for result in invocation_results)
+        for field in ("rob_peak", "reception_queue_peak", "inflight_tile_peak"):
+            metrics[field] = max(result.metrics[field] for result in invocation_results)
+        for field in ("wq_peak", "iq_peak", "fu_peak"):
+            metrics[field] = {unit.name: max(result.metrics[field][unit.name] for result in invocation_results)
+                              for unit in machine.execution_units}
     return RuntimeSequenceSimulationResult(
         backend=invocation_results[-1].backend,
         policy=policy,

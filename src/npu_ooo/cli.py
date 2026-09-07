@@ -13,6 +13,7 @@ import sys
 from typing import Any
 
 from npu_ooo.arch import (
+    SchedulerPipelineConfig,
     load_machine_config,
     lpu_like_machine_config,
     minimal_machine_config,
@@ -263,6 +264,7 @@ def _add_simulation_options(
     if include_architecture:
         parser.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"))
         parser.add_argument("--machine-config", type=Path)
+    parser.add_argument("--scheduler-config", type=Path, help="cycle_event control pipeline JSON")
     parser.add_argument("--timing-config", type=Path)
     parser.add_argument(
         "--timing-provider",
@@ -379,6 +381,7 @@ def _add_simulation_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_paper_matrix_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--scheduler-config", type=Path, help="cycle_event control pipeline JSON")
     parser.add_argument(
         "--benchmarks",
         default="all",
@@ -902,16 +905,7 @@ def run_paper_matrix(args: argparse.Namespace) -> int:
         if args.tile_size_candidates
         else None
     )
-    simulator_config = SimulatorConfig(
-        instruction_queue_depth=args.instruction_queue_depth,
-        rob_entries=args.rob_entries,
-        max_inflight_tiles=args.max_inflight_tiles,
-        dependency_window=args.dependency_window,
-        ready_queue_depth=args.ready_queue_depth,
-        address_scoreboard=args.address_scoreboard,
-        memory_bank_scoreboard=args.memory_bank_scoreboard,
-        dynamic_priority=args.dynamic_priority,
-    )
+    simulator_config = _simulation_config(args)
     timing_model = _timing_model(args.timing_config, args.timing_provider)
     event_backend = default_event_backend_registry().create(args.event_backend)
     codegen_backend = default_codegen_backend_registry().create(args.codegen_backend)
@@ -1165,16 +1159,7 @@ def run_compile_and_sim(args: argparse.Namespace) -> int:
         )
     write_artifact_json(runtime_submission, args.output_dir / "runtime_submission.json")
 
-    simulator_config = SimulatorConfig(
-        instruction_queue_depth=args.instruction_queue_depth,
-        rob_entries=args.rob_entries,
-        max_inflight_tiles=args.max_inflight_tiles,
-        dependency_window=args.dependency_window,
-        ready_queue_depth=args.ready_queue_depth,
-        address_scoreboard=args.address_scoreboard,
-        memory_bank_scoreboard=args.memory_bank_scoreboard,
-        dynamic_priority=args.dynamic_priority,
-    )
+    simulator_config = _simulation_config(args)
     timing_model = _timing_model(args.timing_config, args.timing_provider)
     event_backend = default_event_backend_registry().create(args.event_backend)
     if runtime_sequence is not None:
@@ -1325,6 +1310,13 @@ def _load_compile_package(root: Path):
 
 
 def _simulation_config(args: argparse.Namespace) -> SimulatorConfig:
+    pipeline = None
+    if args.scheduler_config is not None:
+        if args.event_backend != "cycle_event":
+            raise ValueError("--scheduler-config requires --event-backend cycle_event")
+        pipeline = SchedulerPipelineConfig.from_dict(
+            _read_json_object(args.scheduler_config, description="scheduler pipeline")
+        )
     return SimulatorConfig(
         instruction_queue_depth=args.instruction_queue_depth,
         rob_entries=args.rob_entries,
@@ -1334,6 +1326,7 @@ def _simulation_config(args: argparse.Namespace) -> SimulatorConfig:
         address_scoreboard=args.address_scoreboard,
         memory_bank_scoreboard=args.memory_bank_scoreboard,
         dynamic_priority=args.dynamic_priority,
+        pipeline=pipeline,
     )
 
 

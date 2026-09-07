@@ -21,6 +21,34 @@ FRONTEND_AVAILABLE = bool(
 
 @unittest.skipUnless(FRONTEND_AVAILABLE, "requires PyTorch, Torch-XLA and official StableHLO")
 class PyTorchFrontendTest(unittest.TestCase):
+    def test_cycle_scheduler_policies_reuse_real_attention_compilation(self):
+        import torch
+        from examples.torch_models import MultiHeadAttentionBlock
+        from npu_ooo.backend import CycleEventBackend
+        from npu_ooo.ir import allocate_buffer_bindings, create_runtime_submission
+        from npu_ooo.simulator import SimulatorConfig
+
+        machine = minimal_machine_config()
+        compiled = compile_torch_module(
+            MultiHeadAttentionBlock().eval(), (torch.ones(1, 4, 8), torch.zeros(1, 1, 4, 4)),
+            machine, tile_size=4,
+        )
+        artifact = compiled.backend_artifact
+        before = artifact.to_dict()
+        submission = create_runtime_submission(artifact, allocate_buffer_bindings(compiled.graph.tensors))
+        results = [schedule_tisa_program(
+            artifact, machine, policy, runtime_submission=submission,
+            event_backend=CycleEventBackend(), simulator_config=SimulatorConfig(address_scoreboard=True),
+        ) for policy in (SchedulerPolicy.STATIC_PIPELINE, SchedulerPolicy.DYNAMIC_READY_QUEUE)]
+        self.assertEqual(before, artifact.to_dict())
+        self.assertEqual(results[0].metrics["compile_package_sha256"], results[1].metrics["compile_package_sha256"])
+        for result in results:
+            self.assertEqual(result.metrics["retired_instruction_count"], len(artifact.program.instructions))
+            for inst in artifact.program.instructions:
+                for dependency in inst.dependencies:
+                    self.assertGreaterEqual(result.instruction_timing(inst.tisa_id).issue,
+                                            result.instruction_timing(dependency.source).finish)
+
     def test_two_matmul_follows_the_only_frontend_route(self) -> None:
         import torch
 

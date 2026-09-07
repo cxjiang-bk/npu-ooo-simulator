@@ -94,10 +94,14 @@ static/dynamic 的差异来自 policy；小图数据可以逐项核对。
 - [x] reception、queue、ROB/window、资源占用和 completion feedback analytical model；
 - [x] typed RAW/WAR/WAW/STATE/ACCUMULATE、address scoreboard、partial-ready 原型；
 - [x] memory bank/port structural-conflict model 与独立 stall 计数。
+- [x] cycle_event：独立 reception/WQ/IQ/Fu/ROB 状态与逐 cycle 生命周期；
+- [x] receive/dispatch/select/issue/completion/retire width 和显式 wakeup/控制延迟；
+- [x] completion 与 retirement 分离、队列/Fu/tile 反压和逐周期 stall taxonomy；
+- [x] 较老未 issue 地址冲突保护、hand-derived micro-tests 和同 artifact 策略比较。
 
 ### 进行中
 
-- [ ] 论文 WQ/IQ/Fu 容量、dispatch width、控制开销校准；
+- [ ] 用实际 scheduler RTL/profile 校准控制开销、在线仲裁及多核行为；
 - [ ] SCALE-Sim/Ramulator2 类 MXU/memory timing；
 - [ ] RTL/Verilator unit timing 与 system simulator adapter；
 - [ ] backend capability、timing interval、calibration status 的统一声明。

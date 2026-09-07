@@ -383,6 +383,12 @@ device 和 synchronization 周期求和。
 `schedule_tisa_program()` 消费 BackendArtifact、MachineConfig、RuntimeSubmission、
 SimulatorConfig、TimingProvider 和 EventBackend。
 
+`analytical_event` 使用事件级基线；`cycle_event` 使用显式 reception FIFO、per-EU
+WQ/IQ/Fu 和按 descriptor 提交顺序退休的 ROB。其周期顺序固定为
+`retire → complete → wakeup → issue → select → dispatch → receive`。
+`MachineConfig.scheduler.pipeline` 或 `--scheduler-config` 配置控制延迟和带宽。
+完整接口、手算案例和设计假设见 [device-scheduler.md](device-scheduler.md)。
+
 ```text
 static_pipeline:
   按 program order 与依赖约束 issue
@@ -410,7 +416,7 @@ memory backend 提供。
 | --- | --- | --- |
 | `CodegenBackend` | TISAProgram -> backend payload | analytical |
 | `TimingProvider` | ExecutionTask -> duration/II | analytical、timing_table、systolic_mxu_profile |
-| `EventBackend` | TISA + payload -> event execution | analytical_event |
+| `EventBackend` | TISA + payload -> event execution | analytical_event、cycle_event |
 
 `MachineConfig` 描述 execution unit 数量、memory hierarchy、interconnect、队列容量和
 默认 timing。配置变化作用于 backend 和 scheduler 参数，IR schema 保持一致。

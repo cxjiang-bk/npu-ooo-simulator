@@ -8,7 +8,7 @@ import math
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
-from npu_ooo.arch import ExecutionUnitConfig, MachineConfig
+from npu_ooo.arch import ExecutionUnitConfig, MachineConfig, SchedulerPipelineConfig
 from npu_ooo.ir import ExecutionGraph, ExecutionTask
 from .address import AddressConflict, AddressScoreboard
 
@@ -200,6 +200,7 @@ class SimulatorConfig:
     memory_bank_scoreboard: bool = False
     static_pipeline: StaticPipelineConfig | None = None
     dynamic_priority: str = "critical_path"
+    pipeline: SchedulerPipelineConfig | None = None
 
     def resolved(self, machine: MachineConfig) -> "SimulatorConfig":
         scheduler = machine.scheduler
@@ -233,6 +234,7 @@ class SimulatorConfig:
             memory_bank_scoreboard=self.memory_bank_scoreboard,
             static_pipeline=self.static_pipeline,
             dynamic_priority=self.dynamic_priority,
+            pipeline=self.pipeline or scheduler.pipeline,
         )
         issues = result.validate()
         if issues:
@@ -252,6 +254,8 @@ class SimulatorConfig:
                 issues.append(f"simulator {name} must be positive when specified")
         if self.static_pipeline is not None:
             issues.extend(self.static_pipeline.validate())
+        if self.pipeline is not None:
+            issues.extend(self.pipeline.validate())
         if self.dynamic_priority not in {"critical_path", "oldest_first"}:
             issues.append(
                 "simulator dynamic_priority must be 'critical_path' or 'oldest_first'"
@@ -271,6 +275,7 @@ class SimulatorConfig:
                 self.static_pipeline.to_dict() if self.static_pipeline is not None else None
             ),
             "dynamic_priority": self.dynamic_priority,
+            "pipeline": self.pipeline.to_dict() if self.pipeline is not None else None,
         }
 
 
@@ -373,18 +378,19 @@ class SimulationResult:
         }
 
     def perfetto_trace(self) -> dict[str, Any]:
-        trace_events: list[dict[str, Any]] = []
+        cycle_model = self.metrics.get("scheduler_model") == "cycle-stepped-v1"
+        trace_events = _cycle_tisa_spans(self.instruction_timings) if cycle_model else []
         for event in self.events:
             if event.event in {"START", "COMPLETE"}:
                 phase = "B" if event.event == "START" else "E"
                 pid = 2 if self.instruction_timings else 1
             elif event.event in {"TISA_ISSUE", "TISA_COMPLETE"}:
-                phase = "B" if event.event == "TISA_ISSUE" else "E"
+                phase = "i" if cycle_model else "B" if event.event == "TISA_ISSUE" else "E"
                 pid = 1
             elif event.event in {"RUNTIME_SUBMIT_START", "RUNTIME_SUBMIT_COMPLETE"}:
                 phase = "B" if event.event == "RUNTIME_SUBMIT_START" else "E"
                 pid = 0
-            elif event.event in {"TISA_PARTIAL_READY", "TISA_ADDRESS_BLOCK"}:
+            elif event.event.startswith("TISA_"):
                 phase = "i"
                 pid = 1
             else:
@@ -452,13 +458,14 @@ class RuntimeSequenceSimulationResult:
         }
 
     def perfetto_trace(self) -> dict[str, Any]:
-        trace_events: list[dict[str, Any]] = []
+        cycle_model = self.metrics.get("scheduler_model") == "cycle-stepped-v1"
+        trace_events = _cycle_tisa_spans(self.instruction_timings) if cycle_model else []
         for event in self.events:
             if event.event in {"START", "COMPLETE"}:
                 phase = "B" if event.event == "START" else "E"
                 pid = 2
             elif event.event in {"TISA_ISSUE", "TISA_COMPLETE"}:
-                phase = "B" if event.event == "TISA_ISSUE" else "E"
+                phase = "i" if cycle_model else "B" if event.event == "TISA_ISSUE" else "E"
                 pid = 1
             elif event.event in {"RUNTIME_SUBMIT_START", "RUNTIME_SUBMIT_COMPLETE"}:
                 phase = "B" if event.event == "RUNTIME_SUBMIT_START" else "E"
@@ -466,7 +473,7 @@ class RuntimeSequenceSimulationResult:
             elif event.event in {"STATE_RELEASE", "STATE_WAIT", "STATE_READY"}:
                 phase = "i"
                 pid = 3
-            elif event.event in {"TISA_PARTIAL_READY", "TISA_ADDRESS_BLOCK"}:
+            elif event.event.startswith("TISA_"):
                 phase = "i"
                 pid = 1
             else:
@@ -483,6 +490,15 @@ class RuntimeSequenceSimulationResult:
                 }
             )
         return {"traceEvents": trace_events, "displayTimeUnit": "cycle"}
+
+
+def _cycle_tisa_spans(timings: tuple[TaskTiming, ...]) -> list[dict[str, Any]]:
+    # EU reuse can precede acknowledgement of the previous completion. Use
+    # complete spans: begin/end stack events cannot represent that overlap.
+    return [{"name": timing.task_id, "cat": timing.resource, "ph": "X",
+             "ts": timing.issue, "dur": timing.finish - timing.issue,
+             "pid": 1, "tid": f"{timing.resource}[{timing.instance}]"}
+            for timing in timings]
 
 
 @dataclass

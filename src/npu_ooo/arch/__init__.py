@@ -1,5 +1,7 @@
 """Configurable machine descriptions."""
 
+from .scheduler import SchedulerPipelineConfig
+
 from .machine import (
     ExecutionUnitConfig,
     load_machine_config,
@@ -20,6 +22,7 @@ __all__ = [
     "machine_config_from_dict",
     "MemoryLevelConfig",
     "SchedulerCapacityConfig",
+    "SchedulerPipelineConfig",
     "TransferPathConfig",
     "lpu_like_machine_config",
     "minimal_machine_config",

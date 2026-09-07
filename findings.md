@@ -19,6 +19,22 @@ PyTorch nn.Module
 用户入口使用真实 PyTorch module。StableHLO 由 Torch-XLA 生成，官方 bindings 负责
 parse/verify，项目维护 semantic capability 到 Canonical/TISA/backend 的映射。
 
+## Device scheduler 周期模型决策（2026-09-06）
+
+`cycle_event` 显式实现 WQ/IQ/Fu 和完成反馈，独立配置控制延迟与带宽。每周期逆向推进
+流水保证 receive/dispatch/select/issue 的寄存边界。ROB 以 descriptor submission order
+退休；这一机制是项目用于探索有序完成与反压的设计，并非论文公开的 Epoch ROB 规格。
+Fu 按 operand 计数，执行单元在 physical done 释放，Fu 在 completion feedback 接受时释放，
+ROB 在 retire 释放。三种时刻独立记录。
+
+地址安全需要同时考虑较老的未 issue 指令。仅检查 active set 会允许年轻消费者先执行，
+即使稍后检测到物理重叠，也已无法恢复正确顺序。新模型在 select 和 issue 检查所有较老
+未 complete 指令；有限队列与不安全的 runtime 重排组合会显式报告死锁。
+
+`stall_cycles` 按原因统计发生周期，`stall_instruction_cycles` 按指令/原因/周期统计，
+前者各项可以重叠。固定流水延迟由 instruction_pipeline 记录，不作为数据依赖阻塞。
+`cycle_event` 的总周期包含退休 drain；物理 payload timing 与控制校准标签分别保存。
+
 ## 语义与执行层次
 
 - `TileInstance` 表达切分范围；

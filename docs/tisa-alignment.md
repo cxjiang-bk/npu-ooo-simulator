@@ -52,7 +52,7 @@ payload 可以包含该 execution unit 内部的多个步骤。
 | Attributes | `TISAInstruction.attributes` | readiness、region、state、fusion 和 reorder |
 | UnitMap | `TISAInstruction.unit_map` | execution unit 类别与数量 |
 | typed Deps | `TISADependency` | kind、condition、provenance；GC 同时保存 logical region |
-| WQ/IQ/Fu | simulator queue/ROB/in-flight | 可配置行为模型，参数来自 MachineConfig |
+| WQ/IQ/Fu | `cycle_event` 的 per-EU 队列和 operand tracking | 时钟边界与容量显式可配；ROB 为项目扩展 |
 
 memory bank scoreboard 读取 MachineConfig 的 bank、width、read/write port，形成
 analytical structural reservation，独立记录 memory conflict stall。
@@ -115,6 +115,8 @@ Backend Timing/Event
 论文的 tile-by-tile OOO 决策位于 device hardware；runtime 控制 descriptor 的可见时间。
 项目用 `--runtime-policy` 和 `--policy` 分别研究两层，`--runtime-device-matrix`
 一次编译后运行四种组合。
+
+逐周期配置与论文公开机制/项目假设的区分见 [device-scheduler.md](device-scheduler.md)。
 
 ## 6. 当前实现与扩展项
 

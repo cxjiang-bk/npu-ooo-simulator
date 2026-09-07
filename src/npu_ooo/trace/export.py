@@ -150,11 +150,19 @@ def write_instruction_csv(result: ScheduleResult, path: str | Path) -> None:
         for event in result.events
         if event.event == "TISA_ISSUE"
     }
+    stage_events = {
+        "receive": "TISA_RECEIVE", "dispatch": "TISA_DISPATCH", "wakeup": "TISA_WAKE_UP",
+        "select": "TISA_SELECT", "execution_done": "TISA_EXECUTION_DONE",
+        "complete": "TISA_COMPLETE", "retire": "TISA_RETIRE",
+    }
+    stages = {(event.task_id, event.event): event.timestamp for event in result.events
+              if event.event in stage_events.values()}
     with target.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
             handle,
             fieldnames=(
                 "tisa_id",
+                *stage_events,
                 "tile_id",
                 "operator_id",
                 "op_type",
@@ -181,6 +189,7 @@ def write_instruction_csv(result: ScheduleResult, path: str | Path) -> None:
             writer.writerow(
                 {
                     "tisa_id": timing.task_id,
+                    **{name: stages.get((timing.task_id, event), "") for name, event in stage_events.items()},
                     "tile_id": details.get("tile_id", ""),
                     "operator_id": details.get("operator_id", ""),
                     "op_type": details.get("op_type", ""),

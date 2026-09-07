@@ -2,7 +2,8 @@
 
 ## 当前快照
 
-项目已完成 model/benchmark proxy 覆盖扩展，下一阶段进入 Device scheduler 微结构对齐。
+项目已交付 Device scheduler 的逐周期微结构模型；控制开销的实际硬件校准和外部执行
+timing backend 是后续工作。
 生产链路和实验目录已经固定：
 
 ```text
@@ -19,7 +20,7 @@ PyTorch nn.Module
   -> cycles、stall、swimlane、Perfetto
 ```
 
-当前回归状态以本文件末尾的模型覆盖验收记录为准。
+当前回归状态以本文件末尾的 scheduler 周期模型验收记录为准。
 
 ## 已交付能力
 
@@ -281,3 +282,27 @@ GC typed dependency 已完成，下一项转入 symbolic shape、dynamic index �
   这些数值属于 analytical proxy，只用于验证完整实验链和相对调度趋势。
 - 本地回归发现 161 项，127 项执行通过、34 项因缺少 Torch-XLA/MLIR 跳过；9980X-new
   的完整前端环境执行全部 161 项并全部通过。两端 `compileall` 与 `git diff --check` 通过。
+
+## 2026-09-06：Device scheduler 逐周期微结构模型
+
+- 以 `af8b528` 为代码基线，新增可选择的 `cycle_event`，输入保持 BackendArtifact、
+  RuntimeSubmission 和 MachineConfig。payload 使用现有 TimingProvider。
+- 显式维护 reception、per-EU WQ/IQ/Fu、完成待反馈状态和 ROB；Fu 按 operand 条目占用，
+  ROB 在 dispatch 分配、按 descriptor 提交顺序退休。ROB 规则属于项目设计假设。
+- 固定每周期 `retire → complete → wakeup → issue → select → dispatch → receive`，
+  参数化各阶段 width、dispatch/select/wakeup/completion/retire latency；物理完成、完成反馈
+  和退休分别输出事件。
+- 地址检查覆盖原始 program order 中所有较老未完成指令，包括尚未 issue 的生产者。
+  修正 bank 跨界元素映射，并限制大连续区间扫描到 bank 数量。
+- 独立统计队列满、Fu/tile 窗口、依赖、资源、地址、bank/port、完成带宽、退休反压及各阶段
+  带宽；输出每周期容量和每条指令生命周期。Sequence 保留各 invocation 的阶段绝对周期。
+- 新增 20 项调度专项测试，其中一项覆盖 20 组固定种子依赖图的两种策略；另增加真实
+  Attention 编译包跨策略 hash 与依赖检查。CSV/Perfetto/standalone CLI 均有验收。
+- 全量验证：本地发现 182 项，147 项执行通过、35 项因 Torch-XLA/MLIR 依赖缺失跳过；
+  9980X-new 的独立测试副本执行全部 182 项并通过。新增模块 Ruff F 类检查、compileall
+  和 git diff --check 通过。
+- Attention CLI 实验：同一 127 条 TISA 编译包，address scoreboard 开启，默认 cycle
+  pipeline 下 static=3874 cycles、dynamic=3613 cycles。各阶段产物保存于
+  `out/scheduler-cycle-20260906/`（实验输出目录不纳入 Git）。
+- 接口及设计边界见 `docs/device-scheduler.md`。scheduler 时序状态为 uncalibrated；
+  实际 Epoch 7–9 cycle dispatch、partial-ready 子区域协议、在线优先级和多核路由需独立校准。

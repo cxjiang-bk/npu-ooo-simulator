@@ -190,9 +190,11 @@ def default_event_backend_registry() -> EventBackendRegistry:
     # Keep the import lazy: the analytical adapter delegates to simulator.tisa,
     # while simulator.tisa imports backend capability validation.
     from .analytical import AnalyticalEventBackend
+    from .cycle import CycleEventBackend
 
     registry = EventBackendRegistry()
     registry.register("analytical_event", AnalyticalEventBackend)
+    registry.register("cycle_event", CycleEventBackend)
     return registry
 
 

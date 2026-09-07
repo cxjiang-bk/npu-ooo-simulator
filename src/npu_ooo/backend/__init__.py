@@ -17,6 +17,7 @@ from .registry import (
     default_timing_provider_registry,
 )
 from .analytical import AnalyticalEventBackend
+from .cycle import CycleEventBackend
 from .codegen import AnalyticalCodegenBackend
 from .mxu_profile import SystolicMXUProfileEntry, SystolicMXUProfileTimingProvider
 from .rtl_trace import (
@@ -37,6 +38,7 @@ __all__ = [
     "CodegenBackend",
     "CodegenBackendRegistry",
     "AnalyticalEventBackend",
+    "CycleEventBackend",
     "EventBackend",
     "EventBackendRegistry",
     "SystemBackend",

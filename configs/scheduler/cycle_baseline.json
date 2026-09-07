@@ -1,0 +1,16 @@
+{
+  "receive_width": 1,
+  "dispatch_width": 1,
+  "select_width": 1,
+  "issue_width": 1,
+  "completion_width": 1,
+  "retire_width": 1,
+  "dispatch_latency": 1,
+  "select_latency": 1,
+  "wakeup_latency": 1,
+  "completion_latency": 0,
+  "retire_latency": 1,
+  "iq_entries": 8,
+  "inflight_entries": 16,
+  "max_cycles": 1000000
+}

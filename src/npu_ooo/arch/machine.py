@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
+from .scheduler import SchedulerPipelineConfig
+
 
 @dataclass(frozen=True)
 class MemoryLevelConfig:
@@ -165,9 +167,10 @@ class SchedulerCapacityConfig:
     rob_entries: int = 8
     max_inflight_tiles: int = 8
     dependency_window: int = 8
+    pipeline: SchedulerPipelineConfig = field(default_factory=SchedulerPipelineConfig)
 
     def validate(self) -> tuple[str, ...]:
-        return tuple(
+        return self.pipeline.validate() + tuple(
             f"scheduler {name} must be positive"
             for name, value in (
                 ("instruction_queue_depth", self.instruction_queue_depth),
@@ -178,12 +181,13 @@ class SchedulerCapacityConfig:
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0
         )
 
-    def to_dict(self) -> dict[str, int]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "instruction_queue_depth": self.instruction_queue_depth,
             "rob_entries": self.rob_entries,
             "max_inflight_tiles": self.max_inflight_tiles,
             "dependency_window": self.dependency_window,
+            "pipeline": self.pipeline.to_dict(),
         }
 
 
@@ -436,6 +440,7 @@ def machine_config_from_dict(payload: Mapping[str, Any]) -> MachineConfig:
             rob_entries=scheduler_payload.get("rob_entries", 8),
             max_inflight_tiles=scheduler_payload.get("max_inflight_tiles", 8),
             dependency_window=scheduler_payload.get("dependency_window", 8),
+            pipeline=SchedulerPipelineConfig.from_dict(scheduler_payload.get("pipeline", {})),
         )
         config = MachineConfig(
             config_id=payload["config_id"],
