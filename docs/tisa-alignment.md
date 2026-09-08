@@ -95,14 +95,17 @@ policy 独立，沿 GC、FC 和 backend payload 传播。
 
 ## 4. Scheduler 的输入
 
-全局 scheduler 处理 `TISAInstruction`：
+全局 scheduler 处理 loader 已绑定的 `BoundTISADescriptor`；其中复用同一个
+`TISAInstruction` 语义，不另造重复 ISA：
 
 ```text
+Runtime loader
+  -> TISAInstruction + 本次地址/依赖/completion token + arrival envelope
 TISA ready
-  -> 到达时间、Deps、UnitMap、queue/ROB、地址冲突检查
+  -> Deps、UnitMap、queue/ROB、已接收地址冲突检查
   -> issue 整条 instruction
-  -> backend 执行绑定 payload
-  -> completion 唤醒后继 TISA
+  -> ExecutionBackend 执行 payload 并返回 physical-done/partial-ready
+  -> completion 带宽/延迟接受后唤醒后继 TISA
 ```
 
 在 minimal profile 上，Matmul tile 形成：
@@ -129,6 +132,12 @@ abstract→target 映射，Matmul payload 直接消费该计划，不从 task gr
 Softmax 的 `reduce_max/exp/reduce_sum/normalize` 属于同一 VE payload。payload lane
 事件进入 timing 和泳道图，TISA 依赖保持全局可见。
 
+阶段 4 的最小 Attention 片上交接是项目 target-lowering 优化：当 QK Matmul 的最终片上
+output 与 Softmax input 在 memory、role、layout、dtype 和 tile geometry 上完全兼容且
+fan-out=1 时，TargetPlan 可以消除 root store/load，并将 Softmax 依赖改接到片上 producer
+completion。论文支持 locality-aware tile flow，但没有公开这一项目规则的具体判定与归属，
+因此结果不标为作者实现的逐项复现。
+
 ## 5. Runtime 与 device scheduler
 
 ```text
@@ -138,8 +147,8 @@ Host Runtime
 TISA Device Scheduler
   reception、WQ/IQ、依赖检查、资源检查、OOO issue、completion
 
-Backend Timing/Event
-  已 issue instruction 的 task duration、II 和事件
+Execution Backend
+  已加载 payload 的 can-accept、EU busy/II、task trace 和物理完成反馈
 ```
 
 论文的 tile-by-tile OOO 决策位于 device hardware；runtime 控制 descriptor 的可见时间。
@@ -157,6 +166,8 @@ Backend Timing/Event
 - embedding gather 与 scheduler-visible MoE dispatch region；
 - instruction-level static/dynamic scheduler；
 - descriptor arrival、queue/ROB/window、resource、completion feedback analytical model；
+- invocation-scoped bound descriptor、提交 envelope、静态计划和 runtime alias token；
+- scheduler/execution 分离：设备仲裁器不读取 ExecutionGraph/payload primitive；
 - analytical、timing table、systolic MXU profile 和 RTL importer；
 - `payload_ready:<task_id>` partial-ready 原型和 memory bank scoreboard。
 - GC `TileDependency` 的 hazard kind、logical region、condition 和 provenance，并向
@@ -175,8 +186,8 @@ Backend Timing/Event
 - 论文 WQ/IQ/Fu 容量、dispatch/wake-up/issue/completion 控制开销；
 - 完整 RTL 与真实芯片 timing calibration；
 - online Softmax 数值 rescale、最终 normalization 和 workspace 生命周期。
-- Matmul 之外各 operation 的专用 operand-role placement（当前使用通用 root/local
-  target materialization）；
+- Matmul 之外的 operation 使用显式 operation-class placement；复合算子 payload 仍经
+  TargetPlan recipe adapter，逐算子专用多跳 target codegen 是后续能力；
 - bank-aware placement 优化、fragmentation/eviction、跨 core memory routing；
 
 当前结果标签为 `TISA instruction-level analytical scheduling baseline`。profile 加载后，

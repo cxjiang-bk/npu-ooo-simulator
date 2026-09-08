@@ -137,7 +137,33 @@ class TargetPlan:
                         f"abstract instruction '{item.abstract_tisa_id}'"
                     )
             mapped = {item.abstract_tisa_id for item in self.instructions}
-            missing = sorted(abstract_ids - mapped)
+            elided = self.attributes.get("elided_abstract_instructions", {})
+            if not isinstance(elided, Mapping):
+                issues.append("target plan elided_abstract_instructions must be a mapping")
+                elided_ids: set[str] = set()
+            else:
+                elided_ids = {str(item) for item in elided}
+                unknown_elided = sorted(elided_ids - abstract_ids)
+                if unknown_elided:
+                    issues.append(
+                        "target plan elides unknown abstract instructions: "
+                        + ", ".join(unknown_elided[:8])
+                    )
+                target_ids = set(ids)
+                for abstract_id, record in elided.items():
+                    if not isinstance(record, Mapping):
+                        issues.append(
+                            f"elided abstract instruction '{abstract_id}' must be a mapping"
+                        )
+                        continue
+                    replacements = record.get("resolved_target_tisa_ids", ())
+                    if not replacements or any(
+                        str(target_id) not in target_ids for target_id in replacements
+                    ):
+                        issues.append(
+                            f"elided abstract instruction '{abstract_id}' has invalid replacement targets"
+                        )
+            missing = sorted(abstract_ids - mapped - elided_ids)
             if missing:
                 issues.append(
                     "target plan does not map abstract instructions: "

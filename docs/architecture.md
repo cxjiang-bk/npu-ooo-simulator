@@ -20,20 +20,22 @@ flowchart TB
     end
 
     subgraph Runtime[Runtime]
-        J --> K[基址/动态参数绑定、command chunk、descriptor arrival]
+        J --> K[地址/动态参数绑定与 descriptor envelope]
+        K --> U[LoadedDeviceProgram]
     end
 
     subgraph Device[Device scheduler]
-        K --> L[reception / WQ / IQ / ROB]
+        U --> L[reception / WQ / IQ / ROB]
         L --> M{Device policy}
         M --> N[Static: program order]
         M --> O[Dynamic: ready queue + OOO]
     end
 
-    subgraph Backend[Backend timing/event]
-        N --> P[ExecutionTask payload]
-        O --> P
-        P --> Q[completion feedback]
+    subgraph Backend[Execution backend]
+        J --> P[payload registration]
+        N -->|issue request| P
+        O -->|issue request| P
+        P --> Q[physical done / partial ready]
         Q -.-> L
     end
 
@@ -57,9 +59,10 @@ flowchart TB
 | Target Lowering | 虚拟 TISA + `MachineConfig` | `TargetPlan`、目标 TISA | 统一决定 memory、每跳 route/engine、target stage、operand 和依赖展开 |
 | Backend payload | `TargetPlan` | `ExecutionGraph` | 按目标计划生成 payload；实际 region 用于一致性校验 |
 | Memory planner | `TargetPlan` + payload resource declaration | `MemoryPlan` | 容量、对齐、allocation、alias、slot 和复用依赖 |
-| Runtime | `BackendArtifact.memory_plan` + invocation bindings | `RuntimeSubmission` | 绑定地址空间基址、动态参数、command chunk、到达时间和同步 |
-| Device scheduler | submission + policy | schedule result | 处理 queue/ROB、依赖、资源和 issue |
-| Event backend | issued instruction + payload | events、cycles、trace | 计算执行时序并输出可视化 |
+| Runtime | final TISA、MemoryPlan、invocation bindings | `RuntimeSubmission`、`LoadedDeviceProgram` | 绑定地址/动态参数；拆分 descriptor 与 arrival envelope；加入 invocation token/alias dependency |
+| Device scheduler | bound descriptors + feedback + policy | issue request、scheduler timing | 处理 queue/ROB、依赖、仲裁和 feedback 接受，不读取 payload task |
+| Execution backend | payload registrations + issue request | accept/reject、physical done、partial-ready、task trace | 独占 EU 接收能力、busy 状态和 payload 内部执行 |
+| DeviceSimulator | loader、scheduler、execution backend | `SimulationResult` | 推进事件/时钟并连接组件 |
 
 编译层保留语义信息，后端层提供硬件执行细节，runtime 层管理 invocation 生命周期。
 
@@ -81,6 +84,10 @@ main
        -> TargetLowerer
        -> CodegenBackend
        -> RuntimeSubmission
+       -> load_device_program
+       -> DeviceSimulator
+            -> bound-descriptor scheduler
+            <-> ExecutionBackend
        -> schedule_tisa_program
        -> trace writer
 ```
@@ -299,8 +306,8 @@ payload_ref
 `CompiledArtifact.tisa_program` 与 `BackendArtifact.program` 是同一个最终目标程序。
 
 `ExecutionTask` 属于 backend payload，表示同一 TISA issue 后在目标 execution unit
-内执行的步骤。全局 scheduler 以 TISA instruction 为唯一调度单位；payload lane 事件
-用于 timing 和泳道图。每个 task 的 predecessor metadata 保存对应 GC edge 的
+内执行的步骤。全局 scheduler 以 TISA instruction 为唯一调度单位；payload 的解析、
+timing 和 lane trace 均由 ExecutionBackend 负责。每个 task 的 predecessor metadata 保存对应 GC edge 的
 `hazard_kind`、`condition`、logical region 和 provenance；trace 的 `WAKE_UP`、`ISSUE`、
 `COMPLETE` 与 address scoreboard event 直接消费这份 metadata。
 
@@ -358,8 +365,10 @@ dtype_convert / kv_cache_update
 embedding gather
 ```
 
-backend 通过 `TimingProvider` 提供 duration 和 initiation interval；`EventBackend`
-把 issue、task start、task done、TISA completion 和 resource release 写入统一 trace。
+backend 通过 `TimingProvider` 提供 duration 和 initiation interval。`ExecutionBackend`
+注册 payload handle、响应 can-accept/issue，并产生 physical-done/partial-ready；scheduler
+不遍历 `ExecutionGraph`。完整覆盖与限制见
+[target-lowering-coverage.md](target-lowering-coverage.md)。
 
 ## 8. Runtime
 
@@ -373,6 +382,18 @@ descriptor available cycle
 launch latency
 synchronization cost
 ```
+
+`runtime.loader` 随后把最终 TISA 语义和本次 submission 连接成 `LoadedDeviceProgram`：
+
+```text
+BoundTISADescriptor = instruction + physical operands + bound dependencies
+                    + invocation completion token + payload handle
+DescriptorEnvelope  = chunk + arrival + launch/submission order
+StaticSchedulePlan  = 固定 submission order、resource、dependency token、reservation
+```
+
+loader 还将只有绑定物理地址后才可见的 RAW/WAR/WAW alias 关系转换为显式 dependency token；
+提交顺序若把消费者放在新增生产者之前会被拒绝，避免设备端等待尚未提交的 descriptor。
 
 Runtime 可以和编译阶段分开执行。`compile` 将以下文件组成可复用的 compile package：
 
@@ -432,8 +453,9 @@ device 和 synchronization 周期求和。
 
 ## 9. Device Scheduler
 
-`schedule_tisa_program()` 消费 BackendArtifact、MachineConfig、RuntimeSubmission、
-SimulatorConfig、TimingProvider 和 EventBackend。
+`schedule_tisa_program()` 是兼容外层入口。它把 BackendArtifact、RuntimeSubmission 和
+MachineConfig 交给 `DeviceSimulator`；内部 scheduler 实际只消费 `LoadedDeviceProgram`、
+执行反馈、策略和有限容量配置。
 
 `analytical_event` 使用事件级基线；`cycle_event` 使用显式 reception FIFO、per-EU
 WQ/IQ/Fu 和按 descriptor 提交顺序退休的 ROB。其周期顺序固定为
@@ -443,7 +465,7 @@ WQ/IQ/Fu 和按 descriptor 提交顺序退休的 ROB。其周期顺序固定为
 
 ```text
 static_pipeline:
-  按 program order 与依赖约束 issue
+  按 StaticSchedulePlan 冻结的本次 submission 顺序 admission；不同 EU 可以重叠执行
 
 dynamic_ready_queue:
   在 dependency window / ROB / ready queue 内选择
@@ -451,11 +473,13 @@ dynamic_ready_queue:
 ```
 
 可配置参数包括 instruction queue depth、ROB entries、dependency window、ready queue
-depth、max inflight tiles、address scoreboard 和 dynamic priority。
+depth、max inflight tiles、address scoreboard 和 dynamic priority。默认在线优先级是
+`oldest_first`，只使用已接收队列年龄；`compiler_hint` 只读取 descriptor 显式 hint；
+`oracle_critical_path` 才允许使用完整图，且只作为参考策略。
 
-`address scoreboard` 的 RAW/WAR/WAW 观察包含 predecessor、successor、tensor、memory、
-condition 和 provenance。若冲突来自编译期 GC edge，记录中嵌入同一条 TISA dependency；
-若冲突只由运行时物理区间产生，记录 `address_scoreboard` 作为来源。
+编译器负责语义依赖与 allocation reuse，runtime loader 负责本次物理 alias token，设备
+scoreboard 只观察已经接收且未完成的 descriptor。它不读取尚未到达的未来指令；完整图
+检查仅可用于离线审计。
 
 memory bank scoreboard 读取 `MachineConfig.memory_levels` 的 bank 数、bank width、
 read/write ports，为 active TISA instruction 建立 analytical reservation，并记录
@@ -468,7 +492,8 @@ memory backend 提供。
 | --- | --- | --- |
 | `CodegenBackend` | virtual TISA -> TargetPlan -> final TISA/payload/MemoryPlan | analytical |
 | `TimingProvider` | ExecutionTask -> duration/II | analytical、timing_table、systolic_mxu_profile |
-| `EventBackend` | TISA + payload -> event execution | analytical_event、cycle_event |
+| `ExecutionBackend` | payload handle + issue -> accept/feedback/trace | analytical_execution；fake contract tests |
+| `EventBackend` | 选择 event/cycle scheduler 驱动方式 | analytical_event、cycle_event |
 
 `MachineConfig` 描述 execution unit 数量、memory hierarchy、interconnect、队列容量和
 默认 timing。配置变化作用于 backend 和 scheduler 参数，IR schema 保持一致。
@@ -484,6 +509,24 @@ dependency 数量。`manifest.json` 保存 frontend path、工具版本、machin
 policy、TISA instruction count、cycle 和 calibration status。
 
 ## 12. 当前范围与扩展项
+
+### 12.1 Attention 最小片上交接
+
+默认 TargetPlan 仍使用 root-memory handoff。启用
+`onchip_handoff_policy=attention_single_consumer` 时，TargetLowerer 只优化单个
+Matmul/batched-Matmul/GEMV producer 到 Softmax consumer 的边，并逐项检查 fan-out、
+operand role、memory/EU 可达性、layout、dtype、tile geometry 和容量。lpu-like 的合法变换为：
+
+```text
+原始：MXU -> PSB -> UB -> GM ; GM -> UB -> Softmax(ARU)
+优化：MXU -> PSB -> UB ----------------> Softmax(ARU)
+```
+
+被消除的两个 abstract/target transfer、替代 producer token、共享 buffer 和检查结果写入
+TargetPlan。payload 删除对应 root load，MemoryPlan 延长该 UB buffer 生命周期，runtime
+producer write 与 consumer read 绑定同一地址。不满足条件时保留 root path，并在
+`onchip_handoff_rejections` 记录原因。当前只覆盖 QK→Softmax 的最小交接，不包含
+Softmax→PV Matmul、多 tile fan-out、格式转换或跨 core 路由。
 
 当前生产链路覆盖：
 

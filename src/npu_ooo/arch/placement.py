@@ -127,3 +127,76 @@ class OperationPlacementConfig:
         if issues:
             raise ValueError("; ".join(issues))
         return result
+
+
+@dataclass(frozen=True)
+class OperationClassPlacementConfig:
+    """Explicit target rule for operations sharing one storage pattern."""
+
+    class_id: str
+    operations: tuple[str, ...]
+    unit: str
+    local_memory: str
+    input_route: tuple[str, ...]
+    output_route: tuple[str, ...]
+    direct: bool = False
+
+    def validate(self) -> tuple[str, ...]:
+        issues: list[str] = []
+        if not self.class_id or not self.unit or not self.local_memory:
+            issues.append("operation class placement identities must not be empty")
+        if not self.operations or len(set(self.operations)) != len(self.operations):
+            issues.append(
+                f"operation class placement '{self.class_id}' operations must be non-empty and unique"
+            )
+        if not self.input_route or not self.output_route:
+            issues.append(
+                f"operation class placement '{self.class_id}' routes must not be empty"
+            )
+        if self.direct:
+            if len(self.input_route) != 1 or len(self.output_route) != 1:
+                issues.append(
+                    f"direct operation class '{self.class_id}' routes must contain one memory"
+                )
+        else:
+            if self.input_route[-1:] != (self.local_memory,):
+                issues.append(
+                    f"operation class '{self.class_id}' input route must end at local memory"
+                )
+            if self.output_route[:1] != (self.local_memory,):
+                issues.append(
+                    f"operation class '{self.class_id}' output route must start at local memory"
+                )
+        return tuple(issues)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "class_id": self.class_id,
+            "operations": list(self.operations),
+            "unit": self.unit,
+            "local_memory": self.local_memory,
+            "input_route": list(self.input_route),
+            "output_route": list(self.output_route),
+            "direct": self.direct,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "OperationClassPlacementConfig":
+        if not isinstance(payload, Mapping):
+            raise ValueError("operation class placement must be a JSON object")
+        try:
+            result = cls(
+                class_id=str(payload["class_id"]),
+                operations=tuple(str(item) for item in payload["operations"]),
+                unit=str(payload["unit"]),
+                local_memory=str(payload["local_memory"]),
+                input_route=tuple(str(item) for item in payload["input_route"]),
+                output_route=tuple(str(item) for item in payload["output_route"]),
+                direct=bool(payload.get("direct", False)),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid operation class placement") from exc
+        issues = result.validate()
+        if issues:
+            raise ValueError("; ".join(issues))
+        return result

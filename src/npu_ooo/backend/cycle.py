@@ -31,16 +31,14 @@ class CycleEventBackend:
         timing_provider=None,
         simulator_config=None,
     ):
-        from npu_ooo.simulator.cycle import simulate_cycle_artifact
+        from npu_ooo.simulator.device import DeviceSimulator
 
         issues = self.capabilities.validate_artifact(artifact, machine)
         if issues:
             raise ValueError("; ".join(issues))
-        return simulate_cycle_artifact(
+        return DeviceSimulator(
             artifact,
             machine,
-            policy,
-            runtime_submission=runtime_submission,
-            timing_model=timing_provider,
-            config=simulator_config,
-        )
+            runtime_submission,
+            timing_provider,
+        ).run(policy, model="cycle", config=simulator_config)

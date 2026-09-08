@@ -47,6 +47,7 @@ from npu_ooo.scheduler import (
     schedule_tisa_program,
     schedule_tisa_sequence,
 )
+from npu_ooo.runtime import load_device_program
 from npu_ooo.trace import (
     ensure_output_layout,
     write_artifact_index,
@@ -239,6 +240,12 @@ def _add_compile_arguments(
             "analytical online state chain"
         ),
     )
+    parser.add_argument(
+        "--onchip-handoff",
+        choices=("root_memory", "attention_single_consumer"),
+        default="root_memory",
+        help="target-lowering policy for an eligible Matmul-to-Softmax edge",
+    )
     parser.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
     parser.add_argument("--machine-config", type=Path)
     parser.add_argument(
@@ -294,8 +301,8 @@ def _add_simulation_options(
     )
     parser.add_argument(
         "--dynamic-priority",
-        choices=("critical_path", "oldest_first"),
-        default="critical_path",
+        choices=("oldest_first", "compiler_hint", "oracle_critical_path", "critical_path"),
+        default="oldest_first",
     )
     parser.add_argument(
         "--runtime-policy",
@@ -439,6 +446,12 @@ def _add_paper_matrix_arguments(parser: argparse.ArgumentParser) -> None:
         help="softmax strategy applied during GC/FC compilation",
     )
     parser.add_argument(
+        "--onchip-handoff",
+        choices=("root_memory", "attention_single_consumer"),
+        default="root_memory",
+        help="target-lowering policy for an eligible Matmul-to-Softmax edge",
+    )
+    parser.add_argument(
         "--runtime-device-matrix",
         action="store_true",
         help="also vary runtime submission policy, producing four combinations per case",
@@ -457,8 +470,8 @@ def _add_paper_matrix_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--memory-bank-scoreboard", action="store_true")
     parser.add_argument(
         "--dynamic-priority",
-        choices=("critical_path", "oldest_first"),
-        default="critical_path",
+        choices=("oldest_first", "compiler_hint", "oracle_critical_path", "critical_path"),
+        default="oldest_first",
     )
     parser.add_argument("--runtime-chunk-size", type=int)
     parser.add_argument("--runtime-launch-latency", type=float, default=0.0)
@@ -898,6 +911,14 @@ def run_paper_matrix(args: argparse.Namespace) -> int:
                 "softmax_algorithm": args.softmax_algorithm,
             },
         )
+    if args.onchip_handoff != "root_memory":
+        machine = replace(
+            machine,
+            attributes={
+                **dict(machine.attributes),
+                "onchip_handoff_policy": args.onchip_handoff,
+            },
+        )
     tile_size_candidates = (
         _parse_positive_int_list(args.tile_size_candidates, name="--tile-size-candidates")
         if args.tile_size_candidates
@@ -956,6 +977,9 @@ def run_paper_matrix(args: argparse.Namespace) -> int:
         "tile_size": args.tile_size,
         "tile_size_candidates": list(tile_size_candidates or (args.tile_size,)),
         "softmax_algorithm": machine.attributes.get("softmax_algorithm", "materialized"),
+        "onchip_handoff_policy": machine.attributes.get(
+            "onchip_handoff_policy", "root_memory"
+        ),
         "codegen_backend": codegen_backend.name,
         "runtime_policies": list(runtime_policies),
         "device_policies": list(device_policies),
@@ -1001,6 +1025,14 @@ def _compile_from_args(args: argparse.Namespace):
             attributes={
                 **dict(machine.attributes),
                 "softmax_algorithm": args.softmax_algorithm,
+            },
+        )
+    if args.onchip_handoff != "root_memory":
+        machine = replace(
+            machine,
+            attributes={
+                **dict(machine.attributes),
+                "onchip_handoff_policy": args.onchip_handoff,
             },
         )
     codegen_backend = default_codegen_backend_registry().create(args.codegen_backend)
@@ -1089,6 +1121,9 @@ def _compile_manifest(compiled, machine) -> dict[str, Any]:
         "architecture": machine.config_id,
         "machine_hash": machine.stable_hash(),
         "machine_topology_hash": machine.topology_hash(),
+        "onchip_handoff_policy": machine.attributes.get(
+            "onchip_handoff_policy", "root_memory"
+        ),
         "memory_plan_schema": compiled.backend_artifact.memory_plan.schema_version,
         "target_plan_schema": compiled.backend_artifact.target_plan.schema_version,
         "codegen_backend": compiled.attributes["codegen_backend"],
@@ -1176,6 +1211,10 @@ def run_compile_and_sim(args: argparse.Namespace) -> int:
             descriptor_available_cycles=descriptor_availability,
         )
     write_artifact_json(runtime_submission, args.output_dir / "runtime_submission.json")
+    write_artifact_json(
+        load_device_program(compiled.backend_artifact, runtime_submission),
+        args.output_dir / "bound_device_program.json",
+    )
 
     simulator_config = _simulation_config(args)
     timing_model = _timing_model(args.timing_config, args.timing_provider)
@@ -1229,6 +1268,9 @@ def run_compile_and_sim(args: argparse.Namespace) -> int:
         "stablehlo_version": compiled.attributes["stablehlo_version"],
         "architecture": machine.config_id,
         "softmax_algorithm": machine.attributes.get("softmax_algorithm", "materialized"),
+        "onchip_handoff_policy": machine.attributes.get(
+            "onchip_handoff_policy", "root_memory"
+        ),
         "machine_hash": machine.stable_hash(),
         "codegen_backend": compiled.attributes["codegen_backend"],
         "timing_provider": getattr(timing_model, "name", "analytical"),
@@ -1510,6 +1552,10 @@ def run_simulate(args: argparse.Namespace) -> int:
 
     ensure_output_layout(args.output_dir)
     write_artifact_json(runtime_submission, args.output_dir / "runtime_submission.json")
+    write_artifact_json(
+        load_device_program(artifact, runtime_submission),
+        args.output_dir / "bound_device_program.json",
+    )
     if runtime_sequence is not None:
         write_artifact_json(runtime_sequence, args.output_dir / "runtime_sequence.json")
     write_json(result, args.output_dir / "summary.json")

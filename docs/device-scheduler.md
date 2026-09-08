@@ -1,8 +1,9 @@
 # Device scheduler 周期模型
 
 `cycle_event` 将 TISA 的接收、WQ、IQ、执行、完成反馈和退休建成逐周期状态机。
-入口仍为 `BackendArtifact + RuntimeSubmission + MachineConfig`；现有
-`analytical_event` 保留为事件模型基线。两种后端共享 payload recipe 和 TimingProvider。
+外层兼容入口仍接受 `BackendArtifact + RuntimeSubmission + MachineConfig`，但 scheduler
+内核只接受 loader 产生的 `LoadedDeviceProgram` 与 `ExecutionBackend` 反馈；现有
+`analytical_event` 保留为事件模型基线。两种模型共享公开 descriptor/feedback 语义。
 
 论文依据是 Section V、Figure 4 和 Algorithm 1/2。论文公开的是语义结构和整体 dispatch
 开销，下面的流水寄存边界、共享总线和 ROB 规则是本项目显式选择的研究参数。
@@ -47,12 +48,13 @@ PYTHONPATH=src python3.12 -m npu_ooo.cli simulate \
 | 每类 EU 的语义表 Fu | `pipeline.inflight_entries`，按 operand 条目计数 | issue 分配，完成反馈接受后释放 |
 | ROB | `rob_entries`，按 TISA 指令计数 | dispatch 分配，按 descriptor 提交顺序 retire |
 | Tile window | `max_inflight_tiles` | 首条子 stage issue 占用，整 tile 所有 TISA complete 释放 |
-| EU 实例 | `unit.count` | issue 占用，payload 物理执行结束后可再次接收 |
+| EU 实例 | `unit.count` | 由 ExecutionBackend 独占；issue 接受后占用，物理执行结束后释放 |
 
 `Fu` 保存活动指令身份，operand 的范围、访问类型和依赖通过 descriptor 查得。
-一条 TISA 绑定一个具体 EU 资源类别，每实例执行一条完整 payload；payload 内的 primitive
-顺序执行。实例再次 issue 同时受前条物理完成和 initiation interval 约束。`pipeline_depth`
-在本版不启用同一实例的多 TISA 流水重叠。
+一条 TISA 绑定一个具体 EU 资源类别。scheduler 只调用 can-accept/issue；payload 内部
+primitive 顺序、实例 busy/II、task trace 和 physical-done 都由 ExecutionBackend 实现，
+不会在 scheduler 中维护第二份 EU 状态。`pipeline_depth` 在 analytical execution backend
+中尚未启用同一实例的多 TISA 流水重叠。
 
 `receive_width/dispatch_width/select_width/issue_width/completion_width/retire_width`
 均为全局每周期上限；issue 同时受 `unit.issue_width` 的资源类别上限约束。
@@ -91,23 +93,26 @@ CPU 推测执行、异常回滚或将内存写入延迟至退休。
 
 ## 调度与依赖
 
-- `static_pipeline` 按本次 descriptor 提交顺序 select/issue；它是保序基线，论文的强静态
-  多阶段 reservation/fence 方案仍需要独立的静态排程输入。
-- `dynamic_ready_queue` 在各 WQ 窗口中选择 ready 条目，优先级为 `critical_path` 或
-  `oldest_first`。critical path 根据既定 payload timing 计算，当前不实现在线学习。
+- `static_pipeline` 消费 `StaticSchedulePlan`，按本次 runtime 已选择的提交顺序 admission；前一条 issue
+  后下一条可在不同 EU 上重叠。计划显式记录 resource、dependency token 和 reservation。
+  这是项目的“固定 host 顺序 + 跨 EU overlap”基线，不声称复现作者未公开的静态排程器。
+- `dynamic_ready_queue` 只在已接收 descriptor 的各 WQ 有界窗口中选择 ready 条目。默认
+  `oldest_first` 使用接收队列年龄；`compiler_hint` 使用 descriptor 显式 hint；
+  `oracle_critical_path` 使用完整图，仅作为离线参考。旧名称 `critical_path` 是该 oracle 的
+  兼容别名，不称为论文在线自适应算法。
 - `sequential` 在上一条退休后才 issue 下一条。
 - 所有显式依赖均等待对应 complete；`payload_ready:<task_id>` 使用指定 primitive 的
   完成边界，加 completion/wakeup latency 唤醒。partial-ready 通知是独立 sideband 原型，
   不消耗 full-completion 总线宽度，也不模拟逐子区域有效位。
-- `--address-scoreboard` 比较原始 program order 中所有较老且未 complete 指令的
-  RAW/WAR/WAW，包括未到达和未 issue 的生产者；runtime 有物理绑定时使用其地址。
-  未解析的布局使用保守区间。partial-ready 不自动放松这项完整区间保护。
+- 编译器提供语义/复用依赖；runtime loader 在地址绑定后把额外物理 alias 转换为显式
+  RAW/WAR/WAW completion-token dependency；设备 `--address-scoreboard` 只比较已经接收、
+  较老且未 complete 的 descriptor。它不读取未到达的未来指令。未解析布局仍使用保守区间。
 - `--memory-bank-scoreboard` 在整个物理 payload 执行期间保留 bank/port；这是保守的结构
   资源模型，逐次 SRAM/DRAM transaction timing 由后续 memory backend 提供。
 
-编译器负责显式 dependency 的完整性。物理 alias 启用 scoreboard 后，runtime 的提前提交
-若使有限 ROB 无法容纳较老的地址生产者，会报告 deadlock 并列出等待队列。配置的资源
-不足同样会产生明确诊断；`max_cycles` 为有时间进展但长期无法完成的运行提供上限。
+若 runtime 的预排序会让消费者先于 loader 新增的 alias producer 到达，loader 会在设备
+执行前明确拒绝，而不是让有限 ROB 死锁。配置资源不足同样产生明确诊断；`max_cycles`
+为有时间进展但长期无法完成的运行提供上限。
 
 ## 输出与统计
 
@@ -120,6 +125,8 @@ CPU 推测执行、异常回滚或将内存写入延迟至退休。
 - `stall_cycles`：每种原因发生的周期数；同周期多条指令计 1；
 - `stall_instruction_cycles`：按 `(instruction, reason, cycle)` 去重后计数；
 - `compile_package_sha256`：本次消费的 BackendArtifact 规范 JSON hash；
+- `offchip_read/write/total_bytes`：由 execution backend 按 payload 的 root-memory region
+  统计，避免 scheduler 反向读取 task；
 - `device_finish_cycle` 为最终 retire，`completion_finish_cycle` 为最终 complete，
   `retirement_drain_cycles` 为差值；`total_cycles` 包含 runtime synchronization。
 
@@ -136,3 +143,18 @@ invocation 汇总。
 
 主要验收位于 `tests/test_cycle_scheduler.py`：使用 1–6 条 TISA 的手算时间线覆盖依赖、
 并行、窗口、所有主要反压、反馈/退休、部分就绪、物理到达、独立 CLI 和 sequence。
+
+## 公开设备契约
+
+```text
+RuntimeSubmission + final TISA + MemoryPlan
+  -> runtime.loader
+  -> BoundTISADescriptor + DescriptorEnvelope + StaticSchedulePlan
+  -> scheduler --IssueRequest--> ExecutionBackend
+  <- scheduler <- ExecutionFeedback(execution_done / partial_ready)
+```
+
+completion token 包含 invocation id，重复调用不会串扰。`execution_done` 是物理结束；
+cycle scheduler 之后仍经过 completion latency/width 仲裁才标记 complete，再经 wakeup latency
+唤醒依赖，最后按 ROB 规则 retire。execution backend 拒绝 issue 时 scheduler 不产生假 issue。
+模块边界测试禁止 event/cycle scheduler 读取 `BackendArtifact.execution_graph` 或 payload map。

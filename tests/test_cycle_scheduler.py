@@ -350,7 +350,7 @@ class CycleSchedulerTest(unittest.TestCase):
             8,
         )
 
-    def test_address_checks_include_older_unissued_and_cross_unit_hazards(self):
+    def test_runtime_alias_tokens_protect_older_unissued_cross_unit_hazards(self):
         for first_access, second_access in (
             ("write", "read"),
             ("read", "write"),
@@ -395,9 +395,9 @@ class CycleSchedulerTest(unittest.TestCase):
                     result.instruction_timing("young").issue,
                     result.instruction_timing("old").finish,
                 )
-                self.assertGreater(result.metrics["stall_cycles"]["address_hazard"], 0)
-                self.assertEqual(
-                    result.metrics["address_hazards"][0]["predecessor"], "old"
+                self.assertGreater(result.metrics["stall_cycles"]["dependency_wait"], 0)
+                self.assertGreaterEqual(
+                    result.metrics["runtime_alias_dependency_count"], 1
                 )
 
     def test_memory_ports_and_tile_window_limit_overlap(self):
@@ -674,7 +674,9 @@ class CycleSchedulerTest(unittest.TestCase):
             chunk_size=1,
             descriptor_available_cycles={"a": 2, "b": 0},
         )
-        with self.assertRaisesRegex(RuntimeError, "deadlocked.*address_hazard"):
+        with self.assertRaisesRegex(
+            ValueError, "descriptor order.*physical alias dependencies"
+        ):
             run(
                 program,
                 submission=submission,

@@ -7,7 +7,11 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .scheduler import SchedulerPipelineConfig
-from .placement import OperandPlacementConfig, OperationPlacementConfig
+from .placement import (
+    OperandPlacementConfig,
+    OperationClassPlacementConfig,
+    OperationPlacementConfig,
+)
 
 
 @dataclass(frozen=True)
@@ -200,6 +204,7 @@ class MachineConfig:
     transfer_paths: tuple[TransferPathConfig, ...]
     scheduler: SchedulerCapacityConfig = field(default_factory=SchedulerCapacityConfig)
     operation_placements: tuple[OperationPlacementConfig, ...] = ()
+    operation_class_placements: tuple[OperationClassPlacementConfig, ...] = ()
     attributes: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -272,6 +277,43 @@ class MachineConfig:
                         f"{operand.direction} placement '{placement.operation}.{operand.role}' "
                         "route must end at a root memory"
                     )
+        class_ids = [item.class_id for item in self.operation_class_placements]
+        if len(set(class_ids)) != len(class_ids):
+            issues.append("operation class placement ids must be unique")
+        class_operations: dict[str, str] = {}
+        for rule in self.operation_class_placements:
+            issues.extend(rule.validate())
+            if rule.unit not in unit_names:
+                issues.append(
+                    f"operation class '{rule.class_id}' references unknown unit '{rule.unit}'"
+                )
+            if rule.local_memory not in memory_names:
+                issues.append(
+                    f"operation class '{rule.class_id}' references unknown local memory "
+                    f"'{rule.local_memory}'"
+                )
+            for operation in rule.operations:
+                previous = class_operations.setdefault(operation, rule.class_id)
+                if previous != rule.class_id:
+                    issues.append(
+                        f"operation '{operation}' belongs to target classes '{previous}' and "
+                        f"'{rule.class_id}'"
+                    )
+            for route in (rule.input_route, rule.output_route):
+                for source, target in zip(route, route[1:]):
+                    if (source, target) not in paths:
+                        issues.append(
+                            f"operation class '{rule.class_id}' has no transfer path "
+                            f"{source}->{target}"
+                        )
+            if rule.input_route and rule.input_route[0] not in roots:
+                issues.append(
+                    f"operation class '{rule.class_id}' input route must start at root memory"
+                )
+            if rule.output_route and rule.output_route[-1] not in roots:
+                issues.append(
+                    f"operation class '{rule.class_id}' output route must end at root memory"
+                )
         return tuple(issues)
 
     def _validate_memory_acyclic(self) -> tuple[str, ...]:
@@ -304,6 +346,16 @@ class MachineConfig:
                 return item
         raise KeyError(operation)
 
+    def operation_class(self, operation: str) -> OperationClassPlacementConfig:
+        matches = [
+            item
+            for item in self.operation_class_placements
+            if operation in item.operations
+        ]
+        if len(matches) != 1:
+            raise KeyError(operation)
+        return matches[0]
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "config_id": self.config_id,
@@ -313,6 +365,9 @@ class MachineConfig:
             "scheduler": self.scheduler.to_dict(),
             "operation_placements": [
                 item.to_dict() for item in self.operation_placements
+            ],
+            "operation_class_placements": [
+                item.to_dict() for item in self.operation_class_placements
             ],
             "attributes": dict(self.attributes),
         }
@@ -359,6 +414,10 @@ class MachineConfig:
             "operation_placements": [
                 placement.to_dict() for placement in self.operation_placements
             ],
+            "operation_class_placements": [
+                placement.to_dict()
+                for placement in self.operation_class_placements
+            ],
         }
         encoded = json.dumps(
             payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
@@ -392,7 +451,18 @@ def minimal_machine_config() -> MachineConfig:
             ),
             ExecutionUnitConfig(
                 "ARU",
-                supported_ops=("elementwise", "reduce", "kv_cache_update", "batch_norm", "pool"),
+                supported_ops=(
+                    "elementwise",
+                    "residual_add",
+                    "reduce",
+                    "softmax",
+                    "rmsnorm",
+                    "layernorm",
+                    "swiglu",
+                    "kv_cache_update",
+                    "batch_norm",
+                    "pool",
+                ),
                 queue_depth=8,
                 latency_cycles=4,
                 initiation_interval_cycles=2,
@@ -414,6 +484,44 @@ def minimal_machine_config() -> MachineConfig:
                     OperandPlacementConfig("rhs", "SRAM", ("DRAM", "SRAM"), "input"),
                     OperandPlacementConfig("output", "SRAM", ("SRAM", "DRAM"), "output"),
                 ),
+            ),
+        ),
+        operation_class_placements=(
+            OperationClassPlacementConfig(
+                "vector-local",
+                (
+                    "elementwise",
+                    "residual_add",
+                    "reduce",
+                    "softmax",
+                    "rmsnorm",
+                    "layernorm",
+                    "swiglu",
+                    "kv_cache_update",
+                    "batch_norm",
+                    "pool",
+                ),
+                "ARU",
+                "SRAM",
+                ("DRAM", "SRAM"),
+                ("SRAM", "DRAM"),
+            ),
+            OperationClassPlacementConfig(
+                "tensor-local",
+                ("conv2d",),
+                "MXU",
+                "SRAM",
+                ("DRAM", "SRAM"),
+                ("SRAM", "DRAM"),
+            ),
+            OperationClassPlacementConfig(
+                "root-transfer",
+                ("reshape", "transpose", "slice", "embedding"),
+                "DMA",
+                "DRAM",
+                ("DRAM",),
+                ("DRAM",),
+                direct=True,
             ),
         ),
         attributes={"source": "hand-written", "calibration_status": "analytical"},
@@ -464,7 +572,24 @@ def lpu_like_machine_config() -> MachineConfig:
             ),
             ExecutionUnitConfig("LDMA", supported_ops=("load", "store", "transpose"), queue_depth=8, latency_cycles=4, initiation_interval_cycles=1),
             ExecutionUnitConfig("MXU", supported_ops=("matmul", "batched_matmul", "gemv", "conv2d"), queue_depth=8, pipeline_depth=4, latency_cycles=32, initiation_interval_cycles=4, attributes={"rows": 16, "cols": 8, "k": 8}),
-            ExecutionUnitConfig("ARU", supported_ops=("softmax", "layernorm", "rmsnorm", "reduce", "elementwise", "kv_cache_update", "batch_norm", "pool"), queue_depth=8, latency_cycles=8, initiation_interval_cycles=2),
+            ExecutionUnitConfig(
+                "ARU",
+                supported_ops=(
+                    "softmax",
+                    "layernorm",
+                    "rmsnorm",
+                    "swiglu",
+                    "reduce",
+                    "elementwise",
+                    "residual_add",
+                    "kv_cache_update",
+                    "batch_norm",
+                    "pool",
+                ),
+                queue_depth=8,
+                latency_cycles=8,
+                initiation_interval_cycles=2,
+            ),
         ),
         transfer_paths=(
             TransferPathConfig("GM", "UB", "GDMA", bandwidth_bytes_per_cycle=16, setup_latency_cycles=4),
@@ -482,6 +607,44 @@ def lpu_like_machine_config() -> MachineConfig:
                     OperandPlacementConfig("rhs", "RMB", ("GM", "UB", "RMB"), "input"),
                     OperandPlacementConfig("output", "PSB", ("PSB", "UB", "GM"), "output"),
                 ),
+            ),
+        ),
+        operation_class_placements=(
+            OperationClassPlacementConfig(
+                "vector-local",
+                (
+                    "elementwise",
+                    "residual_add",
+                    "reduce",
+                    "softmax",
+                    "rmsnorm",
+                    "layernorm",
+                    "swiglu",
+                    "kv_cache_update",
+                    "batch_norm",
+                    "pool",
+                ),
+                "ARU",
+                "UB",
+                ("GM", "UB"),
+                ("UB", "GM"),
+            ),
+            OperationClassPlacementConfig(
+                "tensor-local",
+                ("conv2d",),
+                "MXU",
+                "UB",
+                ("GM", "UB"),
+                ("UB", "GM"),
+            ),
+            OperationClassPlacementConfig(
+                "root-transfer",
+                ("reshape", "transpose", "slice", "embedding"),
+                "GDMA",
+                "GM",
+                ("GM",),
+                ("GM",),
+                direct=True,
             ),
         ),
         scheduler=SchedulerCapacityConfig(instruction_queue_depth=32, rob_entries=8, max_inflight_tiles=8, dependency_window=8),
@@ -567,6 +730,10 @@ def machine_config_from_dict(payload: Mapping[str, Any]) -> MachineConfig:
             operation_placements=tuple(
                 OperationPlacementConfig.from_dict(item)
                 for item in payload.get("operation_placements", ())
+            ),
+            operation_class_placements=tuple(
+                OperationClassPlacementConfig.from_dict(item)
+                for item in payload.get("operation_class_placements", ())
             ),
             attributes=payload.get("attributes", {}),
         )

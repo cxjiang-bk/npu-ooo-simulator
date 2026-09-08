@@ -47,13 +47,6 @@ def _path(machine: MachineConfig, source: str, target: str):
     return matches[0]
 
 
-def _default_local_memory(machine: MachineConfig, root: str) -> str:
-    for path in machine.transfer_paths:
-        if path.source == root:
-            return path.target
-    return root
-
-
 def _packed_strides(shape: tuple[int, ...], element_bytes: int) -> tuple[int, ...]:
     stride = element_bytes
     result: list[int] = []
@@ -129,28 +122,6 @@ def _by_role(
     return result
 
 
-def _unit_for_abstract(
-    instruction: TISAInstruction,
-    machine: MachineConfig,
-) -> str:
-    requested = instruction.unit_map.unit.lower()
-    aliases = {
-        "dma": {"dma", "gdma", "ldma", "de", "copy"},
-        "tensor": {"mxu", "me", "tensor", "matrix"},
-        "vector": {"aru", "ve", "vector", "vu"},
-    }
-    for unit in machine.execution_units:
-        if unit.name.lower() in aliases.get(requested, {requested}):
-            return unit.name
-    for unit in machine.execution_units:
-        if instruction.op_type in unit.supported_ops:
-            return unit.name
-    raise ValueError(
-        f"machine '{machine.config_id}' has no target unit for abstract UnitMap "
-        f"'{instruction.unit_map.unit}'"
-    )
-
-
 @dataclass
 class _Draft:
     abstract: TISAInstruction
@@ -188,7 +159,6 @@ class TargetLowerer:
                 )
             )
         root = _root_memory(machine)
-        local = _default_local_memory(machine, root)
         tiles = {tile.tile_id: tile for tile in tile_graph.tiles}
         operators = {operator.op_id: operator for operator in graph.operators}
         tensors = {tensor.name: tensor for tensor in graph.tensors}
@@ -221,7 +191,7 @@ class TargetLowerer:
             else:
                 generated = (
                     self._lower_generic_instruction(
-                        abstract, machine, root=root, local=local
+                        abstract, machine, root=root
                     ),
                 )
             if not generated:
@@ -246,16 +216,24 @@ class TargetLowerer:
                 )
                 if stage and draft.abstract.attributes.get("tisa_stage") != stage:
                     raise ValueError("target draft lost its abstract stage provenance")
-                for operand in draft.instruction.operands:
-                    record_operand(operand)
                 drafts.append(draft)
+
+        (
+            drafts,
+            onchip_handoffs,
+            elided_replacements,
+            onchip_rejections,
+        ) = self._apply_onchip_handoffs(graph, machine, drafts, root=root)
+        for draft in drafts:
+            for operand in draft.instruction.operands:
+                record_operand(operand)
 
         mapped: dict[str, list[str]] = {}
         for draft in drafts:
             mapped.setdefault(draft.abstract.tisa_id, []).append(
                 draft.instruction.tisa_id
             )
-        terminals = {}
+        terminals: dict[str, tuple[str, ...]] = {}
         for abstract_id, target_ids in mapped.items():
             consumed = {
                 source
@@ -266,6 +244,36 @@ class TargetLowerer:
             terminals[abstract_id] = tuple(
                 target_id for target_id in target_ids if target_id not in consumed
             )
+        unresolved = dict(elided_replacements)
+        while unresolved:
+            progressed = False
+            for abstract_id, replacement in tuple(unresolved.items()):
+                target_id = replacement.get("target_tisa_id")
+                source_abstract = replacement.get("source_abstract_tisa_id")
+                if target_id:
+                    terminals[abstract_id] = (str(target_id),)
+                elif source_abstract in terminals:
+                    terminals[abstract_id] = terminals[str(source_abstract)]
+                else:
+                    continue
+                del unresolved[abstract_id]
+                progressed = True
+            if not progressed:
+                raise ValueError(
+                    "cannot resolve elided target dependencies: "
+                    + ", ".join(sorted(unresolved))
+                )
+        resolved_handoffs = []
+        for record in onchip_handoffs:
+            producer_terminal = terminals[str(record["producer_store_abstract_id"])]
+            if len(producer_terminal) != 1:
+                raise ValueError("on-chip handoff requires one producer terminal")
+            resolved_handoffs.append(
+                {**record, "producer_target_tisa_id": producer_terminal[0]}
+            )
+        handoff_target_ids = {
+            str(item["producer_target_tisa_id"]) for item in resolved_handoffs
+        }
 
         planned: list[TargetInstructionPlan] = []
         for draft in drafts:
@@ -309,6 +317,19 @@ class TargetLowerer:
                     "stage_id": tiles[draft.instruction.tile_id].stage_id,
                     "scheduler_visible": True,
                     "target_expansion_required": False,
+                    **(
+                        {
+                            "onchip_handoff_producer": True,
+                            "handoff_tensor": next(
+                                item["tensor"]
+                                for item in resolved_handoffs
+                                if item["producer_target_tisa_id"]
+                                == draft.instruction.tisa_id
+                            ),
+                        }
+                        if draft.instruction.tisa_id in handoff_target_ids
+                        else {}
+                    ),
                 },
             )
             planned.append(
@@ -346,12 +367,260 @@ class TargetLowerer:
                     "machine_topology_hash": machine.topology_hash(),
                 },
                 "route_policy": "explicit_machine_config",
+                "onchip_handoff_policy": machine.attributes.get(
+                    "onchip_handoff_policy", "root_memory"
+                ),
+                "onchip_handoffs": resolved_handoffs,
+                "onchip_handoff_rejections": onchip_rejections,
+                "elided_abstract_instructions": {
+                    key: {
+                        **dict(value),
+                        "resolved_target_tisa_ids": list(terminals[key]),
+                    }
+                    for key, value in elided_replacements.items()
+                },
             },
         )
         issues = target_plan.validate(abstract_program)
         if issues:
             raise ValueError("target plan is invalid: " + "; ".join(issues))
         return target_plan
+
+    @staticmethod
+    def _apply_onchip_handoffs(
+        graph: OperatorGraph,
+        machine: MachineConfig,
+        drafts: list[_Draft],
+        *,
+        root: str,
+    ) -> tuple[
+        list[_Draft],
+        list[dict[str, Any]],
+        dict[str, dict[str, Any]],
+        list[dict[str, Any]],
+    ]:
+        """Elide one proven root round-trip for a compatible Attention edge."""
+
+        policy = str(machine.attributes.get("onchip_handoff_policy", "root_memory"))
+        if policy == "root_memory":
+            return drafts, [], {}, []
+        if policy != "attention_single_consumer":
+            raise ValueError(f"unknown on-chip handoff policy '{policy}'")
+        operators = {item.op_id: item for item in graph.operators}
+        fanout: dict[str, int] = {}
+        for edge in graph.edges:
+            fanout[edge.tensor] = fanout.get(edge.tensor, 0) + 1
+        retained = list(drafts)
+        handoffs: list[dict[str, Any]] = []
+        elided: dict[str, dict[str, Any]] = {}
+        rejections: list[dict[str, Any]] = []
+
+        def reject(edge: Any, reason: str) -> None:
+            rejections.append(
+                {
+                    "producer": edge.producer,
+                    "consumer": edge.consumer,
+                    "tensor": edge.tensor,
+                    "reason": reason,
+                }
+            )
+
+        for edge in graph.edges:
+            producer = operators[edge.producer]
+            consumer = operators[edge.consumer]
+            if producer.normalized_type not in {"matmul", "batched_matmul", "gemv"}:
+                continue
+            if consumer.normalized_type != "softmax":
+                continue
+            if fanout.get(edge.tensor, 0) != 1:
+                reject(edge, "fanout_is_not_one")
+                continue
+            producer_stores = [
+                item for item in retained
+                if item.abstract.operator_id == edge.producer
+                and item.abstract.attributes.get("tisa_stage") == "store"
+            ]
+            consumer_loads = [
+                item for item in retained
+                if item.abstract.operator_id == edge.consumer
+                and item.abstract.attributes.get("tisa_stage") == "load"
+            ]
+            consumer_computes = [
+                item for item in retained
+                if item.abstract.operator_id == edge.consumer
+                and item.abstract.attributes.get("tisa_stage") == "compute"
+            ]
+            root_stores = [
+                item for item in producer_stores
+                if any(
+                    operand.tile_mem.tensor == edge.tensor
+                    and operand.tile_mem.physical_space == root
+                    and operand.normalized_access in {"write", "read_write"}
+                    for operand in item.instruction.operands
+                )
+            ]
+            if len(root_stores) != 1 or len(consumer_loads) != 1 or len(consumer_computes) != 1:
+                reject(edge, "requires_single_store_load_compute_tile")
+                continue
+            root_store, consumer_load, consumer_compute = (
+                root_stores[0], consumer_loads[0], consumer_computes[0]
+            )
+            producer_sources = [
+                operand for operand in root_store.instruction.operands
+                if operand.tile_mem.tensor == edge.tensor
+                and operand.tile_mem.physical_space != root
+                and operand.normalized_access in {"read", "read_write"}
+            ]
+            consumer_destinations = [
+                operand for operand in consumer_load.instruction.operands
+                if operand.tile_mem.tensor == edge.tensor
+                and operand.tile_mem.physical_space != root
+                and operand.normalized_access in {"write", "read_write"}
+            ]
+            compute_inputs = [
+                operand for operand in consumer_compute.instruction.operands
+                if operand.tile_mem.tensor == edge.tensor
+                and operand.normalized_access in {"read", "read_write"}
+            ]
+            if not (
+                len(producer_sources) == len(consumer_destinations) == len(compute_inputs) == 1
+            ):
+                reject(edge, "operand_roles_are_ambiguous")
+                continue
+            source = producer_sources[0]
+            destination = consumer_destinations[0]
+            compute_input = compute_inputs[0]
+            if source.tile_mem.role != "output" or destination.tile_mem.role != "input":
+                reject(edge, "operand_role_mismatch")
+                continue
+            if source.tile_mem.physical_space != destination.tile_mem.physical_space:
+                reject(edge, "producer_consumer_memory_mismatch")
+                continue
+            try:
+                consumer_rule = machine.operation_class(consumer.normalized_type)
+            except KeyError:
+                reject(edge, "consumer_target_class_missing")
+                continue
+            if consumer_rule.local_memory != source.tile_mem.physical_space:
+                reject(edge, "consumer_eu_cannot_access_producer_memory")
+                continue
+            if (
+                source.tile_shape != destination.tile_shape
+                or source.tile_shape != compute_input.tile_shape
+            ):
+                reject(edge, "tile_geometry_mismatch")
+                continue
+            if source.tile_mem.dtype != destination.tile_mem.dtype:
+                reject(edge, "dtype_mismatch")
+                continue
+            if source.tile_mem.layout != destination.tile_mem.layout:
+                reject(edge, "layout_mismatch")
+                continue
+            capacity = machine.memory(source.tile_mem.physical_space).capacity_bytes
+            required = int(source.tile_mem.size_bytes or source.tile_mem.valid_bytes or 0)
+            if capacity is not None and required > capacity:
+                reject(edge, "producer_tile_exceeds_local_capacity")
+                continue
+            if not root_store.internal_sources and not root_store.abstract.dependencies:
+                reject(edge, "producer_store_has_no_replacement_token")
+                continue
+            producer_abstract_id = root_store.abstract.tisa_id
+            consumer_abstract_id = consumer_load.abstract.tisa_id
+            source_buffer = str(source.tile_mem.buffer_id)
+            rewritten_operands = tuple(
+                replace(
+                    operand,
+                    tile_mem=replace(
+                        operand.tile_mem,
+                        base=source_buffer,
+                        buffer_id=source_buffer,
+                        symbolic_buffer_id=source.tile_mem.symbolic_buffer_id,
+                        memory_space=source.tile_mem.physical_space,
+                        layout=source.tile_mem.layout,
+                        strides_bytes=source.tile_mem.strides_bytes,
+                        size_bytes=source.tile_mem.size_bytes,
+                        valid_bytes=source.tile_mem.valid_bytes,
+                    ),
+                )
+                if operand is compute_input
+                else operand
+                for operand in consumer_compute.instruction.operands
+            )
+            replacement_compute = replace(
+                consumer_compute,
+                instruction=replace(
+                    consumer_compute.instruction,
+                    operands=rewritten_operands,
+                    attributes={
+                        **dict(consumer_compute.instruction.attributes),
+                        "onchip_handoff_consumer": True,
+                        "handoff_tensor": edge.tensor,
+                        "handoff_buffer_id": source_buffer,
+                    },
+                ),
+                attributes={
+                    **dict(consumer_compute.attributes),
+                    "onchip_handoff_consumer": True,
+                },
+            )
+            retained = [
+                replacement_compute if item is consumer_compute else item
+                for item in retained
+                if item is not root_store and item is not consumer_load
+            ]
+            store_replacement: dict[str, Any]
+            if root_store.internal_sources:
+                store_replacement = {
+                    "target_tisa_id": root_store.internal_sources[-1]
+                }
+            else:
+                source_abstract = next(
+                    dependency.source
+                    for dependency in root_store.abstract.dependencies
+                )
+                store_replacement = {"source_abstract_tisa_id": source_abstract}
+            elided[producer_abstract_id] = {
+                **store_replacement,
+                "reason": "onchip_handoff_root_store_elided",
+                "tensor": edge.tensor,
+            }
+            elided[consumer_abstract_id] = {
+                "source_abstract_tisa_id": producer_abstract_id,
+                "reason": "onchip_handoff_root_load_elided",
+                "tensor": edge.tensor,
+            }
+            handoffs.append(
+                {
+                    "producer": edge.producer,
+                    "consumer": edge.consumer,
+                    "tensor": edge.tensor,
+                    "memory": source.tile_mem.physical_space,
+                    "root_memory": root,
+                    "buffer_id": source_buffer,
+                    "dtype": source.tile_mem.dtype,
+                    "layout": source.tile_mem.layout,
+                    "tile_shape": list(source.tile_shape),
+                    "valid_bytes": int(source.tile_mem.valid_bytes or required),
+                    "producer_store_abstract_id": producer_abstract_id,
+                    "consumer_load_abstract_id": consumer_abstract_id,
+                    "removed_target_tisa_ids": [
+                        root_store.instruction.tisa_id,
+                        consumer_load.instruction.tisa_id,
+                    ],
+                    "checks": {
+                        "fanout": 1,
+                        "same_memory": True,
+                        "eu_reachable": True,
+                        "role_compatible": True,
+                        "layout_compatible": True,
+                        "dtype_compatible": True,
+                        "tile_geometry_compatible": True,
+                        "capacity_checked": True,
+                        "slot_reuse_guarded_by_memory_plan": True,
+                    },
+                }
+            )
+        return retained, handoffs, elided, rejections
 
     @staticmethod
     def _output_slots(
@@ -388,8 +657,23 @@ class TargetLowerer:
         machine: MachineConfig,
         *,
         root: str,
-        local: str,
     ) -> _Draft:
+        semantic_type = str(abstract.attributes.get("semantic_op_type", ""))
+        try:
+            rule = machine.operation_class(semantic_type)
+        except KeyError as exc:
+            raise ValueError(
+                f"machine '{machine.config_id}' has no explicit target class for "
+                f"operation '{semantic_type}'"
+            ) from exc
+        local = rule.local_memory
+        if not rule.direct and (
+            len(rule.input_route) != 2 or len(rule.output_route) != 2
+        ):
+            raise ValueError(
+                f"generic target class '{rule.class_id}' currently requires one-hop routes; "
+                "use an operation-specific target lowerer for multi-hop expansion"
+            )
         operands: list[TISAOperand] = []
         for operand in abstract.operands:
             memory = operand.tile_mem
@@ -412,14 +696,16 @@ class TargetLowerer:
                 )
             )
         stage = str(abstract.attributes.get("tisa_stage", ""))
-        if stage == "load":
-            path = _path(machine, root, local)
+        if rule.direct:
+            unit = rule.unit
+        elif stage == "load":
+            path = _path(machine, rule.input_route[0], rule.input_route[1])
             unit = path.engine
         elif stage == "store":
-            path = _path(machine, local, root)
+            path = _path(machine, rule.output_route[0], rule.output_route[1])
             unit = path.engine
         else:
-            unit = _unit_for_abstract(abstract, machine)
+            unit = rule.unit
         target_id = f"{abstract.tisa_id}.target"
         return _Draft(
             abstract=abstract,
@@ -437,6 +723,7 @@ class TargetLowerer:
                 attributes={
                     **dict(abstract.attributes),
                     "target_stage_kind": "direct",
+                    "target_class": rule.class_id,
                 },
             ),
             expansion_kind="direct",

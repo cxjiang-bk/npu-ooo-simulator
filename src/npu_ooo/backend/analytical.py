@@ -51,17 +51,19 @@ class AnalyticalEventBackend:
                 "event backend capability validation failed: " + "; ".join(issues)
             )
         provider: TimingModel = timing_provider or AnalyticalTimingModel()
-        # Import lazily to keep backend contracts and registries independent of
-        # the simulator package import order.
-        from npu_ooo.simulator.tisa import simulate_tisa_artifact
+        from npu_ooo.simulator.device import DeviceSimulator
 
-        result = simulate_tisa_artifact(
+        result = DeviceSimulator(
             artifact,
             machine,
+            runtime_submission,
+            provider,
+        ).run(
             policy,
-            timing_model=provider,
             config=simulator_config,
-            runtime_submission=runtime_submission,
+            audit={
+                "event_backend": self.name,
+            },
         )
         return replace(
             result,

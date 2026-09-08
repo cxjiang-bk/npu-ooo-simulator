@@ -17,7 +17,6 @@ from npu_ooo.arch import MachineConfig
 from npu_ooo.ir import (
     AccessType,
     BackendArtifact,
-    ExecutionTask,
     OperatorGraph,
     ScheduleSpec,
     TISADependency,
@@ -1225,123 +1224,10 @@ class AnalyticalBackendCodegen:
             tile_graph=tile_graph,
             target_plan=target_plan,
         )
-        tasks_by_stage: dict[tuple[str, str], list[ExecutionTask]] = {}
-        tasks_by_target: dict[str, list[ExecutionTask]] = {}
-        for task in lowering.execution_graph.tasks:
-            tasks_by_stage.setdefault((task.tile_id, task.primitive), []).append(task)
-            target_tisa_id = task.attributes.get("target_tisa_id")
-            if isinstance(target_tisa_id, str) and target_tisa_id:
-                tasks_by_target.setdefault(target_tisa_id, []).append(task)
-        payloads: dict[str, tuple[str, ...]] = {}
-        consumed: set[str] = set()
-        original_tasks = {task.task_id: task for task in lowering.execution_graph.tasks}
-
-        composite_ops = {"softmax", "rmsnorm", "layernorm", "swiglu", "kv_cache_update"}
-        for instruction in program.instructions:
-            stage = str(instruction.attributes.get("tisa_stage", ""))
-            semantic_op = str(instruction.attributes.get("semantic_op_type", ""))
-            explicit_candidates = tuple(
-                task
-                for task in tasks_by_target.get(instruction.tisa_id, ())
-                if task.task_id not in consumed
-            )
-            if explicit_candidates:
-                resources = {task.resource for task in explicit_candidates}
-                if len(resources) != 1:
-                    raise ValueError(
-                        f"target TISA stage '{instruction.tisa_id}' spans resources: "
-                        + ", ".join(sorted(resources))
-                    )
-                payloads[instruction.tisa_id] = tuple(
-                    task.task_id for task in explicit_candidates
-                )
-                consumed.update(payloads[instruction.tisa_id])
-                continue
-            if semantic_op in composite_ops:
-                if stage == "load":
-                    primitive_names = {"load", "load_transpose", "copy", "transpose"}
-                elif stage == "store":
-                    primitive_names = {"store"}
-                else:
-                    primitive_names = set(
-                        instruction.attributes.get("payload_primitives", ())
-                    )
-                candidates = tuple(
-                    task
-                    for task in lowering.execution_graph.tasks
-                    if task.tile_id == instruction.tile_id
-                    and task.primitive in primitive_names
-                    and task.task_id not in consumed
-                )
-                if not candidates:
-                    raise ValueError(
-                        f"analytical backend has no composite payload for TISA instruction "
-                        f"'{instruction.tisa_id}' stage '{stage}'"
-                    )
-                resources = {task.resource for task in candidates}
-                if len(resources) != 1:
-                    raise ValueError(
-                        f"composite TISA payload '{instruction.tisa_id}' spans resources: "
-                        + ", ".join(sorted(resources))
-                    )
-                # Keep the detailed primitive DAG in BackendArtifact.  It is
-                # expanded only after the semantic TISA instruction issues;
-                # the primitive tasks never enter the global ready queue.
-                payloads[instruction.tisa_id] = tuple(task.task_id for task in candidates)
-                consumed.update(task.task_id for task in candidates)
-                continue
-
-            primitive = str(instruction.attributes.get("primitive", ""))
-            candidates = tuple(
-                task
-                for task in tasks_by_stage.get((instruction.tile_id, primitive), ())
-                if task.task_id not in consumed
-            )
-            if not candidates:
-                raise ValueError(
-                    f"analytical backend has no payload for TISA instruction '{instruction.tisa_id}' "
-                    f"stage '{primitive}' on tile '{instruction.tile_id}'"
-                )
-            task_ids = tuple(task.task_id for task in candidates)
-            payloads[instruction.tisa_id] = task_ids
-            consumed.update(task_ids)
-
-        all_tasks = set(original_tasks)
-        unbound = sorted(all_tasks - consumed)
-        if unbound:
-            raise ValueError(
-                "analytical backend generated primitive tasks without TISA ownership: "
-                + ", ".join(unbound[:8])
-            )
-
-        instruction_by_id = {
-            instruction.tisa_id: instruction for instruction in program.instructions
-        }
-        owner_by_task = {
-            task_id: tisa_id
-            for tisa_id, task_ids in payloads.items()
-            for task_id in task_ids
-        }
-        execution_graph = replace(
-            lowering.execution_graph,
-            tasks=tuple(
-                replace(
-                    task,
-                    attributes={
-                        **dict(task.attributes),
-                        "target_tisa_id": owner_by_task[task.task_id],
-                        "abstract_tisa_id": instruction_by_id[
-                            owner_by_task[task.task_id]
-                        ].attributes.get("abstract_tisa_id"),
-                    },
-                )
-                for task in lowering.execution_graph.tasks
-            ),
-            attributes={
-                **dict(lowering.execution_graph.attributes),
-                "target_plan_id": target_plan.plan_id,
-            },
-        )
+        payloads = lowering.payloads
+        execution_graph = lowering.execution_graph
+        if set(payloads) != {item.tisa_id for item in program.instructions}:
+            raise ValueError("target payload ownership does not cover final TISA program")
         from npu_ooo.backend.target_lowering import declare_internal_resources
 
         target_plan = declare_internal_resources(

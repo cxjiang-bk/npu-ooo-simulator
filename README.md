@@ -10,9 +10,12 @@ flowchart LR
     D --> E[TISA Generator: 虚拟 TISA]
     E --> I[Target Lowering: TargetPlan]
     I --> J[最终 TISA、BackendArtifact 与 MemoryPlan]
-    J --> F[Runtime 基址绑定与提交]
-    F --> G[Static / Dynamic device scheduler]
-    G --> H[周期、stall、泳道图、Perfetto]
+    J --> F[Runtime Loader: 地址绑定与 descriptor envelope]
+    F --> G[LoadedDeviceProgram]
+    G --> K[Static / Dynamic device scheduler]
+    K --> L[Execution backend]
+    L -->|completion feedback| K
+    L --> H[周期、stall、泳道图、Perfetto]
 ```
 
 项目用于研究 TISA 风格 NPU 的编译、运行时和乱序调度。生产入口是一条线性的真实
@@ -30,8 +33,8 @@ PyTorch nn.Module
   -> 虚拟 TISAProgram
   -> TargetPlan / 目标 TISAProgram
   -> Backend payload / MemoryPlan
-  -> RuntimeSubmission
-  -> TISA device scheduler
+  -> RuntimeSubmission / LoadedDeviceProgram
+  -> TISA device scheduler + ExecutionBackend
   -> 周期、泳道图和 Perfetto trace
 ```
 
@@ -51,9 +54,8 @@ ATen 到 StableHLO 的转换，项目维护 StableHLO semantic family 到 Canoni
   Lowering 依据 `MachineConfig` 生成唯一 `TargetPlan`，再由该计划共同生成最终 TISA、
   payload 与 `MemoryPlan`；
 - static 和 dynamic device policy 共享同一份编译产物、地址绑定和 timing source；
-- runtime 消费编译期 `MemoryPlan`，只绑定各地址空间基址、动态参数、command chunk、
-  descriptor arrival 和同步；device scheduler
-  负责 queue、ROB、依赖、资源和 OOO issue；
+- runtime 消费编译期 `MemoryPlan`，绑定地址、动态参数和提交 envelope，再由 loader 生成
+  可校验的 bound descriptor；device scheduler 只负责 queue、ROB、依赖和 OOO issue；
 - 支持 Matmul、batched Matmul、GEMV、elementwise、reduce、Softmax、LayerNorm、
   RMSNorm、Attention region、SwiGLU、RoPE、Conv2D、BatchNorm inference、pooling、
   reshape/transpose、embedding gather、固定窗口 KV-cache；
@@ -65,6 +67,8 @@ ATen 到 StableHLO 的转换，项目维护 StableHLO semantic family 到 Canoni
 - symbolic shape 使用 normalized shape environment 完成 Canonical resolve 与 specialization；
 - 输出分阶段 artifact、周期与 stall 统计、SVG/PNG 泳道图和 Perfetto JSON；
 - `cycle_event` 提供显式 reception/WQ/IQ/Fu/ROB、逐周期控制延迟、完成带宽与退休反压；
+- `ExecutionBackend` 独占 payload 解析、EU 接收/占用、内部 task trace 和物理完成反馈；
+  `DeviceSimulator` 负责连接 loader、scheduler 与 execution backend；
 - 支持 analytical、timing table、systolic MXU profile 以及 RTL completion trace
   importer。
 
@@ -184,9 +188,12 @@ compile_torch_module(...)
   -> virtual TISA / TargetPlan / final TISA
   -> BackendArtifact / MemoryPlan                # 编译期，保持不变
 allocate_memory_plan_bindings(...)
-  -> RuntimeSubmission                   # invocation，绑定基址和动态参数
+  -> RuntimeSubmission                   # host 提交描述
+load_device_program(...)
+  -> LoadedDeviceProgram                 # bound descriptors、envelopes、静态计划
 schedule_tisa_program(...)
-  -> SimulationResult                    # device scheduler + backend timing
+  -> DeviceSimulator -> scheduler <-> ExecutionBackend
+  -> SimulationResult
 ```
 
 `--input-shape` 是 `torch.export` 的示例输入和 shape-specialization 参数，不是仿真时
@@ -407,6 +414,7 @@ out/<run>/
 │   └── machine.json
 ├── 05_runtime/
 │   ├── runtime_submission.json
+│   ├── bound_device_program.json
 │   └── address_dependencies.json
 ├── 06_simulation/
 │   ├── summary.json
@@ -425,6 +433,10 @@ route hop、engine、目标 operand 和 provenance，`memory_plan.json` 保存�
 buffer、allocation、slot、生命周期和复用关系。复合算子的内部 scratch 以 TargetPlan 的
 显式 internal-resource declaration 保存。
 
+`05_runtime/bound_device_program.json` 是 scheduler 的实际设备输入：instruction 语义、
+本次物理 operand、invocation-scoped completion token 和 dependency 位于 descriptor；
+chunk、arrival、launch latency 位于 envelope；静态模式另带可审计的固定计划。
+
 Softmax 默认使用 materialized row-wise payload。`--softmax-algorithm online` 选择
 分析版 online state-chain：相邻 reduction tile 传递 `(max, sum)` 状态，TISA 语义边界
 保持同一语义边界。该模式用于观察状态依赖对调度周期的影响；完整 rescale、最终归一化和
@@ -434,13 +446,21 @@ workspace 生命周期属于后续数值 backend 扩展。
 
 ```text
 编译器/backend：tile、operand placement、搬运路径、buffer allocation/reuse
-runtime：地址空间基址、动态 binding、command chunk、descriptor arrival、同步
-device scheduler：依赖、ROB、queue、资源状态与 TISA issue
-backend：ExecutionTask 时序、completion event、泳道图
+runtime/loader：地址、动态 binding、command chunk、descriptor envelope
+device scheduler：依赖、ROB、queue、仲裁、TISA issue 与 feedback 接受
+execution backend：payload、EU 接收能力/占用、物理完成与内部 task trace
+DeviceSimulator：时间推进和组件连接
 ```
 
-`static_pipeline` 按 program order 与依赖 issue；`dynamic_ready_queue` 在到达、依赖
+`static_pipeline` 按显式 `StaticSchedulePlan` 冻结的本次 runtime submission order 与依赖 issue；
+`dynamic_ready_queue` 在到达、依赖
 满足且资源可用的窗口内选择 ready TISA instruction。两种 policy 复用同一份编译产物。
+
+设备在线策略默认只使用已到达 descriptor、有限队列、执行反馈和历史状态；
+`oracle_critical_path` 是完整图参考策略，不等同论文在线调度。编译参数
+`--onchip-handoff attention_single_consumer` 可在 role、layout、dtype、tile、容量、fan-out
+和 EU 可达性全部通过时，将 Attention 的 QK Matmul 输出直接交给 Softmax；默认
+`root_memory` 保留原有往返，不满足条件时 TargetPlan 会记录回退原因。
 
 ## Backend 与 RTL 校准
 
@@ -485,8 +505,10 @@ manifest 会保留该区间标签。
 | `lowering/` | 将 TISA 对应的计算展开为 backend 执行任务 |
 | `arch/` | 描述存储、执行单元和 scheduler 配置 |
 | `backend/` | 提供可替换的代码生成和时序来源 |
-| `scheduler/` | 提供 static/dynamic 调度公共入口 |
-| `simulator/` | 模拟 device scheduler 和硬件执行时序 |
+| `runtime/` | 装载程序、地址绑定和提交 envelope，生成设备 descriptor |
+| `scheduler/` | 只基于 bound descriptor/feedback 执行 static/dynamic 仲裁 |
+| `execution/` | 注册/执行 payload，拥有 EU 状态并产生完成反馈 |
+| `simulator/` | 推进时间并连接设备组件；保留旧参考模型兼容入口 |
 | `experiments/` | 运行模型、策略和硬件配置实验矩阵 |
 | `trace/` | 输出阶段产物、统计、泳道图和 Perfetto trace |
 

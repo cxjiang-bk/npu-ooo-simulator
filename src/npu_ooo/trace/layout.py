@@ -51,6 +51,7 @@ _STAGE_BY_FILENAME: dict[str, str] = {
     "execution_graph.dot": "04_backend",
     "address_dependencies.json": "05_runtime",
     "runtime_submission.json": "05_runtime",
+    "bound_device_program.json": "05_runtime",
     "runtime_sequence.json": "05_runtime",
     "summary.json": "06_simulation",
     "tasks.csv": "06_simulation",

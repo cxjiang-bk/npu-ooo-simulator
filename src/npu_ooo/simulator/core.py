@@ -199,6 +199,9 @@ class SimulatorConfig:
     address_scoreboard: bool = False
     memory_bank_scoreboard: bool = False
     static_pipeline: StaticPipelineConfig | None = None
+    # The generic ExecutionGraph reference engine historically uses the full
+    # graph critical path. Device TISA schedulers override an omitted config
+    # to oldest_first because future descriptors are not device-visible.
     dynamic_priority: str = "critical_path"
     pipeline: SchedulerPipelineConfig | None = None
 
@@ -256,9 +259,15 @@ class SimulatorConfig:
             issues.extend(self.static_pipeline.validate())
         if self.pipeline is not None:
             issues.extend(self.pipeline.validate())
-        if self.dynamic_priority not in {"critical_path", "oldest_first"}:
+        if self.dynamic_priority not in {
+            "oldest_first",
+            "compiler_hint",
+            "oracle_critical_path",
+            "critical_path",
+        }:
             issues.append(
-                "simulator dynamic_priority must be 'critical_path' or 'oldest_first'"
+                "simulator dynamic_priority must be oldest_first, compiler_hint or "
+                "oracle_critical_path ('critical_path' is a legacy alias)"
             )
         return tuple(issues)
 

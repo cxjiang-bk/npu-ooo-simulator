@@ -47,6 +47,16 @@ from .runtime import (
     derive_tensor_lifetimes,
     derive_tensor_reuse_pairs,
 )
+from .device import (
+    DEVICE_PROGRAM_SCHEMA_VERSION,
+    BoundDependency,
+    BoundTISADescriptor,
+    CompletionToken,
+    DescriptorEnvelope,
+    LoadedDeviceProgram,
+    StaticScheduleEntry,
+    StaticSchedulePlan,
+)
 
 __all__ = [
     "DataEdge",
@@ -100,6 +110,14 @@ __all__ = [
     "create_runtime_state_registry",
     "derive_tensor_lifetimes",
     "derive_tensor_reuse_pairs",
+    "DEVICE_PROGRAM_SCHEMA_VERSION",
+    "BoundDependency",
+    "BoundTISADescriptor",
+    "CompletionToken",
+    "DescriptorEnvelope",
+    "LoadedDeviceProgram",
+    "StaticScheduleEntry",
+    "StaticSchedulePlan",
     "OperatorSchedule",
     "ScheduleSpec",
     "TensorResidency",

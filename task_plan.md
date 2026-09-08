@@ -195,3 +195,42 @@ PYTHONPATH=src /usr/bin/python3.12 -m unittest discover -s tests -v
 PYTHONPATH=src /usr/bin/python3.12 -m compileall -q src tests examples
 git diff --check
 ```
+
+## 2026-09-08：设备执行契约、统一 target 边界与有界调度
+
+### 阶段 1：设备输入与反馈契约（完成）
+
+- [x] `BoundTISADescriptor`、`DescriptorEnvelope`、invocation-scoped completion token；
+- [x] `LoadedDeviceProgram` JSON 校验/恢复和 runtime loader；
+- [x] `ExecutionBackend` 的 register/estimate/can-accept/issue/advance/feedback 契约；
+- [x] fake reject、延迟反馈、物理完成/完成接受分离测试。
+
+### 阶段 2：已有算子的 target lowering（完成，能力边界已列明）
+
+- [x] MachineConfig 显式 operation-class placement，删除 first-path/default-local 猜测；
+- [x] 全部 lowering registry 类型要求唯一 TargetPlan ownership 和 operand/payload 校验；
+- [x] Matmul 直接从 TargetInstructionPlan 生成，多级 route 单一来源；
+- [x] 其他算子的 recipe adapter 不允许重新选择 route/memory/EU；覆盖清单见
+      `docs/target-lowering-coverage.md`；
+- [x] scratch 在 memory allocation 前加入 TargetPlan。
+
+### 阶段 3：模块职责迁移（完成）
+
+- [x] runtime loader 与纯 runtime IR 分离；
+- [x] event/cycle scheduler 只消费 bound descriptor 和 execution feedback；
+- [x] payload timing、EU busy、内部 task trace 归 ExecutionBackend；
+- [x] `DeviceSimulator` 连接 loader、scheduler 和执行后端；
+- [x] module-boundary 检查禁止生产 scheduler 绕过新契约。
+
+### 阶段 4：论文调度与片上数据流（完成最小研究范围）
+
+- [x] 默认在线优先级改为已接收队列的 `oldest_first`；完整图策略显式命名为 oracle；
+- [x] runtime physical alias 转换为 completion-token RAW/WAR/WAW，设备 scoreboard 有界；
+- [x] `StaticSchedulePlan` 冻结每次 runtime submission 顺序，并提供 dependency/resource/
+      reservation 审计；
+- [x] Attention QK Matmul→Softmax 单消费者片上交接与明确回退原因；
+- [x] root/static、root/dynamic、onchip/static、onchip/dynamic 四组受控输出。
+
+后续顺序：外部 execution backend 接口校准，真实 SRAM/DRAM transaction timing，作者
+static baseline/在线优先级细节确认，多 tile/fan-out/跨 core 片上交接扩展。未经授权不连接
+外部 RTL 项目。

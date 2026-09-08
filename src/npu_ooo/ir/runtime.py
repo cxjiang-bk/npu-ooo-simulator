@@ -266,6 +266,37 @@ class RuntimeOperandBinding:
             "buffer_id": self.buffer_id,
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "RuntimeOperandBinding":
+        if not isinstance(payload, Mapping):
+            raise ValueError("runtime operand binding must be a JSON object")
+        try:
+            result = cls(
+                tisa_id=str(payload["tisa_id"]),
+                operand_name=str(payload["operand_name"]),
+                tensor=str(payload["tensor"]),
+                logical_scope=str(payload["logical_scope"]),
+                physical_scope=str(payload["physical_scope"]),
+                address=int(payload["address"]),
+                size_bytes=int(payload["size_bytes"]),
+                access_type=str(payload["access_type"]),
+                offset_bytes=int(payload["offset_bytes"]),
+                attributes=payload.get("attributes", {}),
+                buffer_id=(
+                    str(payload["buffer_id"])
+                    if payload.get("buffer_id") is not None
+                    else None
+                ),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid runtime operand binding") from exc
+        issues = result.validate()
+        if issues:
+            raise ValueError(
+                "invalid runtime operand binding: " + "; ".join(issues)
+            )
+        return result
+
 
 @dataclass(frozen=True)
 class RuntimeCommandChunk:

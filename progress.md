@@ -366,3 +366,36 @@ GC typed dependency 已完成，下一项转入 symbolic shape、dynamic index �
   compile package SHA256 均为
   `0fec557838af564a90fc9bf8b4a500d2463d44b7d83f4cd02eedd88b47997b7d`，当前小图两种
   policy 均为 560 cycles。
+
+## 2026-09-08：四阶段设备契约与调度职责改造
+
+- 阶段 1：新增 bound descriptor/envelope、invocation completion token、静态计划和严格
+  JSON round-trip；ExecutionBackend 明确 can-accept/issue/physical-done/partial-ready。
+  fake backend 拒绝不会产生 issue，反馈延迟会等量推迟消费者唤醒。
+- 阶段 2：MachineConfig 为 registry 中全部已有算子提供显式 operation/operation-class
+  placement；generic target lowering 不再猜第一条路径或默认 local。Matmul payload 直接按
+  TargetInstructionPlan 生成；其余 recipe 在 TargetPlan adapter 中建立唯一 ownership，
+  scratch 在 allocation 前声明。真实边界记录于 `docs/target-lowering-coverage.md`。
+- 阶段 3：生产 event/cycle scheduler 不再读取 BackendArtifact、ExecutionGraph 或内部
+  primitive。runtime loader 生成 LoadedDeviceProgram；ExecutionBackend 拥有 payload、EU
+  busy/II 和 task trace；DeviceSimulator 负责组件连接。独立 simulate 仍从 JSON package
+  启动，不导入前端。
+- 阶段 4：设备默认优先级只看已接收队列年龄；compiler hint 和完整图 oracle 显式分开。
+  runtime 绑定后 alias 变为 completion-token 依赖，scoreboard 只观察已到达 descriptor。
+  StaticSchedulePlan 冻结本次 runtime submission 顺序，表达项目固定顺序/跨 EU overlap 基线。
+- Attention 最小优化在检查 fan-out、role、memory/EU、layout、dtype、tile 和容量后，将 QK
+  Matmul 的片上输出直接交给 Softmax。lpu-like 删除 `UB→GM` 与 `GM→UB` 两条 target TISA；
+  MemoryPlan/runtime 中 producer write 与 consumer read 使用同一 UB buffer/address。fan-out
+  case 明确回退。
+- 四组 cycle_event 对照位于 `out/device-contract-stage4-20260908/`。root/static 与
+  root/dynamic 均为 560 cycles、832 B off-chip；onchip/static 与 onchip/dynamic 均为
+  532 cycles、704 B off-chip。该小图没有可利用的在线重排，28 cycles 与 128 B 的变化来自
+  数据流优化，不能归因于动态调度。
+- 本地全量回归：`169 passed, 35 skipped, 51 subtests passed`。skip 来自本机缺少完整
+  PyTorch/Torch-XLA/StableHLO 前端；9980X 完整前端环境使用隔离临时副本执行
+  `204 tests`，全部通过，临时副本随后删除。
+- 远端回归首次暴露动态 host 提交 + 静态 device 计划的有限 WQ 头阻塞：静态计划错误地
+  强制 compiler program order，使计划下一条尚未进入 WQ。修复为显式冻结本次合法的
+  runtime submission order；LLaMA2 decode 两 invocation 原失败用例和全量回归均通过。
+- 论文边界：Algorithm 1/2 的有界队列、依赖/资源检查、完成反馈已结构对齐；项目仍未获得
+  作者 static baseline 的具体编排、在线优先级公式、partial-ready 粒度和真实控制时序。

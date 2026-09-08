@@ -123,7 +123,12 @@ class TISADeviceSimulatorTest(unittest.TestCase):
             artifact, machine, SchedulerPolicy.STATIC_PIPELINE
         )
         dynamic = schedule_tisa_program(
-            artifact, machine, SchedulerPolicy.DYNAMIC_READY_QUEUE
+            artifact,
+            machine,
+            SchedulerPolicy.DYNAMIC_READY_QUEUE,
+            simulator_config=SimulatorConfig(
+                dynamic_priority="oracle_critical_path"
+            ),
         )
 
         self.assertEqual(static.instruction_timing("short").issue, 0)
@@ -136,6 +141,9 @@ class TISADeviceSimulatorTest(unittest.TestCase):
         self.assertEqual(static.metrics["payload_task_count"], 3)
         self.assertEqual(dynamic.metrics["payload_task_count"], 3)
         self.assertEqual(dynamic.metrics["event_backend"], "analytical_event")
+        self.assertEqual(
+            dynamic.metrics["priority_information"], "full_program_oracle"
+        )
 
     def test_backend_artifact_round_trip_preserves_scheduler_contract(self) -> None:
         artifact = self._critical_path_artifact()
@@ -492,7 +500,10 @@ class TISADeviceSimulatorTest(unittest.TestCase):
         self.assertEqual(disjoint_result.instruction_timing("tensor").issue, 0)
         self.assertEqual(overlapping_result.instruction_timing("dma").issue, 0)
         self.assertEqual(overlapping_result.instruction_timing("tensor").issue, 10)
-        self.assertGreater(overlapping_result.metrics["address_scoreboard_block_events"], 0)
+        self.assertGreater(overlapping_result.metrics["dependency_block_events"], 0)
+        self.assertEqual(
+            overlapping_result.metrics["runtime_alias_dependency_count"], 1
+        )
 
     def test_tisa_trace_and_address_hazard_keep_dependency_provenance(self) -> None:
         shared_write = _operand("shared", AccessType.WRITE)

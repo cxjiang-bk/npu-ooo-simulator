@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from typing import Any
 
@@ -26,12 +26,14 @@ class LoweringResult:
     tile_graph: TileGraph
     execution_graph: ExecutionGraph
     statistics: dict[str, int | float]
+    payloads: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "tile_graph": self.tile_graph.to_dict(),
             "execution_graph": self.execution_graph.to_dict(),
             "statistics": dict(self.statistics),
+            "payloads": {key: list(value) for key, value in self.payloads.items()},
         }
 
 
@@ -404,5 +406,9 @@ def lower_matmul_graph(
             "task_count": len(execution.tasks),
             "macs": total_macs,
             "transfer_bytes": transfer_bytes,
+        },
+        payloads={
+            target_id: tuple(task_ids)
+            for target_id, task_ids in by_target.items()
         },
     )

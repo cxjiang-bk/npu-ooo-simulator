@@ -7,9 +7,11 @@ from npu_ooo.arch import MachineConfig
 from npu_ooo.ir import (
     BufferRegion,
     ExecutionGraph,
+    ExecutionTask,
     OperatorGraph,
     ScheduleSpec,
     TileGraph,
+    TargetPlan,
     build_tile_graph,
 )
 
@@ -29,6 +31,183 @@ from .embedding import lower_embedding_graph
 
 
 GraphLowerer = Callable[[OperatorGraph, ScheduleSpec, MachineConfig], LoweringResult]
+
+
+def _apply_onchip_payload_handoffs(
+    tasks_by_operator: dict[str, tuple[ExecutionTask, ...]],
+    target_plan: TargetPlan,
+) -> dict[str, tuple[ExecutionTask, ...]]:
+    """Remove legacy root-load payloads replaced by a planned local handoff."""
+
+    handoffs = target_plan.attributes.get("onchip_handoffs", ())
+    if not handoffs:
+        return tasks_by_operator
+    all_tasks = tuple(
+        task for tasks in tasks_by_operator.values() for task in tasks
+    )
+    replacement_by_dropped: dict[str, tuple[str, ...]] = {}
+    dropped: set[str] = set()
+    for record in handoffs:
+        producer_target = str(record["producer_target_tisa_id"])
+        replacements = tuple(
+            task.task_id
+            for task in all_tasks
+            if task.attributes.get("target_tisa_id") == producer_target
+        )
+        if not replacements:
+            raise ValueError(
+                f"on-chip handoff producer target '{producer_target}' has no payload"
+            )
+        consumer = str(record["consumer"])
+        tensor = str(record["tensor"])
+        memory = str(record["memory"])
+        root_memory = str(record["root_memory"])
+        candidates = tuple(
+            task
+            for task in tasks_by_operator[consumer]
+            if task.primitive in {"load", "load_transpose"}
+            and any(
+                region.tensor == tensor and region.memory == root_memory
+                for region in task.reads
+            )
+            and any(
+                region.tensor == tensor and region.memory == memory
+                for region in task.writes
+            )
+        )
+        if len(candidates) != 1:
+            raise ValueError(
+                f"on-chip handoff {record['producer']}->{consumer} resolves to "
+                f"{len(candidates)} consumer root-load payloads"
+            )
+        dropped_task = candidates[0]
+        dropped.add(dropped_task.task_id)
+        replacement_by_dropped[dropped_task.task_id] = replacements
+
+    def expand(predecessor: str) -> tuple[str, ...]:
+        return replacement_by_dropped.get(predecessor, (predecessor,))
+
+    return {
+        operator_id: tuple(
+            replace(
+                task,
+                predecessors=tuple(
+                    sorted(
+                        {
+                            replacement
+                            for predecessor in task.predecessors
+                            for replacement in expand(predecessor)
+                        }
+                    )
+                ),
+                attributes={
+                    **dict(task.attributes),
+                    **(
+                        {"onchip_handoff_payload": True}
+                        if any(
+                            predecessor in replacement_by_dropped
+                            for predecessor in task.predecessors
+                        )
+                        else {}
+                    ),
+                },
+            )
+            for task in tasks
+            if task.task_id not in dropped
+        )
+        for operator_id, tasks in tasks_by_operator.items()
+    }
+
+
+def _bind_operator_payloads(
+    operator: object,
+    tasks: tuple[ExecutionTask, ...],
+    target_plan: TargetPlan,
+) -> tuple[tuple[ExecutionTask, ...], dict[str, tuple[str, ...]]]:
+    """Assign every generated task to one planned target instruction."""
+
+    operator_id = str(getattr(operator, "op_id"))
+    target_items = tuple(
+        item for item in target_plan.instructions
+        if item.instruction.operator_id == operator_id
+    )
+    consumed: set[str] = set()
+    payloads: dict[str, tuple[str, ...]] = {}
+    ownership_sources: dict[str, str] = {}
+    composite_ops = {"softmax", "rmsnorm", "layernorm", "swiglu", "kv_cache_update"}
+    for item in target_items:
+        instruction = item.instruction
+        exact = tuple(
+            task for task in tasks
+            if task.attributes.get("target_tisa_id") == instruction.tisa_id
+            and task.task_id not in consumed
+        )
+        if exact:
+            selected = exact
+            ownership_source = "target_instruction_plan"
+        else:
+            stage = str(instruction.attributes.get("tisa_stage", ""))
+            semantic_op = str(instruction.attributes.get("semantic_op_type", ""))
+            if semantic_op in composite_ops:
+                if stage == "load":
+                    primitives = {"load", "load_transpose", "copy", "transpose"}
+                elif stage == "store":
+                    primitives = {"store"}
+                else:
+                    primitives = set(instruction.attributes.get("payload_primitives", ()))
+            else:
+                primitives = {str(instruction.attributes.get("primitive", instruction.op_type))}
+            selected = tuple(
+                task for task in tasks
+                if task.tile_id == instruction.tile_id
+                and task.primitive in primitives
+                and task.task_id not in consumed
+            )
+            ownership_source = "target_plan_recipe"
+        if not selected:
+            raise ValueError(
+                f"target instruction '{instruction.tisa_id}' has no generated payload"
+            )
+        resources = {task.resource for task in selected}
+        if resources != {instruction.unit_map.unit}:
+            raise ValueError(
+                f"target instruction '{instruction.tisa_id}' expects resource "
+                f"'{instruction.unit_map.unit}', payload uses {sorted(resources)}"
+            )
+        payloads[instruction.tisa_id] = tuple(task.task_id for task in selected)
+        ownership_sources[instruction.tisa_id] = ownership_source
+        consumed.update(payloads[instruction.tisa_id])
+        for task in selected:
+            if task.attributes.get("target_tisa_id") not in {None, instruction.tisa_id}:
+                raise ValueError(f"task '{task.task_id}' has conflicting target owner")
+    unowned = sorted({task.task_id for task in tasks} - consumed)
+    if unowned:
+        raise ValueError(
+            f"operator '{operator_id}' generated unowned payload tasks: "
+            + ", ".join(unowned[:8])
+        )
+    owner = {
+        task_id: tisa_id
+        for tisa_id, task_ids in payloads.items()
+        for task_id in task_ids
+    }
+    instructions = {
+        item.instruction.tisa_id: item for item in target_items
+    }
+    updated = tuple(
+        replace(
+            task,
+            attributes={
+                **dict(task.attributes),
+                "target_tisa_id": owner[task.task_id],
+                "abstract_tisa_id": instructions[owner[task.task_id]].abstract_tisa_id,
+                "payload_ownership": "target_plan",
+                "payload_generation": ownership_sources[owner[task.task_id]],
+            },
+        )
+        for task in tasks
+    )
+    return updated, payloads
 
 
 class LoweringRegistry:
@@ -131,8 +310,12 @@ def lower_mixed_graph(
         raise ValueError("; ".join((*graph_issues, *schedule_issues, *machine_issues)))
 
     active_registry = registry or default_lowering_registry()
+    if not isinstance(target_plan, TargetPlan):
+        raise ValueError("mixed target payload lowering requires a TargetPlan")
     operators = {operator.op_id: operator for operator in graph.operators}
     tasks = []
+    payloads: dict[str, tuple[str, ...]] = {}
+    raw_tasks_by_operator: dict[str, tuple[ExecutionTask, ...]] = {}
     statistics: dict[str, int | float] = {}
     for operator_id in graph.topological_order():
         operator = operators[operator_id]
@@ -148,10 +331,26 @@ def lower_mixed_graph(
             lowered = lowerer(*lowering_args, target_plan=target_plan)
         else:
             lowered = lowerer(*lowering_args)
-        tasks.extend(lowered.execution_graph.tasks)
+        raw_tasks_by_operator[operator_id] = lowered.execution_graph.tasks
         for name, value in lowered.statistics.items():
             if name not in {"tile_count", "task_count"}:
                 statistics[f"{operator_id}.{name}"] = value
+
+    raw_tasks_by_operator = _apply_onchip_payload_handoffs(
+        raw_tasks_by_operator, target_plan
+    )
+    for operator_id in graph.topological_order():
+        operator = operators[operator_id]
+        owned_tasks, operator_payloads = _bind_operator_payloads(
+            operator, raw_tasks_by_operator[operator_id], target_plan
+        )
+        tasks.extend(owned_tasks)
+        overlap = set(payloads) & set(operator_payloads)
+        if overlap:
+            raise ValueError(
+                "duplicate target payload ownership: " + ", ".join(sorted(overlap))
+            )
+        payloads.update(operator_payloads)
 
     # GC owns the semantic tile graph.  Resolve it before backend handoffs so
     # every execution predecessor can retain the originating typed edge.
@@ -168,7 +367,48 @@ def lower_mixed_graph(
     }
     root_memory = _root_memory(machine)
     cross_operator_dependencies: set[tuple[str, str, str]] = set()
+    onchip_edges = {
+        (str(item["producer"]), str(item["consumer"]), str(item["tensor"])): item
+        for item in target_plan.attributes.get("onchip_handoffs", ())
+    }
     for edge in graph.edges:
+        onchip = onchip_edges.get((edge.producer, edge.consumer, edge.tensor))
+        if onchip is not None:
+            memory = str(onchip["memory"])
+            producer_regions = [
+                (region, task.task_id)
+                for task in tasks_by_operator[edge.producer]
+                for region in task.writes
+                if region.tensor == edge.tensor and region.memory == memory
+            ]
+            consumer_regions = [
+                (region, task.task_id)
+                for task in tasks_by_operator[edge.consumer]
+                for region in task.reads
+                if region.tensor == edge.tensor and region.memory == memory
+            ]
+            if not producer_regions or not consumer_regions:
+                raise ValueError(
+                    f"on-chip edge {edge.producer}->{edge.consumer} for tensor "
+                    f"'{edge.tensor}' has no local producer/consumer payload"
+                )
+            for consumer_region, consumer_task_id in consumer_regions:
+                overlapping = [
+                    producer_task_id
+                    for producer_region, producer_task_id in producer_regions
+                    if _regions_overlap(producer_region, consumer_region)
+                ]
+                if not overlapping:
+                    raise ValueError(
+                        f"on-chip consumer task '{consumer_task_id}' has no overlapping "
+                        f"producer for tensor '{edge.tensor}'"
+                    )
+                predecessor_sets[consumer_task_id].update(overlapping)
+                cross_operator_dependencies.update(
+                    (producer_task_id, consumer_task_id, edge.tensor)
+                    for producer_task_id in overlapping
+                )
+            continue
         producer_regions = _root_regions(
             tasks_by_operator,
             edge.producer,
@@ -286,7 +526,12 @@ def lower_mixed_graph(
         attributes={
             "source": "mixed-lowering-registry",
             "root_memory": root_memory,
-            "handoff": "root_memory",
+            "handoff": (
+                "target_plan_onchip_and_root"
+                if onchip_edges
+                else "root_memory"
+            ),
+            "onchip_handoff_count": len(onchip_edges),
             "cross_operator_dependency_count": len(cross_operator_dependencies),
             "registered_operator_types": list(active_registry.supported_types),
         },
@@ -303,4 +548,5 @@ def lower_mixed_graph(
             "cross_operator_dependency_count": len(cross_operator_dependencies),
             **statistics,
         },
+        payloads=payloads,
     )
