@@ -103,12 +103,27 @@ static/dynamic 的差异来自 policy；小图数据可以逐项核对。
 
 - [x] `MachineConfig` 按 operation/operand role 定义 EU、目标 memory 与合法 transfer route；
 - [x] minimal Matmul 映射到 DRAM/SRAM，lpu-like 映射到 LMB/RMB/PSB；
-- [x] 多 EU 搬运在 FC 形成独立 TISA stage，最终 TISA 与 BackendArtifact.program 一致；
+- [x] 多 EU 搬运在 FC 后的 Target Lowering 形成独立 TISA stage，最终 TISA 与
+      BackendArtifact.program 一致；
 - [x] `MemoryPlan` v2 保存 buffer/allocation、memory、alignment、layout/stride、slot、
       lifetime、alias 与 dependency-guarded reuse；
 - [x] Runtime 只按编译计划绑定基址，旧 package 诊断与 MachineConfig topology guard；
 - [x] 多 K/边界/strided Matmul、容量溢出、JSON round-trip、dynamic index/KV sequence、
       Attention 正式前端与 static/dynamic 同包验收。
+
+### FC / Target Lowering 抽象边界（已完成）
+
+- [x] FC Matmul 固定输出抽象 load/compute/store，不读取具体 memory、route hop 或 engine；
+- [x] 抽象 transfer 显式声明 source/destination、operand role、符号 buffer 和
+      Private/Local/Shared visibility/owner/domain；
+- [x] TISA Generator 独立输出 virtual TISA；
+- [x] `TargetPlan` 成为 memory placement、route/engine、target instruction/operand、
+      dependency expansion 与 abstract→target provenance 的单一来源；
+- [x] Matmul payload 直接从 TargetPlan 生成，删除 FC/lowering 双份 route grouping 和
+      stage-key 配对；
+- [x] backend 内部 scratch 在 allocation 前以 TargetPlan internal-resource declaration
+      显式登记；
+- [x] 同一 FC/virtual TISA 分别 lower 到 minimal 与 lpu-like，并覆盖 route/engine 变体。
 
 ### 进行中
 

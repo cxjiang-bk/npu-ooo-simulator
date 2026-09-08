@@ -202,7 +202,11 @@ class CompilerStageContractTest(unittest.TestCase):
 
         self.assertEqual(compiled.gc_artifact.to_dict()["paper_stage"], "GC")
         self.assertEqual(compiled.tisa_dialect.to_dict()["paper_stage"], "FC")
-        self.assertEqual(compiled.tisa_program.attributes["paper_stage"], "TISA_GENERATOR")
+        self.assertEqual(
+            compiled.virtual_tisa_program.attributes["paper_stage"],
+            "TISA_GENERATOR",
+        )
+        self.assertEqual(compiled.tisa_program.attributes["paper_stage"], "TARGET_LOWERING")
         self.assertEqual(compiled.validate(), ())
 
     def test_gc_dependency_provenance_reaches_backend_tasks_and_tisa(self) -> None:

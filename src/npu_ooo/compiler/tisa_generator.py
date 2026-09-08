@@ -20,11 +20,14 @@ class TISAGenerator:
             raise ValueError("TISA dialect is invalid: " + "; ".join(issues))
         return replace(
             dialect.program,
-            program_id=dialect.program.program_id.replace(".tisa-dialect", ".tisa"),
+            program_id=dialect.program.program_id.replace(
+                ".tisa-dialect", ".virtual-tisa"
+            ),
             attributes={
                 **dict(dialect.program.attributes),
                 "paper_stage": "TISA_GENERATOR",
                 "virtual_isa": "tisa-v1",
+                "target_materialized": False,
                 "source_dialect": "tisa",
                 "implementation": "python-semantic-proxy",
             },

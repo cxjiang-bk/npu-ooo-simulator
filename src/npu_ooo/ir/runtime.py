@@ -1398,10 +1398,11 @@ def create_runtime_submission(
                         f"target operand '{instruction.tisa_id}:{operand.name}' has no buffer_id"
                     )
                 binding = planned_buffer_lookup.get(operand.tile_mem.buffer_id)
-                if binding is not None and binding.memory != logical_scope:
+                if binding is not None and binding.memory != operand.tile_mem.physical_space:
                     raise ValueError(
                         f"compiled operand '{instruction.tisa_id}:{operand.name}' expects "
-                        f"memory '{logical_scope}', binding uses '{binding.memory}'"
+                        f"memory '{operand.tile_mem.physical_space}', binding uses "
+                        f"'{binding.memory}'"
                     )
             else:
                 binding = buffer_lookup.get((tensor, logical_scope))

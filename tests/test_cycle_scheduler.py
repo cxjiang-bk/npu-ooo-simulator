@@ -26,6 +26,8 @@ from npu_ooo.ir import (
     TISAInstruction,
     TISAOperand,
     TISAProgram,
+    TargetInstructionPlan,
+    TargetPlan,
     TileMem,
     UnitMap,
     create_runtime_submission,
@@ -592,6 +594,26 @@ class CycleSchedulerTest(unittest.TestCase):
                     ),
                 ),
             ),
+        )
+        target_plan = TargetPlan(
+            "micro.target-plan",
+            "micro.abstract",
+            "minimal",
+            minimal_machine_config().topology_hash(),
+            (
+                TargetInstructionPlan(
+                    "micro.abstract.a",
+                    program.program.instructions[0],
+                    "direct",
+                ),
+            ),
+            {"a": ("a@SRAM",)},
+            attributes={"target_program_id": program.program.program_id},
+        )
+        program = replace(
+            program,
+            program=target_plan.program,
+            target_plan=target_plan,
         )
         graph = OperatorGraph("micro", (TensorSpec("a", (4,)),), ())
         with tempfile.TemporaryDirectory() as directory:

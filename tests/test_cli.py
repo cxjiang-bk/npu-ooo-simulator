@@ -23,6 +23,8 @@ from npu_ooo.ir import (
     TISAInstruction,
     TISAOperand,
     TISAProgram,
+    TargetInstructionPlan,
+    TargetPlan,
     TileMem,
     UnitMap,
 )
@@ -206,22 +208,38 @@ class CompileAndSimCliTest(unittest.TestCase):
             edges=(),
         )
         input_mem = TileMem(
-            base="input",
-            scope="logical",
+            base="input@DRAM",
+            scope="Shared",
             tensor="input",
             offset_bytes=0,
             size_bytes=8,
             logical_starts=(0,),
             logical_shape=(4,),
+            memory_space="DRAM",
+            visibility="Shared",
+            role="input",
+            owner="input",
+            domain="program",
+            symbolic_buffer_id="symbolic.input.shared",
+            buffer_id="input@DRAM",
+            valid_bytes=8,
         )
         output_mem = TileMem(
-            base="output",
-            scope="logical",
+            base="output@DRAM",
+            scope="Shared",
             tensor="output",
             offset_bytes=0,
             size_bytes=8,
             logical_starts=(0,),
             logical_shape=(4,),
+            memory_space="DRAM",
+            visibility="Shared",
+            role="output",
+            owner="output",
+            domain="program",
+            symbolic_buffer_id="symbolic.output.shared",
+            buffer_id="output@DRAM",
+            valid_bytes=8,
         )
         instruction = TISAInstruction(
             tisa_id="copy.t0000",
@@ -249,13 +267,35 @@ class CompileAndSimCliTest(unittest.TestCase):
             ),
             duration_cycles=4,
         )
+        machine = minimal_machine_config()
+        target_plan = TargetPlan(
+            plan_id="cli.test.target-plan",
+            abstract_program_id="cli.test.abstract",
+            machine_config_id=machine.config_id,
+            machine_topology_hash=machine.topology_hash(),
+            instructions=(
+                TargetInstructionPlan(
+                    abstract_tisa_id="copy.abstract",
+                    instruction=instruction,
+                    expansion_kind="direct",
+                ),
+            ),
+            symbolic_buffer_map={
+                "symbolic.input.shared": ("input@DRAM",),
+                "symbolic.output.shared": ("output@DRAM",),
+            },
+            attributes={
+                "target_program_id": "cli.test.program",
+                "program_attributes": {},
+            },
+        )
         backend = BackendArtifact(
             artifact_id="cli.test.backend",
-            program=TISAProgram("cli.test.program", (instruction,)),
+            program=target_plan.program,
             execution_graph=ExecutionGraph("cli.test.execution", (task,)),
             payloads={"copy.t0000": ("copy.task",)},
+            target_plan=target_plan,
         )
-        machine = minimal_machine_config()
         backend = materialize_target_memory(graph, machine, backend)
         write_artifact_json(graph, root / "01_gc" / "canonical_graph.json")
         write_artifact_json(backend, root / "04_backend" / "backend_artifact.json")

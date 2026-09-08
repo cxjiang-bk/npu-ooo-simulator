@@ -34,7 +34,7 @@ class TISADialectProgram:
 
 
 class FusionCompiler:
-    """Specialize a GC TileGraph into scheduler-visible TISA dialect ops."""
+    """Specialize a GC TileGraph into symbolic TISA dialect operations."""
 
     name = "fusion-compiler-python-v1"
 
@@ -46,7 +46,6 @@ class FusionCompiler:
             artifact.graph,
             artifact.schedule,
             artifact.tile_graph,
-            machine,
             program_id=f"{artifact.graph.graph_id}.tisa-dialect",
         )
         program = replace(
@@ -64,6 +63,11 @@ class FusionCompiler:
                     "TileMem.strides_bytes",
                     "TileMem.stride_expr",
                     "TileMem.layout",
+                    "TileMem.visibility",
+                    "TileMem.role",
+                    "TileMem.owner",
+                    "TileMem.domain",
+                    "TileMem.symbolic_buffer_id",
                     "AccessType",
                     "Deps",
                     "UnitMap",
@@ -77,7 +81,8 @@ class FusionCompiler:
                 "paper_stage": "FC",
                 "compiler": self.name,
                 "input_contract": "software-scheduled semantic TileGraph",
-                "output_contract": "TISA dialect operations",
+                "output_contract": "symbolic target-independent TISA dialect operations",
+                "target_route_expansion": False,
             },
         )
         result_issues = result.validate()

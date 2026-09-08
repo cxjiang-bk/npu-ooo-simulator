@@ -9,10 +9,13 @@ but the device scheduler observes the instruction as one run-to-complete unit.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Mapping, TYPE_CHECKING
 
 from .execution import AccessType, ExecutionGraph
 from .memory import MemoryPlan
+
+if TYPE_CHECKING:
+    from .target import TargetPlan
 
 
 @dataclass(frozen=True)
@@ -27,6 +30,7 @@ class TileMem:
     base: str
     scope: str = "local"
     tensor: str | None = None
+    dtype: str = "fp16"
     offset_bytes: int | None = None
     size_bytes: int | None = None
     address_expr: str | None = None
@@ -35,9 +39,21 @@ class TileMem:
     layout: str = "dense"
     logical_starts: tuple[int, ...] | None = None
     logical_shape: tuple[int, ...] | None = None
+    memory_space: str | None = None
+    visibility: str | None = None
+    role: str | None = None
+    owner: str | None = None
+    domain: str | None = None
+    symbolic_buffer_id: str | None = None
     buffer_id: str | None = None
     allocation_id: str | None = None
     valid_bytes: int | None = None
+
+    @property
+    def physical_space(self) -> str:
+        """Return the target memory, falling back for legacy descriptors."""
+
+        return self.memory_space or self.scope
 
     def validate(self) -> tuple[str, ...]:
         issues: list[str] = []
@@ -45,6 +61,8 @@ class TileMem:
             issues.append("TISA TileMem base must not be empty")
         if not self.scope:
             issues.append("TISA TileMem scope must not be empty")
+        if not self.dtype:
+            issues.append("TISA TileMem dtype must not be empty")
         if self.offset_bytes is not None and self.offset_bytes < 0:
             issues.append("TISA TileMem offset_bytes must be non-negative")
         if self.size_bytes is not None and self.size_bytes <= 0:
@@ -53,6 +71,16 @@ class TileMem:
             issues.append("TISA TileMem buffer_id must not be blank")
         if self.allocation_id is not None and not self.allocation_id:
             issues.append("TISA TileMem allocation_id must not be blank")
+        for label, value in (
+            ("memory_space", self.memory_space),
+            ("visibility", self.visibility),
+            ("role", self.role),
+            ("owner", self.owner),
+            ("domain", self.domain),
+            ("symbolic_buffer_id", self.symbolic_buffer_id),
+        ):
+            if value is not None and not value.strip():
+                issues.append(f"TISA TileMem {label} must not be blank")
         if self.valid_bytes is not None and (
             self.valid_bytes <= 0
             or (self.size_bytes is not None and self.valid_bytes > self.size_bytes)
@@ -96,6 +124,7 @@ class TileMem:
             "base": self.base,
             "scope": self.scope,
             "tensor": self.tensor,
+            "dtype": self.dtype,
             "offset_bytes": self.offset_bytes,
             "size_bytes": self.size_bytes,
             "address_expr": self.address_expr,
@@ -104,6 +133,12 @@ class TileMem:
             "layout": self.layout,
             "logical_starts": list(self.logical_starts) if self.logical_starts is not None else None,
             "logical_shape": list(self.logical_shape) if self.logical_shape is not None else None,
+            "memory_space": self.memory_space,
+            "visibility": self.visibility,
+            "role": self.role,
+            "owner": self.owner,
+            "domain": self.domain,
+            "symbolic_buffer_id": self.symbolic_buffer_id,
             "buffer_id": self.buffer_id,
             "allocation_id": self.allocation_id,
             "valid_bytes": self.valid_bytes,
@@ -118,6 +153,7 @@ class TileMem:
                 base=str(payload["base"]),
                 scope=str(payload.get("scope", "local")),
                 tensor=(str(payload["tensor"]) if payload.get("tensor") is not None else None),
+                dtype=str(payload.get("dtype", "fp16")),
                 offset_bytes=(int(payload["offset_bytes"]) if payload.get("offset_bytes") is not None else None),
                 size_bytes=(int(payload["size_bytes"]) if payload.get("size_bytes") is not None else None),
                 address_expr=(str(payload["address_expr"]) if payload.get("address_expr") is not None else None),
@@ -136,6 +172,16 @@ class TileMem:
                 logical_shape=(
                     tuple(int(item) for item in payload["logical_shape"])
                     if payload.get("logical_shape") is not None
+                    else None
+                ),
+                memory_space=(str(payload["memory_space"]) if payload.get("memory_space") is not None else None),
+                visibility=(str(payload["visibility"]) if payload.get("visibility") is not None else None),
+                role=(str(payload["role"]) if payload.get("role") is not None else None),
+                owner=(str(payload["owner"]) if payload.get("owner") is not None else None),
+                domain=(str(payload["domain"]) if payload.get("domain") is not None else None),
+                symbolic_buffer_id=(
+                    str(payload["symbolic_buffer_id"])
+                    if payload.get("symbolic_buffer_id") is not None
                     else None
                 ),
                 buffer_id=(str(payload["buffer_id"]) if payload.get("buffer_id") is not None else None),
@@ -437,6 +483,7 @@ class BackendArtifact:
     backend: str = "analytical"
     attributes: Mapping[str, Any] = field(default_factory=dict)
     memory_plan: MemoryPlan | None = None
+    target_plan: TargetPlan | None = None
 
     def validate(self) -> tuple[str, ...]:
         issues = list(self.program.validate())
@@ -569,10 +616,10 @@ class BackendArtifact:
                         )
                         continue
                     target = planned[memory.buffer_id]
-                    if memory.scope != target.memory:
+                    if memory.physical_space != target.memory:
                         issues.append(
                             f"TISA operand '{instruction.tisa_id}:{operand.name}' memory "
-                            f"'{memory.scope}' differs from plan '{target.memory}'"
+                            f"'{memory.physical_space}' differs from plan '{target.memory}'"
                         )
                     if memory.allocation_id != target.allocation_id:
                         issues.append(
@@ -612,7 +659,7 @@ class BackendArtifact:
                         for region in regions:
                             covered = any(
                                 operand.tile_mem.buffer_id == region.buffer_id
-                                and operand.tile_mem.scope == region.memory
+                                and operand.tile_mem.physical_space == region.memory
                                 and operand.tile_mem.offset_bytes is not None
                                 and operand.tile_mem.size_bytes is not None
                                 and operand.tile_mem.offset_bytes <= region.offset_bytes
@@ -626,6 +673,17 @@ class BackendArtifact:
                                     f"TISA instruction '{instruction.tisa_id}' does not cover "
                                     f"payload access '{task_id}:{region.buffer_id}'"
                                 )
+        if self.target_plan is not None:
+            issues.extend(self.target_plan.validate())
+            target_program = self.target_plan.program
+            if target_program.to_dict() != self.program.to_dict():
+                issues.append("backend target plan program differs from final TISA program")
+            if (
+                self.memory_plan is not None
+                and self.target_plan.memory_plan is not None
+                and self.target_plan.memory_plan.to_dict() != self.memory_plan.to_dict()
+            ):
+                issues.append("backend TargetPlan and MemoryPlan disagree")
         return tuple(issues)
 
     def to_dict(self) -> dict[str, Any]:
@@ -637,6 +695,7 @@ class BackendArtifact:
             "backend": self.backend,
             "attributes": dict(self.attributes),
             "memory_plan": self.memory_plan.to_dict() if self.memory_plan is not None else None,
+            "target_plan": self.target_plan.to_dict() if self.target_plan is not None else None,
         }
 
     @classmethod
@@ -644,6 +703,8 @@ class BackendArtifact:
         if not isinstance(payload, Mapping):
             raise ValueError("backend artifact payload must be an object")
         try:
+            from .target import TargetPlan
+
             value = cls(
                 artifact_id=str(payload["artifact_id"]),
                 program=TISAProgram.from_dict(payload["program"]),
@@ -657,6 +718,11 @@ class BackendArtifact:
                 memory_plan=(
                     MemoryPlan.from_dict(payload["memory_plan"])
                     if payload.get("memory_plan") is not None
+                    else None
+                ),
+                target_plan=(
+                    TargetPlan.from_dict(payload["target_plan"])
+                    if payload.get("target_plan") is not None
                     else None
                 ),
             )

@@ -336,3 +336,33 @@ GC typed dependency 已完成，下一项转入 symbolic shape、dynamic index �
 - 兼容边界：Matmul 已具备专用 role placement；其他 operation 目前由 backend 通用
   root/local materialization 保证 TISA/payload/runtime 一致，尚未逐类加入专用多级 route。
   bank-aware placement、eviction/fragmentation、跨 core routing 和真实 memory timing 仍属后续。
+
+## 2026-09-07：FC 与 Target Lowering 边界修正
+
+- 上一版虽然统一了 MemoryPlan，但 FC 的 `_matmul_target_stages()` 已读取具体 route/EU，
+  Matmul lowering 又用 `_route_stage_keys()` 独立重复分组。本轮删除两处配对逻辑，将物理
+  route 展开完整后移到 CodegenBackend 内的 `TargetLowerer`。
+- FC Matmul 对不同 target 固定为 abstract load/compute/store。Load/store 同时声明 source
+  与 destination，TileMem 保存 operand role、symbolic buffer、Private/Local/Shared
+  visibility、owner/domain；FC 不再出现 GM/UB/LMB/RMB/PSB 或 GDMA/LDMA。
+- Generator 输出独立 `virtual_tisa_program.json`。`TargetPlan` 保存 abstract→target 映射、
+  每跳 source/destination/engine/transform、target operands、依赖展开和 provenance；最终
+  scheduler program 仍满足 `compiled.tisa_program == backend_artifact.program`。
+- Matmul payload 逐条读取 TargetPlan 生成。其他已有 lowerer 的 region 必须绑定到规划 operand
+  并通过覆盖校验；Softmax/Norm 等 backend-private scratch 在 allocation 前作为显式
+  internal-resource declaration 加入 TargetPlan。
+- 新增隔离测试：同一 GCArtifact/FC 输出在 minimal 与 lpu-like 完全一致，而 target plan
+  分别生成 3 条和 5 条 target TISA；添加 MID 中间存储和 AUX_DMA engine 时只改变
+  TargetPlan，FC 保持不变。另覆盖 abstract provenance、跨 hop 依赖及 TargetPlan JSON
+  round-trip。
+- 保留 MemoryPlan v2、容量/对齐、valid-bytes/span、alias/reuse hazard、Runtime binding、
+  topology guard、dynamic index/KV state 和 static/dynamic 同包契约。新验收产物使用
+  `out/fc-target-boundary-20260907/`，旧实验目录保留作历史对照。
+- 该职责划分是本项目的实现选择：论文支持符号 TileMem 与 target-specific generation，
+  但未公开 Epoch 内部 TargetPlan/allocation 的确切模块归属。
+- 验证：本地 `155 passed, 35 skipped, 51 subtests passed`；9980X-new 正式前端环境
+  `190 tests` 全部通过。真实 Attention 的 FC/virtual 指令数均为 14，lpu-like target
+  lowering 展开为 21 条，static/dynamic 均退休 21 条并共享完全相同的 runtime buffers；
+  compile package SHA256 均为
+  `0fec557838af564a90fc9bf8b4a500d2463d44b7d83f4cd02eedd88b47997b7d`，当前小图两种
+  policy 均为 560 cycles。

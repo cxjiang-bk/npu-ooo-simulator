@@ -6,9 +6,11 @@
 flowchart LR
     A[PyTorch nn.Module] --> B[torch.export + Torch-XLA + StableHLO]
     B --> C[GC: Canonical IR 与 TileGraph]
-    C --> D[FC: TISA 方言]
-    D --> E[目标 TISA、BackendArtifact 与 MemoryPlan]
-    E --> F[Runtime 基址绑定与提交]
+    C --> D[FC: 符号 TISA 方言]
+    D --> E[TISA Generator: 虚拟 TISA]
+    E --> I[Target Lowering: TargetPlan]
+    I --> J[最终 TISA、BackendArtifact 与 MemoryPlan]
+    J --> F[Runtime 基址绑定与提交]
     F --> G[Static / Dynamic device scheduler]
     G --> H[周期、stall、泳道图、Perfetto]
 ```
@@ -24,9 +26,10 @@ PyTorch nn.Module
   -> Graph Compiler (GC)
   -> Canonical OperatorGraph / Semantic TileGraph
   -> Fusion Compiler (FC)
-  -> TISA 方言
-  -> 逻辑 TISAProgram
-  -> 目标存储规划 / 最终 TISAProgram / BackendArtifact
+  -> 符号 TISA 方言
+  -> 虚拟 TISAProgram
+  -> TargetPlan / 目标 TISAProgram
+  -> Backend payload / MemoryPlan
   -> RuntimeSubmission
   -> TISA device scheduler
   -> 周期、泳道图和 Perfetto trace
@@ -42,11 +45,11 @@ ATen 到 StableHLO 的转换，项目维护 StableHLO semantic family 到 Canoni
 - Torch-XLA 生成 StableHLO，OpenXLA 官方 bindings 完成 MLIR parse/verify；
 - GC 完成 canonicalization、复合语义恢复、tile 切分、region/state 依赖和 locality
   metadata；
-- FC 输出带逻辑 operand、符号 TileMem、UnitMap、typed dependency 和 payload recipe 的
-  TISA 方言；TISA Generator 完成规范化，CodegenBackend 输出 scheduler 最终消费的
-  目标 `TISAProgram`；
-- `AnalyticalCodegenBackend` 依据 `MachineConfig` 将存储位置、搬运路径和有限容量落实为
-  最终 TISA、payload 与 `MemoryPlan`；
+- FC 输出带明确 source/destination、operand role、符号 buffer、Private/Local/Shared
+  visibility、抽象 UnitMap 和 typed dependency 的目标无关 TISA 方言；
+- TISA Generator 将其规范化为 `virtual_tisa_program.json`；CodegenBackend 内的 Target
+  Lowering 依据 `MachineConfig` 生成唯一 `TargetPlan`，再由该计划共同生成最终 TISA、
+  payload 与 `MemoryPlan`；
 - static 和 dynamic device policy 共享同一份编译产物、地址绑定和 timing source；
 - runtime 消费编译期 `MemoryPlan`，只绑定各地址空间基址、动态参数、command chunk、
   descriptor arrival 和同步；device scheduler
@@ -131,8 +134,10 @@ PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli simulate \
   --output-dir out/attention-wide-dynamic
 ```
 
-`compile` 的输出包含 `01_gc/canonical_graph.json`、`03_tisa/tisa_program.json`、
-`04_backend/backend_artifact.json`、`04_backend/memory_plan.json` 和
+`compile` 的输出包含 `01_gc/canonical_graph.json`、
+`03_tisa/virtual_tisa_program.json`、`03_tisa/tisa_program.json`、
+`04_backend/target_plan.json`、`04_backend/backend_artifact.json`、
+`04_backend/memory_plan.json` 和
 `04_backend/machine.json`。`simulate` 从这些文件
 恢复编译结果，只重新执行 runtime 地址绑定、动态参数解析和 device/backend timing。
 同一 compile package 可以被多个 `simulate` 命令复用。
@@ -141,7 +146,7 @@ PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli simulate \
 接受 `--policy`、`--runtime-*` 或 timing/event 选项。`simulate` 才选择 device policy、
 runtime policy、机器覆盖、timing provider 和输出目录。容量、带宽、时延和执行单元数量
 可以在兼容范围内覆盖；改变存储拓扑、搬运引擎、对齐或 operand placement 必须重新编译。
-缺少 `MemoryPlan` v2 的旧编译包会得到明确的重新编译诊断。
+缺少 `TargetPlan` v1 或 `MemoryPlan` v2 的旧编译包会得到明确的重新编译诊断。
 
 运行时动态参数使用 JSON manifest 传入：
 
@@ -176,7 +181,8 @@ runtime policy、机器覆盖、timing provider 和输出目录。容量、带�
 
 ```text
 compile_torch_module(...)
-  -> TISAProgram / BackendArtifact / MemoryPlan  # 编译期，保持不变
+  -> virtual TISA / TargetPlan / final TISA
+  -> BackendArtifact / MemoryPlan                # 编译期，保持不变
 allocate_memory_plan_bindings(...)
   -> RuntimeSubmission                   # invocation，绑定基址和动态参数
 schedule_tisa_program(...)
@@ -390,10 +396,12 @@ out/<run>/
 │   ├── tisa_dialect.json
 │   └── fc_diagnostics.json
 ├── 03_tisa/
+│   ├── virtual_tisa_program.json
 │   ├── tisa_program.json
 │   └── compiled_artifact.json
 ├── 04_backend/
 │   ├── backend_artifact.json
+│   ├── target_plan.json
 │   ├── memory_plan.json
 │   ├── execution_graph.{json,dot}
 │   └── machine.json
@@ -410,10 +418,12 @@ out/<run>/
 ```
 
 `generated.mlir` 展示 Torch-XLA 输出；`01_gc/pass_dumps/` 展示每个 GC pass 的输入、
-输出和诊断；`02_fc/tisa_dialect.json` 展示 FC 语义 op；`03_tisa/tisa_program.json`
-是 device scheduler 输入；`04_backend/backend_artifact.json` 展示每条 TISA instruction
-的 backend payload，`memory_plan.json` 保存各 memory space 的 buffer、allocation、slot、
-生命周期和复用关系。复合算子的内部 primitive 保留在 payload 和 lane trace 中。
+输出和诊断；`02_fc/tisa_dialect.json` 是不含 GM/UB/GDMA 等目标细节的符号方言；
+`03_tisa/virtual_tisa_program.json` 是 Generator 输出，`03_tisa/tisa_program.json` 是
+device scheduler 实际输入；`04_backend/target_plan.json` 保存 abstract→target 指令映射、
+route hop、engine、目标 operand 和 provenance，`memory_plan.json` 保存各 memory space 的
+buffer、allocation、slot、生命周期和复用关系。复合算子的内部 scratch 以 TargetPlan 的
+显式 internal-resource declaration 保存。
 
 Softmax 默认使用 materialized row-wise payload。`--softmax-algorithm online` 选择
 分析版 online state-chain：相邻 reduction tile 传递 `(max, sum)` 状态，TISA 语义边界

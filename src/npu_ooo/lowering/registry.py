@@ -120,6 +120,7 @@ def lower_mixed_graph(
     *,
     registry: LoweringRegistry | None = None,
     tile_graph: TileGraph | None = None,
+    target_plan: object | None = None,
 ) -> LoweringResult:
     """Lower a heterogeneous graph and connect explicit root-memory handoffs."""
 
@@ -136,11 +137,17 @@ def lower_mixed_graph(
     for operator_id in graph.topological_order():
         operator = operators[operator_id]
         lowerer = active_registry.lowerer_for(operator.normalized_type)
-        lowered = lowerer(
+        lowering_args = (
             _single_operator_graph(graph, operator_id),
             _single_operator_schedule(schedule, operator_id),
             machine,
         )
+        if operator.normalized_type in {"matmul", "batched_matmul", "gemv"}:
+            if target_plan is None:
+                raise ValueError("Matmul payload lowering requires a TargetPlan")
+            lowered = lowerer(*lowering_args, target_plan=target_plan)
+        else:
+            lowered = lowerer(*lowering_args)
         tasks.extend(lowered.execution_graph.tasks)
         for name, value in lowered.statistics.items():
             if name not in {"tile_count", "task_count"}:

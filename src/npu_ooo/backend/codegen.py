@@ -34,7 +34,7 @@ class AnalyticalCodegenBackend:
             calibration_status="analytical",
             attributes={
                 "payload": "ExecutionGraph",
-                "codegen_direction": "tilegraph->tisa->analytical-payload",
+                "codegen_direction": "virtual-tisa->target-plan->analytical-payload",
             },
         )
     )

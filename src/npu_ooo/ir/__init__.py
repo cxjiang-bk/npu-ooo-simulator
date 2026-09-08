@@ -20,6 +20,7 @@ from .index import DynamicIndexBinding, DynamicIndexExpr, IndexValue, resolve_dy
 from .dtype import canonical_dtype, dtype_bytes, is_known_dtype, known_dtype_names, normalize_dtype
 from .layout import LayoutInfo, resolve_layout, tensor_layout
 from .memory import MEMORY_PLAN_SCHEMA_VERSION, MemoryBuffer, MemoryPlan
+from .target import TARGET_PLAN_SCHEMA_VERSION, TargetInstructionPlan, TargetPlan
 from .tisa import (
     BackendArtifact,
     TISADependency,
@@ -72,6 +73,9 @@ __all__ = [
     "MEMORY_PLAN_SCHEMA_VERSION",
     "MemoryBuffer",
     "MemoryPlan",
+    "TARGET_PLAN_SCHEMA_VERSION",
+    "TargetInstructionPlan",
+    "TargetPlan",
     "resolve_layout",
     "tensor_layout",
     "BackendArtifact",

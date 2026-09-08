@@ -10,6 +10,7 @@ primitive belongs to exactly one stage.
 """
 
 from dataclasses import dataclass, replace
+import math
 from typing import Any, Mapping
 
 from npu_ooo.arch import MachineConfig
@@ -101,135 +102,14 @@ def _is_last_reduction_tile(tile: TileInstance, operator: Any) -> bool:
     return all(tile.bound_map[name][1] == extents[name] for name in reductions)
 
 
-def _matmul_target_stages(
-    operator: Any,
-    tile: TileInstance,
-    machine: MachineConfig,
-) -> tuple[TISAStage, ...] | None:
-    """Create target transfer boundaries from the placement contract.
-
-    These boundaries are derived before payload lowering.  In particular, a
-    multi-hop route that changes execution unit becomes multiple TISA stages;
-    the backend never has to infer a scheduler-visible boundary from tasks.
-    """
-
-    try:
-        placement = machine.placement("matmul")
-        roles = {
-            "lhs": placement.operand("lhs"),
-            "rhs": placement.operand("rhs"),
-            "output": placement.operand("output"),
-        }
-    except KeyError:
-        return None
-
-    stages: list[TISAStage] = []
-
-    def append_route_stages(direction: str, role_names: tuple[str, ...]) -> None:
-        route_edges = {
-            role: tuple(zip(roles[role].route, roles[role].route[1:]))
-            for role in role_names
-        }
-        maximum_hops = max((len(edges) for edges in route_edges.values()), default=0)
-        for hop in range(maximum_hops):
-            grouped: dict[str, list[dict[str, Any]]] = {}
-            for role in role_names:
-                edges = route_edges[role]
-                if hop >= len(edges):
-                    continue
-                source, target = edges[hop]
-                path = next(
-                    item
-                    for item in machine.transfer_paths
-                    if item.source == source and item.target == target
-                )
-                grouped.setdefault(path.engine, []).append(
-                    {
-                        "role": role,
-                        "source": source,
-                        "target": target,
-                        "transform": path.transform,
-                    }
-                )
-            for group_index, (engine, transfers) in enumerate(sorted(grouped.items())):
-                key = f"{direction}_hop_{hop:02d}_{group_index:02d}"
-                primitive = (
-                    str(transfers[0]["transform"])
-                    if len(transfers) == 1 and transfers[0]["transform"]
-                    else "load" if direction == "input" else "store"
-                )
-                stages.append(
-                    TISAStage(
-                        key=key,
-                        primitive=primitive,
-                        unit_map=UnitMap(engine, affinity="data"),
-                        ordinal=len(stages),
-                        attributes={
-                            "tisa_stage": key,
-                            "primitive": primitive,
-                            "semantic_op": operator.normalized_type,
-                            "transfer_direction": direction,
-                            "transfers": transfers,
-                            "payload_primitives": sorted(
-                                {
-                                    str(item["transform"])
-                                    if item["transform"]
-                                    else "load" if direction == "input" else "store"
-                                    for item in transfers
-                                }
-                            ),
-                        },
-                        payload_primitives=tuple(
-                            sorted(
-                                {
-                                    str(item["transform"])
-                                    if item["transform"]
-                                    else "load" if direction == "input" else "store"
-                                    for item in transfers
-                                }
-                            )
-                        ),
-                    )
-                )
-
-    append_route_stages("input", ("lhs", "rhs"))
-    stages.append(
-        TISAStage(
-            key="compute",
-            primitive="matmul",
-            unit_map=UnitMap(placement.unit, affinity="matrix"),
-            ordinal=len(stages),
-            attributes={
-                "tisa_stage": "compute",
-                "primitive": "matmul",
-                "semantic_op": operator.normalized_type,
-                "operand_placement": {
-                    role: roles[role].memory for role in ("lhs", "rhs", "output")
-                },
-                "payload_primitives": ["matmul"],
-            },
-            payload_primitives=("matmul",),
-        )
-    )
-    if _is_last_reduction_tile(tile, operator):
-        append_route_stages("output", ("output",))
-    return tuple(stages)
-
-
 def _stages_for_tile(
     operator: Any,
     tile: TileInstance,
-    machine: MachineConfig,
 ) -> tuple[TISAStage, ...]:
     op_type = operator.normalized_type
     stages: list[tuple[str, str]] = []
     if op_type in {"matmul", "batched_matmul", "gemv"}:
-        target_stages = _matmul_target_stages(operator, tile, machine)
-        if target_stages is not None:
-            return target_stages
         stages.append(("load", "load"))
-        if operator.attributes.get("rhs_transposed"):
-            stages.append(("load_transpose", "load_transpose"))
         stages.append(("compute", "matmul"))
         if _is_last_reduction_tile(tile, operator):
             stages.append(("store", "store"))
@@ -348,6 +228,13 @@ def _stages_for_tile(
                 "tisa_stage": key,
                 "primitive": primitive,
                 "semantic_op": op_type,
+                **(
+                    {"logical_transforms": {"rhs": "transpose"}}
+                    if op_type in {"matmul", "batched_matmul", "gemv"}
+                    and key == "load"
+                    and operator.attributes.get("rhs_transposed")
+                    else {}
+                ),
                 "payload_primitives": list(payload_for_stage(key, primitive)),
                 **state_attributes,
                 **(
@@ -556,15 +443,22 @@ def _operand_geometry(
                     return (0,) * len(full_shape), tuple(int(value) for value in sizes)
             starts = operator.attributes.get("slice_starts")
             limits = operator.attributes.get("slice_limits")
+            strides = operator.attributes.get("slice_strides")
             if (
                 isinstance(starts, (tuple, list))
                 and isinstance(limits, (tuple, list))
+                and isinstance(strides, (tuple, list))
                 and len(starts) == len(full_shape)
                 and len(limits) == len(full_shape)
+                and len(strides) == len(full_shape)
             ):
                 return (
                     tuple(int(value) for value in starts),
-                    tuple(int(limit) - int(start) for start, limit in zip(starts, limits)),
+                    tuple(
+                        (int(limit) - int(start) + int(stride) - 1)
+                        // int(stride)
+                        for start, limit, stride in zip(starts, limits, strides)
+                    ),
                 )
             return (0,) * len(full_shape), full_shape
         return None
@@ -742,7 +636,28 @@ def _operand_geometry(
                 return (0,) * len(update_shape), update_shape
         return (0,) * len(full_shape), full_shape
 
-    if op_type in {"reshape", "transpose"}:
+    if op_type == "transpose":
+        full_shape = _resolved_tensor_shape(tensor)
+        permutation = operator.attributes.get("transpose_dims")
+        if (
+            full_shape is None
+            or not isinstance(permutation, (tuple, list))
+            or len(permutation) != len(full_shape)
+        ):
+            return None
+        output_starts, output_shape = _dim_geometry(bounds, iteration)
+        if name == operator.outputs[0]:
+            return output_starts, output_shape
+        if name == operator.inputs[0]:
+            source_starts = [0] * len(permutation)
+            source_shape = [0] * len(permutation)
+            for output_axis, source_axis in enumerate(permutation):
+                source_starts[int(source_axis)] = output_starts[output_axis]
+                source_shape[int(source_axis)] = output_shape[output_axis]
+            return tuple(source_starts), tuple(source_shape)
+        return None
+
+    if op_type == "reshape":
         full_shape = _resolved_tensor_shape(tensor)
         if full_shape is None:
             return None
@@ -763,57 +678,204 @@ def _operand_geometry(
     return None
 
 
+def _abstract_operand_role(operator: Any, tensor_name: str) -> str:
+    if operator.normalized_type in {"matmul", "batched_matmul", "gemv"}:
+        if tensor_name == operator.inputs[0]:
+            return "lhs"
+        if len(operator.inputs) > 1 and tensor_name == operator.inputs[1]:
+            return "rhs"
+        if tensor_name in operator.outputs:
+            return "output"
+    state_buffer = operator.attributes.get("state_buffer")
+    if tensor_name == state_buffer:
+        return "state"
+    if tensor_name in operator.outputs:
+        return "output" if len(operator.outputs) == 1 else f"output{operator.outputs.index(tensor_name)}"
+    if tensor_name in operator.inputs:
+        index = operator.inputs.index(tensor_name)
+        return "input" if len(operator.inputs) == 1 else f"input{index}"
+    return "operand"
+
+
+def _abstract_local_buffer_id(
+    operator: Any,
+    tile: TileInstance,
+    role: str,
+    *,
+    is_output: bool,
+) -> str:
+    if is_output and operator.reduction_dims:
+        coordinates = ".".join(
+            str(tile.bound_map[name][0]) for name, _extent in operator.iteration_dims
+        )
+        return f"symbolic.{operator.op_id}.{role}.{coordinates or 'scalar'}"
+    return f"symbolic.{tile.tile_id}.{role}"
+
+
+def _packed_strides(shape: tuple[int, ...], dtype: str) -> tuple[int, ...]:
+    stride = _dtype_bytes(dtype)
+    result: list[int] = []
+    for extent in reversed(shape):
+        result.append(stride)
+        stride *= extent
+    return tuple(reversed(result))
+
+
+def _abstract_operand(
+    operator: Any,
+    tile: TileInstance,
+    tensor: Any,
+    tensors: Mapping[str, Any],
+    *,
+    role: str,
+    access: AccessType,
+    visibility: str,
+    domain: str,
+    is_output: bool,
+    suffix: str,
+) -> TISAOperand:
+    geometry = _operand_geometry(operator, tile, tensor, tensors)
+    operand_shape = geometry[1] if geometry is not None else tuple(
+        stop - start for _name, start, stop in tile.bounds
+    ) or (1,)
+    valid_bytes = math.prod(operand_shape) * _dtype_bytes(tensor.dtype)
+    if visibility == "Shared":
+        buffer_id = f"symbolic.{tensor.name}.shared"
+        dense_region = _dense_region(tensor, *geometry) if geometry is not None else None
+        offset_bytes = dense_region[0] if dense_region is not None else None
+        size_bytes = dense_region[1] if dense_region is not None else None
+        strides_bytes = _tensor_strides_bytes(tensor)
+        if (
+            operator.normalized_type == "slice"
+            and tensor.name == operator.inputs[0]
+            and isinstance(operator.attributes.get("slice_strides"), (tuple, list))
+            and strides_bytes is not None
+        ):
+            strides_bytes = tuple(
+                stride * int(step)
+                for stride, step in zip(
+                    strides_bytes, operator.attributes["slice_strides"]
+                )
+            )
+            layout_info = tensor_layout(tensor)
+            if geometry is not None:
+                interval = layout_info.interval(
+                    geometry[0], geometry[1], strides_bytes=strides_bytes
+                )
+                if interval is not None:
+                    offset_bytes, size_bytes = interval
+        layout = _tensor_layout(tensor)
+        owner = tensor.name
+    else:
+        buffer_id = _abstract_local_buffer_id(
+            operator, tile, role, is_output=is_output
+        )
+        offset_bytes = 0
+        size_bytes = valid_bytes
+        strides_bytes = _packed_strides(operand_shape, tensor.dtype)
+        layout = "packed"
+        owner = operator.op_id if visibility == "Local" else tile.tile_id
+    return TISAOperand(
+        name=f"{role}.{suffix}",
+        tile_shape=operand_shape,
+        tile_mem=TileMem(
+            base=buffer_id,
+            scope=(
+                "program"
+                if visibility == "Shared"
+                else f"operator:{operator.op_id}"
+                if visibility == "Local"
+                else f"tile:{tile.tile_id}"
+            ),
+            tensor=tensor.name,
+            dtype=tensor.dtype,
+            offset_bytes=offset_bytes,
+            size_bytes=size_bytes,
+            address_expr=_dynamic_address_expression(
+                operator, tensor.name, geometry
+            ),
+            strides_bytes=strides_bytes,
+            stride_expr=_stride_expression(strides_bytes),
+            layout=layout,
+            logical_starts=geometry[0] if geometry is not None else None,
+            logical_shape=geometry[1] if geometry is not None else None,
+            visibility=visibility,
+            role=role,
+            owner=owner,
+            domain=domain,
+            symbolic_buffer_id=buffer_id,
+            buffer_id=buffer_id,
+            valid_bytes=valid_bytes,
+        ),
+        access_type=access,
+    )
+
+
 def _stage_operands(
     operator: Any,
     tile: TileInstance,
     stage: TISAStage,
     tensors: Mapping[str, Any],
 ) -> tuple[TISAOperand, ...]:
-    is_load = stage.primitive in {"load", "load_transpose"}
-    is_store = stage.primitive == "store"
-    names: list[tuple[str, AccessType]] = []
-    if not is_store:
-        names.extend((name, AccessType.READ) for name in operator.inputs)
-    if not is_load:
-        names.extend((name, AccessType.WRITE) for name in operator.outputs)
-    if not names:
-        names.append((operator.outputs[0], AccessType.WRITE))
     operands: list[TISAOperand] = []
-    seen: set[tuple[str, str]] = set()
-    for index, (name, access) in enumerate(names):
-        key = (name, access.value)
-        if key in seen:
-            continue
-        seen.add(key)
-        tensor = tensors[name]
-        geometry = _operand_geometry(operator, tile, tensor, tensors)
-        operand_shape = geometry[1] if geometry is not None else tuple(
-            stop - start for _name, start, stop in tile.bounds
-        ) or (1,)
-        dense_region = _dense_region(tensor, *geometry) if geometry is not None else None
-        offset_bytes = dense_region[0] if dense_region is not None else None
-        size_bytes = dense_region[1] if dense_region is not None else None
-        strides_bytes = _tensor_strides_bytes(tensor)
+    compute_domain = (
+        "tensor"
+        if operator.normalized_type in {"matmul", "batched_matmul", "gemv", "conv2d"}
+        else "vector"
+    )
+
+    def append(
+        name: str,
+        access: AccessType,
+        visibility: str,
+        suffix: str,
+    ) -> None:
+        role = _abstract_operand_role(operator, name)
+        is_output = name in operator.outputs
         operands.append(
-            TISAOperand(
-                name=f"{name}:{access.value}:{index}",
-                tile_shape=operand_shape,
-                tile_mem=TileMem(
-                    base=name,
-                    scope="logical",
-                    tensor=name,
-                    offset_bytes=offset_bytes,
-                    size_bytes=size_bytes,
-                    address_expr=_dynamic_address_expression(operator, name, geometry),
-                    strides_bytes=strides_bytes,
-                    stride_expr=_stride_expression(strides_bytes),
-                    layout=_tensor_layout(tensor),
-                    logical_starts=geometry[0] if geometry is not None else None,
-                    logical_shape=geometry[1] if geometry is not None else None,
-                ),
-                access_type=access,
+            _abstract_operand(
+                operator,
+                tile,
+                tensors[name],
+                tensors,
+                role=role,
+                access=access,
+                visibility=visibility,
+                domain="program" if visibility == "Shared" else compute_domain,
+                is_output=is_output,
+                suffix=suffix,
             )
         )
+
+    if stage.key == "load":
+        for name in operator.inputs:
+            append(name, AccessType.READ, "Shared", "source")
+            append(name, AccessType.WRITE, "Private", "tile")
+    elif stage.key == "store":
+        for name in operator.outputs:
+            local_visibility = "Local" if operator.reduction_dims else "Private"
+            append(name, AccessType.READ, local_visibility, "tile")
+            append(name, AccessType.WRITE, "Shared", "destination")
+    elif stage.key == "compute":
+        for name in operator.inputs:
+            append(name, AccessType.READ, "Private", "tile")
+        for name in operator.outputs:
+            local_visibility = "Local" if operator.reduction_dims else "Private"
+            access = (
+                AccessType.READ_WRITE
+                if operator.reduction_dims
+                and not _is_first_reduction_tile(tile, operator)
+                else AccessType.WRITE
+            )
+            append(name, access, local_visibility, "tile")
+    else:
+        # A transform/gather is itself an abstract transfer.  It explicitly
+        # names both externally visible ends; target lowering may introduce
+        # internal copies or scratch declarations later.
+        for name in operator.inputs:
+            append(name, AccessType.READ, "Shared", "source")
+        for name in operator.outputs:
+            append(name, AccessType.WRITE, "Shared", "destination")
     return tuple(operands)
 
 
@@ -825,17 +887,15 @@ class TISASemanticBuilder:
         graph: OperatorGraph,
         schedule: ScheduleSpec,
         tile_graph: TileGraph,
-        machine: MachineConfig,
         *,
         program_id: str,
     ) -> TISAProgram:
         graph_issues = graph.validate()
         schedule_issues = schedule.validate(graph)
         tile_issues = tile_graph.validate()
-        machine_issues = machine.validate()
-        if graph_issues or schedule_issues or tile_issues or machine_issues:
+        if graph_issues or schedule_issues or tile_issues:
             raise ValueError(
-                "; ".join((*graph_issues, *schedule_issues, *tile_issues, *machine_issues))
+                "; ".join((*graph_issues, *schedule_issues, *tile_issues))
             )
         operators = {operator.op_id: operator for operator in graph.operators}
         tensors = {tensor.name: tensor for tensor in graph.tensors}
@@ -846,7 +906,7 @@ class TISASemanticBuilder:
         for order, tile_id in enumerate(tile_graph.topological_order()):
             tile = tiles[tile_id]
             operator = operators[tile.operator_id]
-            for stage in _stages_for_tile(operator, tile, machine):
+            for stage in _stages_for_tile(operator, tile):
                 tisa_id = f"tisa.{tile_id}.s{stage.ordinal:02d}"
                 stage_map[(tile_id, stage.key)] = stage
                 source_order[tisa_id] = order * 100 + stage.ordinal
@@ -869,7 +929,8 @@ class TISASemanticBuilder:
                             "semantic_tile_id": tile_id,
                             "semantic_op_type": operator.normalized_type,
                             "paper_stage": "FC",
-                            "scheduler_visible": True,
+                            "scheduler_visible": False,
+                            "target_expansion_required": True,
                             "readiness_condition": _readiness_condition(stage),
                             "source_program_order": source_order[tisa_id],
                         },
@@ -928,7 +989,7 @@ class TISASemanticBuilder:
             return f"tisa.{tile_id}.s{stage.ordinal:02d}"
 
         for tile in tile_graph.tiles:
-            stages = _stages_for_tile(operators[tile.operator_id], tile, machine)
+            stages = _stages_for_tile(operators[tile.operator_id], tile)
             for previous, current in zip(stages, stages[1:]):
                 add_dependency(
                     instruction_id(tile.tile_id, current.key),
@@ -947,8 +1008,8 @@ class TISASemanticBuilder:
         for dependency in tile_graph.dependencies:
             producer = tiles[dependency.producer]
             consumer = tiles[dependency.consumer]
-            producer_stages = _stages_for_tile(operators[producer.operator_id], producer, machine)
-            consumer_stages = _stages_for_tile(operators[consumer.operator_id], consumer, machine)
+            producer_stages = _stages_for_tile(operators[producer.operator_id], producer)
+            consumer_stages = _stages_for_tile(operators[consumer.operator_id], consumer)
             if dependency.kind in {"state", "accumulate"}:
                 producer_stage = next(
                     (stage for stage in producer_stages if stage.key == "compute"),
@@ -1127,8 +1188,8 @@ class TISASemanticBuilder:
             instructions=tuple(ordered),
             attributes={
                 "source": "tile-graph-semantic-builder",
-                "scheduler_granularity": "tisa_tile",
-                "codegen_direction": "tilegraph->tisa->backend-payload",
+                "descriptor_granularity": "abstract_tile_stage",
+                "codegen_direction": "tilegraph->symbolic-tisa->target-lowering",
             },
         )
         issues = program.validate()
@@ -1150,20 +1211,27 @@ class AnalyticalBackendCodegen:
         program: TISAProgram,
         registry: LoweringRegistry | None = None,
     ) -> BackendArtifact:
+        from npu_ooo.backend.target_lowering import default_target_lowerer
+
+        target_plan = default_target_lowerer().lower(
+            graph, schedule, tile_graph, machine, program
+        )
+        program = target_plan.program
         lowering = lower_mixed_graph(
             graph,
             schedule,
             machine,
             registry=registry or default_lowering_registry(),
             tile_graph=tile_graph,
+            target_plan=target_plan,
         )
         tasks_by_stage: dict[tuple[str, str], list[ExecutionTask]] = {}
-        tasks_by_explicit_stage: dict[tuple[str, str], list[ExecutionTask]] = {}
+        tasks_by_target: dict[str, list[ExecutionTask]] = {}
         for task in lowering.execution_graph.tasks:
             tasks_by_stage.setdefault((task.tile_id, task.primitive), []).append(task)
-            stage_key = task.attributes.get("tisa_stage_key")
-            if isinstance(stage_key, str) and stage_key:
-                tasks_by_explicit_stage.setdefault((task.tile_id, stage_key), []).append(task)
+            target_tisa_id = task.attributes.get("target_tisa_id")
+            if isinstance(target_tisa_id, str) and target_tisa_id:
+                tasks_by_target.setdefault(target_tisa_id, []).append(task)
         payloads: dict[str, tuple[str, ...]] = {}
         consumed: set[str] = set()
         original_tasks = {task.task_id: task for task in lowering.execution_graph.tasks}
@@ -1174,7 +1242,7 @@ class AnalyticalBackendCodegen:
             semantic_op = str(instruction.attributes.get("semantic_op_type", ""))
             explicit_candidates = tuple(
                 task
-                for task in tasks_by_explicit_stage.get((instruction.tile_id, stage), ())
+                for task in tasks_by_target.get(instruction.tisa_id, ())
                 if task.task_id not in consumed
             )
             if explicit_candidates:
@@ -1224,7 +1292,11 @@ class AnalyticalBackendCodegen:
                 continue
 
             primitive = str(instruction.attributes.get("primitive", ""))
-            candidates = tuple(tasks_by_stage.get((instruction.tile_id, primitive), ()))
+            candidates = tuple(
+                task
+                for task in tasks_by_stage.get((instruction.tile_id, primitive), ())
+                if task.task_id not in consumed
+            )
             if not candidates:
                 raise ValueError(
                     f"analytical backend has no payload for TISA instruction '{instruction.tisa_id}' "
@@ -1242,16 +1314,50 @@ class AnalyticalBackendCodegen:
                 + ", ".join(unbound[:8])
             )
 
-        execution_graph = lowering.execution_graph
+        instruction_by_id = {
+            instruction.tisa_id: instruction for instruction in program.instructions
+        }
+        owner_by_task = {
+            task_id: tisa_id
+            for tisa_id, task_ids in payloads.items()
+            for task_id in task_ids
+        }
+        execution_graph = replace(
+            lowering.execution_graph,
+            tasks=tuple(
+                replace(
+                    task,
+                    attributes={
+                        **dict(task.attributes),
+                        "target_tisa_id": owner_by_task[task.task_id],
+                        "abstract_tisa_id": instruction_by_id[
+                            owner_by_task[task.task_id]
+                        ].attributes.get("abstract_tisa_id"),
+                    },
+                )
+                for task in lowering.execution_graph.tasks
+            ),
+            attributes={
+                **dict(lowering.execution_graph.attributes),
+                "target_plan_id": target_plan.plan_id,
+            },
+        )
+        from npu_ooo.backend.target_lowering import declare_internal_resources
+
+        target_plan = declare_internal_resources(
+            target_plan, graph, execution_graph, payloads
+        )
+        program = target_plan.program
         artifact = BackendArtifact(
-            artifact_id=f"{graph.graph_id}.analytical-tisa-dialect",
+            artifact_id=f"{graph.graph_id}.{machine.config_id}.analytical-target",
             program=program,
             execution_graph=execution_graph,
             payloads=payloads,
             backend="analytical",
+            target_plan=target_plan,
             attributes={
                 "calibration_status": "analytical",
-                "codegen_direction": "tilegraph->tisa->analytical-payload",
+                "codegen_direction": "virtual-tisa->target-plan->analytical-payload",
                 "lowering_statistics": lowering.statistics,
             },
         )

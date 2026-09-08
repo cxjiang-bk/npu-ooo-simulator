@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Any, Mapping
+from typing import Any
 
 from npu_ooo.arch import MachineConfig
 from npu_ooo.ir import (
@@ -193,89 +193,50 @@ def _matmul_regions(operator: OperatorSpec, tensors: dict[str, Any], tile: TileI
     return left_region, right_region, output_region, red_shape
 
 
-def _valid_bytes(region: BufferRegion) -> int:
-    return region.elements * dtype_bytes(region.dtype)
-
-
-def _packed_strides(shape: tuple[int, ...], element_size: int) -> tuple[int, ...]:
-    stride = element_size
-    result: list[int] = []
-    for extent in reversed(shape):
-        result.append(stride)
-        stride *= extent
-    return tuple(reversed(result))
-
-
-def _placed_region(
-    region: BufferRegion,
-    *,
-    memory: str,
-    buffer_id: str,
+def _operand_region(
+    operand: Any,
+    tensor: Any,
     access: AccessType,
-    role: str,
-    slot: int | None,
-    packed: bool,
 ) -> BufferRegion:
-    valid_bytes = _valid_bytes(region)
+    memory = operand.tile_mem
+    if memory.memory_space is None or memory.buffer_id is None:
+        raise ValueError(f"target operand '{operand.name}' is not materialized")
+    if memory.logical_starts is None or memory.logical_shape is None:
+        starts = (0,) * len(operand.tile_shape)
+        shape = operand.tile_shape
+    else:
+        starts = memory.logical_starts
+        shape = memory.logical_shape
+    valid_bytes = memory.valid_bytes or math.prod(shape) * dtype_bytes(tensor.dtype)
     return BufferRegion(
-        tensor=region.tensor,
-        memory=memory,
-        shape=region.shape,
-        starts=region.starts,
-        dtype=region.dtype,
+        tensor=tensor.name,
+        memory=memory.memory_space,
+        shape=shape,
+        starts=starts,
+        dtype=tensor.dtype,
         access=access,
-        offset_bytes=0 if packed else region.offset_bytes,
-        size_bytes=valid_bytes if packed else region.size_bytes,
-        layout="packed" if packed else region.layout,
-        strides_bytes=(
-            _packed_strides(region.shape, dtype_bytes(region.dtype))
-            if packed
-            else region.strides_bytes
-        ),
-        buffer_id=buffer_id,
+        offset_bytes=memory.offset_bytes or 0,
+        size_bytes=memory.size_bytes or valid_bytes,
+        layout=memory.layout,
+        strides_bytes=memory.strides_bytes,
+        buffer_id=memory.buffer_id,
         valid_bytes=valid_bytes,
         attributes={
-            "operand_role": role,
-            "slot": slot,
-            "range_semantics": "packed_valid_bytes" if packed else "source_bounding_span",
+            "operand_role": memory.role,
+            "symbolic_buffer_id": memory.symbolic_buffer_id,
+            "target_plan_operand": operand.name,
         },
     )
-
-
-def _route_stage_keys(
-    machine: MachineConfig,
-    routes: Mapping[str, tuple[str, ...]],
-    direction: str,
-) -> dict[tuple[str, int], str]:
-    """Mirror the FC route grouping without coupling lowering to FC tasks."""
-
-    result: dict[tuple[str, int], str] = {}
-    maximum_hops = max((len(route) - 1 for route in routes.values()), default=0)
-    for hop in range(maximum_hops):
-        engines = sorted(
-            {
-                _path(machine, route[hop], route[hop + 1]).engine
-                for route in routes.values()
-                if hop + 1 < len(route)
-            }
-        )
-        engine_index = {engine: index for index, engine in enumerate(engines)}
-        for role, route in routes.items():
-            if hop + 1 >= len(route):
-                continue
-            engine = _path(machine, route[hop], route[hop + 1]).engine
-            result[(role, hop)] = (
-                f"{direction}_hop_{hop:02d}_{engine_index[engine]:02d}"
-            )
-    return result
 
 
 def lower_matmul_graph(
     graph: OperatorGraph,
     schedule: ScheduleSpec,
     machine: MachineConfig,
+    *,
+    target_plan: Any,
 ) -> LoweringResult:
-    """Lower every matmul in a resolved graph into load/compute/store tasks."""
+    """Generate Matmul payload tasks directly from ``TargetPlan``."""
 
     graph_issues = graph.validate()
     schedule_issues = schedule.validate(graph)
@@ -283,283 +244,152 @@ def lower_matmul_graph(
     if graph_issues or schedule_issues or machine_issues:
         raise ValueError("; ".join((*graph_issues, *schedule_issues, *machine_issues)))
     tensors = {tensor.name: tensor for tensor in graph.tensors}
-    root = _root_memory(machine)
-    try:
-        placement = machine.placement("matmul")
-        role_placements = {
-            role: placement.operand(role) for role in ("lhs", "rhs", "output")
-        }
-    except KeyError as exc:
-        raise ValueError(
-            f"machine '{machine.config_id}' has no explicit matmul operand placement"
-        ) from exc
+    operators = {operator.op_id: operator for operator in graph.operators}
+    target_instructions = tuple(
+        item.instruction
+        for item in target_plan.instructions
+        if item.instruction.operator_id in operators
+    )
+    by_target: dict[str, list[str]] = {}
     tasks: list[ExecutionTask] = []
-    producer_stores: dict[str, list[tuple[BufferRegion, str]]] = {}
-    compute_by_output: dict[tuple[str, tuple[int, ...]], list[tuple[int, str]]] = {}
-    task_order = 0
+    transfer_bytes = 0
     total_macs = 0
-    total_transfer_bytes = 0
+    program_order = 0
 
-    for operator_id in graph.topological_order():
-        operator = next(operator for operator in graph.operators if operator.op_id == operator_id)
-        if operator.normalized_type not in {"matmul", "batched_matmul", "gemv"}:
-            raise NotImplementedError(f"no matmul lowering for operator type '{operator.normalized_type}'")
-        op_schedule = schedule.for_operator(operator_id)
-        tiles = []
-        # Reuse the canonical tile expansion order from TileGraph.
-        from npu_ooo.ir.tile import enumerate_operator_tiles
-
-        tiles.extend(enumerate_operator_tiles(operator, op_schedule))
-        ping_pong = op_schedule.attributes.get("ping_pong", {})
-        slot_count = int(ping_pong.get("buffer_count", 1)) if isinstance(ping_pong, Mapping) else 1
-        slot_count = max(1, slot_count)
-        output_keys = sorted(
-            {
-                tuple(
-                    tile.bound_map[name][0]
-                    for name, _extent in operator.iteration_dims
-                )
-                for tile in tiles
-            }
+    def predecessor_tasks(instruction: Any) -> tuple[str, ...]:
+        return tuple(
+            task_id
+            for dependency in instruction.dependencies
+            for task_id in by_target.get(dependency.source, ())
         )
-        output_slots = {
-            key: index % slot_count for index, key in enumerate(output_keys)
-        }
-        input_routes = {
-            role: role_placements[role].route for role in ("lhs", "rhs")
-        }
-        output_routes = {"output": role_placements["output"].route}
-        input_stage_keys = _route_stage_keys(machine, input_routes, "input")
-        output_stage_keys = _route_stage_keys(machine, output_routes, "output")
-        reduction_name = operator.reduction_dims[0][0]
-        output_dims = tuple(name for name, _ in operator.iteration_dims)
-        for tile in tiles:
-            left, right, output, reduction_shape = _matmul_regions(operator, tensors, tile)
-            tile_prefix = tile.tile_id
-            input_slot = tile.ordinal % slot_count
-            output_key = (operator_id, tuple(tile.bound_map[name][0] for name in output_dims))
-            output_slot = output_slots[output_key[1]]
-            base_regions = {"lhs": left, "rhs": right, "output": output}
 
-            final_input_tasks: list[str] = []
-            for role in ("lhs", "rhs"):
-                route = role_placements[role].route
-                source_region = _placed_region(
-                    base_regions[role],
-                    memory=route[0],
-                    buffer_id=f"{base_regions[role].tensor}@{route[0]}",
-                    access=AccessType.READ,
-                    role=role,
-                    slot=None,
-                    packed=False,
+    for instruction in target_instructions:
+        operator = operators[instruction.operator_id]
+        if operator.normalized_type not in {"matmul", "batched_matmul", "gemv"}:
+            continue
+        operands = {operand.name: operand for operand in instruction.operands}
+        task_ids: list[str] = []
+        transfer_pairs = instruction.attributes.get("transfer_pairs", ())
+        if transfer_pairs:
+            for index, pair in enumerate(transfer_pairs):
+                source = operands[str(pair["source_operand"])]
+                destination = operands[str(pair["destination_operand"])]
+                source_region = _operand_region(
+                    source, tensors[source.tile_mem.tensor], AccessType.READ
                 )
-                predecessors = {
-                    store_id
-                    for produced_region, store_id in producer_stores.get(source_region.tensor, [])
-                    if _regions_overlap(produced_region, source_region)
-                }
-                previous_id: str | None = None
-                for hop, (source, target) in enumerate(zip(route, route[1:])):
-                    destination = _placed_region(
-                        base_regions[role],
-                        memory=target,
-                        buffer_id=f"{operator_id}.{role}.slot{input_slot}@{target}",
-                        access=AccessType.WRITE,
-                        role=role,
-                        slot=input_slot,
-                        packed=role_placements[role].layout == "packed",
+                destination_region = _operand_region(
+                    destination,
+                    tensors[destination.tile_mem.tensor],
+                    AccessType.WRITE,
+                )
+                size = int(pair["valid_bytes"])
+                duration, interval, resource = _transfer_timing(
+                    machine,
+                    source.tile_mem.memory_space,
+                    destination.tile_mem.memory_space,
+                    size,
+                )
+                task_id = f"{instruction.tisa_id}.payload{index:02d}"
+                task_ids.append(task_id)
+                tasks.append(
+                    ExecutionTask(
+                        task_id=task_id,
+                        tile_id=instruction.tile_id,
+                        operator_id=instruction.operator_id,
+                        primitive=str(pair.get("transform") or instruction.op_type),
+                        resource=resource,
+                        reads=(source_region,),
+                        writes=(destination_region,),
+                        predecessors=predecessor_tasks(instruction),
+                        duration_cycles=duration,
+                        initiation_interval_cycles=interval,
+                        stage_id=int(instruction.attributes.get("stage_id", 0)),
+                        program_order=program_order,
+                        attributes={
+                            "target_tisa_id": instruction.tisa_id,
+                            "abstract_tisa_id": instruction.attributes.get("abstract_tisa_id"),
+                            "operand": pair["role"],
+                            "route_hop": instruction.attributes.get("route_hop"),
+                            "transfer_bytes": size,
+                        },
                     )
-                    duration, interval, unit = _transfer_timing(
-                        machine, source, target, _valid_bytes(base_regions[role])
-                    )
-                    path = _path(machine, source, target)
-                    task_id = f"{tile_prefix}.{role}.hop{hop:02d}"
-                    task_predecessors = set(predecessors if hop == 0 else ())
-                    if previous_id is not None:
-                        task_predecessors.add(previous_id)
-                    tasks.append(
-                        ExecutionTask(
-                            task_id=task_id,
-                            tile_id=tile.tile_id,
-                            operator_id=operator_id,
-                            primitive=str(path.transform or "load"),
-                            resource=unit,
-                            reads=(source_region,),
-                            writes=(destination,),
-                            predecessors=tuple(sorted(task_predecessors)),
-                            duration_cycles=duration,
-                            initiation_interval_cycles=interval,
-                            stage_id=tile.stage_id,
-                            program_order=task_order,
-                            attributes={
-                                "operand": role,
-                                "iteration": tile.ordinal,
-                                "route_hop": hop,
-                                "route": list(route),
-                                "tisa_stage_key": input_stage_keys[(role, hop)],
-                                "transfer_bytes": _valid_bytes(base_regions[role]),
-                            },
-                        )
-                    )
-                    task_order += 1
-                    total_transfer_bytes += _valid_bytes(base_regions[role])
-                    source_region = BufferRegion(
-                        **{**destination.__dict__, "access": AccessType.READ}
-                    )
-                    previous_id = task_id
-                if previous_id is not None:
-                    final_input_tasks.append(previous_id)
-
-            compute_id = f"{tile_prefix}.mxu"
-            compute_duration, compute_ii, compute_unit = _compute_timing(
-                machine, output.shape, reduction_shape
+                )
+                program_order += 1
+                transfer_bytes += size
+        else:
+            reads = tuple(
+                _operand_region(
+                    operand,
+                    tensors[operand.tile_mem.tensor],
+                    AccessType.READ_WRITE
+                    if operand.normalized_access == AccessType.READ_WRITE.value
+                    else AccessType.READ,
+                )
+                for operand in instruction.operands
+                if operand.normalized_access
+                in {AccessType.READ.value, AccessType.READ_WRITE.value}
             )
-            previous = compute_by_output.setdefault(output_key, [])
-            predecessors = set(final_input_tasks)
-            if previous:
-                predecessors.add(max(previous, key=lambda item: item[0])[1])
-            lhs_compute = _placed_region(
-                left,
-                memory=role_placements["lhs"].memory,
-                buffer_id=f"{operator_id}.lhs.slot{input_slot}@{role_placements['lhs'].memory}",
-                access=AccessType.READ,
-                role="lhs",
-                slot=input_slot,
-                packed=role_placements["lhs"].layout == "packed",
+            writes = tuple(
+                _operand_region(
+                    operand,
+                    tensors[operand.tile_mem.tensor],
+                    AccessType.READ_WRITE
+                    if operand.normalized_access == AccessType.READ_WRITE.value
+                    else AccessType.WRITE,
+                )
+                for operand in instruction.operands
+                if operand.normalized_access
+                in {AccessType.WRITE.value, AccessType.READ_WRITE.value}
             )
-            rhs_compute = _placed_region(
-                right,
-                memory=role_placements["rhs"].memory,
-                buffer_id=f"{operator_id}.rhs.slot{input_slot}@{role_placements['rhs'].memory}",
-                access=AccessType.READ,
-                role="rhs",
-                slot=input_slot,
-                packed=role_placements["rhs"].layout == "packed",
+            output = next(region for region in writes if region.tensor in operator.outputs)
+            reduction = int(instruction.attributes["k_tile"])
+            duration, interval, resource = _compute_timing(
+                machine, output.shape, reduction
             )
-            output_buffer_id = (
-                f"{operator_id}.output.slot{output_slot}@{role_placements['output'].memory}"
-            )
-            output_read = _placed_region(
-                output,
-                memory=role_placements["output"].memory,
-                buffer_id=output_buffer_id,
-                access=AccessType.READ,
-                role="output",
-                slot=output_slot,
-                packed=role_placements["output"].layout == "packed",
-            )
-            output_write = BufferRegion(
-                **{**output_read.__dict__, "access": AccessType.WRITE}
-            )
-            first_partial = not previous
+            task_id = f"{instruction.tisa_id}.payload00"
+            task_ids.append(task_id)
             tasks.append(
                 ExecutionTask(
-                    task_id=compute_id,
-                    tile_id=tile.tile_id,
-                    operator_id=operator_id,
+                    task_id=task_id,
+                    tile_id=instruction.tile_id,
+                    operator_id=instruction.operator_id,
                     primitive="matmul",
-                    resource=compute_unit,
-                    reads=(lhs_compute, rhs_compute, *((output_read,) if not first_partial else ())),
-                    writes=(output_write,),
-                    predecessors=tuple(sorted(predecessors)),
-                    duration_cycles=compute_duration,
-                    initiation_interval_cycles=compute_ii,
-                    stage_id=tile.stage_id,
-                    program_order=task_order,
+                    resource=resource,
+                    reads=reads,
+                    writes=writes,
+                    predecessors=predecessor_tasks(instruction),
+                    duration_cycles=duration,
+                    initiation_interval_cycles=interval,
+                    program_order=program_order,
                     attributes={
-                        "batch_tile": list(output.shape[:-2]),
+                        "target_tisa_id": instruction.tisa_id,
+                        "abstract_tisa_id": instruction.attributes.get("abstract_tisa_id"),
                         "m_tile": output.shape[-2],
                         "n_tile": output.shape[-1],
-                        "k_tile": reduction_shape,
-                        "macs": math.prod(output.shape) * reduction_shape,
-                        "rhs_transposed": bool(operator.attributes.get("rhs_transposed", False)),
-                        "rhs_broadcast_batch": bool(
-                            operator.attributes.get("rhs_broadcast_batch", False)
+                        "k_tile": reduction,
+                        "macs": math.prod(output.shape) * reduction,
+                        "partial_sum_access": (
+                            "read_modify_write"
+                            if any(
+                                item.normalized_access == AccessType.READ_WRITE.value
+                                for item in instruction.operands
+                                if item.tile_mem.role == "output"
+                            )
+                            else "write"
                         ),
-                        "iteration": tile.ordinal,
-                        "partial_sum_access": "write" if first_partial else "read_modify_write",
-                        "tisa_stage_key": "compute",
                     },
                 )
             )
-            task_order += 1
-            previous.append((tile.bound_map[reduction_name][0], compute_id))
-            if tile.bound_map[reduction_name][1] == dict(operator.reduction_dims)[reduction_name]:
-                route = role_placements["output"].route
-                source_region = BufferRegion(
-                    **{**output_write.__dict__, "access": AccessType.READ}
-                )
-                previous_id = compute_id
-                for hop, (source, target) in enumerate(zip(route, route[1:])):
-                    is_root_target = target == root
-                    destination = _placed_region(
-                        output,
-                        memory=target,
-                        buffer_id=(
-                            f"{output.tensor}@{target}"
-                            if is_root_target
-                            else f"{operator_id}.output.slot{output_slot}@{target}"
-                        ),
-                        access=AccessType.WRITE,
-                        role="output",
-                        slot=None if is_root_target else output_slot,
-                        packed=(
-                            False
-                            if is_root_target
-                            else role_placements["output"].layout == "packed"
-                        ),
-                    )
-                    duration, interval, unit = _transfer_timing(
-                        machine, source, target, _valid_bytes(output)
-                    )
-                    path = _path(machine, source, target)
-                    task_id = f"{tile_prefix}.output.hop{hop:02d}"
-                    tasks.append(
-                        ExecutionTask(
-                            task_id=task_id,
-                            tile_id=tile.tile_id,
-                            operator_id=operator_id,
-                            primitive=str(path.transform or "store"),
-                            resource=unit,
-                            reads=(source_region,),
-                            writes=(destination,),
-                            predecessors=(previous_id,),
-                            duration_cycles=duration,
-                            initiation_interval_cycles=interval,
-                            stage_id=tile.stage_id,
-                            program_order=task_order,
-                            attributes={
-                                "operand": "output",
-                                "iteration": tile.ordinal,
-                                "route_hop": hop,
-                                "route": list(route),
-                                "final_reduction_tile": True,
-                                "tisa_stage_key": output_stage_keys[("output", hop)],
-                                "transfer_bytes": _valid_bytes(output),
-                            },
-                        )
-                    )
-                    task_order += 1
-                    total_transfer_bytes += _valid_bytes(output)
-                    source_region = BufferRegion(
-                        **{**destination.__dict__, "access": AccessType.READ}
-                    )
-                    previous_id = task_id
-                producer_stores.setdefault(output.tensor, []).append(
-                    (source_region, previous_id)
-                )
-            total_macs += math.prod(output.shape) * reduction_shape
+            program_order += 1
+            total_macs += math.prod(output.shape) * reduction
+        by_target[instruction.tisa_id] = task_ids
 
     execution = ExecutionGraph(
         graph_id=f"{graph.graph_id}.execution",
         tasks=tuple(tasks),
         attributes={
-            "source": "matmul-target-lowering",
-            "root_memory": root,
-            "operand_placement": {
-                role: role_placements[role].to_dict()
-                for role in ("lhs", "rhs", "output")
-            },
+            "source": "target-plan-matmul-payload",
+            "target_plan_id": target_plan.plan_id,
         },
     )
     issues = execution.validate()
@@ -573,6 +403,6 @@ def lower_matmul_graph(
             "tile_count": len(tile_graph.tiles),
             "task_count": len(execution.tasks),
             "macs": total_macs,
-            "transfer_bytes": total_transfer_bytes,
+            "transfer_bytes": transfer_bytes,
         },
     )

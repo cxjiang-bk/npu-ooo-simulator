@@ -71,7 +71,14 @@ class PyTorchFrontendTest(unittest.TestCase):
         )
         self.assertEqual(
             compiled.attributes["compiler_stages"],
-            ["framework_bridge", "graph_compiler", "fusion_compiler", "tisa_generator", "backend"],
+            [
+                "framework_bridge",
+                "graph_compiler",
+                "fusion_compiler",
+                "tisa_generator",
+                "target_lowering",
+                "backend",
+            ],
         )
         self.assertEqual(compiled.source_frontend.frontend.value, "torch.export")
         self.assertEqual(compiled.frontend.frontend.value, "stablehlo")

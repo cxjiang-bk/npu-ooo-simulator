@@ -113,6 +113,7 @@ class CompiledArtifact:
     source_frontend: FrontendImport
     gc_artifact: GCArtifact | None = None
     tisa_dialect: TISADialectProgram | None = None
+    virtual_tisa_program: TISAProgram | None = None
     diagnostics: tuple[CompilerDiagnostic, ...] = ()
     attributes: Mapping[str, Any] = field(default_factory=dict)
 
@@ -130,6 +131,18 @@ class CompiledArtifact:
             issues.extend(self.gc_artifact.validate())
         if self.tisa_dialect is not None:
             issues.extend(self.tisa_dialect.validate())
+        if self.virtual_tisa_program is not None:
+            issues.extend(self.virtual_tisa_program.validate())
+            if self.backend_artifact.target_plan is not None:
+                issues.extend(
+                    self.backend_artifact.target_plan.validate(
+                        self.virtual_tisa_program
+                    )
+                )
+        if self.backend_artifact.program.to_dict() != self.tisa_program.to_dict():
+            issues.append(
+                "compiled TISA program differs from BackendArtifact.program"
+            )
         return tuple(issues)
 
     def to_dict(self) -> dict[str, Any]:
@@ -144,6 +157,11 @@ class CompiledArtifact:
             "backend_artifact": self.backend_artifact.to_dict(),
             "gc_artifact": self.gc_artifact.to_dict() if self.gc_artifact else None,
             "tisa_dialect": self.tisa_dialect.to_dict() if self.tisa_dialect else None,
+            "virtual_tisa_program": (
+                self.virtual_tisa_program.to_dict()
+                if self.virtual_tisa_program is not None
+                else None
+            ),
             "diagnostics": [item.to_dict() for item in self.diagnostics],
             "attributes": dict(self.attributes),
         }
@@ -192,7 +210,7 @@ def compile_operator_graph(
     schedule = gc_artifact.schedule
     tile_graph = gc_artifact.tile_graph
     tisa_dialect = default_fusion_compiler().compile(gc_artifact, machine)
-    program = default_tisa_generator().generate(tisa_dialect)
+    virtual_program = default_tisa_generator().generate(tisa_dialect)
 
     selected_codegen = codegen_backend or default_codegen_backend_registry().create(
         "analytical",
@@ -203,7 +221,7 @@ def compile_operator_graph(
         schedule,
         tile_graph,
         machine,
-        program=program,
+        program=virtual_program,
     )
     # Codegen owns target-memory materialization.  The public program must be
     # the exact scheduler-visible descriptor embedded in BackendArtifact, not
@@ -228,6 +246,7 @@ def compile_operator_graph(
         backend_artifact=backend_artifact,
         gc_artifact=gc_artifact,
         tisa_dialect=tisa_dialect,
+        virtual_tisa_program=virtual_program,
         diagnostics=(
             CompilerDiagnostic("info", "torch.export", "captured PyTorch module"),
             CompilerDiagnostic("info", "torch-xla", "exported official StableHLO"),
@@ -236,12 +255,13 @@ def compile_operator_graph(
             CompilerDiagnostic("info", "tisa", f"generated {len(program.instructions)} TISA instructions"),
         ),
         attributes={
-            "compiler_pipeline": "pytorch->torch.export->torch-xla->stablehlo->GC->FC->tisa-generator->backend",
+            "compiler_pipeline": "pytorch->torch.export->torch-xla->stablehlo->GC->FC->tisa-generator->target-lowering->backend",
             "compiler_stages": [
                 "framework_bridge",
                 "graph_compiler",
                 "fusion_compiler",
                 "tisa_generator",
+                "target_lowering",
                 "backend",
             ],
             "frontend_path": "torch_export->torch_xla->official_stablehlo->canonical",

@@ -1047,9 +1047,20 @@ def _write_compile_artifacts(compiled, machine, output_dir: Path) -> None:
             compiled.tisa_dialect.attributes,
             output_dir / "fc_diagnostics.json",
         )
+    if compiled.virtual_tisa_program is not None:
+        write_artifact_json(
+            compiled.virtual_tisa_program,
+            output_dir / "virtual_tisa_program.json",
+        )
     write_artifact_json(compiled.tisa_program, output_dir / "tisa_program.json")
     write_artifact_json(compiled, output_dir / "compiled_artifact.json")
     write_artifact_json(compiled.backend_artifact, output_dir / "backend_artifact.json")
+    if compiled.backend_artifact.target_plan is None:
+        raise ValueError("codegen backend did not produce a target plan")
+    write_artifact_json(
+        compiled.backend_artifact.target_plan,
+        output_dir / "target_plan.json",
+    )
     if compiled.backend_artifact.memory_plan is None:
         raise ValueError("codegen backend did not produce a target memory plan")
     write_artifact_json(
@@ -1079,6 +1090,7 @@ def _compile_manifest(compiled, machine) -> dict[str, Any]:
         "machine_hash": machine.stable_hash(),
         "machine_topology_hash": machine.topology_hash(),
         "memory_plan_schema": compiled.backend_artifact.memory_plan.schema_version,
+        "target_plan_schema": compiled.backend_artifact.target_plan.schema_version,
         "codegen_backend": compiled.attributes["codegen_backend"],
         "tisa_program_id": compiled.tisa_program.program_id,
         "artifact_id": compiled.backend_artifact.artifact_id,
@@ -1087,6 +1099,8 @@ def _compile_manifest(compiled, machine) -> dict[str, Any]:
             "canonical_graph": "01_gc/canonical_graph.json",
             "machine": "04_backend/machine.json",
             "tisa_program": "03_tisa/tisa_program.json",
+            "virtual_tisa_program": "03_tisa/virtual_tisa_program.json",
+            "target_plan": "04_backend/target_plan.json",
             "memory_plan": "04_backend/memory_plan.json",
         },
     }
@@ -1299,6 +1313,11 @@ def _load_compile_package(root: Path):
     if backend.memory_plan is None:
         raise ValueError(
             "legacy compile package lacks target memory plan schema v2; recompile it "
+            "before independent simulation"
+        )
+    if backend.target_plan is None:
+        raise ValueError(
+            "compile package lacks target lowering plan schema v1; recompile it "
             "before independent simulation"
         )
     graph = OperatorGraph.from_dict(_read_json_object(graph_path, description="canonical graph"))

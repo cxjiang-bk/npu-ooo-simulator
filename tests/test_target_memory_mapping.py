@@ -69,7 +69,7 @@ class TargetMemoryMappingTest(unittest.TestCase):
         )
         compute = compiled.tisa_program.instructions[1]
         self.assertEqual(
-            {(operand.tile_mem.scope, operand.normalized_access) for operand in compute.operands},
+            {(operand.tile_mem.physical_space, operand.normalized_access) for operand in compute.operands},
             {("SRAM", "read"), ("SRAM", "write")},
         )
         bindings = allocate_memory_plan_bindings(
@@ -77,6 +77,20 @@ class TargetMemoryMappingTest(unittest.TestCase):
         )
         submission = create_runtime_submission(compiled.backend_artifact, bindings)
         self.assertEqual(submission.validate(compiled.tisa_program), ())
+        target_ids = {
+            instruction.tisa_id for instruction in compiled.tisa_program.instructions
+        }
+        abstract_ids = {
+            instruction.tisa_id
+            for instruction in compiled.virtual_tisa_program.instructions
+        }
+        self.assertTrue(
+            all(
+                task.attributes["target_tisa_id"] in target_ids
+                and task.attributes["abstract_tisa_id"] in abstract_ids
+                for task in compiled.backend_artifact.execution_graph.tasks
+            )
+        )
         by_id = {binding.buffer_id: binding for binding in submission.buffers}
         for operand in submission.operands:
             self.assertEqual(operand.physical_scope, by_id[operand.buffer_id].memory)
@@ -98,7 +112,7 @@ class TargetMemoryMappingTest(unittest.TestCase):
             if instruction.unit_map.unit == "MXU"
         )
         accesses = {
-            (operand.tile_mem.scope, operand.normalized_access)
+            (operand.tile_mem.physical_space, operand.normalized_access)
             for operand in compute.operands
         }
         self.assertEqual(
@@ -115,8 +129,8 @@ class TargetMemoryMappingTest(unittest.TestCase):
             paths,
             [
                 ("GM", "UB", "GDMA"),
-                ("UB", "LMB", "LDMA"),
                 ("GM", "UB", "GDMA"),
+                ("UB", "LMB", "LDMA"),
                 ("UB", "RMB", "LDMA"),
                 ("PSB", "UB", "ARU"),
                 ("UB", "GM", "GDMA"),

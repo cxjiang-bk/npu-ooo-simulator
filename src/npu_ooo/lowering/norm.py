@@ -100,6 +100,7 @@ def lower_rmsnorm_graph(
             )
             square_ids: dict[str, str] = {}
             load_ids: dict[str, str] = {}
+            weight_load_ids: dict[str, str] = {}
             for tile in row_tiles:
                 bounds = tile.bound_map
                 starts = (
@@ -138,6 +139,57 @@ def lower_rmsnorm_graph(
                 )
                 task_order += 1
                 load_ids[tile.tile_id] = load_id
+                if weight_tensor is not None:
+                    weight_starts = (bounds[reduction_name][0],)
+                    weight_shape = (
+                        bounds[reduction_name][1] - bounds[reduction_name][0],
+                    )
+                    weight_global = _region(
+                        weight_tensor,
+                        root,
+                        weight_starts,
+                        weight_shape,
+                        AccessType.READ,
+                    )
+                    weight_local = _region(
+                        weight_tensor,
+                        local,
+                        weight_starts,
+                        weight_shape,
+                        AccessType.WRITE,
+                    )
+                    weight_load_id = f"{tile.tile_id}.load_weight"
+                    weight_duration, weight_ii, weight_unit = _transfer_timing(
+                        machine, root, local, weight_global.size_bytes
+                    )
+                    weight_predecessors = {
+                        store_id
+                        for region, store_id in producer_stores.get(weight_tensor.name, [])
+                        if _regions_overlap(region, weight_global)
+                    }
+                    tasks.append(
+                        ExecutionTask(
+                            task_id=weight_load_id,
+                            tile_id=tile.tile_id,
+                            operator_id=operator_id,
+                            primitive="load",
+                            resource=weight_unit,
+                            reads=(weight_global,),
+                            writes=(weight_local,),
+                            predecessors=tuple(sorted(weight_predecessors)),
+                            duration_cycles=weight_duration,
+                            initiation_interval_cycles=weight_ii,
+                            stage_id=tile.stage_id,
+                            program_order=task_order,
+                            attributes={
+                                "iteration": tile.ordinal,
+                                "operand": "affine_weight",
+                            },
+                        )
+                    )
+                    task_order += 1
+                    weight_load_ids[tile.tile_id] = weight_load_id
+                    transfer_bytes += weight_global.size_bytes
                 square_region = _virtual_region(f"{operator_id}.square", local, shape, starts, AccessType.WRITE)
                 square_id = f"{tile.tile_id}.square"
                 square_duration, square_ii, square_unit = _elementwise_timing(machine, math.prod(shape))
@@ -206,7 +258,7 @@ def lower_rmsnorm_graph(
                 weight_region = (
                     _region(
                         weight_tensor,
-                        root,
+                        local,
                         (bounds[reduction_name][0],),
                         (bounds[reduction_name][1] - bounds[reduction_name][0],),
                         AccessType.READ,
@@ -229,7 +281,15 @@ def lower_rmsnorm_graph(
                             if item is not None
                         ),
                         writes=(output_local,),
-                        predecessors=(load_ids[tile.tile_id], sum_final),
+                        predecessors=tuple(
+                            item
+                            for item in (
+                                load_ids[tile.tile_id],
+                                weight_load_ids.get(tile.tile_id),
+                                sum_final,
+                            )
+                            if item is not None
+                        ),
                         duration_cycles=normalize_duration,
                         initiation_interval_cycles=normalize_ii,
                         stage_id=tile.stage_id,

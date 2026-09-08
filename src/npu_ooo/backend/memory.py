@@ -1,16 +1,15 @@
 """Target-memory materialization for analytical backend artifacts.
 
-FC descriptors deliberately carry logical operands.  This module is the
-backend boundary that assigns every payload region a stable buffer identity,
-projects those exact accesses back onto the scheduler-visible TISA program,
-allocates finite target memories, and adds physical hazard dependencies.
+Target lowering has already produced target operands before this module runs.
+This module binds payload regions to that plan, allocates finite target
+memories, and adds physical hazard dependencies.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import math
-from typing import Any, Iterable, Mapping
+from typing import Any, Mapping
 
 from npu_ooo.arch import MachineConfig
 from npu_ooo.ir import (
@@ -23,10 +22,7 @@ from npu_ooo.ir import (
     OperatorGraph,
     TISADependency,
     TISAInstruction,
-    TISAOperand,
     TISAProgram,
-    TileMem,
-    UnitMap,
     dtype_bytes,
     tensor_layout,
 )
@@ -54,21 +50,10 @@ def _packed_strides(shape: tuple[int, ...], dtype: str) -> tuple[int, ...]:
 def _normalize_region(
     region: BufferRegion,
     *,
-    task_tile_id: str,
-    operator_id: str,
     root_memories: set[str],
 ) -> BufferRegion:
     valid_bytes = _valid_bytes(region)
     size_bytes = region.size_bytes or valid_bytes
-    if region.buffer_id is not None:
-        buffer_id = region.buffer_id
-    elif region.memory in root_memories:
-        buffer_id = f"{region.tensor}@{region.memory}"
-    else:
-        # Generic lowerers still describe one local copy per semantic tile.
-        # The allocator may safely map several such identities to one physical
-        # allocation after it inserts explicit BUFFER_REUSE dependencies.
-        buffer_id = f"{operator_id}.{task_tile_id}.{region.tensor}@{region.memory}"
     backend_packed = region.buffer_id is None and region.memory not in root_memories
     return replace(
         region,
@@ -81,12 +66,59 @@ def _normalize_region(
             else region.strides_bytes
         ),
         valid_bytes=valid_bytes,
-        buffer_id=buffer_id,
         attributes={
             **dict(region.attributes),
-            "buffer_identity_source": (
-                "lowering" if region.buffer_id is not None else "backend"
-            ),
+            "buffer_identity_source": "target_plan",
+        },
+    )
+
+
+def _bind_region_to_plan(
+    region: BufferRegion,
+    instruction: TISAInstruction,
+    *,
+    write: bool,
+) -> BufferRegion:
+    allowed = (
+        {AccessType.WRITE.value, AccessType.READ_WRITE.value}
+        if write
+        else {AccessType.READ.value, AccessType.READ_WRITE.value}
+    )
+    matches = [
+        operand
+        for operand in instruction.operands
+        if operand.tile_mem.tensor == region.tensor
+        and operand.tile_mem.physical_space == region.memory
+        and operand.normalized_access in allowed
+        and (
+            operand.tile_mem.logical_starts is None
+            or operand.tile_mem.logical_starts == region.starts
+        )
+        and (
+            operand.tile_mem.logical_shape is None
+            or operand.tile_mem.logical_shape == region.shape
+        )
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"payload region '{region.tensor}@{region.memory}' in target instruction "
+            f"'{instruction.tisa_id}' resolves to {len(matches)} planned operands"
+        )
+    planned = matches[0].tile_mem
+    return replace(
+        region,
+        access=(AccessType.WRITE if write else AccessType.READ),
+        offset_bytes=int(planned.offset_bytes or 0),
+        size_bytes=int(planned.size_bytes or region.size_bytes),
+        layout=planned.layout,
+        strides_bytes=planned.strides_bytes,
+        buffer_id=planned.buffer_id,
+        valid_bytes=planned.valid_bytes or _valid_bytes(region),
+        attributes={
+            **dict(region.attributes),
+            "buffer_identity_source": "target_plan",
+            "target_plan_operand": matches[0].name,
+            "symbolic_buffer_id": planned.symbolic_buffer_id,
         },
     )
 
@@ -96,26 +128,33 @@ def _normalize_execution_graph(
     machine: MachineConfig,
 ) -> ExecutionGraph:
     roots = {level.name for level in machine.memory_levels if level.parent is None}
+    task_owner = {
+        task_id: next(
+            instruction
+            for instruction in artifact.program.instructions
+            if instruction.tisa_id == tisa_id
+        )
+        for tisa_id, task_ids in artifact.payloads.items()
+        for task_id in task_ids
+    }
     return replace(
         artifact.execution_graph,
         tasks=tuple(
             replace(
                 task,
                 reads=tuple(
-                    _normalize_region(
-                        region,
-                        task_tile_id=task.tile_id,
-                        operator_id=task.operator_id,
-                        root_memories=roots,
+                    _bind_region_to_plan(
+                        _normalize_region(region, root_memories=roots),
+                        task_owner[task.task_id],
+                        write=False,
                     )
                     for region in task.reads
                 ),
                 writes=tuple(
-                    _normalize_region(
-                        region,
-                        task_tile_id=task.tile_id,
-                        operator_id=task.operator_id,
-                        root_memories=roots,
+                    _bind_region_to_plan(
+                        _normalize_region(region, root_memories=roots),
+                        task_owner[task.task_id],
+                        write=True,
                     )
                     for region in task.writes
                 ),
@@ -125,106 +164,7 @@ def _normalize_execution_graph(
         attributes={
             **dict(artifact.execution_graph.attributes),
             "target_memory_materialized": True,
-        },
-    )
-
-
-def _merged_access(values: Iterable[str]) -> str:
-    normalized = set(values)
-    if AccessType.READ_WRITE.value in normalized or normalized == {
-        AccessType.READ.value,
-        AccessType.WRITE.value,
-    }:
-        return AccessType.READ_WRITE.value
-    return next(iter(normalized))
-
-
-def _materialize_operands(
-    instruction: TISAInstruction,
-    task_ids: tuple[str, ...],
-    execution_graph: ExecutionGraph,
-) -> TISAInstruction:
-    task_by_id = {task.task_id: task for task in execution_graph.tasks}
-    records: dict[tuple[Any, ...], dict[str, Any]] = {}
-    for task_id in task_ids:
-        task = task_by_id[task_id]
-        for collection, default_access in (
-            (task.reads, AccessType.READ.value),
-            (task.writes, AccessType.WRITE.value),
-        ):
-            for region in collection:
-                key = (
-                    region.buffer_id,
-                    region.tensor,
-                    region.memory,
-                    region.offset_bytes,
-                    region.size_bytes,
-                    region.shape,
-                    region.starts,
-                    region.layout,
-                    region.strides_bytes,
-                )
-                record = records.setdefault(
-                    key,
-                    {"region": region, "accesses": set()},
-                )
-                access = region.normalized_access
-                record["accesses"].add(
-                    AccessType.READ_WRITE.value
-                    if access == AccessType.READ_WRITE.value
-                    else default_access
-                )
-
-    logical_by_tensor = {
-        operand.tile_mem.tensor or operand.tile_mem.base: operand.tile_mem
-        for operand in instruction.operands
-    }
-    operands: list[TISAOperand] = []
-    for index, record in enumerate(records.values()):
-        region: BufferRegion = record["region"]
-        logical = logical_by_tensor.get(region.tensor)
-        access = _merged_access(record["accesses"])
-        operands.append(
-            TISAOperand(
-                name=f"{region.tensor}:{region.memory}:{index}:{access}",
-                tile_shape=region.shape,
-                tile_mem=TileMem(
-                    base=str(region.buffer_id),
-                    scope=region.memory,
-                    tensor=region.tensor,
-                    offset_bytes=region.offset_bytes,
-                    size_bytes=region.size_bytes,
-                    address_expr=(logical.address_expr if logical is not None else None),
-                    strides_bytes=region.strides_bytes,
-                    stride_expr=(logical.stride_expr if logical is not None else None),
-                    layout=region.layout,
-                    logical_starts=region.starts,
-                    logical_shape=region.shape,
-                    buffer_id=region.buffer_id,
-                    valid_bytes=_valid_bytes(region),
-                ),
-                access_type=access,
-            )
-        )
-    resources = {task_by_id[task_id].resource for task_id in task_ids}
-    if len(resources) != 1:
-        raise ValueError(
-            f"TISA instruction '{instruction.tisa_id}' payload spans target units: "
-            + ", ".join(sorted(resources))
-        )
-    resource = next(iter(resources))
-    return replace(
-        instruction,
-        operands=tuple(operands),
-        unit_map=UnitMap(
-            resource,
-            quantity=instruction.unit_map.quantity,
-            affinity=instruction.unit_map.affinity,
-        ),
-        attributes={
-            **dict(instruction.attributes),
-            "target_memory_materialized": True,
-            "operand_contract": "payload_regions_v2",
+            "operand_source": "target_plan",
         },
     )
 
@@ -351,13 +291,18 @@ def _allocate_plan(
                 buffer_id,
                 {
                     "tensor": memory.tensor or memory.base,
-                    "memory": memory.scope,
+                    "dtype": memory.dtype,
+                    "memory": memory.physical_space,
                     "allocation_bytes": 0,
                     "valid_bytes": 0,
                     "layout": memory.layout,
                     "strides_bytes": memory.strides_bytes,
                     "tile_id": instruction.tile_id,
-                    "role": None,
+                    "role": memory.role,
+                    "visibility": memory.visibility,
+                    "owner": memory.owner,
+                    "domain": memory.domain,
+                    "symbolic_buffer_id": memory.symbolic_buffer_id,
                     "slot": None,
                 },
             )
@@ -383,14 +328,6 @@ def _allocate_plan(
         buffer_accesses = accesses[buffer_id]
         requirement["lifetime_start"] = min(item.instruction_index for item in buffer_accesses)
         requirement["lifetime_end"] = max(item.instruction_index for item in buffer_accesses)
-        requirement["role"] = next(
-            (
-                role
-                for role in ("lhs", "rhs", "output", "state")
-                if f".{role}." in buffer_id or buffer_id.startswith(f"{role}.")
-            ),
-            None,
-        )
         marker = ".slot"
         if marker in buffer_id:
             try:
@@ -508,11 +445,15 @@ def _allocate_plan(
                 lifetime_start=requirement["lifetime_start"],
                 lifetime_end=requirement["lifetime_end"],
                 alias_of=alias_of,
-                dtype=(tensor.dtype if tensor is not None else "fp16"),
+                dtype=(tensor.dtype if tensor is not None else requirement["dtype"]),
                 attributes={
                     "allocation_policy": (
                         "external_linear" if external else "dependency_guarded_reuse"
                     ),
+                    "visibility": requirement["visibility"],
+                    "owner": requirement["owner"],
+                    "domain": requirement["domain"],
+                    "symbolic_buffer_id": requirement["symbolic_buffer_id"],
                     **(
                         {
                             "shape": list(tensor.shape),
@@ -538,7 +479,7 @@ def _allocate_plan(
             )
 
     plan = MemoryPlan(
-        plan_id=f"{program.program_id}.memory",
+        plan_id=f"{program.program_id}.{machine.config_id}.memory",
         machine_config_id=machine.config_id,
         machine_topology_hash=machine.topology_hash(),
         buffers=tuple(buffers),
@@ -611,16 +552,10 @@ def materialize_target_memory(
 ) -> BackendArtifact:
     """Return a backend artifact with one auditable physical memory contract."""
 
+    if artifact.target_plan is None:
+        raise ValueError("target memory materialization requires a TargetPlan")
     execution_graph = _normalize_execution_graph(artifact, machine)
-    instructions = tuple(
-        _materialize_operands(
-            instruction,
-            tuple(artifact.payloads[instruction.tisa_id]),
-            execution_graph,
-        )
-        for instruction in artifact.program.instructions
-    )
-    program = replace(artifact.program, instructions=instructions)
+    program = artifact.program
     program = _add_physical_hazards(program)
     plan, allocation_for, reuse_dependencies = _allocate_plan(
         graph, program, machine
@@ -632,11 +567,29 @@ def materialize_target_memory(
     # that share an allocation.  Existing BUFFER_REUSE edges take precedence;
     # the pass fills only missing physical hazard ordering.
     program = _add_physical_hazards(program, by_allocation=True)
+    instruction_by_id = {
+        instruction.tisa_id: instruction for instruction in program.instructions
+    }
+    target_plan = replace(
+        artifact.target_plan,
+        instructions=tuple(
+            replace(item, instruction=instruction_by_id[item.instruction.tisa_id])
+            for item in artifact.target_plan.instructions
+        ),
+        attributes={
+            **dict(artifact.target_plan.attributes),
+            "program_attributes": dict(program.attributes),
+            "memory_plan_id": plan.plan_id,
+            "memory_plan_schema": plan.schema_version,
+        },
+        memory_plan=plan,
+    )
     result = replace(
         artifact,
         program=program,
         execution_graph=execution_graph,
         memory_plan=plan,
+        target_plan=target_plan,
         attributes={
             **dict(artifact.attributes),
             "memory_contract": "target_memory_plan_v2",

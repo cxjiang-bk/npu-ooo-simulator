@@ -23,6 +23,7 @@ def _broadcast_region(
     tensor,
     output_shape: tuple[int, ...],
     starts: tuple[int, ...],
+    tile_shape: tuple[int, ...],
     memory: str,
     access: AccessType,
     feature_index: int,
@@ -38,8 +39,8 @@ def _broadcast_region(
         return _region(
             tensor,
             memory,
-            (0,),
-            shape,
+            (starts[feature_index],),
+            (tile_shape[feature_index],),
             access,
         )
     padded = (1,) * (len(output_shape) - len(shape)) + shape
@@ -117,8 +118,24 @@ def lower_batch_norm_graph(
                     region = _region(tensor, root, starts, tile_shape, AccessType.READ)
                     local_region = _region(tensor, local, starts, tile_shape, AccessType.WRITE)
                 else:
-                    region = _broadcast_region(tensor, output_shape, starts, root, AccessType.READ, feature_index)
-                    local_region = _broadcast_region(tensor, output_shape, starts, local, AccessType.WRITE, feature_index)
+                    region = _broadcast_region(
+                        tensor,
+                        output_shape,
+                        starts,
+                        tile_shape,
+                        root,
+                        AccessType.READ,
+                        feature_index,
+                    )
+                    local_region = _broadcast_region(
+                        tensor,
+                        output_shape,
+                        starts,
+                        tile_shape,
+                        local,
+                        AccessType.WRITE,
+                        feature_index,
+                    )
                 load_id = f"{tile.tile_id}.load_{input_index}"
                 duration, ii, unit = _transfer_timing(machine, root, local, region.size_bytes)
                 tasks.append(

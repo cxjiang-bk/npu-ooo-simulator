@@ -30,15 +30,18 @@ software-scheduled Semantic TileGraph
 FC: TISA dialect
         |
         v
-TISAInstruction                  device scheduler 可见
+virtual TISAInstruction          target-independent
+        |
+        v
+TargetPlan / target TISA         device scheduler 可见
         |
         v
 backend ExecutionTask payload    DMA/MXU/Vector 单元内部执行
 ```
 
-一个 semantic tile 跨越多个 execution unit 时，compiler 按 unit/stage 边界生成多条
-TISA instruction，并用 typed dependency 串联。每条 instruction 绑定一个主要 UnitMap；
-payload 可以包含该 execution unit 内部的多个步骤。
+FC 用抽象 transfer/compute 表达 semantic tile；一条抽象 transfer 若跨越多个 target EU，
+由 FC 之后的 Target Lowering 展开为多条 scheduler-visible TISA，并用 typed dependency
+串联。每条 target instruction 绑定一个主要 UnitMap，payload 只包含该 EU 内部的步骤。
 
 论文明确给出 TISA operand、GC/FC/TISA generator 的抽象关系以及硬件 scheduler 的调度
 粒度，但没有公开 Epoch generator/backend 内部由谁完成全部 buffer allocation。本项目将
@@ -52,7 +55,12 @@ payload 可以包含该 execution unit 内部的多个步骤。
 | tile bounds | `TileInstance.bounds` | 静态 shape、边界 tile 和 logical region |
 | OpType | `TISAInstruction.op_type`、`semantic_family` | 复合语义保持 semantic op，stage 按 EU 划分 |
 | TileShape | `TISAOperand.tile_shape` | resolved shape；symbolic binding 使用 normalized shape environment |
-| TileMem | `TISAOperand.tile_mem` | FC 保留符号描述；最终程序保存 buffer/allocation id、memory、offset/span、valid bytes、stride/layout |
+| TileMem scope | `scope` | `program`、`operator:<id>`、`tile:<id>` 等逻辑所有权范围 |
+| visibility | `visibility/owner/domain` | Private/Local/Shared 可见性、owner 和资源域，不等同具体 memory |
+| operand role | `role` | lhs/rhs/output/state/scratch；参与目标 memory 选择 |
+| symbolic buffer | `symbolic_buffer_id` | FC source、tile buffer、accumulator 的逻辑身份 |
+| target memory | `memory_space` | 只在 Target Lowering 后出现 GM/UB/LMB/RMB/PSB 等实例 |
+| allocation | `buffer_id/allocation_id` | target copy 与最终物理分配身份 |
 | AccessType | operand/buffer access | read、write、read-write |
 | Attributes | `TISAInstruction.attributes` | readiness、region、state、fusion 和 reorder |
 | UnitMap | `TISAInstruction.unit_map` | execution unit 类别与数量 |
@@ -71,8 +79,9 @@ PyTorch nn.Module
   -> official StableHLO parse/verify
   -> GCArtifact / Semantic TileGraph
   -> TISADialectProgram
-  -> logical TISAProgram
-  -> target lowering / MemoryPlan
+  -> virtual TISAProgram
+  -> TargetPlan / target TISA
+  -> backend payload / MemoryPlan
   -> final TISAProgram + BackendArtifact
 ```
 
@@ -113,8 +122,9 @@ TISA GDMA -> TISA LDMA -> TISA MXU(LMB,RMB -> PSB)
           -> TISA ARU -> TISA GDMA
 ```
 
-多跳 route 在 FC 阶段按 EU 边界拆成 TISA stage，Backend 再为每个 stage 生成 payload，
-不会从已经展开的 task graph 反推边界。
+FC 对 minimal 和 lpu-like 都只生成 `load → tensor compute → store`。多跳 route 在
+Target Lowering 阶段按 EU 边界展开；TargetPlan 同时生成 target operands 与
+abstract→target 映射，Matmul payload 直接消费该计划，不从 task graph 反推边界。
 
 Softmax 的 `reduce_max/exp/reduce_sum/normalize` 属于同一 VE payload。payload lane
 事件进入 timing 和泳道图，TISA 依赖保持全局可见。
@@ -152,6 +162,8 @@ Backend Timing/Event
 - GC `TileDependency` 的 hazard kind、logical region、condition 和 provenance，并向
   TISA dependency 与 compile statistics 贯通。
 - `MachineConfig.operation_placements`、多跳 transfer stage 和 target `MemoryPlan`；
+- FC 符号 source/destination、Private/Local/Shared、role/owner/domain；
+- `TargetPlan` 的 abstract→target mapping、route hop/engine、target operands 和 provenance；
 - TISA、payload 与 RuntimeSubmission 共享 `buffer_id/allocation_id`，局部 slot 的复用由
   RAW/WAR/WAW/BUFFER_REUSE 依赖保护；
 - compile package schema v2 与 topology hash 检查。

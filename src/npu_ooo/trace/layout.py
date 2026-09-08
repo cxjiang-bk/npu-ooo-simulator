@@ -41,9 +41,11 @@ _STAGE_BY_FILENAME: dict[str, str] = {
     "tisa_dialect.json": "02_fc",
     "fc_diagnostics.json": "02_fc",
     "tisa_program.json": "03_tisa",
+    "virtual_tisa_program.json": "03_tisa",
     "compiled_artifact.json": "03_tisa",
     "backend_artifact.json": "04_backend",
     "memory_plan.json": "04_backend",
+    "target_plan.json": "04_backend",
     "machine.json": "04_backend",
     "execution_graph.json": "04_backend",
     "execution_graph.dot": "04_backend",
@@ -88,8 +90,8 @@ def _root_readme() -> str:
             "`stablehlo_module.json` 保存程序文本、producer、版本、验证状态和 provenance。",
             "`01_gc/compile_statistics.json` 汇总各算子的 tile、TISA、MAC、",
             "root-memory traffic 和 region dependency 数量。",
-            "`02_fc/tisa_dialect.json` 是 FC 输出；`03_tisa/tisa_program.json` 是 device scheduler 的输入；`04_backend/` 保存",
-            "与每条 TISA instruction 绑定的硬件 payload 和 `memory_plan.json` 目标存储规划。",
+            "`02_fc/tisa_dialect.json` 是符号 FC 输出；`03_tisa/virtual_tisa_program.json` 是 Generator 输出，`tisa_program.json` 是 device scheduler 输入；`04_backend/` 保存",
+            "`target_plan.json`、与每条 target TISA 绑定的 payload 和 `memory_plan.json`。",
         ]
     )
     return "\n".join(rows) + "\n"

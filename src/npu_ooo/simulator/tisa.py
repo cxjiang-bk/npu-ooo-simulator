@@ -103,7 +103,7 @@ def _memory_accesses(
     else:
         candidates = tuple(
             (
-                operand.tile_mem.scope,
+                operand.tile_mem.physical_space,
                 operand.tile_mem.offset_bytes or 0,
                 operand.tile_mem.size_bytes or 1,
                 operand.normalized_access,
@@ -286,7 +286,7 @@ def _overlaps(left: TISAOperand, right: TISAOperand) -> bool:
         or right_mem.tensor
         or right_mem.base
     )
-    if left_base != right_base or left_mem.scope != right_mem.scope:
+    if left_base != right_base or left_mem.physical_space != right_mem.physical_space:
         return False
     if (
         left_mem.offset_bytes is None
@@ -428,7 +428,7 @@ def _tisa_address_observation(
         address = region.address
         size = region.size_bytes
     else:
-        memory = region.tile_mem.scope
+        memory = region.tile_mem.physical_space
         tensor = region.tile_mem.tensor or region.tile_mem.base
         address = region.tile_mem.offset_bytes
         size = region.tile_mem.size_bytes
