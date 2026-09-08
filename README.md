@@ -1,6 +1,16 @@
 # NPU OOO Simulator
 
-## 整体流程
+用于研究 TISA 风格 NPU 的编译、目标存储映射和乱序调度。输入真实 PyTorch 模型，
+输出分阶段编译产物、周期与 stall 统计、泳道图和 Perfetto trace。
+
+最常见的使用方式是：**编译一次 → 固定编译包比较 static/dynamic → 查看周期和阻塞原因**。
+当前结果主要来自可配置的分析模型；加载执行单元的 RTL timing 不代表整个 scheduler 已完成硬件校准。
+
+## 整体架构
+
+先从全流程理解各阶段的位置：编译器决定算子如何切成 tile、放在哪些存储中以及如何搬运；
+Runtime 绑定本次调用的地址并提交 descriptor；设备 scheduler 决定何时发射，
+execution backend 执行并反馈完成。
 
 ```mermaid
 flowchart LR
@@ -11,336 +21,422 @@ flowchart LR
     E --> I[Target Lowering: TargetPlan]
     I --> J[最终 TISA、BackendArtifact 与 MemoryPlan]
     J --> F[Runtime Loader: 地址绑定与 descriptor envelope]
-    F --> G[LoadedDeviceProgram]
+    F --> G[LoadedDeviceProgram: 已绑定的设备描述符]
     G --> K[Static / Dynamic device scheduler]
-    K --> L[Execution backend]
+    K -->|issue| L[Execution backend]
+    J -.->|加载 payload| L
     L -->|completion feedback| K
-    L --> H[周期、stall、泳道图、Perfetto]
+    K --> H[周期、stall、泳道图、Perfetto]
+    L --> H
 ```
 
-项目用于研究 TISA 风格 NPU 的编译、运行时和乱序调度。生产入口是一条线性的真实
-PyTorch 路径：
+其中，FC 保留抽象 scope/role，Target Lowering 才根据机器配置选择具体 memory、route 和 EU。
+最终 TISA 是编译产物，绑定后的 `LoadedDeviceProgram` 才是本次调用的设备输入。
+`DeviceSimulator` 负责推进时间并连接 scheduler 与 execution backend；复合 TISA 的内部
+primitive 由 execution backend 执行，不独立进入全局乱序窗口。
+
+快速导航：[运行指南](#运行指南) · [参数配置](#参数配置) · [查看结果](#查看结果) ·
+[常见问题](#常见问题) · [更多实验](#更多实验) · [架构与开发](#架构与开发)
+
+## 运行指南
+
+### 1. 准备环境
+
+以下命令均在仓库根目录执行，使用 `PYTHONPATH=src`，无需先安装本项目：
+
+```bash
+cd /home/jiangcx/LPU/npu-ooo-simulator
+PYTHONPATH=src python3.12 -m npu_ooo.cli --help
+```
+
+如果仓库位于其他机器，请替换 `cd` 路径；如果使用虚拟环境，请将 `python3.12` 换成对应解释器。
+
+| 运行内容 | 环境要求 |
+| --- | --- |
+| `compile`、`compile-and-sim`、`paper-matrix` | 完整前端环境：PyTorch、Torch-XLA、官方 StableHLO bindings 必须安装在同一个 Python 环境中 |
+| `simulate` | 已有兼容编译包；不需要安装或导入 PyTorch、Torch-XLA、StableHLO 前端 |
+
+项目记录的完整前端验证组合为 Python 3.12、torch 2.9.1、torch-xla 2.9.0、
+StableHLO wheel 1.12.1。安装和 parse/verify 检查见 [环境安装指南](docs/install-stablehlo.md)。
+仅能运行 `--help` 不代表完整前端依赖已经可用。
+
+### 2. 先跑通一个 Attention
+
+下面运行两头 Attention 的小尺寸样例，显式选择逐周期模型和动态设备调度：
+
+```bash
+PYTHONPATH=src python3.12 -m npu_ooo.cli compile-and-sim \
+  --torch-module examples.torch_models:MultiHeadAttentionBlock \
+  --input-shape 1,4,8 --input-shape 1,1,4,4 \
+  --tile-size 4 --arch minimal \
+  --event-backend cycle_event \
+  --scheduler-config configs/scheduler/cycle_baseline.json \
+  --runtime-policy static --policy dynamic_ready_queue \
+  --address-scoreboard \
+  --output-dir out/quickstart-attention
+```
+
+- 第一个输入是 `x`：`[batch=1, sequence=4, hidden=8]`。
+- 第二个输入是可广播的加性 attention mask：`[1, 1, 4, 4]`。
+- CLI 自动生成确定性示例 tensor；这不是加载真实模型权重或数据集的入口。
+- `runtime-policy static` 固定 host 提交流；`policy dynamic_ready_queue` 允许设备在到达的指令中乱序选择，两者不矛盾。
+
+运行后先打开：
 
 ```text
-PyTorch nn.Module
-  -> torch.export.ExportedProgram
-  -> Torch-XLA StableHLO
-  -> 官方 StableHLO parse/verify
-  -> Graph Compiler (GC)
-  -> Canonical OperatorGraph / Semantic TileGraph
-  -> Fusion Compiler (FC)
-  -> 符号 TISA 方言
-  -> 虚拟 TISAProgram
-  -> TargetPlan / 目标 TISAProgram
-  -> Backend payload / MemoryPlan
-  -> RuntimeSubmission / LoadedDeviceProgram
-  -> TISA device scheduler + ExecutionBackend
-  -> 周期、泳道图和 Perfetto trace
+out/quickstart-attention/06_simulation/summary.json    # 周期、stall、资源统计
+out/quickstart-attention/07_trace/swimlane.svg         # 执行泳道图
+out/quickstart-attention/06_simulation/tisa_instructions.csv  # 指令生命周期
 ```
 
-新增 workload 时提供真实的 `torch.nn.Module` 和 example inputs。Torch-XLA 负责
-ATen 到 StableHLO 的转换，项目维护 StableHLO semantic family 到 Canonical、TISA
-和 backend capability 的映射。
+建议每次实验使用新的输出目录，不要覆盖需要保留的结果。
 
-## 当前能力
+### 3. 编译一次，比较 static 与 dynamic
 
-- `torch.export` 捕获真实 PyTorch module，并保存源图 provenance；
-- Torch-XLA 生成 StableHLO，OpenXLA 官方 bindings 完成 MLIR parse/verify；
-- GC 完成 canonicalization、复合语义恢复、tile 切分、region/state 依赖和 locality
-  metadata；
-- FC 输出带明确 source/destination、operand role、符号 buffer、Private/Local/Shared
-  visibility、抽象 UnitMap 和 typed dependency 的目标无关 TISA 方言；
-- TISA Generator 将其规范化为 `virtual_tisa_program.json`；CodegenBackend 内的 Target
-  Lowering 依据 `MachineConfig` 生成唯一 `TargetPlan`，再由该计划共同生成最终 TISA、
-  payload 与 `MemoryPlan`；
-- static 和 dynamic device policy 共享同一份编译产物、地址绑定和 timing source；
-- runtime 消费编译期 `MemoryPlan`，绑定地址、动态参数和提交 envelope，再由 loader 生成
-  可校验的 bound descriptor；device scheduler 只负责 queue、ROB、依赖和 OOO issue；
-- 支持 Matmul、batched Matmul、GEMV、elementwise、reduce、Softmax、LayerNorm、
-  RMSNorm、Attention region、SwiGLU、RoPE、Conv2D、BatchNorm inference、pooling、
-  reshape/transpose、embedding gather、固定窗口 KV-cache；
-- 论文模型 registry 同时提供稳定的 `one_block` 基线和带 embedding、position、causal
-  mask、重复 block、输出 head 的 `model_proxy`；DeepSeek 提供 dense 与 MoE proxy；
-- `RuntimeStateRegistry` 和 `RuntimeSequence` 支持固定窗口 decode 的多次 invocation；
-- `paper-matrix` 支持顺序 request replay，并为 scope、层数、DeepSeek 模式和请求数生成
-  独立实验身份；
-- symbolic shape 使用 normalized shape environment 完成 Canonical resolve 与 specialization；
-- 输出分阶段 artifact、周期与 stall 统计、SVG/PNG 泳道图和 Perfetto JSON；
-- `cycle_event` 提供显式 reception/WQ/IQ/Fu/ROB、逐周期控制延迟、完成带宽与退休反压；
-- `ExecutionBackend` 独占 payload 解析、EU 接收/占用、内部 task trace 和物理完成反馈；
-  `DeviceSimulator` 负责连接 loader、scheduler 与 execution backend；
-- 支持 analytical、timing table、systolic MXU profile 以及 RTL completion trace
-  importer。
+正式对照实验优先使用分离流程，避免每个策略重新编译。
 
-默认 timing source 是 analytical event model。加载 RTL-observed profile 后，manifest
-会记录相应 calibration status；两类结果分别用于趋势研究和校准时序分析。
-
-## 环境
-
-正式前端使用同一个 Python 环境中的：
-
-```text
-Python 3.12
-torch 2.9.1
-torch-xla 2.9.0
-OpenXLA StableHLO wheel 1.12.1
-```
-
-本机验证解释器为 `/usr/bin/python3.12`，安装细节见
-[docs/install-stablehlo.md](docs/install-stablehlo.md)。
-
-## 快速运行
-
-编译并动态调度一个真实的两头 Attention block：
+**先编译：**
 
 ```bash
-cd /home/lora/OpenTPU/npu-ooo-simulator
-
-PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-and-sim \
+PYTHONPATH=src python3.12 -m npu_ooo.cli compile \
   --torch-module examples.torch_models:MultiHeadAttentionBlock \
   --input-shape 1,4,8 --input-shape 1,1,4,4 \
-  --tile-size 4 \
-  --policy dynamic_ready_queue \
-  --output-dir out/attention-dynamic
-```
-
-比较 static 与 dynamic 时固定 module、shape、tile planner、MachineConfig、backend 和
-timing provider，实验变量设为 `--policy` 与输出目录：
-
-```bash
-PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-and-sim \
-  --torch-module examples.torch_models:MultiHeadAttentionBlock \
-  --input-shape 1,4,8 --input-shape 1,1,4,4 \
-  --tile-size 4 --policy static_pipeline \
-  --output-dir out/attention-static
-```
-
-`--runtime-device-matrix` 在一次编译后运行 runtime/device 四种组合，保证所有策略行
-共享 `artifact_id`、`program_id` 和 buffer binding。
-
-### 分离编译与仿真
-
-需要重复比较多个硬件或调度配置时，先生成 compile package，再独立运行仿真：
-
-```bash
-# 只执行前端、GC、FC、TISA 和 backend lowering
-PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile \
-  --torch-module examples.torch_models:MultiHeadAttentionBlock \
-  --input-shape 1,4,8 --input-shape 1,1,4,4 \
-  --tile-size 4 \
+  --tile-size 4 --arch minimal \
   --output-dir out/attention-compile
-
-# 仿真阶段不需要 PyTorch；只读取 compile package
-PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli simulate \
-  --compile-dir out/attention-compile \
-  --policy dynamic_ready_queue \
-  --arch wide-mxu \
-  --output-dir out/attention-wide-dynamic
 ```
 
-`compile` 的输出包含 `01_gc/canonical_graph.json`、
-`03_tisa/virtual_tisa_program.json`、`03_tisa/tisa_program.json`、
-`04_backend/target_plan.json`、`04_backend/backend_artifact.json`、
-`04_backend/memory_plan.json` 和
-`04_backend/machine.json`。`simulate` 从这些文件
-恢复编译结果，只重新执行 runtime 地址绑定、动态参数解析和 device/backend timing。
-同一 compile package 可以被多个 `simulate` 命令复用。
+**再用同一编译包运行两种设备策略：**
 
-`compile` 的参数只描述输入、shape specialization、tile/GC 选项和 backend codegen；它不
-接受 `--policy`、`--runtime-*` 或 timing/event 选项。`simulate` 才选择 device policy、
-runtime policy、机器覆盖、timing provider 和输出目录。容量、带宽、时延和执行单元数量
-可以在兼容范围内覆盖；改变存储拓扑、搬运引擎、对齐或 operand placement 必须重新编译。
-缺少 `TargetPlan` v1 或 `MemoryPlan` v2 的旧编译包会得到明确的重新编译诊断。
+```bash
+for policy in static_pipeline dynamic_ready_queue; do
+  PYTHONPATH=src python3.12 -m npu_ooo.cli simulate \
+    --compile-dir out/attention-compile \
+    --event-backend cycle_event \
+    --scheduler-config configs/scheduler/cycle_baseline.json \
+    --runtime-policy static --policy "$policy" \
+    --dynamic-priority oldest_first --address-scoreboard \
+    --output-dir "out/attention-$policy"
+done
+```
 
-运行时动态参数使用 JSON manifest 传入：
+`simulate` 默认读取编译包内的 `04_backend/machine.json`，无需再写 `--arch`。
+两次运行只改变设备 policy；输入、编译包、runtime 提交配置、硬件和 timing source 均相同。
+对照 `compile_package_sha256`、周期和 stall，而不是只看泳道图是否更紧凑。
+
+`static_pipeline` 是项目的固定提交顺序、允许跨 EU 重叠的静态计划基线，
+不等同于论文作者未公开的强静态排程器。小图中 static/dynamic 周期相同是正常结果。
+
+### 4. 选择合适的入口
+
+| 命令 | 做什么 | 何时使用 |
+| --- | --- | --- |
+| `compile` | 前端、GC/FC、TISA、target lowering、payload 和 MemoryPlan | 改模型、shape、tile、存储映射时 |
+| `simulate --compile-dir …` | 加载编译包，重新绑定 runtime 并仿真 | 比较策略、队列、控制延迟、timing 时 |
+| `compile-and-sim` | 串联上述两个阶段 | 首次跑通或单次实验 |
+| `paper-matrix` | 按 benchmark registry 批量编译、比较设备策略 | 模型 proxy、策略矩阵和请求重放 |
+
+`compile` 不接受 device policy、runtime、event/timing 参数。
+`--runtime-config` 仅属于 `simulate`；各入口完整参数以子命令帮助为准：
+
+```bash
+PYTHONPATH=src python3.12 -m npu_ooo.cli compile --help
+PYTHONPATH=src python3.12 -m npu_ooo.cli simulate --help
+PYTHONPATH=src python3.12 -m npu_ooo.cli paper-matrix --help
+```
+
+## 参数配置
+
+先分清参数在哪个阶段生效。下面的默认值指 CLI 默认，不代表某台真实芯片的参数。
+时间单位均为 **cycles**，容量和带宽字段带 `bytes` 时按字节计。
+
+### 1. 编译参数：修改后需要重新 compile
+
+适用于 `compile`、`compile-and-sim`；`paper-matrix` 的模型输入由 registry 提供。
+
+| 参数 | 默认值 / 可选值 | 含义与使用提示 |
+| --- | --- | --- |
+| `--torch-module` | 必填，`MODULE:CLASS_OR_FACTORY` | 可导入的无参数 `nn.Module` 类或工厂；需要构造参数时自行提供无参数工厂 |
+| `--input-shape` | 必填，可重复 | 每个 positional tensor 输入对应一个 shape，顺序与 `forward` 一致，如 `32,64`；不是运行时任意可变的 seqlen |
+| `--input-dtype` | `float32`；另有 `float16`、`bfloat16` | CLI 示例输入的统一 dtype；不保证任意自定义模型的参数 dtype 会自动转换 |
+| `--model-id` | 默认来自类/工厂名 | 实验标识，不选择另一套模型实现 |
+| `--tile-size` | `32` | GC 的基线 tile 尺度；不同算子按自身维度解释，边界 tile 可更小 |
+| `--tile-size-candidates` | 不启用；如 `2,4,8` | 启用 GC cost model 选择候选，评分见 `01_gc/schedule.json`；不是自动输出所有候选的 sweep |
+| `--arch` | `minimal`；另有 `wide-mxu`、`lpu-like` | 选择内置机器；具体映射见下文 |
+| `--machine-config` | 不指定 | 读取完整 MachineConfig JSON，优先于 `--arch`，不是局部补丁 |
+| `--codegen-backend` | `analytical` | 生成 target payload 的后端；与仿真的 event/timing 选项不同 |
+| `--softmax-algorithm` | 不覆盖模型设置；普通默认为 `materialized` | `materialized` 为行级实现；`online` 为分析版 `(max,sum)` state chain，不代表完整在线 Softmax 数值实现 |
+| `--onchip-handoff` | `root_memory` | `attention_single_consumer` 尝试合法的 Matmul→Softmax 片上交接；受 role、layout、dtype、tile、容量、fan-out 和可达性限制，不满足时记录回退原因 |
+
+片上交接开关会改变搬运和编译产物。研究其收益时分别编译 root/onchip 两个版本，
+再在每个版本内部比较 static/dynamic，不要将减少访存的收益全部归因于乱序调度。
+
+### 2. 设备调度：先选模型，再选策略
+
+适用于 `simulate`、`compile-and-sim`。`paper-matrix` 用 `--device-policies` 指定策略列表。
+
+这里 EU 指执行单元，WQ 是等待队列，IQ 是发射队列；payload 是一条 TISA 绑定的内部执行实现。
+
+| 参数 | 默认值 / 可选值 | 含义 |
+| --- | --- | --- |
+| `--event-backend` | `analytical_event` / `cycle_event` | 默认事件模型用于分析基线；逐周期模型用于 WQ/IQ、控制流水、反馈和退休反压研究。它不是执行延迟表的选择开关 |
+| `--policy` | `static_pipeline`（默认） | 固定本次提交顺序的静态计划，允许跨 EU 重叠 |
+| 同上 | `dynamic_ready_queue` | 从已到达、依赖满足且资源可用的窗口内选择指令 |
+| 同上 | `sequential` | 串行参考策略，限制指令间重叠 |
+| `--dynamic-priority` | `oldest_first`（默认） | 动态策略优先选择较老候选 |
+| 同上 | `compiler_hint` | 使用 descriptor 显式携带的优先级 hint |
+| 同上 | `oracle_critical_path` | 使用完整程序的参考策略；旧名 `critical_path` 是兼容别名，不是硬件在线策略 |
+| `--address-scoreboard` | 关闭 | 开启额外地址冲突检查；cycle 设备模型检查已接收的较老未完成 descriptor，runtime loader 另负责将绑定后的 alias 转为显式依赖 |
+| `--memory-bank-scoreboard` | 关闭 | 按 MachineConfig 的 bank/读写端口建模结构冲突；当前为 payload 占用期间的保守模型，不是逐 transaction DRAM 仿真 |
+| `--scheduler-config` | 不指定 | 读取控制流水 JSON，**必须同时选择 `cycle_event`**；格式见下一节 |
+
+CLI 默认是 **static + analytical_event**，不是 dynamic + cycle_event；需要后者时必须显式指定。
+
+### 3. 队列容量与逐周期控制参数
+
+命令行容量覆盖以下默认值；未提供时沿用所选机器配置。
+
+| CLI 参数 | 默认来源 | `cycle_event` 中的含义 |
+| --- | --- | --- |
+| `--instruction-queue-depth` | `machine.scheduler.instruction_queue_depth` | Reception FIFO 的 TISA 指令容量 |
+| `--rob-entries` | `machine.scheduler.rob_entries` | ROB 指令容量；dispatch 分配，按顺序 retire 释放，不模拟 CPU 推测回滚 |
+| `--max-inflight-tiles` | `machine.scheduler.max_inflight_tiles` | 同时活动的 tile 数，不是 TISA 条数；一个 tile 可以有多条 transfer/compute 指令 |
+| `--dependency-window` | `machine.scheduler.dependency_window` | 每个 WQ 的候选扫描窗口，不是整个程序长度 |
+| `--ready-queue-depth` | 最终生效的 `instruction_queue_depth` | 每类 EU 的 IQ 上限之一；实际容量为它与 `pipeline.iq_entries` 的较小值 |
+
+**WQ 容量不由 `--dependency-window` 设置**：每类 EU 的 WQ 容量为
+`execution_units[].queue_depth × count`，需要在 MachineConfig 中配置。
+
+控制流水模板：[configs/scheduler/cycle_baseline.json](configs/scheduler/cycle_baseline.json)。
+文件顶层直接放以下字段，不要再包一层 `pipeline`：
+
+| JSON 字段 | 默认值 | 单位与含义 |
+| --- | ---: | --- |
+| `receive_width` | 1 | 每周期最多接收的指令数 |
+| `dispatch_width` | 1 | 每周期最多从 Reception 分派到 WQ 的指令数 |
+| `select_width` | 1 | 每周期最多从 WQ 选入 IQ 的指令数 |
+| `issue_width` | 1 | 全局每周期最多发射数，还受各 EU 的 `issue_width` 和接收能力限制 |
+| `completion_width` | 1 | 每周期最多接受的完整完成反馈数，不是物理 EU 数量 |
+| `retire_width` | 1 | 每周期最多退休的指令数 |
+| `dispatch_latency` | 1 | dispatch 后进入依赖就绪判断的最小延迟 |
+| `select_latency` | 1 | select 到最早 issue 的延迟 |
+| `wakeup_latency` | 1 | 依赖反馈到消费者可就绪的延迟 |
+| `completion_latency` | 0 | 物理执行结束到最早接受完整反馈的延迟 |
+| `retire_latency` | 1 | complete 到最早 retire 的延迟 |
+| `iq_entries` | 8 | 每类 EU 的 IQ 容量，与 `ready_queue_depth` 共同限制 |
+| `inflight_entries` | 16 | 每类 EU 的语义表 Fu 容量，**按 operand 条目数计，不按指令数计** |
+| `max_cycles` | 1000000 | 运行周期上限，用于诊断长期无法完成的仿真 |
+
+字段均为整数；除 `wakeup_latency`、`completion_latency` 可以为 0 外，其余至少为 1。
+示例：将下列内容保存为 `cycle-tuned.json`，然后传入 `--scheduler-config cycle-tuned.json`：
 
 ```json
 {
-  "runtime_policy": "dynamic_ready_queue",
-  "runtime_invocations": 1,
-  "dynamic_indices": {
-    "cache_update.index": [12, 0]
-  },
-  "dynamic_layouts": {
-    "kv_cache": {
-      "shape": [1, 4096, 8, 64],
-      "strides_bytes": [4194304, 1024, 128, 2],
-      "layout": "paged_kv",
-      "offset_bytes": 65536
-    }
-  }
+  "issue_width": 2,
+  "completion_width": 2,
+  "wakeup_latency": 2,
+  "iq_entries": 16
 }
 ```
 
-使用 `simulate --runtime-config runtime.json` 传入。`dynamic_indices` 的 key 必须是
-编译产物中 TISA instruction 的 `dynamic_index.expression_id`；`dynamic_layouts` 的 key
-必须是已分配的 tensor 名称。改变实际 tensor shape 仍然需要重新 `compile`，而改变
-`position`、cache window 或 page offset 可以复用同一 compile package。
+配置优先级：命令行容量覆盖 MachineConfig 对应容量；`--scheduler-config` 替换所选机器的
+整组 `scheduler.pipeline`。该文件省略的字段取上表默认值，**不是继承机器中同名字段**。
+没有传文件时才完整使用 `machine.scheduler.pipeline`。
 
-### 编译、runtime 与仿真边界
+物理执行结束、反馈接受、依赖唤醒和退休是不同事件。逐周期顺序与手算示例见
+[Device scheduler 周期模型](docs/device-scheduler.md)。
 
-`compile-and-sim` 是一个端到端实验入口，因此一次命令会依次完成编译、runtime buffer
-分配、descriptor 提交和仿真，并把产物写入 `00_frontend` 到 `07_trace`。概念上这仍然
-是三个独立阶段：
+### 4. 硬件与执行时间：三个 JSON 不要混用
 
-```text
-compile_torch_module(...)
-  -> virtual TISA / TargetPlan / final TISA
-  -> BackendArtifact / MemoryPlan                # 编译期，保持不变
-allocate_memory_plan_bindings(...)
-  -> RuntimeSubmission                   # host 提交描述
-load_device_program(...)
-  -> LoadedDeviceProgram                 # bound descriptors、envelopes、静态计划
-schedule_tisa_program(...)
-  -> DeviceSimulator -> scheduler <-> ExecutionBackend
-  -> SimulationResult
-```
-
-`--input-shape` 是 `torch.export` 的示例输入和 shape-specialization 参数，不是仿真时
-可以任意改变的 `seqlen`。`--policy` 选择 device scheduler，`--runtime-policy` 选择
-descriptor 的提交顺序；两者都可以使用同一份编译产物。
-
-当前 Runtime 是 host 侧的静态提交模型：它在仿真前确定物理地址、动态参数、command
-chunk 和 descriptor 顺序，Scheduler 按这个固定输入流接收任务。`runtime-policy` 的两种
-选择都会生成确定的提交顺序，其中 `dynamic_ready_queue` 表示 host 侧预排序。
-
-设备运行过程中的动态决策由 device scheduler 完成。它从已经到达的 TISA 指令中，根据
-依赖和资源状态选择下一条 issue：
-
-```text
-Runtime：预先生成固定提交流
-  -> Device scheduler：运行时动态 issue
-```
-
-### 动态参数
-
-编译期保存符号和约束，运行期提供每次 invocation 的具体值：
-
-| 参数 | 绑定阶段 | 当前语义 |
+| 配置选项 | 配置内容 | 示例/来源 |
 | --- | --- | --- |
-| `position`、dynamic slice 起点、KV-cache 写入位置 | runtime | 通过 `DynamicIndexBinding` 传入，按 StableHLO clamp 规则解析为物理 offset/span |
-| KV-cache 的 page、stride、base offset | runtime | 通过 `RuntimeLayoutBinding` 传入，更新 operand 的 concrete layout 和 bank 映射 |
-| `seqlen` 作为固定 cache/window 内的有效长度 | runtime | 作为 index/window 控制值使用，编译产物保持不变 |
-| `seqlen` 改变输入 tensor 的实际 shape | compile specialization | 需要重新执行 `compile` 或生成对应 shape variant |
+| `--machine-config` | memory 层级/容量/bank/端口、EU、合法 transfer path、operand placement、scheduler 默认值 | 编译输出 `04_backend/machine.json` 是完整模板；内置定义见 [arch/machine.py](src/npu_ooo/arch/machine.py) |
+| `--scheduler-config` | 上节列出的周期控制字段 | [cycle_baseline.json](configs/scheduler/cycle_baseline.json) |
+| `--timing-config` | payload 内部任务的执行时长/发射间隔或 MXU profile | [attention_probe.json](configs/timing/attention_probe.json) |
 
-动态 binding 目前通过 Python runtime API 提供；CLI 已支持 `--runtime-invocations`、
-`--runtime-availability-config`、`--runtime-launch-latency` 等提交参数，但尚未提供把
-任意模型参数自动转换为 `DynamicIndexBinding` 的命令行语法。一个动态 cache invocation
-的最小示例：
+内置机器的区别：
 
-```python
-from npu_ooo.ir import (
-    DynamicIndexBinding,
-    RuntimeLayoutBinding,
-    allocate_memory_plan_bindings,
-    create_runtime_submission,
-)
+| `--arch` | 用途和主要存储映射 |
+| --- | --- |
+| `minimal` | 简单研究基线；DRAM/SRAM/RF，Matmul 输入输出在 SRAM |
+| `wide-mxu` | 与 minimal 具有兼容存储拓扑；增加 MXU 实例数和发射能力 |
+| `lpu-like` | LPU 风格研究配置；GM/UB/LMB/RMB/PSB/ARB，Matmul 使用 LMB/RMB/PSB，路径由目标映射生成；不是已校准真实硬件 |
 
-buffers = allocate_memory_plan_bindings(
-    compiled.backend_artifact.memory_plan,
-    machine,
-)
-submission = create_runtime_submission(
-    compiled.backend_artifact,
-    buffers,
-    policy="dynamic_ready_queue",
-    dynamic_index_bindings=(
-        # expression_id 来自 TISA instruction 的 dynamic_index metadata
-        DynamicIndexBinding("cache_update.index", (position, 0)),
-    ),
-    dynamic_layout_bindings=(
-        RuntimeLayoutBinding(
-            "kv_cache", cache_shape, cache_strides_bytes,
-            layout="paged_kv", offset_bytes=page_base_offset,
-        ),
-    ),
-)
-```
+`simulate` 的机器选择优先级：`--machine-config` > 显式 `--arch` > 编译包的机器。
+切换到不兼容的存储拓扑、engine、alignment、operand placement 或操作能力时必须重新编译。
+兼容的容量、带宽、延迟和 EU 数量调整可以通过拓扑检查，但仍必须满足已编译的分配和执行约束。
 
-`RuntimeSequence` 可以为每个 invocation 传入不同的 index/layout binding，同时复用同一份
-`BackendArtifact`。这就是 decode 中 `position` 逐步变化而无需重复编译的路径。
+注意：**拓扑兼容不等于重新估算了全部任务时长**。默认 analytical timing 优先使用编译包里
+已有的 task duration/II。若要研究算力或带宽变化，应确认 timing provider 如何使用新参数；
+必要时重新编译，或显式提供新的 timing table/profile，不能只改机器 JSON 就认定全部延迟已更新。
 
-真实 pre-norm decoder block：
+`--timing-provider` 的选择：
+
+| 值 | 是否需要 `--timing-config` | 行为 |
+| --- | --- | --- |
+| `analytical` | 不需要 | 使用任务携带的分析时长，缺失时回退到 EU 默认值 |
+| `timing_table` | 需要 | 按任务或 primitive 等键覆盖 duration/II；未命中回退 analytical |
+| `systolic_mxu_profile` | 需要 | 按 Matmul shape 匹配 MXU profile；未命中时按 profile 的策略报错或回退 |
+
+不指定 provider 时：无 timing 文件选择 `analytical`，有文件选择 `timing_table`。
+使用 MXU profile 时必须显式选择对应 provider；不要让它被当成普通 timing table 解析。
+
+Timing 文件中的 `duration_cycles` 是任务执行时长，`initiation_interval_cycles`（II）是两次
+启动的最小间隔，两者不能混用。当前 analytical execution backend 在同一 EU 实例上仍等待
+前条完整 payload 执行结束，因此仅减小 II 不会自动启用同一实例的多 TISA 流水重叠。
 
 ```bash
-PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli compile-and-sim \
-  --torch-module examples.torch_models:PreNormDecoderBlock \
-  --input-shape 1,4,8 --input-shape 1,1,4,4 \
-  --tile-size 4 --policy dynamic_ready_queue \
-  --output-dir out/decoder-dynamic
+PYTHONPATH=src python3.12 -m npu_ooo.cli simulate \
+  --compile-dir out/attention-compile \
+  --event-backend cycle_event --policy dynamic_ready_queue \
+  --timing-provider timing_table \
+  --timing-config configs/timing/attention_probe.json \
+  --output-dir out/attention-timing-table
 ```
 
-论文 benchmark 的 scaled case 使用：
+仓库中的 timing/profile 示例不是硬件实测数据。RTL JSON/CSV、VCS log 导入和测量区间定义见
+[RTL 校准指南](docs/rtl-calibration.md)。
+
+### 5. Runtime：提交顺序、到达时间和动态绑定
+
+Runtime 在仿真前生成固定提交流；设备 scheduler 决定运行时 issue 顺序。
+`--runtime-policy dynamic_ready_queue` 表示 **host 侧确定性预排序**，不是第二个在线设备调度器。
+
+| 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `--runtime-policy` | `static` | `static` 保留程序顺序；`dynamic_ready_queue` 在 host 侧预排序。研究设备乱序时建议先固定为 static |
+| `--runtime-chunk-size` | 全部指令一个 chunk | 每个提交块包含的 TISA 条数；不是 tile 大小，也不是 receive width |
+| `--runtime-launch-latency` | 0 | **每个 chunk** 的提交开销；chunk 越多，累计开销可能越大 |
+| `--runtime-synchronization-cycles` | 0 | invocation 尾部同步开销，计入总周期 |
+| `--runtime-availability-config` | 全部为 0 | 指令 ID→最早可提交周期的 JSON；chunk availability 取所含指令的最大值，再经过 launch 和设备接收限制 |
+| `--runtime-base-address` | `0x10000000` | 编译 MemoryPlan 的 runtime 基址；CLI 支持十六进制写法，不改变已确定的 memory placement |
+| `--runtime-invocations` | 1 | 同包多次调用；`simulate`/`compile-and-sim` 的多 invocation 路径要求 persistent state contract，不是任意无状态模型的压测开关 |
+| `--runtime-inter-invocation-gap` | 0 | 前次 state completion 到下次 invocation 之间的间隔 |
+| `--runtime-config` | 不指定，仅 `simulate` | JSON 中提供上述 runtime 配置及 dynamic index/layout binding |
+
+`--runtime-alignment`、`--runtime-buffer-policy linear/lifetime_reuse` 是保留的旧选项。
+当前生产路径消费编译期 MemoryPlan，**这两个选项不重新决定实际对齐或 buffer 复用**；
+修改 allocation/reuse 应从编译计划入手，不要用它们做新的对照实验。
+
+将下列内容保存为 `runtime.json`，可直接用于前面的 Attention 编译包：
+
+```json
+{
+  "runtime_policy": "static",
+  "runtime_chunk_size": 4,
+  "runtime_launch_latency": 2,
+  "runtime_synchronization_cycles": 1
+}
+```
 
 ```bash
-PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli paper-matrix \
-  --benchmarks all --variant micro --arch minimal \
-  --tile-size 4 --output-dir out/paper-matrix
+PYTHONPATH=src python3.12 -m npu_ooo.cli simulate \
+  --compile-dir out/attention-compile --runtime-config runtime.json \
+  --event-backend cycle_event --policy dynamic_ready_queue \
+  --output-dir out/attention-runtime-overhead
 ```
 
-模型覆盖实验显式选择模型 shell、层数和请求数：
+同一 runtime 标量参数的优先级是：显式 CLI 参数 > runtime JSON > 默认值。
+`--runtime-config` 不配置 device policy、scheduler pipeline 或 timing provider。
+JSON 中的 `runtime_base_address` 应写十进制数；availability 文件在 JSON 中使用相对路径时，
+相对于该 runtime JSON 的目录解析。
+
+**动态 index/layout 属于模型相关的高级用法：**
+
+- `dynamic_indices` 是 expression ID→整数列表；ID 必须取自编译 TISA 的 `dynamic_index.expression_id`，不能任意填写 `position`。
+- `dynamic_layouts` 是 tensor 名→`shape/strides_bytes/layout/offset_bytes` 对象；必须符合已有 allocation 和支持的布局，不能借此任意改变模型形状。
+- 多次调用可以提供 `invocations` 对象列表，每项包含自己的 dynamic binding；列表长度必须等于 `runtime_invocations`。提供该列表时，应在各项中显式写需要的 binding。
+- 改变固定 cache/window 内的位置可以复用编译包；改变真实输入 shape、tile 或模型结构需要重新编译。
+
+## 查看结果
+
+先看结果，再按问题回溯相应编译阶段：
+
+| 想回答的问题 | 文件 |
+| --- | --- |
+| 总共多少周期？卡在哪里？ | `06_simulation/summary.json`；cycle 模型还有 `stall_cycles`、队列占用和生命周期统计 |
+| 哪条 TISA 何时接收、发射、完成、退休？ | `06_simulation/tisa_instructions.csv` |
+| 哪些执行单元发生重叠？ | `07_trace/swimlane.svg`；更细时间线看 `07_trace/perfetto.json` |
+| 本次实际给 scheduler 的指令和地址是什么？ | `05_runtime/bound_device_program.json` |
+| Host 如何分块、绑定地址、提交？ | `05_runtime/runtime_submission.json`；地址依赖见同目录 `address_dependencies.json` |
+| 数据为什么在 UB/LMB/RMB？搬运经过哪里？ | `04_backend/target_plan.json`；实际 buffer/allocation 见 `memory_plan.json` |
+| 最终指令和内部 payload 如何对应？ | `03_tisa/tisa_program.json`、`04_backend/backend_artifact.json` |
+| FC 是否保留抽象 scope/role？ | `02_fc/tisa_dialect.json`；Generator 输出见 `03_tisa/virtual_tisa_program.json` |
+| Tile 怎么切、依赖怎么生成？ | `01_gc/schedule.json`、`tile_graph.json`、`pass_dumps/` |
+| 前端实际生成了什么？ | `00_frontend/generated.mlir`、`stablehlo_module.json` |
+| 本次运行使用了哪些配置？ | 根目录 `manifest.json`、`artifact_index.json`；机器快照见编译包 `04_backend/machine.json` |
+
+目录按阶段分为 `00_frontend`～`04_backend`（编译）与 `05_runtime`～`07_trace`（运行）。
+`compile-and-sim` 集中写入一个目录；分离流程则将编译包和每次 simulation 结果放在各自目录。
+矩阵实验优先从根目录 `matrix_index.json`、`sweep.csv/json` 找到各个策略结果。
+
+读统计时注意：
+
+- `total_cycles` 包含 runtime 开销；`cycle_event` 中物理执行结束、完整反馈完成、最终退休不是同一个时刻。
+- `stall_cycles` 各原因可以在同周期重叠，不能相加解释总运行时间；`stall_instruction_cycles` 是另一种按指令计数的口径。
+- `offchip_*_bytes` 用于核对 root-memory 流量；片上优化会改变它，单纯策略比较应固定编译包。
+- `scheduler_calibration_status` 与执行 timing 的校准状态要分开看；分析周期不等于芯片实测性能。
+
+## 常见问题
+
+**缺少 `torch_xla` 或 `mlir`，但 CLI 可以启动？**
+
+CLI/help 和独立仿真不需要完整前端。检查依赖是否安装在运行命令使用的同一个解释器中，
+按 [安装指南](docs/install-stablehlo.md) 验证官方 StableHLO parse/verify。
+
+**`--scheduler-config requires --event-backend cycle_event`？**
+
+控制流水文件只适用于逐周期模型。补上 `--event-backend cycle_event`，或去掉该文件使用事件基线。
+
+**复用编译包时提示 topology/placement 不匹配？**
+
+例如从 minimal 切换到 lpu-like，不能只在 `simulate` 时换架构。
+应在 `compile --arch lpu-like` 时重新生成 TargetPlan、payload 和 MemoryPlan。
+旧包缺少当前要求的 TargetPlan/MemoryPlan 时也应重新编译。
+
+**改了 receive/issue width，周期却没有变化？**
+
+可能仍受数据依赖、其他流水级、EU 接收能力、队列容量或 memory 冲突限制。
+例如只增加全局 issue width，并不会自动增加 MXU 实例，也不意味着每周期有两条 ready 指令。
+先看 stall、队列和 TISA 生命周期，不要仅按参数倍数推算加速比。
+
+**多个 invocation 报错，或 runtime 预排序被拒绝？**
+
+多 invocation CLI 路径需要 persistent state；无状态请求重放可使用 `paper-matrix --request-count`。
+预排序若让消费者先于 loader 新增的 alias producer 到达，会在执行前被拒绝。
+先恢复 `--runtime-policy static` 并检查物理依赖，不要通过删除依赖来绕过错误。
+
+## 更多实验
+
+### 论文 benchmark / 策略矩阵
 
 ```bash
-PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli paper-matrix \
-  --benchmarks bert-base \
-  --variant micro \
-  --model-scope model_proxy \
-  --layer-count 12 \
-  --request-count 2 \
-  --inter-request-gap 4 \
-  --tile-size 4 \
-  --output-dir out/bert-model-proxy
-
-PYTHONPATH=src /usr/bin/python3.12 -m npu_ooo.cli paper-matrix \
-  --benchmarks deepseek-r1-16b-prefill \
-  --model-scope model_proxy \
-  --deepseek-mode moe_proxy \
-  --layer-count 2 \
-  --output-dir out/deepseek-moe-proxy
+PYTHONPATH=src python3.12 -m npu_ooo.cli paper-matrix \
+  --benchmarks bert-base --variant micro --arch minimal \
+  --tile-size 4 --event-backend cycle_event \
+  --scheduler-config configs/scheduler/cycle_baseline.json \
+  --address-scoreboard \
+  --output-dir out/bert-policy-matrix
 ```
 
-`model_proxy` 使用缩小的 hidden/channel 维度，但保留模型组件和重复深度。DeepSeek
-MoE proxy 在图内计算 router softmax，top-k mask 作为 request 输入；各 expert GEMM、
-weighted dispatch 和 combine 保持 scheduler-visible。动态 top-k 选择、token compaction
-和 expert capacity 属于下一版 MoE 数据流能力。
+| 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `--benchmarks` | `all` | 逗号分隔的 case ID；建议先运行单个 micro case |
+| `--variant` | `micro` | 小尺寸确定性 proxy；`paper_shape` 为较大形状，资源需求更高，不代表完整论文复现 |
+| `--device-policies` | `static_pipeline,dynamic_ready_queue` | 比较的设备策略列表 |
+| `--runtime-device-matrix` | 关闭 | 同时变化 runtime static/dynamic 和 device static/dynamic，生成四组合；`compile-and-sim` 也支持该开关 |
+| `--model-scope` | `one_block` | `model_proxy` 增加 embedding、position、mask、head 等模型 shell |
+| `--layer-count` | 1 | 实际构造的重复 block 数，不是仅乘一个统计系数 |
+| `--deepseek-mode` | `dense` | `moe_proxy` 使用显式路由输入的 MoE proxy；不具备完整动态 top-k/compaction/capacity 行为 |
+| `--request-count` / `--inter-request-gap` | 1 / 0 | 顺序重放请求及间隔，不是并发请求负载生成器 |
+| `--continue-on-error` | 关闭 | 记录失败 case 后继续其他 case；失败不计为成功 |
 
-registry 当前包含：`resnet50`、`bert-base`、`gpt-j-6b-oneblk`、`llama2-13b-oneblk`、
-`deepseek-r1-16b-prefill`、`deepseek-r1-16b-decode`。这些 case 以真实 PyTorch block
-构成 scaled micro 或 representative proxy，用于比较编译语义和调度趋势。`micro`
-提供小尺寸确定性输入；`paper_shape` 使用接近论文的形状并记录更高的资源需求。
+当前 registry：`resnet50`、`bert-base`、`gpt-j-6b-oneblk`、`llama2-13b-oneblk`、
+`deepseek-r1-16b-prefill`、`deepseek-r1-16b-decode`。
+这些是 scheduler research proxy；缩放维度、MoE routing、decode state 等能力边界应与实验结果一起说明。
 
-DeepSeek decode registry 行使用一 token 输入和显式 K/V fixed-window state；
-`--request-count` 通过同一 `BackendArtifact` 重放 invocation，stateful case 由
-`state_complete` 串联，stateless case 按 `--inter-request-gap` 顺序重放。
+### 使用自己的 PyTorch 模型
 
-`paper-matrix` 的目录结构：
-
-```text
-out/paper-matrix/
-├── README.md
-├── matrix_index.json
-├── sweep.csv
-├── sweep.json
-└── <case-id>/<profile>/
-    ├── 00_frontend/ ... 04_backend/   # 共享编译产物
-    ├── artifact_index.json
-    ├── manifest.json
-    ├── summary.json
-    └── policy_matrix/
-        └── runtime-<r>__device-<d>/
-            ├── 05_runtime/
-            ├── 06_simulation/
-            └── 07_trace/
-```
-
-矩阵根目录保存 case 清单和跨 case 汇总；每个 case 保存一份共享编译产物；策略目录
-保存 runtime、simulation 和 trace。实验开始前使用新的输出目录，并以
-`matrix_index.json` 作为本次结果清单。默认 profile 等于 variant；扩展实验的 profile
-编码 `model_scope/layer_count/deepseek_mode/request_count/gap`，避免覆盖 one-block 基线。
-
-## 添加 PyTorch 算子或模型
-
-在可导入模块中定义真实的 `torch.nn.Module`：
+在可导入的 `my_module.py` 中提供无参数类或工厂，例如：
 
 ```python
 import torch
@@ -350,188 +446,44 @@ class MyOperator(torch.nn.Module):
         return torch.matmul(lhs, rhs)
 ```
 
-运行编译：
-
 ```bash
-PYTHONPATH=src:/path/to/module /usr/bin/python3.12 -m npu_ooo.cli compile \
+PYTHONPATH=src:/path/to/module python3.12 -m npu_ooo.cli compile \
   --torch-module my_module:MyOperator \
   --input-shape 32,64 --input-shape 64,128 \
-  --output-dir out/my-operator
+  --tile-size 32 --output-dir out/my-operator
 ```
 
-每个 `--input-shape` 对应一个 positional tensor input。CLI 生成确定性 example input，
-用于 `torch.export` 的 shape/dtype 捕获。
+前端仍使用 `torch.export → Torch-XLA → official StableHLO`，不绕过正式转换链路。
+新增不支持的 operation 时，需要补充 semantic capability、Canonical mapping/recovery、
+TISA stage、target/payload lowering 和端到端测试，不能只注册模型名称。
 
-新增 StableHLO operation 时按以下链路注册能力：
+## 架构与开发
 
-```text
-StableHLO semantic capability
-  -> Canonical op mapping 或 composite recovery pass
-  -> TISA stage definition
-  -> backend lowering capability
-  -> PyTorch 端到端回归
-```
+各模块对应开头[整体架构](#整体架构)中的阶段：
 
-编译边界对 registry 外的 operation 产生明确诊断，诊断包含原始名称、缺失的 capability
-和当前已知集合。semantic fusion pattern 依据 shape、常量和数据流证明结果工作，模型名
-归属于 provenance 与 benchmark registry。
-
-GC 使用 `--tile-size` 生成确定性 baseline；`--tile-size-candidates 2,4,8` 启用
-`cost-model-v1`，按 tile 数、估算计算周期、root traffic 和 local working-set 选择
-候选，并把评分写入 `01_gc/schedule.json`。
-
-## 输出目录
-
-```text
-out/<run>/
-├── manifest.json
-├── artifact_index.json
-├── 00_frontend/
-│   ├── source_frontend_import.json
-│   ├── generated.mlir
-│   ├── stablehlo_module.json
-│   └── frontend_import.json
-├── 01_gc/
-│   ├── canonical_graph.json
-│   ├── gc_artifact.json
-│   ├── pass_dumps/
-│   ├── schedule.json
-│   ├── compile_statistics.json
-│   ├── tile_graph.{json,dot}
-│   └── operator_graph.{dot,svg}
-├── 02_fc/
-│   ├── tisa_dialect.json
-│   └── fc_diagnostics.json
-├── 03_tisa/
-│   ├── virtual_tisa_program.json
-│   ├── tisa_program.json
-│   └── compiled_artifact.json
-├── 04_backend/
-│   ├── backend_artifact.json
-│   ├── target_plan.json
-│   ├── memory_plan.json
-│   ├── execution_graph.{json,dot}
-│   └── machine.json
-├── 05_runtime/
-│   ├── runtime_submission.json
-│   ├── bound_device_program.json
-│   └── address_dependencies.json
-├── 06_simulation/
-│   ├── summary.json
-│   ├── tasks.csv
-│   └── tisa_instructions.csv
-└── 07_trace/
-    ├── swimlane.{svg,png}
-    └── perfetto.json
-```
-
-`generated.mlir` 展示 Torch-XLA 输出；`01_gc/pass_dumps/` 展示每个 GC pass 的输入、
-输出和诊断；`02_fc/tisa_dialect.json` 是不含 GM/UB/GDMA 等目标细节的符号方言；
-`03_tisa/virtual_tisa_program.json` 是 Generator 输出，`03_tisa/tisa_program.json` 是
-device scheduler 实际输入；`04_backend/target_plan.json` 保存 abstract→target 指令映射、
-route hop、engine、目标 operand 和 provenance，`memory_plan.json` 保存各 memory space 的
-buffer、allocation、slot、生命周期和复用关系。复合算子的内部 scratch 以 TargetPlan 的
-显式 internal-resource declaration 保存。
-
-`05_runtime/bound_device_program.json` 是 scheduler 的实际设备输入：instruction 语义、
-本次物理 operand、invocation-scoped completion token 和 dependency 位于 descriptor；
-chunk、arrival、launch latency 位于 envelope；静态模式另带可审计的固定计划。
-
-Softmax 默认使用 materialized row-wise payload。`--softmax-algorithm online` 选择
-分析版 online state-chain：相邻 reduction tile 传递 `(max, sum)` 状态，TISA 语义边界
-保持同一语义边界。该模式用于观察状态依赖对调度周期的影响；完整 rescale、最终归一化和
-workspace 生命周期属于后续数值 backend 扩展。
-
-## 调度边界
-
-```text
-编译器/backend：tile、operand placement、搬运路径、buffer allocation/reuse
-runtime/loader：地址、动态 binding、command chunk、descriptor envelope
-device scheduler：依赖、ROB、queue、仲裁、TISA issue 与 feedback 接受
-execution backend：payload、EU 接收能力/占用、物理完成与内部 task trace
-DeviceSimulator：时间推进和组件连接
-```
-
-`static_pipeline` 按显式 `StaticSchedulePlan` 冻结的本次 runtime submission order 与依赖 issue；
-`dynamic_ready_queue` 在到达、依赖
-满足且资源可用的窗口内选择 ready TISA instruction。两种 policy 复用同一份编译产物。
-
-设备在线策略默认只使用已到达 descriptor、有限队列、执行反馈和历史状态；
-`oracle_critical_path` 是完整图参考策略，不等同论文在线调度。编译参数
-`--onchip-handoff attention_single_consumer` 可在 role、layout、dtype、tile、容量、fan-out
-和 EU 可达性全部通过时，将 Attention 的 QK Matmul 输出直接交给 Softmax；默认
-`root_memory` 保留原有往返，不满足条件时 TargetPlan 会记录回退原因。
-
-## Backend 与 RTL 校准
-
-```text
-CodegenBackend: analytical
-EventBackend: analytical_event | cycle_event
-TimingProvider: analytical | timing_table | systolic_mxu_profile
-```
-
-逐周期调度可以直接消费已有编译包：
-
-```bash
-PYTHONPATH=src python3.12 -m npu_ooo.cli simulate \
-  --compile-dir out/attention-compile \
-  --event-backend cycle_event \
-  --scheduler-config configs/scheduler/cycle_baseline.json \
-  --address-scoreboard --policy dynamic_ready_queue \
-  --output-dir out/attention-cycle
-```
-
-配置文件控制 receive/dispatch/select/issue/completion/retire 带宽、阶段延迟、IQ/Fu
-容量；指令 CSV 增加阶段周期，summary 保存逐周期队列占用和 stall 原因。
-阶段顺序、容量单位、static/dynamic 策略边界和统计口径见
-[docs/device-scheduler.md](docs/device-scheduler.md)。当前控制时序是可配置研究模型，
-校准状态单独记录为 `scheduler_calibration_status=uncalibrated`。
-
-RTL completion trace 的 JSON/CSV schema、VCS console log 转换和 interval 选择见
-[docs/rtl-calibration.md](docs/rtl-calibration.md)。`compute_start_to_compute_done`
-对应 isolated matmul primitive；`descriptor_issue_to_done` 对应 full descriptor interval，
-manifest 会保留该区间标签。
-
-## 代码导航
-
-`src/npu_ooo` 按整体流程拆分：
-
-| 路径 | 主要职责 |
+| 路径 | 职责 |
 | --- | --- |
-| `cli.py` | 命令行入口，串联编译、Runtime 和仿真 |
-| `frontend/` | 将 PyTorch 转换并导入为 StableHLO/Canonical IR |
-| `compiler/` | 执行 GC、FC 和 TISA 生成 |
-| `ir/` | 定义各阶段共享的数据结构 |
-| `lowering/` | 将 TISA 对应的计算展开为 backend 执行任务 |
-| `arch/` | 描述存储、执行单元和 scheduler 配置 |
-| `backend/` | 提供可替换的代码生成和时序来源 |
-| `runtime/` | 装载程序、地址绑定和提交 envelope，生成设备 descriptor |
-| `scheduler/` | 只基于 bound descriptor/feedback 执行 static/dynamic 仲裁 |
-| `execution/` | 注册/执行 payload，拥有 EU 状态并产生完成反馈 |
-| `simulator/` | 推进时间并连接设备组件；保留旧参考模型兼容入口 |
-| `experiments/` | 运行模型、策略和硬件配置实验矩阵 |
-| `trace/` | 输出阶段产物、统计、泳道图和 Perfetto trace |
+| `frontend/`、`compiler/` | PyTorch/StableHLO 导入、GC、FC、TISA 生成 |
+| `arch/`、`ir/` | 架构配置和阶段数据契约 |
+| `backend/`、`lowering/` | target mapping、payload、memory planning、timing provider |
+| `runtime/` | 地址绑定、程序装载、descriptor/envelope 和调用状态 |
+| `scheduler/` | 队列、依赖、仲裁、issue 和反馈接受 |
+| `execution/` | payload 执行、EU 状态、物理完成和内部 task trace |
+| `simulator/` | 时间推进、组件连接与旧参考入口 |
+| `experiments/`、`trace/`、`cli.py` | 实验矩阵、产物与可视化、命令行编排 |
 
-整体调用关系是：
+进一步阅读：[完整架构](docs/architecture.md) · [TISA 论文对齐](docs/tisa-alignment.md) ·
+[周期模型](docs/device-scheduler.md) · [RTL 校准](docs/rtl-calibration.md) ·
+[当前计划](task_plan.md) · [进度记录](progress.md)。
 
-```text
-frontend -> compiler -> TISA/backend artifact
-         -> Runtime submission
-         -> scheduler + simulator
-         -> trace / statistics
-```
-
-完整分层说明见 [docs/architecture.md](docs/architecture.md)，论文语义映射见
-[docs/tisa-alignment.md](docs/tisa-alignment.md)，逐周期调度细节见
-[docs/device-scheduler.md](docs/device-scheduler.md)。
-
-## 验证
+运行回归：
 
 ```bash
-PYTHONPATH=src /usr/bin/python3.12 -m unittest discover -s tests -v
-PYTHONPATH=src /usr/bin/python3.12 -m compileall -q src tests examples
+PYTHONPATH=src python3.12 -m unittest discover -s tests -v
+PYTHONPATH=src python3.12 -m compileall -q src tests examples
 git diff --check
 ```
 
-端到端测试调用 PyTorch、Torch-XLA 和官方 StableHLO；后端与 scheduler 单元测试在
-所属 IR 层验证接口契约。
+前端端到端测试依赖完整环境；后端、runtime 和 scheduler 测试可从所属 IR 层验证契约。
+被跳过的前端测试不代表前端验证通过。完整 online Softmax 数值实现、精确 MoE 数据流、
+全模型数值等价及 scheduler RTL 校准仍应按各自能力边界单独验收。
