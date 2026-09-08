@@ -561,7 +561,9 @@ def lpu_like_machine_config() -> MachineConfig:
         execution_units=(
             ExecutionUnitConfig(
                 "GDMA",
-                supported_ops=("load", "store", "copy", "gather"),
+                # Root-memory layout transforms are an explicit analytical
+                # target policy; their payload must not fall through to LDMA.
+                supported_ops=("load", "store", "copy", "transpose", "gather"),
                 queue_depth=8,
                 latency_cycles=4,
                 initiation_interval_cycles=1,

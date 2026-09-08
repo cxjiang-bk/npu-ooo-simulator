@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 from npu_ooo.arch import minimal_machine_config
 from npu_ooo.backend.memory import materialize_target_memory
-from npu_ooo.cli import _paper_profile_name, build_parser, main
+from npu_ooo.cli import _load_torch_module, _paper_profile_name, build_parser, main
 from npu_ooo.frontend import official_stablehlo_available, torch_xla_available
 from npu_ooo.ir import (
     AccessType,
@@ -39,6 +39,18 @@ FRONTEND_AVAILABLE = bool(
 
 
 class CliSurfaceTest(unittest.TestCase):
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "requires PyTorch")
+    def test_torch_module_loader_applies_requested_dtype_to_module_and_inputs(self):
+        import torch
+
+        module, inputs, _name = _load_torch_module(
+            "examples.paper_benchmarks.llama2:LLaMA2DecodeOneBlock",
+            ["1,1,8", "1,2,4,4", "1,2,4,4", "1,1,1,4", "1,1,1,4", "1,1,1,4"],
+            "float16",
+        )
+        self.assertEqual({parameter.dtype for parameter in module.parameters()}, {torch.float16})
+        self.assertEqual({item.dtype for item in inputs}, {torch.float16})
+
     def test_paper_profile_name_keeps_default_path_and_disambiguates_expansion(self) -> None:
         baseline = SimpleNamespace(
             variant="micro",

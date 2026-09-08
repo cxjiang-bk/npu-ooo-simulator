@@ -611,7 +611,10 @@ def _load_torch_module(specification: str, input_shapes: list[str], dtype_name: 
     dtype = getattr(torch, dtype_name)
     shapes = tuple(_parse_positive_int_list(value, name="--input-shape") for value in input_shapes)
     example_inputs = tuple(torch.randn(*shape, dtype=dtype) for shape in shapes)
-    return module.eval(), example_inputs, factory_name.rsplit(".", 1)[-1]
+    # ``--input-dtype`` is the compile example dtype, so floating parameters
+    # and buffers must use the same dtype as the generated example tensors.
+    # ``Module.to(dtype=...)`` intentionally leaves integer buffers unchanged.
+    return module.eval().to(dtype=dtype), example_inputs, factory_name.rsplit(".", 1)[-1]
 
 
 def _write_policy_matrix(
