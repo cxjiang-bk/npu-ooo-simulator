@@ -5,12 +5,11 @@ from __future__ import annotations
 import argparse
 import csv
 from dataclasses import replace
-import importlib
 import json
 import math
 from pathlib import Path
 import sys
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from npu_ooo.arch import (
     SchedulerPipelineConfig,
@@ -30,6 +29,12 @@ from npu_ooo.backend import (
 )
 from npu_ooo.compiler import compile_torch_module
 from npu_ooo.experiments import run_paper_benchmark_matrix, run_runtime_device_matrix
+from npu_ooo.frontend import (
+    LoadedWorkloadConfig,
+    Workload,
+    build_declarative_workload,
+    load_workload_config,
+)
 from npu_ooo.ir import (
     BackendArtifact,
     DynamicIndexBinding,
@@ -62,6 +67,49 @@ from npu_ooo.trace import (
     write_svg,
     write_tile_graph_dot,
 )
+
+
+class _StoreSpecified(argparse.Action):
+    """Store a value while recording that it came from the command line."""
+
+    def __call__(self, parser, namespace, values, option_string=None) -> None:
+        setattr(namespace, self.dest, values)
+        specified = set(getattr(namespace, "_specified_options", ()))
+        specified.add(self.dest)
+        setattr(namespace, "_specified_options", specified)
+
+
+class _AppendSpecified(argparse.Action):
+    """Append a value and retain CLI-vs-config provenance."""
+
+    def __call__(self, parser, namespace, values, option_string=None) -> None:
+        current = list(getattr(namespace, self.dest, None) or ())
+        current.append(values)
+        setattr(namespace, self.dest, current)
+        specified = set(getattr(namespace, "_specified_options", ()))
+        specified.add(self.dest)
+        setattr(namespace, "_specified_options", specified)
+
+
+class _StoreTrueSpecified(argparse.Action):
+    """``store_true`` equivalent which records an explicit override."""
+
+    def __init__(self, option_strings, dest, default=False, required=False, help=None) -> None:
+        super().__init__(
+            option_strings=option_strings,
+            dest=dest,
+            nargs=0,
+            const=True,
+            default=default,
+            required=required,
+            help=help,
+        )
+
+    def __call__(self, parser, namespace, values, option_string=None) -> None:
+        setattr(namespace, self.dest, True)
+        specified = set(getattr(namespace, "_specified_options", ()))
+        specified.add(self.dest)
+        setattr(namespace, "_specified_options", specified)
 
 
 def _machine(name: str, config_path: Path | None = None):
@@ -208,31 +256,38 @@ def _add_compile_arguments(
     default_output_dir: str = "out/compile",
 ) -> None:
     parser.add_argument(
+        "--config",
+        type=Path,
+        help="schema-v1 JSON workload configuration",
+    )
+    parser.add_argument(
         "--torch-module",
-        required=True,
+        action=_StoreSpecified,
         metavar="MODULE:CLASS_OR_FACTORY",
-        help="import path to a zero-argument nn.Module class or factory",
+        help="legacy shorthand for a zero-argument nn.Module class or factory",
     )
     parser.add_argument(
         "--input-shape",
-        action="append",
-        required=True,
+        action=_AppendSpecified,
         metavar="D0,D1,...",
-        help="example input shape; repeat once per module input",
+        help="legacy randn input shape; repeat once per positional module input",
     )
     parser.add_argument(
         "--input-dtype",
+        action=_StoreSpecified,
         choices=("float16", "float32", "bfloat16"),
         default="float32",
     )
-    parser.add_argument("--model-id")
-    parser.add_argument("--tile-size", type=int, default=32)
+    parser.add_argument("--model-id", action=_StoreSpecified)
+    parser.add_argument("--tile-size", type=int, action=_StoreSpecified, default=32)
     parser.add_argument(
         "--tile-size-candidates",
+        action=_StoreSpecified,
         help="comma-separated tile sizes ranked by the GC cost model",
     )
     parser.add_argument(
         "--softmax-algorithm",
+        action=_StoreSpecified,
         choices=("materialized", "online"),
         default=None,
         help=(
@@ -242,14 +297,21 @@ def _add_compile_arguments(
     )
     parser.add_argument(
         "--onchip-handoff",
+        action=_StoreSpecified,
         choices=("root_memory", "attention_single_consumer"),
         default="root_memory",
         help="target-lowering policy for an eligible Matmul-to-Softmax edge",
     )
-    parser.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"), default="minimal")
-    parser.add_argument("--machine-config", type=Path)
+    parser.add_argument(
+        "--arch",
+        action=_StoreSpecified,
+        choices=("minimal", "wide-mxu", "lpu-like"),
+        default="minimal",
+    )
+    parser.add_argument("--machine-config", type=Path, action=_StoreSpecified)
     parser.add_argument(
         "--codegen-backend",
+        action=_StoreSpecified,
         choices=default_codegen_backend_registry().names(),
         default="analytical",
     )
@@ -267,91 +329,112 @@ def _add_simulation_options(
     """Add options consumed after compilation by runtime/device simulation."""
 
     if include_architecture:
-        parser.add_argument("--arch", choices=("minimal", "wide-mxu", "lpu-like"))
-        parser.add_argument("--machine-config", type=Path)
-    parser.add_argument("--scheduler-config", type=Path, help="cycle_event control pipeline JSON")
-    parser.add_argument("--timing-config", type=Path)
+        parser.add_argument(
+            "--arch",
+            action=_StoreSpecified,
+            choices=("minimal", "wide-mxu", "lpu-like"),
+        )
+        parser.add_argument("--machine-config", type=Path, action=_StoreSpecified)
+    parser.add_argument(
+        "--scheduler-config",
+        type=Path,
+        action=_StoreSpecified,
+        help="cycle_event control pipeline JSON",
+    )
+    parser.add_argument("--timing-config", type=Path, action=_StoreSpecified)
     parser.add_argument(
         "--timing-provider",
+        action=_StoreSpecified,
         choices=default_timing_provider_registry().names(),
         default=None,
     )
     parser.add_argument(
         "--event-backend",
+        action=_StoreSpecified,
         choices=default_event_backend_registry().names(),
         default="analytical_event",
     )
     parser.add_argument(
         "--policy",
+        action=_StoreSpecified,
         choices=tuple(policy.value for policy in SchedulerPolicy),
         default=SchedulerPolicy.STATIC_PIPELINE.value,
     )
     if include_output_dir:
         parser.add_argument("--output-dir", type=Path, default=Path("out/simulate"))
-    parser.add_argument("--instruction-queue-depth", type=int)
-    parser.add_argument("--rob-entries", type=int)
-    parser.add_argument("--max-inflight-tiles", type=int)
-    parser.add_argument("--dependency-window", type=int)
-    parser.add_argument("--ready-queue-depth", type=int)
-    parser.add_argument("--address-scoreboard", action="store_true")
+    parser.add_argument("--instruction-queue-depth", type=int, action=_StoreSpecified)
+    parser.add_argument("--rob-entries", type=int, action=_StoreSpecified)
+    parser.add_argument("--max-inflight-tiles", type=int, action=_StoreSpecified)
+    parser.add_argument("--dependency-window", type=int, action=_StoreSpecified)
+    parser.add_argument("--ready-queue-depth", type=int, action=_StoreSpecified)
+    parser.add_argument("--address-scoreboard", action=_StoreTrueSpecified)
     parser.add_argument(
         "--memory-bank-scoreboard",
-        action="store_true",
+        action=_StoreTrueSpecified,
         help="model configured memory bank and read/write port conflicts",
     )
     parser.add_argument(
         "--dynamic-priority",
+        action=_StoreSpecified,
         choices=("oldest_first", "compiler_hint", "oracle_critical_path", "critical_path"),
         default="oldest_first",
     )
     parser.add_argument(
         "--runtime-policy",
+        action=_StoreSpecified,
         choices=("static", "dynamic_ready_queue"),
         default=None if manifest_overrides else "static",
     )
-    parser.add_argument("--runtime-chunk-size", type=int)
+    parser.add_argument("--runtime-chunk-size", type=int, action=_StoreSpecified)
     parser.add_argument(
         "--runtime-base-address",
         type=lambda value: int(value, 0),
+        action=_StoreSpecified,
         default=None if manifest_overrides else 0x10000000,
     )
     parser.add_argument(
         "--runtime-alignment",
         type=int,
+        action=_StoreSpecified,
         default=None if manifest_overrides else 256,
     )
     parser.add_argument(
         "--runtime-buffer-policy",
+        action=_StoreSpecified,
         choices=("linear", "lifetime_reuse"),
         default=None if manifest_overrides else "linear",
     )
-    parser.add_argument("--runtime-availability-config", type=Path)
+    parser.add_argument("--runtime-availability-config", type=Path, action=_StoreSpecified)
     parser.add_argument(
         "--runtime-launch-latency",
         type=float,
+        action=_StoreSpecified,
         default=None if manifest_overrides else 0.0,
     )
     parser.add_argument(
         "--runtime-synchronization-cycles",
         type=float,
+        action=_StoreSpecified,
         default=None if manifest_overrides else 0.0,
     )
     parser.add_argument(
         "--runtime-invocations",
         type=int,
+        action=_StoreSpecified,
         default=None if manifest_overrides else 1,
         help="number of repeated invocations sharing persistent runtime state",
     )
     parser.add_argument(
         "--runtime-inter-invocation-gap",
         type=float,
+        action=_StoreSpecified,
         default=None if manifest_overrides else 0.0,
         help="cycles between state completion and the next invocation",
     )
     if include_runtime_device_matrix:
         parser.add_argument(
             "--runtime-device-matrix",
-            action="store_true",
+            action=_StoreTrueSpecified,
             help="run the four runtime/device static-dynamic policy combinations",
         )
 
@@ -580,41 +663,198 @@ def run_import_rtl_log(args: argparse.Namespace) -> int:
 
 
 def _load_torch_module(specification: str, input_shapes: list[str], dtype_name: str):
-    if ":" not in specification:
-        raise ValueError("--torch-module must use MODULE:CLASS_OR_FACTORY syntax")
-    module_name, factory_name = specification.split(":", 1)
-    try:
-        python_module = importlib.import_module(module_name)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise ValueError(f"cannot import PyTorch module '{module_name}': {exc}") from exc
-    constructor: Any = python_module
-    try:
-        for attribute in factory_name.split("."):
-            constructor = getattr(constructor, attribute)
-    except AttributeError as exc:
-        raise ValueError(f"PyTorch module class or factory '{specification}' does not exist") from exc
-    if not callable(constructor):
-        raise ValueError(f"PyTorch module class or factory '{specification}' is not callable")
-
-    try:
-        import torch
-    except ModuleNotFoundError as exc:
-        raise ValueError("compile/compile-and-sim requires PyTorch") from exc
-    try:
-        module = constructor()
-    except Exception as exc:
-        raise ValueError(f"PyTorch module class or factory '{specification}' failed: {exc}") from exc
-    if not isinstance(module, torch.nn.Module):
-        raise ValueError(f"PyTorch module class or factory '{specification}' did not return nn.Module")
-
-    torch.manual_seed(0)
-    dtype = getattr(torch, dtype_name)
     shapes = tuple(_parse_positive_int_list(value, name="--input-shape") for value in input_shapes)
-    example_inputs = tuple(torch.randn(*shape, dtype=dtype) for shape in shapes)
-    # ``--input-dtype`` is the compile example dtype, so floating parameters
-    # and buffers must use the same dtype as the generated example tensors.
-    # ``Module.to(dtype=...)`` intentionally leaves integer buffers unchanged.
-    return module.eval().to(dtype=dtype), example_inputs, factory_name.rsplit(".", 1)[-1]
+    workload = build_declarative_workload(
+        {
+            "factory": specification,
+            "kwargs": {},
+            "dtype": dtype_name,
+        },
+        {
+            "args": [
+                {
+                    "kind": "tensor",
+                    "shape": list(shape),
+                    "dtype": dtype_name,
+                    "init": {"kind": "randn"},
+                }
+                for shape in shapes
+            ]
+        },
+        seed=0,
+        source="legacy_cli_shorthand",
+    )
+    factory_name = specification.split(":", 1)[-1].rsplit(".", 1)[-1]
+    return workload.module, workload.args, factory_name
+
+
+def _option_was_specified(args: argparse.Namespace, name: str) -> bool:
+    return name in set(getattr(args, "_specified_options", ()))
+
+
+def _config_option(
+    args: argparse.Namespace,
+    options: Mapping[str, Any],
+    name: str,
+    *,
+    default: Any,
+) -> Any:
+    if _option_was_specified(args, name):
+        return getattr(args, name)
+    return options.get(name, default)
+
+
+def _choice(value: Any, *, path: str, choices: Sequence[str]) -> str:
+    if not isinstance(value, str) or value not in choices:
+        raise ValueError(f"{path}: must be one of: {', '.join(choices)}")
+    return value
+
+
+def _positive_integer(value: Any, *, path: str, optional: bool = False) -> int | None:
+    if optional and value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{path}: must be a positive integer")
+    return value
+
+
+def _non_negative_number(value: Any, *, path: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise ValueError(f"{path}: must be a non-negative number")
+    return float(value)
+
+
+def _tile_size_candidates(value: Any, *, path: str) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return _parse_positive_int_list(value, name=path)
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{path}: must be a non-empty array of positive integers")
+    return tuple(
+        _positive_integer(item, path=f"{path}[{index}]")
+        for index, item in enumerate(value)
+    )
+
+
+def _path_option(value: Any, *, path: str) -> Path | None:
+    if value is None:
+        return None
+    if not isinstance(value, (str, Path)) or not str(value):
+        raise ValueError(f"{path}: must be a non-empty path")
+    return Path(value)
+
+
+def _apply_runtime_config(
+    args: argparse.Namespace,
+    loaded: LoadedWorkloadConfig | None,
+) -> dict[str, Any]:
+    """Apply only existing compile-and-sim options from ``runtime``."""
+
+    options = dict(loaded.runtime_options) if loaded is not None else {}
+    names = (
+        "scheduler_config",
+        "timing_config",
+        "timing_provider",
+        "event_backend",
+        "policy",
+        "instruction_queue_depth",
+        "rob_entries",
+        "max_inflight_tiles",
+        "dependency_window",
+        "ready_queue_depth",
+        "address_scoreboard",
+        "memory_bank_scoreboard",
+        "dynamic_priority",
+        "runtime_policy",
+        "runtime_chunk_size",
+        "runtime_base_address",
+        "runtime_alignment",
+        "runtime_buffer_policy",
+        "runtime_availability_config",
+        "runtime_launch_latency",
+        "runtime_synchronization_cycles",
+        "runtime_invocations",
+        "runtime_inter_invocation_gap",
+        "runtime_device_matrix",
+    )
+    resolved: dict[str, Any] = {}
+    for name in names:
+        current = getattr(args, name)
+        value = _config_option(args, options, name, default=current)
+        if name in {
+            "scheduler_config",
+            "timing_config",
+            "runtime_availability_config",
+        }:
+            value = _path_option(value, path=f"runtime.{name}")
+        elif name in {
+            "instruction_queue_depth",
+            "rob_entries",
+            "max_inflight_tiles",
+            "dependency_window",
+            "ready_queue_depth",
+            "runtime_chunk_size",
+        }:
+            value = _positive_integer(value, path=f"runtime.{name}", optional=True)
+        elif name in {"runtime_alignment", "runtime_invocations"}:
+            value = _positive_integer(value, path=f"runtime.{name}")
+        elif name == "runtime_base_address":
+            if isinstance(value, str):
+                try:
+                    value = int(value, 0)
+                except ValueError as exc:
+                    raise ValueError("runtime.runtime_base_address: must be an integer") from exc
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError("runtime.runtime_base_address: must be a non-negative integer")
+        elif name in {
+            "runtime_launch_latency",
+            "runtime_synchronization_cycles",
+            "runtime_inter_invocation_gap",
+        }:
+            value = _non_negative_number(value, path=f"runtime.{name}")
+        elif name in {"address_scoreboard", "memory_bank_scoreboard", "runtime_device_matrix"}:
+            if not isinstance(value, bool):
+                raise ValueError(f"runtime.{name}: must be a boolean")
+        elif name == "timing_provider" and value is not None:
+            value = _choice(
+                value,
+                path="runtime.timing_provider",
+                choices=default_timing_provider_registry().names(),
+            )
+        elif name == "event_backend":
+            value = _choice(
+                value,
+                path="runtime.event_backend",
+                choices=default_event_backend_registry().names(),
+            )
+        elif name == "policy":
+            value = _choice(
+                value,
+                path="runtime.policy",
+                choices=tuple(policy.value for policy in SchedulerPolicy),
+            )
+        elif name == "dynamic_priority":
+            value = _choice(
+                value,
+                path="runtime.dynamic_priority",
+                choices=("oldest_first", "compiler_hint", "oracle_critical_path", "critical_path"),
+            )
+        elif name == "runtime_policy":
+            value = _choice(
+                value,
+                path="runtime.runtime_policy",
+                choices=("static", "dynamic_ready_queue"),
+            )
+        elif name == "runtime_buffer_policy":
+            value = _choice(
+                value,
+                path="runtime.runtime_buffer_policy",
+                choices=("linear", "lifetime_reuse"),
+            )
+        setattr(args, name, value)
+        resolved[name] = str(value) if isinstance(value, Path) else value
+    return resolved
 
 
 def _write_policy_matrix(
@@ -1011,51 +1251,191 @@ def run_paper_matrix(args: argparse.Namespace) -> int:
 
 
 def _compile_from_args(args: argparse.Namespace):
-    module, example_inputs, factory_name = _load_torch_module(
-        args.torch_module,
-        args.input_shape,
-        args.input_dtype,
+    loaded = load_workload_config(args.config) if args.config is not None else None
+    legacy_fields = ("torch_module", "input_shape", "input_dtype")
+    if loaded is not None and any(_option_was_specified(args, name) for name in legacy_fields):
+        raise ValueError(
+            "--config cannot be combined with --torch-module, --input-shape or "
+            "--input-dtype; declare one workload input source"
+        )
+    if loaded is not None:
+        workload = loaded.workload
+    else:
+        if not args.torch_module:
+            raise ValueError("compile requires --config or --torch-module")
+        if not args.input_shape:
+            raise ValueError("legacy --torch-module shorthand requires at least one --input-shape")
+        shapes = tuple(
+            _parse_positive_int_list(value, name="--input-shape")
+            for value in args.input_shape
+        )
+        workload = build_declarative_workload(
+            {
+                "factory": args.torch_module,
+                "kwargs": {},
+                "dtype": args.input_dtype,
+            },
+            {
+                "args": [
+                    {
+                        "kind": "tensor",
+                        "shape": list(shape),
+                        "dtype": args.input_dtype,
+                        "init": {"kind": "randn"},
+                    }
+                    for shape in shapes
+                ]
+            },
+            seed=0,
+            source="legacy_cli_shorthand",
+        )
+
+    options = dict(loaded.compile_options) if loaded is not None else {}
+    arch = _choice(
+        _config_option(args, options, "arch", default="minimal"),
+        path="compile.arch",
+        choices=("minimal", "wide-mxu", "lpu-like"),
     )
-    machine = _machine(args.arch, args.machine_config)
-    tile_size_candidates = (
-        _parse_positive_int_list(args.tile_size_candidates, name="--tile-size-candidates")
-        if args.tile_size_candidates
-        else None
+    machine_config = _path_option(
+        _config_option(args, options, "machine_config", default=None),
+        path="compile.machine_config",
     )
-    if args.softmax_algorithm is not None:
+    if (
+        _option_was_specified(args, "arch")
+        and not _option_was_specified(args, "machine_config")
+        and "machine_config" in options
+    ):
+        # An explicit built-in architecture replaces a machine file inherited
+        # from JSON.  If both flags are explicit, existing --machine-config
+        # precedence is preserved.
+        machine_config = None
+    tile_size = _positive_integer(
+        _config_option(args, options, "tile_size", default=32),
+        path="compile.tile_size",
+    )
+    tile_size_candidates = _tile_size_candidates(
+        _config_option(args, options, "tile_size_candidates", default=None),
+        path="compile.tile_size_candidates",
+    )
+    softmax_algorithm = _config_option(args, options, "softmax_algorithm", default=None)
+    if softmax_algorithm is not None:
+        softmax_algorithm = _choice(
+            softmax_algorithm,
+            path="compile.softmax_algorithm",
+            choices=("materialized", "online"),
+        )
+    onchip_handoff = _choice(
+        _config_option(args, options, "onchip_handoff", default="root_memory"),
+        path="compile.onchip_handoff",
+        choices=("root_memory", "attention_single_consumer"),
+    )
+    codegen_backend_name = _choice(
+        _config_option(args, options, "codegen_backend", default="analytical"),
+        path="compile.codegen_backend",
+        choices=default_codegen_backend_registry().names(),
+    )
+    model_id = _config_option(
+        args,
+        options,
+        "model_id",
+        default=workload.experiment_id,
+    )
+    if not isinstance(model_id, str) or not model_id:
+        raise ValueError("compile.model_id: must be a non-empty string")
+
+    args.arch = arch
+    args.machine_config = machine_config
+    args.tile_size = tile_size
+    args.tile_size_candidates = tile_size_candidates
+    args.softmax_algorithm = softmax_algorithm
+    args.onchip_handoff = onchip_handoff
+    args.codegen_backend = codegen_backend_name
+    args.model_id = model_id
+
+    machine = _machine(arch, machine_config)
+    if softmax_algorithm is not None:
         machine = replace(
             machine,
             attributes={
                 **dict(machine.attributes),
-                "softmax_algorithm": args.softmax_algorithm,
+                "softmax_algorithm": softmax_algorithm,
             },
         )
-    if args.onchip_handoff != "root_memory":
+    if onchip_handoff != "root_memory":
         machine = replace(
             machine,
             attributes={
                 **dict(machine.attributes),
-                "onchip_handoff_policy": args.onchip_handoff,
+                "onchip_handoff_policy": onchip_handoff,
             },
         )
-    codegen_backend = default_codegen_backend_registry().create(args.codegen_backend)
+    codegen_backend = default_codegen_backend_registry().create(codegen_backend_name)
+    runtime_resolved = (
+        _apply_runtime_config(args, loaded)
+        if args.command == "compile-and-sim"
+        else {
+            "consumed": False,
+            "declared": dict(loaded.runtime_options) if loaded is not None else {},
+        }
+    )
     compiled = compile_torch_module(
-        module,
-        example_inputs,
+        workload.module,
+        workload.args,
         machine,
-        model_id=args.model_id or factory_name,
-        tile_size=args.tile_size,
+        kwargs=workload.kwargs,
+        model_id=model_id,
+        tile_size=tile_size,
         tile_size_candidates=tile_size_candidates,
         codegen_backend=codegen_backend,
     )
+    resolved_config = {
+        "schema_version": 1,
+        "source_path": str(loaded.source_path) if loaded is not None else None,
+        "source_sha256": loaded.source_sha256 if loaded is not None else None,
+        "seed": workload.provenance.get("seed", 0),
+        "experiment_id": workload.experiment_id,
+        "construction": workload.provenance.get("construction"),
+        "workload": workload.to_dict(),
+        "compile": {
+            "arch": arch,
+            "machine_config": str(machine_config) if machine_config is not None else None,
+            "tile_size": tile_size,
+            "tile_size_candidates": list(tile_size_candidates or (tile_size,)),
+            "softmax_algorithm": softmax_algorithm,
+            "onchip_handoff": onchip_handoff,
+            "codegen_backend": codegen_backend_name,
+            "model_id": model_id,
+        },
+        "runtime": runtime_resolved,
+        "precedence": "explicit_cli>json>defaults",
+        "static_shapes": True,
+    }
+    factory_name = str(
+        workload.provenance.get("model_factory")
+        or workload.provenance.get("workload_factory")
+        or type(workload.module).__name__
+    )
+    return compiled, machine, workload, resolved_config, factory_name
 
-    return compiled, machine, factory_name
 
-
-def _write_compile_artifacts(compiled, machine, output_dir: Path) -> None:
+def _write_compile_artifacts(
+    compiled,
+    machine,
+    output_dir: Path,
+    workload: Workload | None = None,
+    resolved_config: Mapping[str, Any] | None = None,
+) -> None:
     """Persist the compiler-owned stages used by both CLI execution modes."""
 
     ensure_output_layout(output_dir)
+    if workload is not None:
+        write_artifact_json(workload, output_dir / "workload.json")
+        write_artifact_json(
+            workload.input_signature,
+            output_dir / "input_signature.json",
+        )
+    if resolved_config is not None:
+        write_artifact_json(resolved_config, output_dir / "resolved_workload_config.json")
     write_artifact_json(compiled.source_frontend, output_dir / "source_frontend_import.json")
     write_artifact_json(compiled.stablehlo, output_dir / "stablehlo_module.json")
     (output_dir / "00_frontend" / "generated.mlir").write_text(
@@ -1117,6 +1497,12 @@ def _compile_manifest(compiled, machine) -> dict[str, Any]:
         "compiler_pipeline": compiled.attributes["compiler_pipeline"],
         "frontend_path": compiled.attributes["frontend_path"],
         "model_id": compiled.source_frontend.model_id,
+        "workload_schema_version": 1,
+        "workload_artifacts": {
+            "workload": "00_frontend/workload.json",
+            "input_signature": "00_frontend/input_signature.json",
+            "resolved_config": "00_frontend/resolved_workload_config.json",
+        },
         "stablehlo_exporter": "torch-xla",
         "stablehlo_exporter_version": compiled.attributes["stablehlo_exporter_version"],
         "stablehlo_verified": True,
@@ -1133,6 +1519,9 @@ def _compile_manifest(compiled, machine) -> dict[str, Any]:
         "tisa_program_id": compiled.tisa_program.program_id,
         "artifact_id": compiled.backend_artifact.artifact_id,
         "compile_artifacts": {
+            "workload": "00_frontend/workload.json",
+            "input_signature": "00_frontend/input_signature.json",
+            "resolved_workload_config": "00_frontend/resolved_workload_config.json",
             "backend_artifact": "04_backend/backend_artifact.json",
             "canonical_graph": "01_gc/canonical_graph.json",
             "machine": "04_backend/machine.json",
@@ -1145,8 +1534,14 @@ def _compile_manifest(compiled, machine) -> dict[str, Any]:
 
 
 def run_compile(args: argparse.Namespace) -> int:
-    compiled, machine, _factory_name = _compile_from_args(args)
-    _write_compile_artifacts(compiled, machine, args.output_dir)
+    compiled, machine, workload, resolved_config, _factory_name = _compile_from_args(args)
+    _write_compile_artifacts(
+        compiled,
+        machine,
+        args.output_dir,
+        workload,
+        resolved_config,
+    )
     manifest = _compile_manifest(compiled, machine)
     write_artifact_json(manifest, args.output_dir / "manifest.json")
     write_artifact_index(args.output_dir)
@@ -1160,8 +1555,14 @@ def run_compile(args: argparse.Namespace) -> int:
 
 
 def run_compile_and_sim(args: argparse.Namespace) -> int:
-    compiled, machine, _factory_name = _compile_from_args(args)
-    _write_compile_artifacts(compiled, machine, args.output_dir)
+    compiled, machine, workload, resolved_config, _factory_name = _compile_from_args(args)
+    _write_compile_artifacts(
+        compiled,
+        machine,
+        args.output_dir,
+        workload,
+        resolved_config,
+    )
 
     if compiled.backend_artifact.memory_plan is None:
         raise ValueError("compiled artifact is missing target memory plan")
@@ -1265,6 +1666,12 @@ def run_compile_and_sim(args: argparse.Namespace) -> int:
         "compiler_pipeline": compiled.attributes["compiler_pipeline"],
         "frontend_path": compiled.attributes["frontend_path"],
         "model_id": compiled.source_frontend.model_id,
+        "workload_schema_version": 1,
+        "workload_artifacts": {
+            "workload": "00_frontend/workload.json",
+            "input_signature": "00_frontend/input_signature.json",
+            "resolved_config": "00_frontend/resolved_workload_config.json",
+        },
         "stablehlo_exporter": "torch-xla",
         "stablehlo_exporter_version": compiled.attributes["stablehlo_exporter_version"],
         "stablehlo_verified": True,

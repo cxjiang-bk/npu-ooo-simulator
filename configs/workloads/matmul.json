@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "seed": 7,
+  "experiment_id": "json-matmul",
+  "model": {
+    "factory": "examples.configurable_models:Matmul",
+    "kwargs": {},
+    "dtype": "float32"
+  },
+  "inputs": {
+    "kwargs": {
+      "lhs": {
+        "kind": "tensor",
+        "shape": [4, 8],
+        "dtype": "float32",
+        "init": {"kind": "randn"}
+      },
+      "rhs": {
+        "kind": "tensor",
+        "shape": [8, 4],
+        "dtype": "float32",
+        "init": {"kind": "randn"}
+      }
+    }
+  },
+  "compile": {
+    "arch": "minimal",
+    "tile_size": 4
+  }
+}

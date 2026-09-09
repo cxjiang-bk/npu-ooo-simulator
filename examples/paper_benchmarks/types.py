@@ -7,6 +7,8 @@ from typing import Any, Mapping
 
 import torch
 
+from npu_ooo.frontend import Workload
+
 
 @dataclass(frozen=True)
 class PaperBenchmarkSpec:
@@ -59,13 +61,28 @@ class PaperBenchmarkSpec:
 
 @dataclass(frozen=True)
 class PaperBenchmarkWorkload:
-    """A concrete module/input tuple ready for ``compile_torch_module``."""
+    """Paper metadata layered over the generic compiler workload contract."""
 
     spec: PaperBenchmarkSpec
-    module: torch.nn.Module
-    inputs: tuple[torch.Tensor, ...]
+    workload: Workload
     variant: str
     attributes: Mapping[str, Any]
+
+    @property
+    def module(self) -> torch.nn.Module:
+        return self.workload.module
+
+    @property
+    def inputs(self) -> tuple[Any, ...]:
+        return self.workload.args
+
+    @property
+    def args(self) -> tuple[Any, ...]:
+        return self.workload.args
+
+    @property
+    def kwargs(self) -> Mapping[str, Any]:
+        return self.workload.kwargs
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -74,5 +91,6 @@ class PaperBenchmarkWorkload:
             "input_shapes": [list(value.shape) for value in self.inputs],
             "input_dtypes": [str(value.dtype).removeprefix("torch.") for value in self.inputs],
             "module": type(self.module).__name__,
+            "workload": self.workload.to_dict(),
             "attributes": dict(self.attributes),
         }

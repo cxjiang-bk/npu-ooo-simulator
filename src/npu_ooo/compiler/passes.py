@@ -668,6 +668,12 @@ class RecoverStableHLOLayerNormPass:
             pre_reshape = producer.get(norm_source)
             if pre_reshape is not None and pre_reshape.normalized_type != "reshape":
                 pre_reshape = None
+            if post_reshape is None:
+                # A reshape may belong to the upstream producer (notably the
+                # flattened result of StableHLO gather/embedding).  Treat it
+                # as LayerNorm flattening only when the normalized result is
+                # reshaped back as part of the same pattern.
+                pre_reshape = None
             source = pre_reshape.inputs[0] if pre_reshape is not None else norm_source
             source_spec = tensors.get(source)
             if source_spec is None or not all(

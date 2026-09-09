@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import torch
 
+from npu_ooo.frontend import make_workload
+
 from .common import PaperTransformerBlock, transformer_workload
 from .types import PaperBenchmarkSpec, PaperBenchmarkWorkload
 
@@ -169,6 +171,7 @@ def _decode_workload(
     dtype: torch.dtype | None,
     model_scope: str,
     mode: str,
+    seed: int | None,
 ) -> PaperBenchmarkWorkload:
     if variant == "micro":
         batch, cache_window = 1, 4
@@ -178,7 +181,8 @@ def _decode_workload(
         raise ValueError("variant must be 'micro' or 'paper_shape'")
     requested_dtype = dtype or getattr(torch, spec.dtype)
     selected_dtype = torch.float32 if requested_dtype == torch.bfloat16 else requested_dtype
-    torch.manual_seed(0)
+    if seed is not None:
+        torch.manual_seed(seed)
     module: torch.nn.Module
     if model_scope == "model_proxy":
         module = DeepSeekR1DecodeModelProxy(mode=mode, cache_window=cache_window)
@@ -220,8 +224,12 @@ def _decode_workload(
     parameter_count = sum(parameter.numel() for parameter in module.parameters())
     return PaperBenchmarkWorkload(
         spec=spec,
-        module=module,
-        inputs=inputs,
+        workload=make_workload(
+            module,
+            inputs,
+            experiment_id=spec.case_id,
+            provenance={"construction": "paper_benchmark_builder", "variant": variant},
+        ),
         variant=variant,
         attributes={
             "paper_reference_only": True,
@@ -296,6 +304,7 @@ def build(
     layer_count: int = 1,
     model_scope: str = "one_block",
     mode: str = "dense",
+    seed: int | None = 0,
 ) -> PaperBenchmarkWorkload:
     if case_id == PREFILL_SPEC.case_id:
         spec = PREFILL_SPEC
@@ -316,6 +325,7 @@ def build(
             dtype=dtype,
             model_scope=model_scope,
             mode=mode,
+            seed=seed,
         )
     return transformer_workload(
         spec,
@@ -324,4 +334,5 @@ def build(
         dtype=dtype,
         layer_count=layer_count,
         model_scope=model_scope,
+        seed=seed,
     )

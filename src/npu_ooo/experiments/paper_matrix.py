@@ -325,9 +325,10 @@ def run_paper_benchmark_matrix(
                 deepseek_mode=deepseek_mode,
             )
             compiled = compile_torch_module(
-                workload.module,
-                workload.inputs,
+                workload.workload.module,
+                workload.workload.args,
                 compile_machine,
+                kwargs=workload.workload.kwargs,
                 model_id=_compiled_model_id(
                     case_id,
                     variant,

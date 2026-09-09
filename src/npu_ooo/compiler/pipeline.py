@@ -12,6 +12,7 @@ unit tests need to start after the framework boundary.
 """
 
 from dataclasses import dataclass, field, replace
+import inspect
 import re
 from typing import Any, Mapping, Sequence
 
@@ -34,6 +35,74 @@ from .fusion_compiler import TISADialectProgram, default_fusion_compiler
 from .graph_compiler import GCArtifact, default_graph_compiler
 from .statistics import build_compile_statistics
 from .tisa_generator import default_tisa_generator
+
+
+def _stablehlo_export_call(
+    module: Any,
+    args: Sequence[Any],
+    kwargs: Mapping[str, Any] | None,
+) -> tuple[tuple[Any, ...], Mapping[str, Any] | None]:
+    """Positionalize ordinary kwargs for the current Torch-XLA exporter.
+
+    ``torch.export`` supports kwargs, but torch-xla 2.9 rejects an exported
+    program whose example-input kwargs mapping is non-empty.  Binding against
+    ``forward`` first preserves Python call semantics while keeping the one
+    official frontend route.  Truly keyword-only or ``**kwargs`` inputs remain
+    unsupported and receive an explicit diagnostic.
+    """
+
+    if not kwargs:
+        return tuple(args), None
+    try:
+        signature = inspect.signature(module.forward)
+        bound = signature.bind(*args, **kwargs)
+    except TypeError as exc:
+        raise FrontendImportError(f"example inputs do not match module.forward: {exc}") from exc
+    positional: list[Any] = []
+    parameters = tuple(signature.parameters.values())
+    positional_parameters = tuple(
+        parameter
+        for parameter in parameters
+        if parameter.kind in {
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        }
+    )
+    last_bound_position = max(
+        (
+            index
+            for index, parameter in enumerate(positional_parameters)
+            if parameter.name in bound.arguments
+        ),
+        default=-1,
+    )
+    for index, parameter in enumerate(positional_parameters):
+        if index > last_bound_position:
+            break
+        if parameter.name in bound.arguments:
+            positional.append(bound.arguments[parameter.name])
+        else:
+            positional.append(parameter.default)
+    for parameter in parameters:
+        if parameter.kind in {
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        }:
+            continue
+        elif parameter.kind == inspect.Parameter.VAR_POSITIONAL:
+            positional.extend(bound.arguments.get(parameter.name, ()))
+        elif parameter.kind == inspect.Parameter.KEYWORD_ONLY:
+            if parameter.name in kwargs:
+                raise FrontendImportError(
+                    "Torch-XLA StableHLO export does not support an explicit keyword-only "
+                    f"example input '{parameter.name}'"
+                )
+        elif bound.arguments.get(parameter.name):
+            raise FrontendImportError(
+                "Torch-XLA StableHLO export does not support example inputs passed through "
+                f"**{parameter.name}"
+            )
+    return tuple(positional), None
 
 
 def _dtype_compatibility(graph: OperatorGraph, machine: MachineConfig) -> dict[str, Any]:
@@ -317,12 +386,13 @@ def compile_torch_module(
     from npu_ooo.frontend.shape_specialization import specialize_stablehlo
 
     normalized_shape_environment = normalize_shape_environment(shape_environment)
+    export_args, export_kwargs = _stablehlo_export_call(module, args, kwargs)
 
     # 1. Capture Python execution as a stable ATen/FX program.
     exported_program = TorchExportAdapter.capture_module(
         module,
-        args,
-        kwargs=kwargs,
+        export_args,
+        kwargs=export_kwargs,
         dynamic_shapes=dynamic_shapes,
     )
     source_frontend = TorchExportAdapter.from_exported_program(

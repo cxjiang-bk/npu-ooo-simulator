@@ -47,6 +47,7 @@ def build_paper_benchmark(
     layer_count: int = 1,
     model_scope: str = "one_block",
     deepseek_mode: str = "dense",
+    seed: int | None = 0,
 ) -> PaperBenchmarkWorkload:
     """Build a real PyTorch workload and deterministic example inputs.
 
@@ -68,6 +69,7 @@ def build_paper_benchmark(
             dtype=dtype,
             layer_count=layer_count,
             model_scope=model_scope,
+            seed=seed,
         )
     if case_id == bert_base.SPEC.case_id:
         return bert_base.build(
@@ -75,6 +77,7 @@ def build_paper_benchmark(
             dtype=dtype,
             layer_count=layer_count,
             model_scope=model_scope,
+            seed=seed,
         )
     if case_id == gpt_j.SPEC.case_id:
         return gpt_j.build(
@@ -82,6 +85,7 @@ def build_paper_benchmark(
             dtype=dtype,
             layer_count=layer_count,
             model_scope=model_scope,
+            seed=seed,
         )
     if case_id == llama2.SPEC.case_id:
         return llama2.build(
@@ -89,6 +93,7 @@ def build_paper_benchmark(
             dtype=dtype,
             layer_count=layer_count,
             model_scope=model_scope,
+            seed=seed,
         )
     return deepseek.build(
         case_id,
@@ -97,6 +102,7 @@ def build_paper_benchmark(
         layer_count=layer_count,
         model_scope=model_scope,
         mode=deepseek_mode,
+        seed=seed,
     )
 
 

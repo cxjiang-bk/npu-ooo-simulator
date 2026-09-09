@@ -23,6 +23,13 @@ from .torch_xla_export import (
     torch_xla_available,
     torch_xla_version,
 )
+from .workload import (
+    LoadedWorkloadConfig,
+    Workload,
+    build_declarative_workload,
+    load_workload_config,
+    make_workload,
+)
 
 __all__ = [
     "FrontendImport",
@@ -40,4 +47,9 @@ __all__ = [
     "TorchXLAStableHLOExporter",
     "torch_xla_available",
     "torch_xla_version",
+    "LoadedWorkloadConfig",
+    "Workload",
+    "build_declarative_workload",
+    "load_workload_config",
+    "make_workload",
 ]

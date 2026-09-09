@@ -7,6 +7,8 @@ from typing import Type
 
 import torch
 
+from npu_ooo.frontend import make_workload
+
 from .types import PaperBenchmarkSpec, PaperBenchmarkWorkload
 
 
@@ -284,6 +286,7 @@ def transformer_workload(
     dtype: torch.dtype | None,
     layer_count: int = 1,
     model_scope: str = "one_block",
+    seed: int | None = 0,
 ) -> PaperBenchmarkWorkload:
     if spec.sequence_length is None:
         raise ValueError("transformer workloads require a sequence length")
@@ -298,7 +301,8 @@ def transformer_workload(
         raise ValueError("model_scope must be 'one_block' or 'model_proxy'")
     requested_dtype = dtype or getattr(torch, spec.dtype)
     selected_dtype = torch.float32 if requested_dtype == torch.bfloat16 else requested_dtype
-    torch.manual_seed(0)
+    if seed is not None:
+        torch.manual_seed(seed)
     backbone = (
         module_type()
         if layer_count == 1
@@ -380,8 +384,12 @@ def transformer_workload(
     input_bytes = sum(value.numel() * value.element_size() for value in inputs)
     return PaperBenchmarkWorkload(
         spec=spec,
-        module=module,
-        inputs=inputs,
+        workload=make_workload(
+            module,
+            inputs,
+            experiment_id=spec.case_id,
+            provenance={"construction": "paper_benchmark_builder", "variant": variant},
+        ),
         variant=variant,
         attributes={
             "paper_reference_only": True,

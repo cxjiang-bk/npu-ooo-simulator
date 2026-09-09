@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import torch
 
+from npu_ooo.frontend import make_workload
+
 from .types import PaperBenchmarkSpec, PaperBenchmarkWorkload
 
 
@@ -95,6 +97,7 @@ def build(
     *,
     layer_count: int = 1,
     model_scope: str = "one_block",
+    seed: int | None = 0,
 ) -> PaperBenchmarkWorkload:
     if layer_count <= 0:
         raise ValueError("layer_count must be positive")
@@ -109,7 +112,8 @@ def build(
     else:
         raise ValueError("variant must be 'micro' or 'paper_shape'")
     requested_dtype = dtype or getattr(torch, SPEC.dtype)
-    torch.manual_seed(0)
+    if seed is not None:
+        torch.manual_seed(seed)
     module = (
         ResNet50BottleneckWorkload()
         if model_scope == "one_block"
@@ -122,7 +126,14 @@ def build(
         for parameter in module.parameters()
     )
     return PaperBenchmarkWorkload(
-        SPEC, module, inputs, variant,
+        SPEC,
+        make_workload(
+            module,
+            inputs,
+            experiment_id=SPEC.case_id,
+            provenance={"construction": "paper_benchmark_builder", "variant": variant},
+        ),
+        variant,
         {
             "paper_reference_only": True,
             "simulation_dimensions": "scaled" if variant == "micro" else "paper_image_shape_representative_bottleneck",

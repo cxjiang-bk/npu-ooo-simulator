@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "seed": 23,
+  "experiment_id": "bert-proxy-2layer-static",
+  "model": {
+    "factory": "examples.configurable_models:ConfigurableBertProxy",
+    "kwargs": {
+      "num_layers": 2,
+      "hidden_size": 8,
+      "num_heads": 2,
+      "intermediate_size": 16,
+      "vocab_size": 32,
+      "max_position_embeddings": 8
+    },
+    "dtype": "float32"
+  },
+  "inputs": {
+    "kwargs": {
+      "input_ids": {
+        "kind": "tensor",
+        "shape": [1, 4],
+        "dtype": "int64",
+        "init": {"kind": "randint", "low": 0, "high": 32}
+      },
+      "attention_mask": {
+        "kind": "tensor",
+        "shape": [1, 1, 4, 4],
+        "dtype": "float32",
+        "init": {"kind": "zeros"}
+      },
+      "position_ids": {
+        "kind": "tensor",
+        "shape": [1, 4],
+        "dtype": "int64",
+        "init": {"kind": "arange", "start": 0, "step": 1}
+      },
+      "token_type_ids": {
+        "kind": "tensor",
+        "shape": [1, 4],
+        "dtype": "int64",
+        "init": {"kind": "zeros"}
+      }
+    }
+  },
+  "compile": {
+    "arch": "lpu-like",
+    "tile_size": 4
+  }
+}

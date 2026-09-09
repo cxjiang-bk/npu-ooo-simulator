@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import torch
 
+from npu_ooo.frontend import make_workload
+
 from .common import PaperTransformerBlock, transformer_workload
 from .types import PaperBenchmarkSpec, PaperBenchmarkWorkload
 
@@ -116,6 +118,7 @@ def build(
     *,
     layer_count: int = 1,
     model_scope: str = "one_block",
+    seed: int | None = 0,
 ) -> PaperBenchmarkWorkload:
     return transformer_workload(
         SPEC,
@@ -124,15 +127,21 @@ def build(
         dtype=dtype,
         layer_count=layer_count,
         model_scope=model_scope,
+        seed=seed,
     )
 
 
-def build_decode(dtype: torch.dtype | None = None) -> PaperBenchmarkWorkload:
+def build_decode(
+    dtype: torch.dtype | None = None,
+    *,
+    seed: int | None = 0,
+) -> PaperBenchmarkWorkload:
     """Build a one-token decode workload for the fixed-window state contract."""
 
     requested_dtype = dtype or getattr(torch, SPEC.dtype)
     selected_dtype = torch.float32 if requested_dtype == torch.bfloat16 else requested_dtype
-    torch.manual_seed(0)
+    if seed is not None:
+        torch.manual_seed(seed)
     module = LLaMA2DecodeOneBlock().eval().to(dtype=selected_dtype)
     sequence = 1
     inputs = (
@@ -145,8 +154,12 @@ def build_decode(dtype: torch.dtype | None = None) -> PaperBenchmarkWorkload:
     )
     return PaperBenchmarkWorkload(
         spec=SPEC,
-        module=module,
-        inputs=inputs,
+        workload=make_workload(
+            module,
+            inputs,
+            experiment_id="llama2-13b-decode",
+            provenance={"construction": "paper_benchmark_builder", "variant": "decode_micro"},
+        ),
         variant="decode_micro",
         attributes={
             "paper_reference_only": True,

@@ -5,7 +5,8 @@
 ```mermaid
 flowchart TB
     subgraph Frontend[前端：真实 PyTorch 输入]
-        A[PyTorch nn.Module] --> B[torch.export]
+        W[JSON / Python Workload factory] --> A[PyTorch module + static args/kwargs]
+        A --> B[torch.export]
         B --> C[Torch-XLA: ATen -> StableHLO]
         C --> D[官方 StableHLO parse / verify]
     end
@@ -52,7 +53,8 @@ flowchart TB
 
 | 层 | 输入 | 输出 | 语义职责 |
 | --- | --- | --- | --- |
-| Frontend | module + example tensors | ExportedProgram、StableHLO module、provenance | 捕获 PyTorch 语义并完成官方 StableHLO 验证 |
+| Workload loader | schema-v1 JSON 或 Python factory | `Workload(module,args,kwargs)`、输入签名、provenance | 参数化构造模型与静态输入；独立于 paper registry |
+| Frontend | Workload 的 module + example input tree | ExportedProgram、StableHLO module、provenance | 捕获 PyTorch 语义并完成官方 StableHLO 验证 |
 | GC | StableHLO projection | `GCArtifact` | canonicalization、semantic recovery、tiling、region/state dependency |
 | FC | `GCArtifact` | `TISADialectProgram` | 生成逻辑 transfer/compute、显式 source/destination、符号 buffer、visibility/owner/domain 和抽象 UnitMap |
 | TISA Generator | TISA 方言 | 虚拟 `TISAProgram` | 规范化 descriptor，不读取目标 route |
@@ -73,6 +75,7 @@ CLI 入口位于 `src/npu_ooo/cli.py`：
 ```text
 main
   -> run_compile / run_simulate / run_compile_and_sim
+  -> load_workload_config / legacy shorthand normalization
   -> compile_torch_module
        -> TorchExportAdapter
        -> Torch-XLA exporter
@@ -103,6 +106,19 @@ backend 契约。用户 CLI 提供 `compile`、`simulate` 和 `compile-and-sim` 
 ```python
 exported_program = torch.export.export(module, args, **export_kwargs)
 ```
+
+`frontend/workload.py` 定义 benchmark-independent `Workload`。声明式 JSON 分别构造
+model kwargs 与 forward args/kwargs；复杂输入也可以由返回 Workload 的 Python factory
+生成。旧 `--torch-module/--input-shape` 会先归一化为同一契约，paper-matrix 也只在其上
+叠加 case/reference 元数据。配置与输入结构不进入 GC/FC 的必要接口。
+
+当前任务只支持静态 shape。Workload 中的每个 tensor extent 在捕获前确定；改变 seqlen、
+kvlen/cache window 等实际计算维度必须重新编译。runtime dynamic index/layout binding 不会
+重新实例化 tile 或改变计算量。
+
+Torch-XLA 2.9 的 StableHLO exporter 不接受非空 example kwargs。编译入口先按
+`forward` 签名绑定，再把普通 positional-or-keyword kwargs 等价位置化后捕获；显式
+keyword-only/`**kwargs` 输入会拒绝，而不是绕过官方 exporter。
 
 `ExportedProgram` 包含 FX/ATen graph、graph signature、参数与 buffer 描述以及 shape
 constraint。example tensors 确定本次编译的 rank、dtype 和 shape。源图摘要写入
@@ -398,6 +414,9 @@ loader 还将只有绑定物理地址后才可见的 RAW/WAR/WAW alias 关系转
 Runtime 可以和编译阶段分开执行。`compile` 将以下文件组成可复用的 compile package：
 
 ```text
+00_frontend/workload.json
+00_frontend/input_signature.json
+00_frontend/resolved_workload_config.json
 01_gc/canonical_graph.json
 02_fc/tisa_dialect.json
 03_tisa/virtual_tisa_program.json
@@ -500,8 +519,8 @@ memory backend 提供。
 
 ## 11. 输出与复现
 
-artifact 按 `00_frontend` 到 `07_trace` 分层。比较策略时固定 module、example
-shape/dtype、Torch-XLA/StableHLO version、tile size、MachineConfig、BackendArtifact、
+artifact 按 `00_frontend` 到 `07_trace` 分层。比较策略时固定解析后的 Workload、example
+input tree/shape/dtype、seed、Torch-XLA/StableHLO version、tile size、MachineConfig、BackendArtifact、
 TimingProvider 和 RuntimeSubmission；实验变量明确写入 manifest。
 
 `compile_statistics.json` 保存 per-operator tile/TISA/payload、MAC、root traffic 和

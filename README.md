@@ -14,7 +14,7 @@ execution backend 执行并反馈完成。
 
 ```mermaid
 flowchart LR
-    A[PyTorch nn.Module] --> B[torch.export + Torch-XLA + StableHLO]
+    A[Workload: PyTorch module + static args/kwargs] --> B[torch.export + Torch-XLA + StableHLO]
     B --> C[GC: Canonical IR 与 TileGraph]
     C --> D[FC: 符号 TISA 方言]
     D --> E[TISA Generator: 虚拟 TISA]
@@ -60,26 +60,28 @@ PYTHONPATH=src python3.12 -m npu_ooo.cli --help
 StableHLO wheel 1.12.1。安装和 parse/verify 检查见 [环境安装指南](docs/install-stablehlo.md)。
 仅能运行 `--help` 不代表完整前端依赖已经可用。
 
-### 2. 先跑通一个 Attention
+### 2. 用 JSON 编译多输入模型
 
-下面运行两头 Attention 的小尺寸样例，显式选择逐周期模型和动态设备调度：
+多输入、混合 dtype 或需要构造参数的模型，优先使用
+[workload JSON](docs/workload-config.md)。下面的配置同时声明四个 Attention 输入、固定
+shape、初始化方式、编译参数和已有的仿真参数：
 
 ```bash
 PYTHONPATH=src python3.12 -m npu_ooo.cli compile-and-sim \
-  --torch-module examples.torch_models:MultiHeadAttentionBlock \
-  --input-shape 1,4,8 --input-shape 1,1,4,4 \
-  --tile-size 4 --arch minimal \
-  --event-backend cycle_event \
-  --scheduler-config configs/scheduler/cycle_baseline.json \
-  --runtime-policy static --policy dynamic_ready_queue \
-  --address-scoreboard \
+  --config configs/workloads/attention.json \
   --output-dir out/quickstart-attention
 ```
 
-- 第一个输入是 `x`：`[batch=1, sequence=4, hidden=8]`。
-- 第二个输入是可广播的加性 attention mask：`[1, 1, 4, 4]`。
-- CLI 自动生成确定性示例 tensor；这不是加载真实模型权重或数据集的入口。
+- `model.kwargs` 是构造模型时传给类/工厂的参数；`inputs.args/kwargs` 是传给
+  `forward` 的静态示例输入，二者不是一回事。
+- `model.dtype` 只转换浮点参数和 buffer；每个 tensor 输入的 `dtype` 独立声明，token
+  ID 应使用整数和 `randint`，不能用统一 `randn` 代替。
+- `seed` 在模型构造和输入生成前设置；最终解析结果、输入结构及初始化 provenance 写入
+  `00_frontend/resolved_workload_config.json`、`workload.json` 和 `input_signature.json`。
 - `runtime-policy static` 固定 host 提交流；`policy dynamic_ready_queue` 允许设备在到达的指令中乱序选择，两者不矛盾。
+
+所有 extent 都是编译时常量。修改 `sequence_length`、`kvlen`、cache window 或其他实际
+计算 shape 后必须重新 `compile`；runtime 的 dynamic index/layout binding 不会改变计算量。
 
 运行后先打开：
 
@@ -99,9 +101,7 @@ out/quickstart-attention/06_simulation/tisa_instructions.csv  # 指令生命周�
 
 ```bash
 PYTHONPATH=src python3.12 -m npu_ooo.cli compile \
-  --torch-module examples.torch_models:MultiHeadAttentionBlock \
-  --input-shape 1,4,8 --input-shape 1,1,4,4 \
-  --tile-size 4 --arch minimal \
+  --config configs/workloads/attention.json \
   --output-dir out/attention-compile
 ```
 
@@ -155,9 +155,10 @@ PYTHONPATH=src python3.12 -m npu_ooo.cli paper-matrix --help
 
 | 参数 | 默认值 / 可选值 | 含义与使用提示 |
 | --- | --- | --- |
-| `--torch-module` | 必填，`MODULE:CLASS_OR_FACTORY` | 可导入的无参数 `nn.Module` 类或工厂；需要构造参数时自行提供无参数工厂 |
-| `--input-shape` | 必填，可重复 | 每个 positional tensor 输入对应一个 shape，顺序与 `forward` 一致，如 `32,64`；不是运行时任意可变的 seqlen |
-| `--input-dtype` | `float32`；另有 `float16`、`bfloat16` | CLI 示例输入的统一 dtype；不保证任意自定义模型的参数 dtype 会自动转换 |
+| `--config` | 不指定 | 通用 schema-v1 workload JSON；支持构造参数、args/kwargs、混合 dtype、初始化和已有 compile/runtime 选项 |
+| `--torch-module` | 与 `--input-shape` 配套的简写 | 可导入的无参数 `nn.Module` 类或工厂；不能和 `--config` 的 workload 同时使用 |
+| `--input-shape` | 简写模式必填，可重复 | 为每个 positional 输入生成 `randn`，顺序与 `forward` 一致；复杂输入应改用 JSON |
+| `--input-dtype` | 简写模式默认 `float32` | 同时作为模型浮点参数和所有 `randn` 输入 dtype；JSON 模式中二者独立 |
 | `--model-id` | 默认来自类/工厂名 | 实验标识，不选择另一套模型实现 |
 | `--tile-size` | `32` | GC 的基线 tile 尺度；不同算子按自身维度解释，边界 tile 可更小 |
 | `--tile-size-candidates` | 不启用；如 `2,4,8` | 启用 GC cost model 选择候选，评分见 `01_gc/schedule.json`；不是自动输出所有候选的 sweep |
@@ -169,6 +170,15 @@ PYTHONPATH=src python3.12 -m npu_ooo.cli paper-matrix --help
 
 片上交接开关会改变搬运和编译产物。研究其收益时分别编译 root/onchip 两个版本，
 再在每个版本内部比较 static/dynamic，不要将减少访存的收益全部归因于乱序调度。
+
+配置优先级为：显式 CLI 编译/仿真选项 > JSON 对应字段 > 项目默认值。JSON 内的
+`model+inputs` 和 `workload` 两种构造方式互斥；旧 `--torch-module/--input-shape` 也是一套
+独立简写输入源，不能与 `--config` 混用。完整 schema 和全部可运行样例见
+[通用 workload 配置](docs/workload-config.md)。
+
+`configs/workloads/` 还覆盖 ResNet-50、GPT-J、LLaMA prefill、DeepSeek dense/MoE
+prefill/decode，并用文件名区分 one-block、两层 model proxy 和固定窗口 decode；这些配置
+可以脱离 `paper-matrix` 单独 `compile`，但不会因此被解释成论文完整尺寸模型。
 
 ### 2. 设备调度：先选模型，再选策略
 
@@ -436,7 +446,7 @@ PYTHONPATH=src python3.12 -m npu_ooo.cli paper-matrix \
 
 ### 使用自己的 PyTorch 模型
 
-在可导入的 `my_module.py` 中提供无参数类或工厂，例如：
+在可导入的 `my_module.py` 中提供普通类或工厂，例如：
 
 ```python
 import torch
@@ -448,10 +458,14 @@ class MyOperator(torch.nn.Module):
 
 ```bash
 PYTHONPATH=src:/path/to/module python3.12 -m npu_ooo.cli compile \
-  --torch-module my_module:MyOperator \
-  --input-shape 32,64 --input-shape 64,128 \
-  --tile-size 32 --output-dir out/my-operator
+  --config /path/to/my-workload.json \
+  --output-dir out/my-operator
 ```
+
+JSON 可把模型构造 kwargs 与命名 `forward` 输入分开；复杂 mask、RoPE 或嵌套 cache 可以
+提供返回 `npu_ooo.frontend.Workload` 的 Python workload factory。简单的两个浮点输入仍可用
+旧 `--torch-module ... --input-shape ...` 简写。普通用户不需要注册 paper benchmark；
+`paper-matrix` 只是调用相同 Workload/编译入口的批量实验层。
 
 前端仍使用 `torch.export → Torch-XLA → official StableHLO`，不绕过正式转换链路。
 新增不支持的 operation 时，需要补充 semantic capability、Canonical mapping/recovery、

@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "seed": 107,
+  "experiment_id": "resnet50-2block-model-proxy",
+  "model": {
+    "factory": "examples.paper_benchmarks.resnet50:ResNet50ModelProxy",
+    "kwargs": {
+      "layer_count": 2,
+      "channels": 16
+    },
+    "dtype": "float16"
+  },
+  "inputs": {
+    "kwargs": {
+      "value": {
+        "kind": "tensor",
+        "shape": [1, 3, 16, 16],
+        "dtype": "float16",
+        "init": {"kind": "randn"}
+      }
+    }
+  },
+  "compile": {
+    "arch": "minimal",
+    "tile_size": 4
+  }
+}

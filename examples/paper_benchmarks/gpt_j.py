@@ -32,6 +32,7 @@ def build(
     *,
     layer_count: int = 1,
     model_scope: str = "one_block",
+    seed: int | None = 0,
 ) -> PaperBenchmarkWorkload:
     return transformer_workload(
         SPEC,
@@ -40,4 +41,5 @@ def build(
         dtype=dtype,
         layer_count=layer_count,
         model_scope=model_scope,
+        seed=seed,
     )
