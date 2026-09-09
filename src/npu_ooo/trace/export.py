@@ -65,7 +65,8 @@ def write_artifact_json(artifact: Any, path: str | Path) -> None:
 def write_json(result: ScheduleResult, path: str | Path) -> None:
     target, compatibility = artifact_path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(result.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
+    payload = result.summary_dict() if hasattr(result, "summary_dict") else result.to_dict()
+    target.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     finalize_artifact(target, compatibility)
 
 

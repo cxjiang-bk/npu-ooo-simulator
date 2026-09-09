@@ -36,7 +36,7 @@ from npu_ooo.ir import (
 )
 from npu_ooo.scheduler import schedule_tisa_program, schedule_tisa_sequence
 from npu_ooo.simulator import SimulatorConfig
-from npu_ooo.trace import write_instruction_csv
+from npu_ooo.trace import write_instruction_csv, write_json
 from npu_ooo.simulator.tisa import _access_banks
 
 
@@ -107,6 +107,60 @@ def run(
 
 
 class CycleSchedulerTest(unittest.TestCase):
+    def test_continuous_stall_is_one_compact_interval(self):
+        result = run(
+            artifact(
+                (
+                    ("source", "DMA", 5, ()),
+                    ("consumer", "MXU", 1, ("source",)),
+                )
+            ),
+            receive_width=2,
+            dispatch_width=2,
+        )
+        stalls = [
+            event
+            for event in result.events
+            if event.event == "TISA_STALL"
+            and event.task_id == "consumer"
+            and event.details["reason"] == "dependency_wait"
+        ]
+        self.assertEqual(len(stalls), 1)
+        details = stalls[0].details
+        self.assertEqual(
+            set(details),
+            {"reason", "stage", "dependency_count", "start", "end", "duration"},
+        )
+        self.assertEqual(details["stage"], "wakeup")
+        self.assertEqual(details["dependency_count"], 1)
+        self.assertEqual(details["duration"], details["end"] - details["start"])
+        self.assertEqual(
+            details["duration"],
+            result.metrics["stall_instruction_cycles"]["dependency_wait"],
+        )
+        perfetto_stall = next(
+            event
+            for event in result.perfetto_trace()["traceEvents"]
+            if event.get("args", {}).get("reason") == "dependency_wait"
+        )
+        self.assertEqual(perfetto_stall["ph"], "X")
+        self.assertEqual(perfetto_stall["dur"], details["duration"])
+
+    def test_default_summary_contains_aggregates_and_timings_not_raw_trace(self):
+        result = run(artifact((("a", "DMA", 2, ()),)))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "06_simulation" / "summary.json"
+            write_json(result, path)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["summary_schema_version"], 2)
+        self.assertNotIn("events", payload)
+        self.assertTrue(payload["timings"])
+        self.assertTrue(payload["instruction_timings"])
+        self.assertNotIn("queue_occupancy_timeline", payload["metrics"])
+        self.assertNotIn("address_hazards", payload["metrics"])
+        self.assertFalse(payload["trace"]["events_embedded"])
+        self.assertEqual(payload["trace"]["event_count"], len(result.events))
+
     def test_seeded_dags_preserve_dependencies_and_bandwidth_limits(self):
         for seed in range(20):
             rng = random.Random(seed)
@@ -713,6 +767,11 @@ class CycleSchedulerTest(unittest.TestCase):
             result.metrics["queue_occupancy_timeline"][-1]["timestamp"], 15
         )
         self.assertEqual(result.metrics["stall_cycles"]["dependency_wait"], 0)
+        summary = result.summary_dict()
+        self.assertNotIn("events", summary)
+        self.assertNotIn("queue_occupancy_timeline", summary["metrics"])
+        self.assertEqual(len(summary["invocations"]), 2)
+        self.assertTrue(all("events" not in item for item in summary["invocations"]))
 
 
 if __name__ == "__main__":

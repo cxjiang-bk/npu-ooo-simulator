@@ -363,7 +363,7 @@ JSON 中的 `runtime_base_address` 应写十进制数；availability 文件在 J
 
 | 想回答的问题 | 文件 |
 | --- | --- |
-| 总共多少周期？卡在哪里？ | `06_simulation/summary.json`；cycle 模型还有 `stall_cycles`、队列占用和生命周期统计 |
+| 总共多少周期？卡在哪里？ | `06_simulation/summary.json`；cycle 模型保存 stall 聚合、队列峰值和生命周期 timing，不嵌入逐周期事件 |
 | 哪条 TISA 何时接收、发射、完成、退休？ | `06_simulation/tisa_instructions.csv` |
 | 哪些执行单元发生重叠？ | `07_trace/swimlane.svg`；更细时间线看 `07_trace/perfetto.json` |
 | 本次实际给 scheduler 的指令和地址是什么？ | `05_runtime/bound_device_program.json` |
@@ -383,6 +383,8 @@ JSON 中的 `runtime_base_address` 应写十进制数；availability 文件在 J
 
 - `total_cycles` 包含 runtime 开销；`cycle_event` 中物理执行结束、完整反馈完成、最终退休不是同一个时刻。
 - `stall_cycles` 各原因可以在同周期重叠，不能相加解释总运行时间；`stall_instruction_cycles` 是另一种按指令计数的口径。
+- 连续相同 stall 在 Perfetto 中是 `[start,end,duration]` 区间；完整依赖只在 bound device
+  program 保存一次，默认 `summary.json` 不再复制 raw events 和 queue timeline。
 - `offchip_*_bytes` 用于核对 root-memory 流量；片上优化会改变它，单纯策略比较应固定编译包。
 - `scheduler_calibration_status` 与执行 timing 的校准状态要分开看；分析周期不等于芯片实测性能。
 

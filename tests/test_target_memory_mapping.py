@@ -2,6 +2,7 @@ import unittest
 from dataclasses import replace
 
 from npu_ooo.arch import lpu_like_machine_config, minimal_machine_config
+from npu_ooo.backend.memory import _add_physical_hazards
 from npu_ooo.compiler import compile_operator_graph
 from npu_ooo.frontend import FrontendImport, OfficialStableHLOModule
 from npu_ooo.ir import (
@@ -10,6 +11,11 @@ from npu_ooo.ir import (
     OperatorGraph,
     OperatorSpec,
     TensorSpec,
+    TISAInstruction,
+    TISAOperand,
+    TISAProgram,
+    TileMem,
+    UnitMap,
     allocate_memory_plan_bindings,
     create_runtime_submission,
 )
@@ -57,6 +63,75 @@ def _compile(machine, *, shape=(4, 4, 4), tile_size=4, lhs_attributes=None):
 
 
 class TargetMemoryMappingTest(unittest.TestCase):
+    @staticmethod
+    def _hazard_instruction(
+        tisa_id: str,
+        access: str,
+        *,
+        offset: int = 0,
+        size: int = 8,
+    ) -> TISAInstruction:
+        return TISAInstruction(
+            tisa_id=tisa_id,
+            tile_id=f"tile.{tisa_id}",
+            operator_id="hazard",
+            op_type="elementwise",
+            operands=(
+                TISAOperand(
+                    "buffer",
+                    (size,),
+                    TileMem(
+                        "shared",
+                        "SRAM",
+                        tensor="shared",
+                        buffer_id="shared@SRAM",
+                        offset_bytes=offset,
+                        size_bytes=size,
+                    ),
+                    access,
+                ),
+            ),
+            unit_map=UnitMap("DMA"),
+            payload_ref=f"payload:{tisa_id}",
+        )
+
+    @staticmethod
+    def _hazard_sources(instruction: TISAInstruction) -> set[tuple[str, str]]:
+        return {
+            (dependency.source, dependency.kind)
+            for dependency in instruction.dependencies
+            if dependency.provenance.get("source") == "target_memory_hazard"
+        }
+
+    def test_target_memory_hazards_use_writer_reader_frontier(self):
+        program = TISAProgram(
+            "frontier",
+            (
+                self._hazard_instruction("writer", "write"),
+                self._hazard_instruction("reader0", "read"),
+                self._hazard_instruction("reader1", "read"),
+                self._hazard_instruction("next_writer", "write"),
+                self._hazard_instruction("last_writer", "write"),
+            ),
+        )
+        lowered = _add_physical_hazards(program)
+        self.assertEqual(
+            self._hazard_sources(lowered.instructions[1]),
+            {("writer", "RAW")},
+        )
+        self.assertEqual(
+            self._hazard_sources(lowered.instructions[2]),
+            {("writer", "RAW")},
+        )
+        self.assertEqual(
+            self._hazard_sources(lowered.instructions[3]),
+            {("reader0", "WAR"), ("reader1", "WAR")},
+        )
+        self.assertEqual(
+            self._hazard_sources(lowered.instructions[4]),
+            {("next_writer", "WAW")},
+        )
+
     def test_minimal_matmul_uses_one_shared_descriptor_payload_contract(self):
         machine = minimal_machine_config()
         compiled = _compile(machine)

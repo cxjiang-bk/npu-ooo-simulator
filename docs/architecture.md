@@ -408,8 +408,9 @@ DescriptorEnvelope  = chunk + arrival + launch/submission order
 StaticSchedulePlan  = 固定 submission order、resource、dependency token、reservation
 ```
 
-loader 还将只有绑定物理地址后才可见的 RAW/WAR/WAW alias 关系转换为显式 dependency token；
-提交顺序若把消费者放在新增生产者之前会被拒绝，避免设备端等待尚未提交的 descriptor。
+loader 还将只有绑定物理地址后才可见的 RAW/WAR/WAW alias 关系转换为显式 dependency token。
+target memory 与 runtime binding 都按地址区间维护 last-writer/reader frontier，而不是向所有
+历史冲突建立边；提交顺序若把消费者放在新增 producer 之前仍会被拒绝。
 
 Runtime 可以和编译阶段分开执行。`compile` 将以下文件组成可复用的 compile package：
 
@@ -526,6 +527,11 @@ TimingProvider 和 RuntimeSubmission；实验变量明确写入 manifest。
 `compile_statistics.json` 保存 per-operator tile/TISA/payload、MAC、root traffic 和
 dependency 数量。`manifest.json` 保存 frontend path、工具版本、machine hash、backend、
 policy、TISA instruction count、cycle 和 calibration status。
+
+默认 `06_simulation/summary.json` 使用 compact schema v2，只包含聚合 metrics、task/TISA/
+runtime timing 和 trace 计数，不嵌入 raw events、逐周期 queue timeline 或详细 hazard 列表。
+连续 cycle stall 合并为一个 duration interval，详细时间线位于 `07_trace/perfetto.json`；
+完整 bound dependency 位于 `05_runtime/bound_device_program.json`。
 
 ## 12. 当前范围与扩展项
 

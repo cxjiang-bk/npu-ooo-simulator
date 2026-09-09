@@ -7,7 +7,8 @@ memories, and adds physical hazard dependencies.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from bisect import bisect_left
+from dataclasses import dataclass, field, replace
 import math
 from typing import Any, Mapping
 
@@ -180,6 +181,12 @@ class _Access:
     write: bool
 
 
+@dataclass
+class _HazardFrontier:
+    writer: _Access | None = None
+    readers: dict[str, _Access] = field(default_factory=dict)
+
+
 def _instruction_accesses(
     program: TISAProgram,
     *,
@@ -221,49 +228,106 @@ def _add_physical_hazards(
     additions: dict[str, dict[str, TISADependency]] = {
         instruction.tisa_id: {} for instruction in program.instructions
     }
+    priority = {"RAW": 0, "WAR": 1, "WAW": 2}
     for buffer_id, accesses in _instruction_accesses(
         program, by_allocation=by_allocation
     ).items():
-        for current_index, current in enumerate(accesses):
-            for previous in accesses[:current_index]:
-                if previous.tisa_id == current.tisa_id:
-                    continue
-                if previous.offset + previous.size <= current.offset or current.offset + current.size <= previous.offset:
-                    continue
-                if not (previous.write or current.write):
-                    continue
-                kind = (
-                    "RAW"
-                    if previous.write and current.read and not current.write
-                    else "WAR"
-                    if previous.read and current.write and not previous.write
-                    else "WAW"
+        boundaries = tuple(
+            sorted(
+                {
+                    boundary
+                    for access in accesses
+                    for boundary in (access.offset, access.offset + access.size)
+                }
+            )
+        )
+        frontiers = [_HazardFrontier() for _ in range(len(boundaries) - 1)]
+        grouped: dict[int, list[_Access]] = {}
+        for access in accesses:
+            grouped.setdefault(access.instruction_index, []).append(access)
+        for instruction_index in sorted(grouped):
+            current_accesses = grouped[instruction_index]
+            current_id = current_accesses[0].tisa_id
+            pending: dict[str, TISADependency] = {}
+
+            def add_hazard(
+                previous: _Access | None,
+                kind: str,
+                start: int,
+                stop: int,
+            ) -> None:
+                if previous is None or previous.tisa_id == current_id:
+                    return
+                dependency = TISADependency(
+                    source=previous.tisa_id,
+                    kind=kind,
+                    condition="physical_range_released",
+                    provenance={
+                        "source": (
+                            "target_allocation_hazard"
+                            if by_allocation
+                            else "target_memory_hazard"
+                        ),
+                        (
+                            "allocation_id" if by_allocation else "buffer_id"
+                        ): buffer_id,
+                        "frontier": "last_writer_reader",
+                        "range": [start, stop],
+                    },
                 )
-                additions[current.tisa_id].setdefault(
-                    previous.tisa_id,
-                    TISADependency(
-                        source=previous.tisa_id,
-                        kind=kind,
-                        condition="physical_range_released",
-                        provenance={
-                            "source": (
-                                "target_allocation_hazard"
-                                if by_allocation
-                                else "target_memory_hazard"
-                            ),
-                            (
-                                "allocation_id" if by_allocation else "buffer_id"
-                            ): buffer_id,
-                            "range": [
-                                max(previous.offset, current.offset),
-                                min(
-                                    previous.offset + previous.size,
-                                    current.offset + current.size,
-                                ),
-                            ],
-                        },
-                    ),
+                existing = pending.get(previous.tisa_id)
+                if existing is None or priority[kind] < priority[existing.kind]:
+                    pending[previous.tisa_id] = dependency
+
+            for current in current_accesses:
+                start_index = bisect_left(boundaries, current.offset)
+                stop_index = bisect_left(
+                    boundaries, current.offset + current.size
                 )
+                for segment_index in range(start_index, stop_index):
+                    state = frontiers[segment_index]
+                    start, stop = (
+                        boundaries[segment_index],
+                        boundaries[segment_index + 1],
+                    )
+                    if current.read:
+                        add_hazard(state.writer, "RAW", start, stop)
+                    if current.write:
+                        if state.readers:
+                            for reader in state.readers.values():
+                                add_hazard(reader, "WAR", start, stop)
+                        elif state.writer is not None:
+                            add_hazard(
+                                state.writer,
+                                "RAW" if current.read else "WAW",
+                                start,
+                                stop,
+                            )
+            for source, dependency in pending.items():
+                existing = additions[current_id].get(source)
+                if (
+                    existing is None
+                    or priority[dependency.kind] < priority[existing.kind]
+                ):
+                    additions[current_id][source] = dependency
+
+            for current in current_accesses:
+                if current.read and not current.write:
+                    start_index = bisect_left(boundaries, current.offset)
+                    stop_index = bisect_left(
+                        boundaries, current.offset + current.size
+                    )
+                    for state in frontiers[start_index:stop_index]:
+                        state.readers[current.tisa_id] = current
+            for current in current_accesses:
+                if current.write:
+                    start_index = bisect_left(boundaries, current.offset)
+                    stop_index = bisect_left(
+                        boundaries, current.offset + current.size
+                    )
+                    for state in frontiers[start_index:stop_index]:
+                        state.writer = current
+                        state.readers.clear()
     instructions = []
     for instruction in program.instructions:
         dependencies = {item.source: item for item in instruction.dependencies}
@@ -392,10 +456,30 @@ def _allocate_plan(
                             block["offset"],
                         ),
                     )
-                    for current_access in accesses[buffer_id]:
-                        reuse_dependencies.setdefault(current_access.tisa_id, set()).update(
-                            selected["all_uses"]
+                    current_accesses = accesses[buffer_id]
+                    first_use = min(
+                        access.instruction_index for access in current_accesses
+                    )
+                    first_users = {
+                        access.tisa_id
+                        for access in current_accesses
+                        if access.instruction_index == first_use
+                    }
+                    for current_id in first_users:
+                        reuse_dependencies.setdefault(current_id, set()).update(
+                            selected["last_uses"]
                         )
+            buffer_accesses = accesses[buffer_id]
+            last_use = max(item.instruction_index for item in buffer_accesses)
+            last_users = tuple(
+                sorted(
+                    {
+                        item.tisa_id
+                        for item in buffer_accesses
+                        if item.instruction_index == last_use
+                    }
+                )
+            )
             if selected is None:
                 offset = _align(cursor, requested_alignment)
                 size = _align(requirement["allocation_bytes"], requested_alignment)
@@ -405,9 +489,7 @@ def _allocate_plan(
                     "offset": offset,
                     "size": size,
                     "lifetime_end": requirement["lifetime_end"],
-                    "all_uses": tuple(
-                        sorted({item.tisa_id for item in accesses[buffer_id]})
-                    ),
+                    "last_uses": last_users,
                     "last_buffer": buffer_id,
                 }
                 blocks.append(selected)
@@ -416,9 +498,7 @@ def _allocate_plan(
                 selected["lifetime_end"] = max(
                     selected["lifetime_end"], requirement["lifetime_end"]
                 )
-                selected["all_uses"] = tuple(
-                    sorted({item.tisa_id for item in accesses[buffer_id]})
-                )
+                selected["last_uses"] = last_users
             allocation_for[buffer_id] = selected["allocation_id"]
             alias_of = (
                 alias_buffer_id

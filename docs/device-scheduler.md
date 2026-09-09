@@ -104,9 +104,11 @@ CPU 推测执行、异常回滚或将内存写入延迟至退休。
 - 所有显式依赖均等待对应 complete；`payload_ready:<task_id>` 使用指定 primitive 的
   完成边界，加 completion/wakeup latency 唤醒。partial-ready 通知是独立 sideband 原型，
   不消耗 full-completion 总线宽度，也不模拟逐子区域有效位。
-- 编译器提供语义/复用依赖；runtime loader 在地址绑定后把额外物理 alias 转换为显式
-  RAW/WAR/WAW completion-token dependency；设备 `--address-scoreboard` 只比较已经接收、
-  较老且未 complete 的 descriptor。它不读取未到达的未来指令。未解析布局仍使用保守区间。
+- 编译器提供语义/复用依赖；target memory planner 与 runtime loader 都按不相交物理区间
+  维护 last-writer/readers frontier：read 只等待最后 writer，write 等待最近 writer 或自
+  上次 writer 以来的 reader 集合，不再连接全部历史冲突。runtime 地址绑定后将该 frontier
+  转换为显式 RAW/WAR/WAW completion-token dependency；设备 `--address-scoreboard` 只比较
+  已经接收、较老且未 complete 的 descriptor。未解析布局仍使用保守区间。
 - `--memory-bank-scoreboard` 在整个物理 payload 执行期间保留 bank/port；这是保守的结构
   资源模型，逐次 SRAM/DRAM transaction timing 由后续 memory backend 提供。
 
@@ -116,15 +118,16 @@ CPU 推测执行、异常回滚或将内存写入延迟至退休。
 
 ## 输出与统计
 
-`summary.json` 增加以下字段：
+`summary.json` schema v2 默认只保存聚合指标与 timing：
 
 - `instruction_pipeline`：每条指令的 received/dispatched/wakeup/selected/issued/done/
   completed/retired 周期；
-- `queue_occupancy_timeline`：每周期末 reception、WQ、IQ、Fu、ROB、tile window 和
-  pending completion 占用；`wq_peak/iq_peak/fu_peak/rob_peak` 保存峰值；
+- `wq_peak/iq_peak/fu_peak/rob_peak`：队列和表项峰值；逐周期
+  `queue_occupancy_timeline` 仍可在进程内结果中检查，但不再嵌入默认 summary；
 - `stall_cycles`：每种原因发生的周期数；同周期多条指令计 1；
 - `stall_instruction_cycles`：按 `(instruction, reason, cycle)` 去重后计数；
 - `compile_package_sha256`：本次消费的 BackendArtifact 规范 JSON hash；
+- `trace.event_counts/stall_interval_count`：未嵌入 summary 的 trace 聚合计数；
 - `offchip_read/write/total_bytes`：由 execution backend 按 payload 的 root-memory region
   统计，避免 scheduler 反向读取 task；
 - `device_finish_cycle` 为最终 retire，`completion_finish_cycle` 为最终 complete，
@@ -137,7 +140,10 @@ WQ 中达到 dispatch_latency 边界的条目参与 dependency stall 统计；se
 流水固定延迟单独由生命周期周期反映。
 
 `tisa_instructions.csv` 增加 receive、dispatch、wakeup、select、execution_done、complete、
-retire 列。Perfetto 保存相应阶段 instant event 和 `TISA_STALL`，事件携带依赖 provenance。
+retire 列。连续的同一 `(instruction, reason, stage)` stall 压缩成一条
+`TISA_STALL [start,end,duration]`；stall 只携带 reason、stage 和 dependency count，不复制
+完整依赖。Perfetto 将其保存为 duration event；完整 bound dependency 仍在
+`05_runtime/bound_device_program.json`，其他生命周期事件可携带依赖 provenance。
 RuntimeSequence 将生命周期周期平移并按 invocation id 区分；stall 和退休数按全部
 invocation 汇总。
 

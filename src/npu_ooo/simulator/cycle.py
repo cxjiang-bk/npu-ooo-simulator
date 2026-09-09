@@ -143,6 +143,7 @@ class _CycleScheduler:
         self.stall_cycles = Counter({reason: 0 for reason in STALL_REASONS})
         self.stall_instruction_cycles = Counter({reason: 0 for reason in STALL_REASONS})
         self.stall_seen, self.cycle_reasons = set(), set()
+        self.active_stalls: dict[tuple[str, str, str], float] = {}
         self.hazards = {}
         self.stream = self._descriptor_stream()
         self.submission_order = {tid: i for i, (_, tid, _) in enumerate(self.stream)}
@@ -260,14 +261,41 @@ class _CycleScheduler:
             )
         )
 
-    def stall(self, tid, reason, stage, **details):
-        key = (tid, reason)
+    def stall(self, tid, reason, stage, **_details):
+        key = (tid, reason, stage)
         if key in self.stall_seen:
             return
         self.stall_seen.add(key)
         self.cycle_reasons.add(reason)
         self.stall_instruction_cycles[reason] += 1
-        self.event("TISA_STALL", tid, reason=reason, stage=stage, **details)
+        self.active_stalls.setdefault(key, self.now)
+
+    def _close_stall(self, key: tuple[str, str, str], end: float) -> None:
+        start = self.active_stalls.pop(key)
+        tid, reason, stage = key
+        entry = self.entries[tid]
+        self.events.append(
+            TraceEvent(
+                start,
+                "TISA_STALL",
+                tid,
+                f"TISA/{entry.resource}",
+                entry.instance,
+                {
+                    "reason": reason,
+                    "stage": stage,
+                    "dependency_count": len(self.descriptors[tid].dependencies),
+                    "start": start,
+                    "end": end,
+                    "duration": end - start,
+                },
+            )
+        )
+
+    def _close_inactive_stalls(self, end: float) -> None:
+        for key in tuple(self.active_stalls):
+            if key not in self.stall_seen:
+                self._close_stall(key, end)
 
     def retire(self):
         for _ in range(self.pipe.retire_width):
@@ -632,6 +660,7 @@ class _CycleScheduler:
             self.select()
             self.dispatch()
             self.receive()
+            self._close_inactive_stalls(self.now)
             self.snapshot()
             if len(self.retired) == len(self.instructions):
                 break
@@ -696,6 +725,8 @@ class _CycleScheduler:
         return False
 
     def result(self):
+        for key in tuple(self.active_stalls):
+            self._close_stall(key, self.now + 1)
         execution_timings = tuple(self.execution.task_timings())
         self.timings = {item.task_id: item for item in execution_timings}
         self.events.extend(self.execution.trace_events())

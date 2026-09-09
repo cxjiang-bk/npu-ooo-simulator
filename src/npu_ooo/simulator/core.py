@@ -347,6 +347,29 @@ class TraceEvent:
         }
 
 
+def _summary_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop detailed traces that have dedicated artifacts or aggregates."""
+
+    omitted = {
+        "queue_occupancy_timeline",
+        "address_hazards",
+    }
+    return {key: value for key, value in metrics.items() if key not in omitted}
+
+
+def _trace_summary(events: tuple[TraceEvent, ...]) -> dict[str, Any]:
+    counts: dict[str, int] = {}
+    for event in events:
+        counts[event.event] = counts.get(event.event, 0) + 1
+    return {
+        "event_count": len(events),
+        "event_counts": counts,
+        "stall_interval_count": counts.get("TISA_STALL", 0),
+        "events_embedded": False,
+        "perfetto_artifact": "07_trace/perfetto.json",
+    }
+
+
 @dataclass(frozen=True)
 class SimulationResult:
     backend: str
@@ -386,10 +409,29 @@ class SimulationResult:
             "metrics": dict(self.metrics),
         }
 
+    def summary_dict(self) -> dict[str, Any]:
+        """Compact default JSON containing aggregates and timing only."""
+
+        return {
+            "summary_schema_version": 2,
+            "backend": self.backend,
+            "policy": self.policy,
+            "graph_id": self.graph_id,
+            "total_cycles": self.total_cycles,
+            "timings": [timing.to_dict() for timing in self.timings],
+            "instruction_timings": [
+                timing.to_dict() for timing in self.instruction_timings
+            ],
+            "runtime_timings": [timing.to_dict() for timing in self.runtime_timings],
+            "metrics": _summary_metrics(self.metrics),
+            "trace": _trace_summary(self.events),
+        }
+
     def perfetto_trace(self) -> dict[str, Any]:
         cycle_model = self.metrics.get("scheduler_model") == "cycle-stepped-v1"
         trace_events = _cycle_tisa_spans(self.instruction_timings) if cycle_model else []
         for event in self.events:
+            duration = None
             if event.event in {"START", "COMPLETE"}:
                 phase = "B" if event.event == "START" else "E"
                 pid = 2 if self.instruction_timings else 1
@@ -399,22 +441,27 @@ class SimulationResult:
             elif event.event in {"RUNTIME_SUBMIT_START", "RUNTIME_SUBMIT_COMPLETE"}:
                 phase = "B" if event.event == "RUNTIME_SUBMIT_START" else "E"
                 pid = 0
+            elif event.event == "TISA_STALL" and "duration" in event.details:
+                phase = "X"
+                pid = 1
+                duration = event.details["duration"]
             elif event.event.startswith("TISA_"):
                 phase = "i"
                 pid = 1
             else:
                 continue
-            trace_events.append(
-                {
-                    "name": event.task_id,
-                    "cat": event.resource,
-                    "ph": phase,
-                    "ts": event.timestamp,
-                    "pid": pid,
-                    "tid": f"{event.resource}[{event.instance}]",
-                    "args": dict(event.details),
-                }
-            )
+            record = {
+                "name": event.task_id,
+                "cat": event.resource,
+                "ph": phase,
+                "ts": event.timestamp,
+                "pid": pid,
+                "tid": f"{event.resource}[{event.instance}]",
+                "args": dict(event.details),
+            }
+            if duration is not None:
+                record["dur"] = duration
+            trace_events.append(record)
         return {"traceEvents": trace_events, "displayTimeUnit": "cycle"}
 
 
@@ -466,10 +513,33 @@ class RuntimeSequenceSimulationResult:
             "invocations": [result.to_dict() for result in self.invocation_results],
         }
 
+    def summary_dict(self) -> dict[str, Any]:
+        """Compact sequence JSON without recursively embedding raw events."""
+
+        return {
+            "summary_schema_version": 2,
+            "backend": self.backend,
+            "policy": self.policy,
+            "sequence_id": self.sequence_id,
+            "graph_id": self.graph_id,
+            "total_cycles": self.total_cycles,
+            "timings": [timing.to_dict() for timing in self.timings],
+            "instruction_timings": [
+                timing.to_dict() for timing in self.instruction_timings
+            ],
+            "runtime_timings": [timing.to_dict() for timing in self.runtime_timings],
+            "metrics": _summary_metrics(self.metrics),
+            "trace": _trace_summary(self.events),
+            "invocations": [
+                result.summary_dict() for result in self.invocation_results
+            ],
+        }
+
     def perfetto_trace(self) -> dict[str, Any]:
         cycle_model = self.metrics.get("scheduler_model") == "cycle-stepped-v1"
         trace_events = _cycle_tisa_spans(self.instruction_timings) if cycle_model else []
         for event in self.events:
+            duration = None
             if event.event in {"START", "COMPLETE"}:
                 phase = "B" if event.event == "START" else "E"
                 pid = 2
@@ -482,22 +552,27 @@ class RuntimeSequenceSimulationResult:
             elif event.event in {"STATE_RELEASE", "STATE_WAIT", "STATE_READY"}:
                 phase = "i"
                 pid = 3
+            elif event.event == "TISA_STALL" and "duration" in event.details:
+                phase = "X"
+                pid = 1
+                duration = event.details["duration"]
             elif event.event.startswith("TISA_"):
                 phase = "i"
                 pid = 1
             else:
                 continue
-            trace_events.append(
-                {
-                    "name": event.task_id,
-                    "cat": event.resource,
-                    "ph": phase,
-                    "ts": event.timestamp,
-                    "pid": pid,
-                    "tid": f"{event.resource}[{event.instance}]",
-                    "args": dict(event.details),
-                }
-            )
+            record = {
+                "name": event.task_id,
+                "cat": event.resource,
+                "ph": phase,
+                "ts": event.timestamp,
+                "pid": pid,
+                "tid": f"{event.resource}[{event.instance}]",
+                "args": dict(event.details),
+            }
+            if duration is not None:
+                record["dur"] = duration
+            trace_events.append(record)
         return {"traceEvents": trace_events, "displayTimeUnit": "cycle"}
 
 

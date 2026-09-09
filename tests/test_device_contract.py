@@ -8,11 +8,19 @@ from npu_ooo.execution import (
     IssueRequest,
 )
 from npu_ooo.ir import (
+    BoundTISADescriptor,
+    CompletionToken,
     LoadedDeviceProgram,
+    RuntimeOperandBinding,
+    TISAInstruction,
+    TISAOperand,
+    TileMem,
+    UnitMap,
     allocate_memory_plan_bindings,
     create_runtime_submission,
 )
 from npu_ooo.runtime import load_device_program
+from npu_ooo.runtime.loader import _add_runtime_alias_dependencies
 from npu_ooo.scheduler.event import schedule_loaded_event_program
 
 from test_target_memory_mapping import _compile
@@ -112,6 +120,120 @@ class _InitiallyBusyBackend(_DelayedFeedbackBackend):
 
 
 class DeviceContractTest(unittest.TestCase):
+    @staticmethod
+    def _alias_descriptor(
+        tisa_id: str,
+        order: int,
+        access: str,
+        *,
+        address: int = 0,
+        size_bytes: int = 8,
+        identity: str | None = None,
+    ) -> BoundTISADescriptor:
+        instruction = TISAInstruction(
+            tisa_id=tisa_id,
+            tile_id=f"tile.{tisa_id}",
+            operator_id="alias",
+            op_type="elementwise",
+            operands=(
+                TISAOperand(
+                    "buffer",
+                    (size_bytes,),
+                    TileMem(
+                        "buffer",
+                        "SRAM",
+                        tensor="buffer",
+                        offset_bytes=0,
+                        size_bytes=size_bytes,
+                    ),
+                    access,
+                ),
+            ),
+            unit_map=UnitMap("DMA"),
+            payload_ref=f"payload:{tisa_id}",
+        )
+        attributes = (
+            {"allocation_identity": identity} if identity is not None else {}
+        )
+        operand = RuntimeOperandBinding(
+            tisa_id=tisa_id,
+            operand_name="buffer",
+            tensor="buffer",
+            logical_scope="SRAM",
+            physical_scope="SRAM",
+            address=address,
+            size_bytes=size_bytes,
+            access_type=access,
+            offset_bytes=0,
+            attributes=attributes,
+        )
+        return BoundTISADescriptor(
+            descriptor_id=f"inv::{tisa_id}",
+            invocation_id="inv",
+            program_id="alias.program",
+            artifact_id="alias.artifact",
+            instruction=instruction,
+            operands=(operand,),
+            dependencies=(),
+            completion_token=CompletionToken("inv", tisa_id),
+            payload_handle=f"alias.artifact::{tisa_id}",
+            program_order=order,
+            submission_order=order,
+        )
+
+    @staticmethod
+    def _alias_sources(descriptor: BoundTISADescriptor) -> set[tuple[str, str]]:
+        return {
+            (dependency.source.tisa_id, dependency.kind)
+            for dependency in descriptor.dependencies
+            if dependency.provenance.get("source") == "runtime_binding_alias"
+        }
+
+    def test_alias_writes_depend_only_on_last_writer_frontier(self):
+        descriptors = tuple(
+            self._alias_descriptor(f"w{index}", index, "write")
+            for index in range(3)
+        )
+        loaded = _add_runtime_alias_dependencies(descriptors)
+        self.assertEqual(self._alias_sources(loaded[0]), set())
+        self.assertEqual(self._alias_sources(loaded[1]), {("w0", "WAW")})
+        self.assertEqual(self._alias_sources(loaded[2]), {("w1", "WAW")})
+
+    def test_alias_write_waits_for_reader_frontier_not_full_history(self):
+        descriptors = (
+            self._alias_descriptor("writer", 0, "write"),
+            self._alias_descriptor("reader0", 1, "read"),
+            self._alias_descriptor("reader1", 2, "read"),
+            self._alias_descriptor("next_writer", 3, "write"),
+        )
+        loaded = _add_runtime_alias_dependencies(descriptors)
+        self.assertEqual(self._alias_sources(loaded[1]), {("writer", "RAW")})
+        self.assertEqual(self._alias_sources(loaded[2]), {("writer", "RAW")})
+        self.assertEqual(
+            self._alias_sources(loaded[3]),
+            {("reader0", "WAR"), ("reader1", "WAR")},
+        )
+
+    def test_alias_frontier_tracks_partial_ranges_and_allocation_identity(self):
+        partial = _add_runtime_alias_dependencies(
+            (
+                self._alias_descriptor("left", 0, "write", address=0, size_bytes=4),
+                self._alias_descriptor("right", 1, "write", address=4, size_bytes=4),
+                self._alias_descriptor("read_all", 2, "read", address=0, size_bytes=8),
+            )
+        )
+        self.assertEqual(
+            self._alias_sources(partial[2]),
+            {("left", "RAW"), ("right", "RAW")},
+        )
+        identified = _add_runtime_alias_dependencies(
+            (
+                self._alias_descriptor("a", 0, "write", identity="alloc.a"),
+                self._alias_descriptor("b", 1, "read", identity="alloc.b"),
+            )
+        )
+        self.assertEqual(self._alias_sources(identified[1]), set())
+
     def _loaded(self, submission_id="invocation.0", launch_latency=2):
         machine = minimal_machine_config()
         compiled = _compile(machine)

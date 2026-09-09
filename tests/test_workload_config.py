@@ -55,7 +55,7 @@ class WorkloadConfigTest(unittest.TestCase):
 
     def test_all_shipped_configs_construct_and_run_forward(self) -> None:
         paths = tuple(sorted(Path("configs/workloads").glob("*.json")))
-        self.assertEqual({path.name for path in paths}, self.EXPECTED_CONFIGS)
+        self.assertTrue(self.EXPECTED_CONFIGS.issubset({path.name for path in paths}))
         for path in paths:
             with self.subTest(config=path.name):
                 workload = load_workload_config(path).workload

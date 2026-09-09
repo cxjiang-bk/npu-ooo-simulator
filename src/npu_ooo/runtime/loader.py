@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from bisect import bisect_left
+from collections import defaultdict
+from dataclasses import dataclass, field, replace
 
 from npu_ooo.ir import (
     BackendArtifact,
@@ -154,35 +156,140 @@ def load_device_program(
 def _add_runtime_alias_dependencies(
     descriptors: tuple[BoundTISADescriptor, ...],
 ) -> tuple[BoundTISADescriptor, ...]:
-    """Convert invocation-specific physical aliases into explicit tokens."""
+    """Convert physical aliases into a minimal writer/reader frontier.
 
-    ordered = sorted(descriptors, key=lambda item: item.program_order)
+    Each disjoint address segment tracks its last writer and the readers since
+    that writer.  A read waits only for the last writer; a write waits for the
+    current reader frontier, or for the last writer when no reader intervened.
+    This preserves RAW/WAR/WAW ordering without connecting every younger
+    descriptor to every historical overlapping access.
+    """
+
+    ordered = tuple(sorted(descriptors, key=lambda item: item.program_order))
+    scope_has_missing_identity: set[str] = set()
+    for descriptor in ordered:
+        for operand in descriptor.operands:
+            identity = operand.attributes.get("allocation_identity")
+            if identity is None:
+                scope_has_missing_identity.add(operand.physical_scope)
+
+    def alias_key(operand: RuntimeOperandBinding) -> tuple[str, object | None]:
+        identity = operand.attributes.get("allocation_identity")
+        if operand.physical_scope in scope_has_missing_identity:
+            # A missing identity has the old contract of matching by physical
+            # scope/address alone. Collapse the scope conservatively when
+            # identified and unidentified bindings are mixed.
+            identity = None
+        elif identity is not None:
+            identity = str(identity)
+        return operand.physical_scope, identity
+
+    boundaries: dict[tuple[str, object | None], set[int]] = defaultdict(set)
+    for descriptor in ordered:
+        for operand in descriptor.operands:
+            key = alias_key(operand)
+            boundaries[key].update((operand.address, operand.address + operand.size_bytes))
+    points = {key: tuple(sorted(values)) for key, values in boundaries.items()}
+    frontiers = {
+        key: [_AliasFrontier() for _ in range(max(0, len(values) - 1))]
+        for key, values in points.items()
+    }
+
     updated: list[BoundTISADescriptor] = []
-    for index, descriptor in enumerate(ordered):
+    priority = {"RAW": 0, "WAR": 1, "WAW": 2}
+    for descriptor in ordered:
         dependencies = {
             (item.source.tisa_id, item.kind, item.condition): item
             for item in descriptor.dependencies
         }
-        for older in ordered[:index]:
-            conflict = _runtime_conflict(older.operands, descriptor.operands)
-            if conflict is None:
-                continue
-            kind, memory, address, size = conflict
+        alias_by_source: dict[str, BoundDependency] = {}
+
+        def add_alias(
+            source: BoundTISADescriptor | None,
+            kind: str,
+            operand: RuntimeOperandBinding,
+        ) -> None:
+            if source is None or source.descriptor_id == descriptor.descriptor_id:
+                return
             dependency = BoundDependency(
-                source=older.completion_token,
+                source=source.completion_token,
                 kind=kind,
                 condition="physical_range_released",
                 provenance={
                     "source": "runtime_binding_alias",
-                    "memory": memory,
-                    "address": address,
-                    "size_bytes": size,
+                    "frontier": "last_writer_reader",
+                    "memory": operand.physical_scope,
+                    "address": operand.address,
+                    "size_bytes": operand.size_bytes,
                 },
             )
-            dependencies[(older.instruction.tisa_id, kind, dependency.condition)] = dependency
+            previous = alias_by_source.get(source.instruction.tisa_id)
+            if previous is None or priority[kind] < priority[previous.kind]:
+                alias_by_source[source.instruction.tisa_id] = dependency
+
+        for operand in descriptor.operands:
+            is_read = operand.access_type in {"read", "read_write"}
+            is_write = operand.access_type in {"write", "read_write"}
+            for state in _operand_frontiers(operand, alias_key, points, frontiers):
+                if is_read:
+                    add_alias(state.writer, "RAW", operand)
+                if is_write:
+                    if state.readers:
+                        for reader in state.readers.values():
+                            add_alias(reader, "WAR", operand)
+                    elif state.writer is not None:
+                        add_alias(
+                            state.writer,
+                            "RAW" if operand.access_type == "read_write" else "WAW",
+                            operand,
+                        )
+
+        for dependency in alias_by_source.values():
+            dependencies[
+                (
+                    dependency.source.tisa_id,
+                    dependency.kind,
+                    dependency.condition,
+                )
+            ] = dependency
         updated.append(replace(descriptor, dependencies=tuple(dependencies.values())))
+
+        # Reads become the WAR frontier. Writes, including read-modify-write,
+        # supersede both the previous writer and all preceding readers.
+        for operand in descriptor.operands:
+            if operand.access_type == "read":
+                for state in _operand_frontiers(
+                    operand, alias_key, points, frontiers
+                ):
+                    state.readers[descriptor.descriptor_id] = descriptor
+        for operand in descriptor.operands:
+            if operand.access_type in {"write", "read_write"}:
+                for state in _operand_frontiers(
+                    operand, alias_key, points, frontiers
+                ):
+                    state.writer = descriptor
+                    state.readers.clear()
     by_id = {item.descriptor_id: item for item in updated}
     return tuple(by_id[item.descriptor_id] for item in descriptors)
+
+
+@dataclass
+class _AliasFrontier:
+    writer: BoundTISADescriptor | None = None
+    readers: dict[str, BoundTISADescriptor] = field(default_factory=dict)
+
+
+def _operand_frontiers(
+    operand: RuntimeOperandBinding,
+    alias_key,
+    points: dict[tuple[str, object | None], tuple[int, ...]],
+    frontiers: dict[tuple[str, object | None], list[_AliasFrontier]],
+) -> tuple[_AliasFrontier, ...]:
+    key = alias_key(operand)
+    boundaries = points[key]
+    start = bisect_left(boundaries, operand.address)
+    stop = bisect_left(boundaries, operand.address + operand.size_bytes)
+    return tuple(frontiers[key][start:stop])
 
 
 def _static_schedule(
@@ -214,37 +321,6 @@ def _static_schedule(
             "calibration_status": "project_baseline",
         },
     )
-
-
-def _runtime_conflict(left, right):
-    reads = {"read", "read_write"}
-    writes = {"write", "read_write"}
-    for older in left:
-        for younger in right:
-            if older.physical_scope != younger.physical_scope:
-                continue
-            older_identity = older.attributes.get("allocation_identity")
-            younger_identity = younger.attributes.get("allocation_identity")
-            if (
-                older_identity is not None
-                and younger_identity is not None
-                and older_identity != younger_identity
-            ):
-                continue
-            start = max(older.address, younger.address)
-            stop = min(
-                older.address + older.size_bytes,
-                younger.address + younger.size_bytes,
-            )
-            if start >= stop:
-                continue
-            if older.access_type in writes and younger.access_type in reads:
-                return "RAW", older.physical_scope, start, stop - start
-            if older.access_type in reads and younger.access_type in writes:
-                return "WAR", older.physical_scope, start, stop - start
-            if older.access_type in writes and younger.access_type in writes:
-                return "WAW", older.physical_scope, start, stop - start
-    return None
 
 
 def load_implicit_device_program(
