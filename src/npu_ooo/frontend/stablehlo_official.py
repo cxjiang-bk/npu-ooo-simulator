@@ -29,7 +29,7 @@ def _bindings() -> tuple[Any, Any, Any]:
     except ModuleNotFoundError as exc:
         raise FrontendImportError(
             "official StableHLO bindings are unavailable; install the OpenXLA "
-            "StableHLO wheel (see docs/install-stablehlo.md)"
+            "StableHLO wheel (see docs/running/install-stablehlo.md)"
         ) from exc
     return Context, Module, stablehlo_dialect
 

@@ -155,7 +155,8 @@ Execution Backend
 项目用 `--runtime-policy` 和 `--policy` 分别研究两层，`--runtime-device-matrix`
 一次编译后运行四种组合。
 
-逐周期配置与论文公开机制/项目假设的区分见 [device-scheduler.md](device-scheduler.md)。
+逐周期配置与论文公开机制/项目假设的区分见
+[scheduler 架构](scheduler.md) 与 [周期仿真运行指南](../running/device-scheduler.md)。
 
 ## 6. 当前实现与扩展项
 

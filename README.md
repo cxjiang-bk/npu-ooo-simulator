@@ -59,13 +59,13 @@ PYTHONPATH=src python3.12 -m npu_ooo.cli --help
 | `simulate` | 已有兼容编译包；不需要安装或导入 PyTorch、Torch-XLA、StableHLO 前端 |
 
 项目记录的完整前端验证组合为 Python 3.12、torch 2.9.1、torch-xla 2.9.0、
-StableHLO wheel 1.12.1。安装和 parse/verify 检查见 [环境安装指南](docs/install-stablehlo.md)。
+StableHLO wheel 1.12.1。安装和 parse/verify 检查见 [环境安装指南](docs/running/install-stablehlo.md)。
 仅能运行 `--help` 不代表完整前端依赖已经可用。
 
 ### 2. 用 JSON 编译多输入模型
 
 多输入、混合 dtype 或需要构造参数的模型，优先使用
-[workload JSON](docs/workload-config.md)。下面的配置同时声明四个 Attention 输入、固定
+[workload JSON](docs/running/workload-config.md)。下面的配置同时声明四个 Attention 输入、固定
 shape、初始化方式、编译参数和已有的仿真参数：
 
 ```bash
@@ -178,7 +178,7 @@ PYTHONPATH=src python3.12 -m npu_ooo.cli paper-matrix --help
 配置优先级为：显式 CLI 编译/仿真选项 > JSON 对应字段 > 项目默认值。JSON 内的
 `model+inputs` 和 `workload` 两种构造方式互斥；旧 `--torch-module/--input-shape` 也是一套
 独立简写输入源，不能与 `--config` 混用。完整 schema 和全部可运行样例见
-[通用 workload 配置](docs/workload-config.md)。
+[通用 workload 配置](docs/running/workload-config.md)。
 
 `configs/workloads/` 还覆盖 ResNet-50、GPT-J、LLaMA prefill、DeepSeek dense/MoE
 prefill/decode，并用文件名区分 one-block、两层 model proxy 和固定窗口 decode；这些配置
@@ -206,7 +206,7 @@ prefill/decode，并用文件名区分 one-block、两层 model proxy 和固定�
 
 CLI 默认是 **static + analytical_event**，不是 dynamic + cycle_event；需要后者时必须显式指定。
 `static_pipeline` 保留为旧全局下一条兼容基线；论文式编译期静态流实验应显式选择
-`static_streams`。同步语义与项目假设见 [静态排程指南](docs/static-scheduling.md)。
+`static_streams`。同步语义与项目假设见 [静态排程指南](docs/running/static-scheduling.md)。
 
 ### 3. 队列容量与逐周期控制参数
 
@@ -262,7 +262,7 @@ CLI 默认是 **static + analytical_event**，不是 dynamic + cycle_event；需
 没有传文件时才完整使用 `machine.scheduler.pipeline`。
 
 物理执行结束、反馈接受、依赖唤醒和退休是不同事件。逐周期顺序与手算示例见
-[Device scheduler 周期模型](docs/device-scheduler.md)。
+[Device scheduler 周期模型](docs/running/device-scheduler.md)。
 
 ### 4. 硬件与执行时间：三个 JSON 不要混用
 
@@ -313,7 +313,7 @@ PYTHONPATH=src python3.12 -m npu_ooo.cli simulate \
 ```
 
 仓库中的 timing/profile 示例不是硬件实测数据。RTL JSON/CSV、VCS log 导入和测量区间定义见
-[RTL 校准指南](docs/rtl-calibration.md)。
+[RTL 校准指南](docs/analysis/rtl-calibration.md)。
 
 ### 5. Runtime：提交顺序、到达时间和动态绑定
 
@@ -404,7 +404,7 @@ JSON 中的 `runtime_base_address` 应写十进制数；availability 文件在 J
 **缺少 `torch_xla` 或 `mlir`，但 CLI 可以启动？**
 
 CLI/help 和独立仿真不需要完整前端。检查依赖是否安装在运行命令使用的同一个解释器中，
-按 [安装指南](docs/install-stablehlo.md) 验证官方 StableHLO parse/verify。
+按 [安装指南](docs/running/install-stablehlo.md) 验证官方 StableHLO parse/verify。
 
 **`--scheduler-config requires --event-backend cycle_event`？**
 
@@ -499,10 +499,11 @@ TISA stage、target/payload lowering 和端到端测试，不能只注册模型�
 | `simulator/` | 时间推进、组件连接与旧参考入口 |
 | `experiments/`、`trace/`、`cli.py` | 实验矩阵、产物与可视化、命令行编排 |
 
-进一步阅读：[完整架构](docs/architecture.md) · [TISA 论文对齐](docs/tisa-alignment.md) ·
-[周期模型](docs/device-scheduler.md) · [RTL 校准](docs/rtl-calibration.md) ·
-[静态排程](docs/static-scheduling.md) · [结果分析](docs/result-analysis.md) ·
-[可视化](docs/visualization.md) ·
+[文档导航](docs/README.md) · [完整架构](docs/architecture/architecture.md) · [Scheduler 架构](docs/architecture/scheduler.md) ·
+[TISA 论文对齐](docs/architecture/tisa-alignment.md) ·
+[周期模型](docs/running/device-scheduler.md) · [RTL 校准](docs/analysis/rtl-calibration.md) ·
+[静态排程](docs/running/static-scheduling.md) · [结果分析](docs/analysis/result-analysis.md) ·
+[可视化](docs/analysis/visualization.md) ·
 [当前计划](task_plan.md) · [进度记录](progress.md)。
 
 运行回归：

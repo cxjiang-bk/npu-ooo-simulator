@@ -45,7 +45,7 @@ class TorchXLAStableHLOExporter:
         except (ImportError, ModuleNotFoundError, OSError) as exc:
             raise FrontendImportError(
                 "torch-xla StableHLO exporter is unavailable; install the verified "
-                "torch-xla package (see docs/install-stablehlo.md)"
+                "torch-xla package (see docs/running/install-stablehlo.md)"
             ) from exc
         try:
             options = StableHLOExportOptions(include_human_readable_text=True)

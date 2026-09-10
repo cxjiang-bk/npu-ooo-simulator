@@ -102,7 +102,9 @@ static/dynamic 的差异来自 policy；小图的 tile、MAC、traffic 和 depen
 当前工作项：
 
 `cycle_event` 已实现独立 WQ/IQ/Fu、ROB 退休、控制延迟/带宽参数、队列反压、逐周期
-stall taxonomy 和 micro-test 对账。配置与语义见 [device-scheduler.md](device-scheduler.md)。
+stall taxonomy 和 micro-test 对账。配置与语义见
+[device scheduler 运行指南](../running/device-scheduler.md) 和
+[scheduler 架构](../architecture/scheduler.md)。
 
 1. 使用真实 scheduler profile 校准上述参数；
 2. 扩展 partial-ready 子区域协议、在线优先级更新与多核路由；

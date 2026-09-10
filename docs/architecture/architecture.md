@@ -26,22 +26,24 @@ flowchart TB
     end
 
     subgraph Device[Device scheduler]
-        U --> L[reception / WQ / IQ / ROB]
-        L --> M{Device policy}
-        M --> N[Static: program order]
-        M --> O[Dynamic: ready queue + OOO]
+        U --> L[Reception FIFO]
+        L --> M[dispatch: ROB + per-EU WQ]
+        M --> O{Device policy}
+        O --> P[Static: program order]
+        O --> Q[Dynamic: ready queue + OOO]
+        P --> N[per-EU IQ]
+        Q --> N
     end
 
     subgraph Backend[Execution backend]
-        J --> P[payload registration]
-        N -->|issue request| P
-        O -->|issue request| P
-        P --> Q[physical done / partial ready]
-        Q -.-> L
+        J --> R[payload registration]
+        N -->|issue request| R
+        R --> S[physical done / partial ready]
+        S -.-> L
     end
 
-    P --> R[cycles / stalls / utilization]
-    P --> S[swimlane / Perfetto trace]
+    R --> T[cycles / stalls / utilization]
+    R --> V[swimlane / Perfetto trace]
 ```
 
 `Static` 与 `Dynamic` 共享同一份 `BackendArtifact`。Runtime policy 和 device policy
@@ -490,7 +492,8 @@ MachineConfig 交给 `DeviceSimulator`；内部 scheduler 实际只消费 `Loade
 WQ/IQ/Fu 和按 descriptor 提交顺序退休的 ROB。其周期顺序固定为
 `retire → complete → wakeup → issue → select → dispatch → receive`。
 `MachineConfig.scheduler.pipeline` 或 `--scheduler-config` 配置控制延迟和带宽。
-完整接口、手算案例和设计假设见 [device-scheduler.md](device-scheduler.md)。
+完整接口、手算案例和设计假设见
+[scheduler 架构](scheduler.md) 与 [周期仿真运行指南](../running/device-scheduler.md)。
 
 ```text
 static_pipeline:

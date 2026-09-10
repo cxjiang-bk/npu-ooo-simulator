@@ -1,4 +1,9 @@
-# Device scheduler 周期模型
+# Device scheduler 周期仿真运行指南
+
+调度器的模块边界、论文 Figure 4 对应关系以及
+`RuntimeSubmission → LoadedDeviceProgram → Reception FIFO → ROB/WQ → IQ → ExecutionBackend`
+架构见 [Scheduler 架构与流程](../architecture/scheduler.md)。本文聚焦如何运行和解释
+`cycle_event` 模型。
 
 `cycle_event` 将 TISA 的接收、WQ、IQ、执行、完成反馈和退休建成逐周期状态机。
 外层兼容入口仍接受 `BackendArtifact + RuntimeSubmission + MachineConfig`，但 scheduler

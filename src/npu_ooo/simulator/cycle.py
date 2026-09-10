@@ -1,4 +1,4 @@
-"""Clock-edge TISA scheduler. See docs/device-scheduler.md for edge semantics.
+"""Clock-edge TISA scheduler. See docs/running/device-scheduler.md for edge semantics.
 
 The payload recipe and timing provider are shared with the event baseline.
 Reception, WQ, IQ, operand tracking, completion and retirement own separate
