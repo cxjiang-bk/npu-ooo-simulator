@@ -1,0 +1,29 @@
+{
+  "name": "attention_probe_v0",
+  "metadata": {
+    "calibration_status": "source-derived-example",
+    "description": "Example timing table for the single-head attention smoke test"
+  },
+  "entries": {
+    "matmul": {
+      "duration_cycles": 64,
+      "initiation_interval_cycles": 4
+    },
+    "reduce_max": {
+      "duration_cycles": 24,
+      "initiation_interval_cycles": 2
+    },
+    "exp": {
+      "duration_cycles": 16,
+      "initiation_interval_cycles": 2
+    },
+    "reduce_sum": {
+      "duration_cycles": 24,
+      "initiation_interval_cycles": 2
+    },
+    "normalize": {
+      "duration_cycles": 16,
+      "initiation_interval_cycles": 2
+    }
+  }
+}

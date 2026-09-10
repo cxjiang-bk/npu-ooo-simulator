@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "seed": 149,
+  "experiment_id": "deepseek-prefill-2layer-model-proxy",
+  "workload": {
+    "factory": "examples.configurable_models:build_paper_model_workload",
+    "kwargs": {
+      "case_id": "deepseek-r1-16b-prefill",
+      "variant": "micro",
+      "layer_count": 2,
+      "model_scope": "model_proxy",
+      "deepseek_mode": "dense"
+    }
+  },
+  "compile": {
+    "arch": "lpu-like",
+    "tile_size": 4
+  }
+}

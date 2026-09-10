@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "seed": 157,
+  "experiment_id": "deepseek-decode-moe-window4",
+  "workload": {
+    "factory": "examples.configurable_models:build_paper_model_workload",
+    "kwargs": {
+      "case_id": "deepseek-r1-16b-decode",
+      "variant": "micro",
+      "layer_count": 1,
+      "model_scope": "model_proxy",
+      "deepseek_mode": "moe_proxy"
+    }
+  },
+  "compile": {
+    "arch": "lpu-like",
+    "tile_size": 4
+  }
+}
