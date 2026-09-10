@@ -234,3 +234,18 @@ git diff --check
 后续顺序：外部 execution backend 接口校准，真实 SRAM/DRAM transaction timing，作者
 static baseline/在线优先级细节确认，多 tile/fan-out/跨 core 片上交接扩展。未经授权不连接
 外部 RTL 项目。
+# 2026-09-09：Static control、离线分析与联合可视化
+
+- [x] 阶段 1：定义 `StaticControlProgram`、per-EU stream、代次化 event 及
+      issue/set/wait/fence；序列化、恢复和共享 workload/control hash。
+- [x] 阶段 2：在 target lowering + MemoryPlan 之后执行资源约束 list scheduling；新增
+      `static_streams` 执行器，保留 `static_pipeline` 兼容模式，Dynamic 明确过滤静态控制。
+- [x] 阶段 3：新增不重跑仿真的 `analyze`，输出物理 EU bubble、等待 blocker、critical
+      wait chain、瓶颈候选和 static/dynamic 公平性检查。
+- [x] 阶段 4：operator-cluster Tile DOT、Static/Dynamic TISA DOT、层级 JSON、物理默认泳道、
+      detailed 兼容泳道和离线联合 HTML。
+- [x] 阶段 5：按实际 issue/physical-done/consumer-complete 生成 buffer version/lifecycle，
+      区分 allocated/protected/retained、padding、capacity 和 persistent state。
+
+后续校准项：Epoch 控制命令编码/带宽、逻辑 stream 到物理 instance 的强制绑定、transaction
+级局部存储状态、跨 core static stream，以及用真实 RTL timing 复核瓶颈结论。

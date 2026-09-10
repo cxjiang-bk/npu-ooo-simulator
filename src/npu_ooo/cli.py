@@ -18,6 +18,13 @@ from npu_ooo.arch import (
     minimal_machine_config,
     wide_mxu_machine_config,
 )
+from npu_ooo.analysis import (
+    analyze_run,
+    build_buffer_lifecycle,
+    combine_buffer_lifecycles,
+    compare_runs,
+    write_analysis_report,
+)
 from npu_ooo.backend import (
     AGGREGATIONS,
     INTERVALS,
@@ -49,6 +56,7 @@ from npu_ooo.ir import (
 from npu_ooo.scheduler import (
     SchedulerPolicy,
     SimulatorConfig,
+    TraceEvent,
     schedule_tisa_program,
     schedule_tisa_sequence,
 )
@@ -63,9 +71,11 @@ from npu_ooo.trace import (
     write_json,
     write_operator_graph_dot,
     write_operator_graph_svg,
+    program_hierarchy,
     write_png,
     write_svg,
     write_tile_graph_dot,
+    write_tisa_graph_dot,
 )
 
 
@@ -614,6 +624,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_paper_matrix_arguments(paper_matrix)
 
+    analyze = commands.add_parser(
+        "analyze",
+        help="analyze one saved run and optionally compare a second run",
+    )
+    analyze.add_argument("--run-dir", type=Path, required=True)
+    analyze.add_argument("--compare-dir", type=Path)
+    analyze.add_argument("--output-dir", type=Path)
+
     rtl_trace = commands.add_parser(
         "import-rtl-trace",
         help="convert an RTL completion trace into an MXU timing profile",
@@ -648,6 +666,63 @@ def run_import_rtl_trace(args: argparse.Namespace) -> int:
     print(
         json.dumps(
             {"output": str(args.output), "shape_count": len(profile["matmul_profiles"])},
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def run_analyze(args: argparse.Namespace) -> int:
+    analysis = analyze_run(args.run_dir)
+    comparison = None
+    if args.compare_dir is not None:
+        comparison = compare_runs(analysis, analyze_run(args.compare_dir))
+    output_dir = args.output_dir or (args.run_dir / "08_analysis")
+    run_manifest_path = args.run_dir / "manifest.json"
+    run_manifest = (
+        _read_json_object(run_manifest_path, description="analysis run manifest")
+        if run_manifest_path.is_file()
+        else {}
+    )
+    compile_root = Path(run_manifest.get("compile_package", args.run_dir))
+    backend_path = compile_root / "04_backend" / "backend_artifact.json"
+    hierarchy = None
+    if backend_path.is_file():
+        artifact = BackendArtifact.from_dict(
+            _read_json_object(backend_path, description="analysis backend artifact")
+        )
+        hierarchy = program_hierarchy(artifact)
+        write_artifact_json(hierarchy, output_dir / "program_hierarchy.json")
+        write_tisa_graph_dot(artifact, output_dir / "tisa_graph.dot")
+        write_tisa_graph_dot(
+            artifact,
+            output_dir / "tisa_graph_dynamic.dot",
+            include_static_control=False,
+        )
+    write_analysis_report(
+        analysis,
+        output_dir,
+        comparison=comparison,
+        hierarchy=hierarchy,
+    )
+    if output_dir.name == "08_analysis":
+        write_artifact_index(output_dir.parent)
+    print(
+        json.dumps(
+            {
+                "run_dir": str(args.run_dir),
+                "compare_dir": (
+                    str(args.compare_dir) if args.compare_dir is not None else None
+                ),
+                "output_dir": str(output_dir),
+                "policy": analysis.policy,
+                "total_cycles": analysis.total_cycles,
+                "same_shared_workload": (
+                    comparison.get("same_shared_workload")
+                    if comparison is not None
+                    else None
+                ),
+            },
             sort_keys=True,
         )
     )
@@ -897,6 +972,11 @@ def _write_policy_matrix(
         write_csv(case.result, case_dir / "tasks.csv")
         write_instruction_csv(case.result, case_dir / "tisa_instructions.csv")
         write_svg(case.result, case_dir / "swimlane.svg")
+        write_svg(
+            case.result,
+            case_dir / "swimlane-detailed.svg",
+            include_tisa_lanes=True,
+        )
         write_png(case.result, case_dir / "swimlane.png")
         write_artifact_json(case.result.perfetto_trace(), case_dir / "perfetto.json")
         record = {
@@ -992,6 +1072,11 @@ def _write_paper_policy_artifacts(case_dir: Path, case) -> None:
     write_csv(case.result, policy_dir / "06_simulation" / "tasks.csv")
     write_instruction_csv(case.result, policy_dir / "06_simulation" / "tisa_instructions.csv")
     write_svg(case.result, policy_dir / "07_trace" / "swimlane.svg")
+    write_svg(
+        case.result,
+        policy_dir / "07_trace" / "swimlane-detailed.svg",
+        include_tisa_lanes=True,
+    )
     write_png(case.result, policy_dir / "07_trace" / "swimlane.png")
     write_artifact_json(case.result.perfetto_trace(), policy_dir / "07_trace" / "perfetto.json")
 
@@ -1470,6 +1555,12 @@ def _write_compile_artifacts(
     write_artifact_json(compiled.tisa_program, output_dir / "tisa_program.json")
     write_artifact_json(compiled, output_dir / "compiled_artifact.json")
     write_artifact_json(compiled.backend_artifact, output_dir / "backend_artifact.json")
+    if compiled.backend_artifact.static_control is None:
+        raise ValueError("codegen backend did not produce a static control program")
+    write_artifact_json(
+        compiled.backend_artifact.static_control,
+        output_dir / "static_control_program.json",
+    )
     if compiled.backend_artifact.target_plan is None:
         raise ValueError("codegen backend did not produce a target plan")
     write_artifact_json(
@@ -1488,6 +1579,16 @@ def _write_compile_artifacts(
     write_operator_graph_svg(compiled.graph, output_dir / "operator_graph.svg")
     write_tile_graph_dot(compiled.tile_graph, output_dir / "tile_graph.dot")
     write_execution_graph_dot(compiled.backend_artifact.execution_graph, output_dir / "execution_graph.dot")
+    write_tisa_graph_dot(compiled.backend_artifact, output_dir / "tisa_graph.dot")
+    write_tisa_graph_dot(
+        compiled.backend_artifact,
+        output_dir / "tisa_graph_dynamic.dot",
+        include_static_control=False,
+    )
+    write_artifact_json(
+        program_hierarchy(compiled.backend_artifact),
+        output_dir / "program_hierarchy.json",
+    )
 
 
 def _compile_manifest(compiled, machine) -> dict[str, Any]:
@@ -1518,6 +1619,15 @@ def _compile_manifest(compiled, machine) -> dict[str, Any]:
         "codegen_backend": compiled.attributes["codegen_backend"],
         "tisa_program_id": compiled.tisa_program.program_id,
         "artifact_id": compiled.backend_artifact.artifact_id,
+        "shared_workload_hash": compiled.backend_artifact.attributes.get(
+            "shared_workload_hash"
+        ),
+        "static_control_hash": compiled.backend_artifact.attributes.get(
+            "static_control_hash"
+        ),
+        "dynamic_control_hash": compiled.backend_artifact.attributes.get(
+            "dynamic_control_hash"
+        ),
         "compile_artifacts": {
             "workload": "00_frontend/workload.json",
             "input_signature": "00_frontend/input_signature.json",
@@ -1529,8 +1639,114 @@ def _compile_manifest(compiled, machine) -> dict[str, Any]:
             "virtual_tisa_program": "03_tisa/virtual_tisa_program.json",
             "target_plan": "04_backend/target_plan.json",
             "memory_plan": "04_backend/memory_plan.json",
+            "static_control": "04_backend/static_control_program.json",
+            "program_hierarchy": "08_analysis/program_hierarchy.json",
+            "tisa_graph": "08_analysis/tisa_graph.dot",
+            "tisa_graph_dynamic": "08_analysis/tisa_graph_dynamic.dot",
         },
     }
+
+
+def _annotate_and_write_buffer_lifecycle(
+    artifact,
+    machine,
+    result,
+    output_dir: Path,
+    *,
+    loaded=None,
+    runtime_sequence=None,
+):
+    if runtime_sequence is None:
+        if loaded is None:
+            raise ValueError("single-invocation buffer analysis requires loaded program")
+        lifecycle = build_buffer_lifecycle(artifact, loaded, result, machine)
+    else:
+        reports = []
+        cursor = 0.0
+        for ordinal, (invocation, invocation_result) in enumerate(
+            zip(runtime_sequence.invocations, result.invocation_results)
+        ):
+            if ordinal:
+                cursor += runtime_sequence.inter_invocation_gap_cycles
+            invocation_loaded = load_device_program(artifact, invocation)
+            reports.append(
+                (
+                    invocation.submission_id,
+                    cursor,
+                    build_buffer_lifecycle(
+                        artifact,
+                        invocation_loaded,
+                        invocation_result,
+                        machine,
+                    ),
+                )
+            )
+            cursor += invocation_result.total_cycles
+        lifecycle = combine_buffer_lifecycles(
+            tuple(reports), total_cycles=result.total_cycles
+        )
+    lifecycle_events = tuple(
+        TraceEvent(
+            float(item["cycle"]),
+            str(item["event"]),
+            str(item["version_id"]),
+            f"Buffer/{item['memory']}",
+            details={key: value for key, value in item.items() if key != "cycle"},
+        )
+        for item in lifecycle.events
+    )
+    memory_summary = {
+        memory: {
+            key: value
+            for key, value in item.items()
+            if key
+            in {
+                "allocated_bytes",
+                "valid_bytes",
+                "padding_bytes",
+                "capacity_bytes",
+                "protected_peak_bytes",
+                "retained_peak_bytes",
+                "allocation_count",
+            }
+        }
+        for memory, item in lifecycle.memories.items()
+    }
+    result = replace(
+        result,
+        events=tuple(sorted((*result.events, *lifecycle_events), key=lambda item: item.timestamp)),
+        metrics={
+            **dict(result.metrics),
+            "buffer_occupancy": memory_summary,
+            "buffer_lifecycle_event_count": len(lifecycle.events),
+            "buffer_lifecycle_granularity": lifecycle.assumptions.get("granularity"),
+        },
+    )
+    write_artifact_json(lifecycle, output_dir / "buffer_lifecycle.json")
+    csv_path = output_dir / "05_runtime" / "buffer_occupancy.csv"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=("memory", "quantity", "cycle", "bytes"),
+        )
+        writer.writeheader()
+        for memory, item in lifecycle.memories.items():
+            for quantity, field in (
+                ("protected", "protected_occupancy"),
+                ("retained", "retained_occupancy"),
+            ):
+                for row in item[field]:
+                    writer.writerow(
+                        {
+                            "memory": memory,
+                            "quantity": quantity,
+                            "cycle": row["cycle"],
+                            "bytes": row["bytes"],
+                        }
+                    )
+    write_artifact_index(output_dir)
+    return result, lifecycle
 
 
 def run_compile(args: argparse.Namespace) -> int:
@@ -1615,8 +1831,11 @@ def run_compile_and_sim(args: argparse.Namespace) -> int:
             descriptor_available_cycles=descriptor_availability,
         )
     write_artifact_json(runtime_submission, args.output_dir / "runtime_submission.json")
+    loaded_device_program = load_device_program(
+        compiled.backend_artifact, runtime_submission
+    )
     write_artifact_json(
-        load_device_program(compiled.backend_artifact, runtime_submission),
+        loaded_device_program,
         args.output_dir / "bound_device_program.json",
     )
 
@@ -1643,10 +1862,23 @@ def run_compile_and_sim(args: argparse.Namespace) -> int:
             runtime_submission=runtime_submission,
             event_backend=event_backend,
         )
+    result, _buffer_lifecycle = _annotate_and_write_buffer_lifecycle(
+        compiled.backend_artifact,
+        machine,
+        result,
+        args.output_dir,
+        loaded=loaded_device_program,
+        runtime_sequence=runtime_sequence,
+    )
     write_json(result, args.output_dir / "summary.json")
     write_csv(result, args.output_dir / "tasks.csv")
     write_instruction_csv(result, args.output_dir / "tisa_instructions.csv")
     write_svg(result, args.output_dir / "swimlane.svg")
+    write_svg(
+        result,
+        args.output_dir / "swimlane-detailed.svg",
+        include_tisa_lanes=True,
+    )
     write_png(result, args.output_dir / "swimlane.png")
     write_artifact_json(result.perfetto_trace(), args.output_dir / "perfetto.json")
     write_artifact_json(
@@ -1686,6 +1918,13 @@ def run_compile_and_sim(args: argparse.Namespace) -> int:
         "timing_provider": getattr(timing_model, "name", "analytical"),
         "event_backend": event_backend.name,
         "runtime_policy": runtime_submission.policy,
+        "shared_workload_hash": result.metrics.get("shared_workload_hash"),
+        "static_control_hash": result.metrics.get("static_control_hash"),
+        "dynamic_control_hash": result.metrics.get("dynamic_control_hash"),
+        "static_controls_consumed": result.metrics.get("static_controls_consumed"),
+        "static_control_busy_cycles": result.metrics.get(
+            "static_control_busy_cycles", 0
+        ),
         "runtime_buffer_policy": "compiled_memory_plan",
         "requested_legacy_runtime_buffer_policy": args.runtime_buffer_policy,
         "runtime_command_chunk_count": len(runtime_submission.commands),
@@ -1962,16 +2201,30 @@ def run_simulate(args: argparse.Namespace) -> int:
 
     ensure_output_layout(args.output_dir)
     write_artifact_json(runtime_submission, args.output_dir / "runtime_submission.json")
+    loaded_device_program = load_device_program(artifact, runtime_submission)
     write_artifact_json(
-        load_device_program(artifact, runtime_submission),
+        loaded_device_program,
         args.output_dir / "bound_device_program.json",
     )
     if runtime_sequence is not None:
         write_artifact_json(runtime_sequence, args.output_dir / "runtime_sequence.json")
+    result, _buffer_lifecycle = _annotate_and_write_buffer_lifecycle(
+        artifact,
+        machine,
+        result,
+        args.output_dir,
+        loaded=loaded_device_program,
+        runtime_sequence=runtime_sequence,
+    )
     write_json(result, args.output_dir / "summary.json")
     write_csv(result, args.output_dir / "tasks.csv")
     write_instruction_csv(result, args.output_dir / "tisa_instructions.csv")
     write_svg(result, args.output_dir / "swimlane.svg")
+    write_svg(
+        result,
+        args.output_dir / "swimlane-detailed.svg",
+        include_tisa_lanes=True,
+    )
     write_png(result, args.output_dir / "swimlane.png")
     write_artifact_json(result.perfetto_trace(), args.output_dir / "perfetto.json")
     write_artifact_json(
@@ -1984,6 +2237,13 @@ def run_simulate(args: argparse.Namespace) -> int:
         "compile_package": str(compile_root),
         "compile_artifact_id": artifact.artifact_id,
         "compile_program_id": artifact.program.program_id,
+        "shared_workload_hash": result.metrics.get("shared_workload_hash"),
+        "static_control_hash": result.metrics.get("static_control_hash"),
+        "dynamic_control_hash": result.metrics.get("dynamic_control_hash"),
+        "static_controls_consumed": result.metrics.get("static_controls_consumed"),
+        "static_control_busy_cycles": result.metrics.get(
+            "static_control_busy_cycles", 0
+        ),
         "compile_manifest": compile_manifest,
         "architecture": machine.config_id,
         "machine_hash": machine.stable_hash(),
@@ -2017,6 +2277,7 @@ def main(argv: list[str] | None = None) -> int:
         "compile-and-sim": run_compile_and_sim,
         "simulate": run_simulate,
         "paper-matrix": run_paper_matrix,
+        "analyze": run_analyze,
         "import-rtl-trace": run_import_rtl_trace,
         "import-rtl-log": run_import_rtl_log,
     }

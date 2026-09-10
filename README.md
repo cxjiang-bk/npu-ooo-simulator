@@ -20,7 +20,9 @@ flowchart LR
     D --> E[TISA Generator: 虚拟 TISA]
     E --> I[Target Lowering: TargetPlan]
     I --> J[最终 TISA、BackendArtifact 与 MemoryPlan]
+    J --> S[Static scheduling: per-EU streams + set/wait/fence]
     J --> F[Runtime Loader: 地址绑定与 descriptor envelope]
+    S --> F
     F --> G[LoadedDeviceProgram: 已绑定的设备描述符]
     G --> K[Static / Dynamic device scheduler]
     K -->|issue| L[Execution backend]
@@ -108,7 +110,7 @@ PYTHONPATH=src python3.12 -m npu_ooo.cli compile \
 **再用同一编译包运行两种设备策略：**
 
 ```bash
-for policy in static_pipeline dynamic_ready_queue; do
+for policy in static_streams dynamic_ready_queue; do
   PYTHONPATH=src python3.12 -m npu_ooo.cli simulate \
     --compile-dir out/attention-compile \
     --event-backend cycle_event \
@@ -123,8 +125,9 @@ done
 两次运行只改变设备 policy；输入、编译包、runtime 提交配置、硬件和 timing source 均相同。
 对照 `compile_package_sha256`、周期和 stall，而不是只看泳道图是否更紧凑。
 
-`static_pipeline` 是项目的固定提交顺序、允许跨 EU 重叠的静态计划基线，
-不等同于论文作者未公开的强静态排程器。小图中 static/dynamic 周期相同是正常结果。
+`static_streams` 是新的编译期 per-EU 固定流基线；`static_pipeline` 保留旧全局下一条兼容
+行为。论文未公开 Epoch 的同步编码与控制时序，因此两者都不能直接声称是作者实现。
+小图中 static/dynamic 周期相同或 Static 更快均可能发生，不能为追求预期加速比改变条件。
 
 ### 4. 选择合适的入口
 
@@ -134,6 +137,7 @@ done
 | `simulate --compile-dir …` | 加载编译包，重新绑定 runtime 并仿真 | 比较策略、队列、控制延迟、timing 时 |
 | `compile-and-sim` | 串联上述两个阶段 | 首次跑通或单次实验 |
 | `paper-matrix` | 按 benchmark registry 批量编译、比较设备策略 | 模型 proxy、策略矩阵和请求重放 |
+| `analyze --run-dir …` | 离线分析物理 EU 气泡、等待链、buffer 和 static/dynamic 公平性 | 已有结果，不重新编译或仿真 |
 
 `compile` 不接受 device policy、runtime、event/timing 参数。
 `--runtime-config` 仅属于 `simulate`；各入口完整参数以子命令帮助为准：
@@ -190,6 +194,7 @@ prefill/decode，并用文件名区分 one-block、两层 model proxy 和固定�
 | --- | --- | --- |
 | `--event-backend` | `analytical_event` / `cycle_event` | 默认事件模型用于分析基线；逐周期模型用于 WQ/IQ、控制流水、反馈和退休反压研究。它不是执行延迟表的选择开关 |
 | `--policy` | `static_pipeline`（默认） | 固定本次提交顺序的静态计划，允许跨 EU 重叠 |
+| 同上 | `static_streams` | 新编译期静态基线：每 EU 固定流，显式 set/wait/fence；不同流独立推进 |
 | 同上 | `dynamic_ready_queue` | 从已到达、依赖满足且资源可用的窗口内选择指令 |
 | 同上 | `sequential` | 串行参考策略，限制指令间重叠 |
 | `--dynamic-priority` | `oldest_first`（默认） | 动态策略优先选择较老候选 |
@@ -200,6 +205,8 @@ prefill/decode，并用文件名区分 one-block、两层 model proxy 和固定�
 | `--scheduler-config` | 不指定 | 读取控制流水 JSON，**必须同时选择 `cycle_event`**；格式见下一节 |
 
 CLI 默认是 **static + analytical_event**，不是 dynamic + cycle_event；需要后者时必须显式指定。
+`static_pipeline` 保留为旧全局下一条兼容基线；论文式编译期静态流实验应显式选择
+`static_streams`。同步语义与项目假设见 [静态排程指南](docs/static-scheduling.md)。
 
 ### 3. 队列容量与逐周期控制参数
 
@@ -232,6 +239,8 @@ CLI 默认是 **static + analytical_event**，不是 dynamic + cycle_event；需
 | `wakeup_latency` | 1 | 依赖反馈到消费者可就绪的延迟 |
 | `completion_latency` | 0 | 物理执行结束到最早接受完整反馈的延迟 |
 | `retire_latency` | 1 | complete 到最早 retire 的延迟 |
+| `control_width` | 1 | static_streams 每周期最多启动的 set/wait/fence 数 |
+| `control_latency` / `wait_latency` / `fence_latency` | 1 / 1 / 1 | 未校准静态控制成本；可显式设 0 做隔离实验 |
 | `iq_entries` | 8 | 每类 EU 的 IQ 容量，与 `ready_queue_depth` 共同限制 |
 | `inflight_entries` | 16 | 每类 EU 的语义表 Fu 容量，**按 operand 条目数计，不按指令数计** |
 | `max_cycles` | 1000000 | 运行周期上限，用于诊断长期无法完成的仿真 |
@@ -365,7 +374,7 @@ JSON 中的 `runtime_base_address` 应写十进制数；availability 文件在 J
 | --- | --- |
 | 总共多少周期？卡在哪里？ | `06_simulation/summary.json`；cycle 模型保存 stall 聚合、队列峰值和生命周期 timing，不嵌入逐周期事件 |
 | 哪条 TISA 何时接收、发射、完成、退休？ | `06_simulation/tisa_instructions.csv` |
-| 哪些执行单元发生重叠？ | `07_trace/swimlane.svg`；更细时间线看 `07_trace/perfetto.json` |
+| 哪些执行单元发生重叠？ | `07_trace/swimlane.svg` 默认只画物理 EU；旧 TISA 重复层见 `swimlane-detailed.svg` |
 | 本次实际给 scheduler 的指令和地址是什么？ | `05_runtime/bound_device_program.json` |
 | Host 如何分块、绑定地址、提交？ | `05_runtime/runtime_submission.json`；地址依赖见同目录 `address_dependencies.json` |
 | 数据为什么在 UB/LMB/RMB？搬运经过哪里？ | `04_backend/target_plan.json`；实际 buffer/allocation 见 `memory_plan.json` |
@@ -374,8 +383,10 @@ JSON 中的 `runtime_base_address` 应写十进制数；availability 文件在 J
 | Tile 怎么切、依赖怎么生成？ | `01_gc/schedule.json`、`tile_graph.json`、`pass_dumps/` |
 | 前端实际生成了什么？ | `00_frontend/generated.mlir`、`stablehlo_module.json` |
 | 本次运行使用了哪些配置？ | 根目录 `manifest.json`、`artifact_index.json`；机器快照见编译包 `04_backend/machine.json` |
+| 哪个气泡在等谁、buffer 何时可复用？ | `npu-ooo analyze --run-dir …`，查看 `08_analysis/report.html` 与 `05_runtime/buffer_lifecycle.json` |
 
-目录按阶段分为 `00_frontend`～`04_backend`（编译）与 `05_runtime`～`07_trace`（运行）。
+目录按阶段分为 `00_frontend`～`04_backend`（编译）、`05_runtime`～`07_trace`（运行）和
+`08_analysis`（离线解释/层级视图）。
 `compile-and-sim` 集中写入一个目录；分离流程则将编译包和每次 simulation 结果放在各自目录。
 矩阵实验优先从根目录 `matrix_index.json`、`sweep.csv/json` 找到各个策略结果。
 
@@ -490,6 +501,8 @@ TISA stage、target/payload lowering 和端到端测试，不能只注册模型�
 
 进一步阅读：[完整架构](docs/architecture.md) · [TISA 论文对齐](docs/tisa-alignment.md) ·
 [周期模型](docs/device-scheduler.md) · [RTL 校准](docs/rtl-calibration.md) ·
+[静态排程](docs/static-scheduling.md) · [结果分析](docs/result-analysis.md) ·
+[可视化](docs/visualization.md) ·
 [当前计划](task_plan.md) · [进度记录](progress.md)。
 
 运行回归：

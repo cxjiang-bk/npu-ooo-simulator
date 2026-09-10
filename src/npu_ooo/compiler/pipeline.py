@@ -34,6 +34,7 @@ from npu_ooo.lowering import LoweringRegistry, default_lowering_registry
 from .fusion_compiler import TISADialectProgram, default_fusion_compiler
 from .graph_compiler import GCArtifact, default_graph_compiler
 from .statistics import build_compile_statistics
+from .static_scheduler import attach_static_control
 from .tisa_generator import default_tisa_generator
 
 
@@ -292,6 +293,11 @@ def compile_operator_graph(
         machine,
         program=virtual_program,
     )
+    # Static synchronization is compiler-owned and is generated only after
+    # target paths, physical allocations and correctness dependencies exist.
+    # Dynamic scheduling consumes the unchanged shared TISA body and ignores
+    # this separate control layer.
+    backend_artifact = attach_static_control(backend_artifact, machine)
     # Codegen owns target-memory materialization.  The public program must be
     # the exact scheduler-visible descriptor embedded in BackendArtifact, not
     # the preceding logical generator output.
@@ -332,6 +338,7 @@ def compile_operator_graph(
                 "tisa_generator",
                 "target_lowering",
                 "backend",
+                "static_scheduling",
             ],
             "frontend_path": "torch_export->torch_xla->official_stablehlo->canonical",
             "stablehlo_variant": stablehlo.variant,

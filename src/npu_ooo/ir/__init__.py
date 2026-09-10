@@ -57,6 +57,14 @@ from .device import (
     StaticScheduleEntry,
     StaticSchedulePlan,
 )
+from .static import (
+    CONTROL_KINDS,
+    STATIC_CONTROL_SCHEMA_VERSION,
+    StaticControlCommand,
+    StaticControlProgram,
+    StaticEvent,
+    StaticInstructionStream,
+)
 
 __all__ = [
     "DataEdge",
@@ -118,6 +126,12 @@ __all__ = [
     "LoadedDeviceProgram",
     "StaticScheduleEntry",
     "StaticSchedulePlan",
+    "CONTROL_KINDS",
+    "STATIC_CONTROL_SCHEMA_VERSION",
+    "StaticControlCommand",
+    "StaticControlProgram",
+    "StaticEvent",
+    "StaticInstructionStream",
     "OperatorSchedule",
     "ScheduleSpec",
     "TensorResidency",

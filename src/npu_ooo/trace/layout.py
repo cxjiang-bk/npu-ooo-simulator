@@ -21,6 +21,7 @@ STAGE_DIRECTORIES: tuple[tuple[str, str], ...] = (
     ("05_runtime", "runtime 地址绑定与依赖观察"),
     ("06_simulation", "离散事件仿真、周期与任务结果"),
     ("07_trace", "泳道图与 Perfetto trace"),
+    ("08_analysis", "离线气泡、等待链、瓶颈与联合报告"),
 )
 
 _STAGE_BY_FILENAME: dict[str, str] = {
@@ -52,9 +53,12 @@ _STAGE_BY_FILENAME: dict[str, str] = {
     "machine.json": "04_backend",
     "execution_graph.json": "04_backend",
     "execution_graph.dot": "04_backend",
+    "static_control_program.json": "04_backend",
     "address_dependencies.json": "05_runtime",
     "runtime_submission.json": "05_runtime",
     "bound_device_program.json": "05_runtime",
+    "buffer_lifecycle.json": "05_runtime",
+    "buffer_occupancy.csv": "05_runtime",
     "runtime_sequence.json": "05_runtime",
     "summary.json": "06_simulation",
     "tasks.csv": "06_simulation",
@@ -62,6 +66,14 @@ _STAGE_BY_FILENAME: dict[str, str] = {
     "perfetto.json": "07_trace",
     "swimlane.svg": "07_trace",
     "swimlane.png": "07_trace",
+    "swimlane-detailed.svg": "07_trace",
+    "analysis.json": "08_analysis",
+    "comparison.json": "08_analysis",
+    "report.md": "08_analysis",
+    "report.html": "08_analysis",
+    "program_hierarchy.json": "08_analysis",
+    "tisa_graph.dot": "08_analysis",
+    "tisa_graph_dynamic.dot": "08_analysis",
 }
 
 _LEGACY_STAGE_DIRECTORIES = ("01_graph_ir", "02_schedule_tile")
@@ -98,9 +110,13 @@ def _root_readme() -> str:
             "root-memory traffic 和 region dependency 数量。",
             "`02_fc/tisa_dialect.json` 是符号 FC 输出；`03_tisa/virtual_tisa_program.json` 是 Generator 输出，`tisa_program.json` 是 device scheduler 输入；`04_backend/` 保存",
             "`target_plan.json`、与每条 target TISA 绑定的 payload 和 `memory_plan.json`。",
+            "`04_backend/static_control_program.json` 保存编译期 per-EU 流与 set/wait/fence；",
+            "Dynamic 运行不会执行这些控制命令。",
             "`06_simulation/summary.json` 默认只保存聚合指标和 timing；连续 stall 在",
             "`07_trace/perfetto.json` 中压缩为 duration interval，完整依赖见",
             "`05_runtime/bound_device_program.json`。",
+            "`05_runtime/buffer_lifecycle.json` 区分 allocation、protected 和 retained；",
+            "`08_analysis/report.html` 联合展示物理 EU、控制队列、气泡与 buffer。",
         ]
     )
     return "\n".join(rows) + "\n"

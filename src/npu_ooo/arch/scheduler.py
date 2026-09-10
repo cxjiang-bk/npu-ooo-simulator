@@ -17,12 +17,22 @@ class SchedulerPipelineConfig:
     wakeup_latency: int = 1
     completion_latency: int = 0
     retire_latency: int = 1
+    control_width: int = 1
+    control_latency: int = 1
+    wait_latency: int = 1
+    fence_latency: int = 1
     iq_entries: int = 8
     inflight_entries: int = 16
     max_cycles: int = 1_000_000
 
     def validate(self) -> tuple[str, ...]:
-        zero_allowed = {"wakeup_latency", "completion_latency"}
+        zero_allowed = {
+            "wakeup_latency",
+            "completion_latency",
+            "control_latency",
+            "wait_latency",
+            "fence_latency",
+        }
         return tuple(
             f"scheduler pipeline {name} must be an integer >= {minimum}"
             for name, value in asdict(self).items()

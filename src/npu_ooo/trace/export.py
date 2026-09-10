@@ -280,12 +280,23 @@ def _legend_layout(primitives: tuple[str, ...], width: int) -> tuple[list[tuple[
     return positions, row + 1
 
 
-def write_svg(result: ScheduleResult, path: str | Path, *, width: int = 1600, row_height: int = 28) -> None:
-    """Write a dependency-free SVG swimlane for quick local inspection."""
+def write_svg(
+    result: ScheduleResult,
+    path: str | Path,
+    *,
+    width: int = 1600,
+    row_height: int = 28,
+    include_tisa_lanes: bool = False,
+) -> None:
+    """Write physical EU lanes; optionally restore the legacy TISA spans."""
 
     target, compatibility = artifact_path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    all_timings = (*result.runtime_timings, *result.instruction_timings, *result.timings)
+    all_timings = (
+        *result.runtime_timings,
+        *(result.instruction_timings if include_tisa_lanes else ()),
+        *result.timings,
+    )
     lanes = sorted({(timing.resource, timing.instance) for timing in all_timings})
     lane_index = {lane: index for index, lane in enumerate(lanes)}
     primitive_issue_details = {
@@ -309,9 +320,10 @@ def write_svg(result: ScheduleResult, path: str | Path, *, width: int = 1600, ro
         )
         for timing in result.timings
     }
-    primitive_by_task.update(
-        {timing.task_id: "tisa_instruction" for timing in result.instruction_timings}
-    )
+    if include_tisa_lanes:
+        primitive_by_task.update(
+            {timing.task_id: "tisa_instruction" for timing in result.instruction_timings}
+        )
     primitive_by_task.update(
         {timing.task_id: "runtime_submit" for timing in result.runtime_timings}
     )

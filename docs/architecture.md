@@ -61,6 +61,7 @@ flowchart TB
 | Target Lowering | 虚拟 TISA + `MachineConfig` | `TargetPlan`、目标 TISA | 统一决定 memory、每跳 route/engine、target stage、operand 和依赖展开 |
 | Backend payload | `TargetPlan` | `ExecutionGraph` | 按目标计划生成 payload；实际 region 用于一致性校验 |
 | Memory planner | `TargetPlan` + payload resource declaration | `MemoryPlan` | 容量、对齐、allocation、alias、slot 和复用依赖 |
+| Static scheduling | final TISA + payload estimate + MemoryPlan | `StaticControlProgram` | 编译期 list schedule、per-EU 固定流、set/wait/fence；不改变共享正文 |
 | Runtime | final TISA、MemoryPlan、invocation bindings | `RuntimeSubmission`、`LoadedDeviceProgram` | 绑定地址/动态参数；拆分 descriptor 与 arrival envelope；加入 invocation token/alias dependency |
 | Device scheduler | bound descriptors + feedback + policy | issue request、scheduler timing | 处理 queue/ROB、依赖、仲裁和 feedback 接受，不读取 payload task |
 | Execution backend | payload registrations + issue request | accept/reject、physical done、partial-ready、task trace | 独占 EU 接收能力、busy 状态和 payload 内部执行 |
@@ -86,6 +87,7 @@ main
        -> TISAGenerator
        -> TargetLowerer
        -> CodegenBackend
+       -> StaticControl lowering
        -> RuntimeSubmission
        -> load_device_program
        -> DeviceSimulator
@@ -406,6 +408,7 @@ BoundTISADescriptor = instruction + physical operands + bound dependencies
                     + invocation completion token + payload handle
 DescriptorEnvelope  = chunk + arrival + launch/submission order
 StaticSchedulePlan  = 固定 submission order、resource、dependency token、reservation
+StaticControlProgram = 编译期 per-EU stream + generation-scoped set/wait/fence
 ```
 
 loader 还将只有绑定物理地址后才可见的 RAW/WAR/WAW alias 关系转换为显式 dependency token。
@@ -445,6 +448,12 @@ MemoryPlan v2，独立 simulate 会明确拒绝，避免把符号 TISA 默认为
 
 Runtime policy 表示 descriptor 的生成和提交顺序；device policy 表示已到达 TISA
 instruction 的 issue 选择。四种组合由 `--runtime-device-matrix` 一次编译后运行。
+
+新的 `static_streams` 与兼容 `static_pipeline` 分开：前者执行编译期控制程序，每个 EU 流
+只推进自己的 head command；后者仍是旧的全局下一条基线。Dynamic 完全过滤
+`StaticControlProgram`，只使用共享 target TISA、operand/MemoryPlan、runtime alias 和反馈。
+三种身份分别记录为 `shared_workload_hash`、`static_control_hash` 和
+`dynamic_control_hash`。
 
 Runtime submission 还携带 `DynamicIndexBinding`。binding 的 expression id 必须匹配
 TISA 的 `dynamic_index` metadata，值的 rank 按 expression contract 校验。runtime 为每个
@@ -520,7 +529,7 @@ memory backend 提供。
 
 ## 11. 输出与复现
 
-artifact 按 `00_frontend` 到 `07_trace` 分层。比较策略时固定解析后的 Workload、example
+artifact 按 `00_frontend` 到 `08_analysis` 分层。比较策略时固定解析后的 Workload、example
 input tree/shape/dtype、seed、Torch-XLA/StableHLO version、tile size、MachineConfig、BackendArtifact、
 TimingProvider 和 RuntimeSubmission；实验变量明确写入 manifest。
 
@@ -532,6 +541,11 @@ policy、TISA instruction count、cycle 和 calibration status。
 runtime timing 和 trace 计数，不嵌入 raw events、逐周期 queue timeline 或详细 hazard 列表。
 连续 cycle stall 合并为一个 duration interval，详细时间线位于 `07_trace/perfetto.json`；
 完整 bound dependency 位于 `05_runtime/bound_device_program.json`。
+
+编译包另保存 `04_backend/static_control_program.json`；`08_analysis/` 保存层级图、TISA
+Static/Dynamic 两种约束视图、离线 bubble/wait-chain 数据和联合 HTML。Buffer 动态状态来自
+实际 issue/physical-done/consumer-complete，不能把 MemoryPlan 的 instruction-order lifetime
+直接当作 cycle。
 
 ## 12. 当前范围与扩展项
 

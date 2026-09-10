@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 from typing import Any, Callable, Mapping
@@ -77,6 +77,15 @@ class DeviceSimulator:
                 ).encode()
             ).hexdigest(),
             "runtime_submission_present": self.runtime_submission is not None,
+            "shared_workload_hash": self.artifact.attributes.get(
+                "shared_workload_hash"
+            ),
+            "static_control_hash": self.artifact.attributes.get(
+                "static_control_hash"
+            ),
+            "dynamic_control_hash": self.artifact.attributes.get(
+                "dynamic_control_hash"
+            ),
             "dynamic_index_bindings": [
                 item.to_dict()
                 for item in (
@@ -103,8 +112,18 @@ class DeviceSimulator:
     ) -> SimulationResult:
         loaded, execution, default_audit = self._prepare()
         merged_audit = {**default_audit, **dict(audit or {})}
+        if policy == "static_streams":
+            from npu_ooo.scheduler.static import schedule_loaded_static_program
+
+            return schedule_loaded_static_program(
+                loaded,
+                self.machine,
+                execution,
+                config=config,
+                audit={**merged_audit, "event_backend": f"{model}_static_streams"},
+            )
         if model == "event":
-            return schedule_loaded_event_program(
+            result = schedule_loaded_event_program(
                 loaded,
                 self.machine,
                 policy,
@@ -112,10 +131,11 @@ class DeviceSimulator:
                 config=config,
                 audit=merged_audit,
             )
+            return self._with_control_identity(result, policy, merged_audit)
         if model == "cycle":
             from .cycle import schedule_loaded_cycle_program
 
-            return schedule_loaded_cycle_program(
+            result = schedule_loaded_cycle_program(
                 loaded,
                 self.machine,
                 policy,
@@ -123,7 +143,30 @@ class DeviceSimulator:
                 config=config,
                 audit=merged_audit,
             )
+            return self._with_control_identity(result, policy, merged_audit)
         raise ValueError(f"unsupported device simulation model '{model}'")
+
+    @staticmethod
+    def _with_control_identity(
+        result: SimulationResult,
+        policy: str,
+        audit: Mapping[str, Any],
+    ) -> SimulationResult:
+        return replace(
+            result,
+            metrics={
+                **dict(result.metrics),
+                "shared_workload_hash": audit.get("shared_workload_hash"),
+                "static_control_hash": audit.get("static_control_hash"),
+                "dynamic_control_hash": audit.get("dynamic_control_hash"),
+                "static_controls_consumed": False,
+                "control_mode": (
+                    "dynamic_semantic_ready"
+                    if policy == "dynamic_ready_queue"
+                    else "legacy_global_order"
+                ),
+            },
+        )
 
 
 __all__ = ["DeviceSimulator", "ExecutionFactory"]

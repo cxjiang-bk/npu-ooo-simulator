@@ -445,6 +445,13 @@ class SimulationResult:
                 phase = "X"
                 pid = 1
                 duration = event.details["duration"]
+            elif event.event.startswith("STATIC_"):
+                phase = "X" if "duration" in event.details else "i"
+                pid = 4
+                duration = event.details.get("duration")
+            elif event.event.startswith("BUFFER_"):
+                phase = "i"
+                pid = 5
             elif event.event.startswith("TISA_"):
                 phase = "i"
                 pid = 1
@@ -457,7 +464,7 @@ class SimulationResult:
                 "ts": event.timestamp,
                 "pid": pid,
                 "tid": f"{event.resource}[{event.instance}]",
-                "args": dict(event.details),
+                "args": {"event": event.event, **dict(event.details)},
             }
             if duration is not None:
                 record["dur"] = duration
@@ -556,6 +563,13 @@ class RuntimeSequenceSimulationResult:
                 phase = "X"
                 pid = 1
                 duration = event.details["duration"]
+            elif event.event.startswith("STATIC_"):
+                phase = "X" if "duration" in event.details else "i"
+                pid = 4
+                duration = event.details.get("duration")
+            elif event.event.startswith("BUFFER_"):
+                phase = "i"
+                pid = 5
             elif event.event.startswith("TISA_"):
                 phase = "i"
                 pid = 1
@@ -568,7 +582,7 @@ class RuntimeSequenceSimulationResult:
                 "ts": event.timestamp,
                 "pid": pid,
                 "tid": f"{event.resource}[{event.instance}]",
-                "args": dict(event.details),
+                "args": {"event": event.event, **dict(event.details)},
             }
             if duration is not None:
                 record["dur"] = duration

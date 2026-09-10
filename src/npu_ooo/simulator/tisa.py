@@ -474,9 +474,23 @@ def simulate_tisa_artifact(
     primitive can enter the global out-of-order window independently.
     """
 
-    supported_policies = {"sequential", "static_pipeline", "dynamic_ready_queue"}
+    supported_policies = {
+        "sequential",
+        "static_pipeline",
+        "static_streams",
+        "dynamic_ready_queue",
+    }
     if policy not in supported_policies:
         raise ValueError(f"unsupported scheduler policy '{policy}'")
+    if policy == "static_streams":
+        from npu_ooo.simulator.device import DeviceSimulator
+
+        return DeviceSimulator(
+            artifact,
+            machine,
+            runtime_submission,
+            timing_model,
+        ).run("static_streams", model="event", config=config)
     artifact_issues = artifact.validate()
     machine_issues = machine.validate()
     if artifact_issues or machine_issues:
@@ -1464,7 +1478,7 @@ def simulate_tisa_sequence(
             },
         }
     )
-    if event_backend.name == "cycle_event":
+    if event_backend.name == "cycle_event" and policy != "static_streams":
         offset = 0.0
         pipeline = {}
         occupancy = []
@@ -1496,6 +1510,43 @@ def simulate_tisa_sequence(
         for field in ("wq_peak", "iq_peak", "fu_peak"):
             metrics[field] = {unit.name: max(result.metrics[field][unit.name] for result in invocation_results)
                               for unit in machine.execution_units}
+    elif policy == "static_streams":
+        offset = 0.0
+        pipeline = {}
+        for ordinal, (invocation, result) in enumerate(
+            zip(sequence.invocations, invocation_results)
+        ):
+            if ordinal:
+                offset += sequence.inter_invocation_gap_cycles
+            for tid, stages in result.metrics["instruction_pipeline"].items():
+                pipeline[f"{invocation.submission_id}/{tid}"] = {
+                    key: cycle + offset for key, cycle in stages.items()
+                }
+            offset += result.total_cycles
+        metrics["instruction_pipeline"] = pipeline
+        metrics["static_control_counts"] = {
+            kind: sum(
+                result.metrics.get("static_control_counts", {}).get(kind, 0)
+                for result in invocation_results
+            )
+            for kind in {"set", "wait", "fence"}
+        }
+        metrics["static_control_busy_cycles"] = sum(
+            result.metrics.get("static_control_busy_cycles", 0)
+            for result in invocation_results
+        )
+        metrics["issued_instruction_count"] = sum(
+            result.metrics["issued_instruction_count"]
+            for result in invocation_results
+        )
+        metrics["completed_instruction_count"] = sum(
+            result.metrics["completed_instruction_count"]
+            for result in invocation_results
+        )
+        metrics["device_finish_cycle"] = cursor - sequence.invocations[-1].synchronization_cycles
+        metrics["completion_finish_cycle"] = max(
+            (timing.finish for timing in merged_instruction_timings), default=0.0
+        )
     return RuntimeSequenceSimulationResult(
         backend=invocation_results[-1].backend,
         policy=policy,

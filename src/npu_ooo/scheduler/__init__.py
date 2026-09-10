@@ -11,6 +11,7 @@ from .core import (
     schedule_tisa_program,
     schedule_tisa_sequence,
 )
+from .static import schedule_loaded_static_program
 
 __all__ = [
     "ScheduleResult",
@@ -22,4 +23,5 @@ __all__ = [
     "schedule_execution_graph",
     "schedule_tisa_program",
     "schedule_tisa_sequence",
+    "schedule_loaded_static_program",
 ]

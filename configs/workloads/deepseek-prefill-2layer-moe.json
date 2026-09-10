@@ -7,7 +7,7 @@
     "kwargs": {
       "case_id": "deepseek-r1-16b-prefill",
       "variant": "micro",
-      "layer_count": 1,
+      "layer_count": 2,
       "model_scope": "one_block",
       "deepseek_mode": "moe_proxy"
     }

@@ -59,6 +59,8 @@ primitive 顺序、实例 busy/II、task trace 和 physical-done 都由 Executio
 `receive_width/dispatch_width/select_width/issue_width/completion_width/retire_width`
 均为全局每周期上限；issue 同时受 `unit.issue_width` 的资源类别上限约束。
 `dependency_window` 是每个 WQ 的扫描窗口。IQ、Fu 在同一类 EU 实例间共享。
+`static_streams` 另使用 `control_width`（默认 1）以及 `control_latency`、`wait_latency`、
+`fence_latency`（默认均为 1）；三种 latency 可显式设 0 做隔离实验，但默认不假设免费同步。
 
 ## 时钟边界
 
@@ -95,7 +97,10 @@ CPU 推测执行、异常回滚或将内存写入延迟至退休。
 
 - `static_pipeline` 消费 `StaticSchedulePlan`，按本次 runtime 已选择的提交顺序 admission；前一条 issue
   后下一条可在不同 EU 上重叠。计划显式记录 resource、dependency token 和 reservation。
-  这是项目的“固定 host 顺序 + 跨 EU overlap”基线，不声称复现作者未公开的静态排程器。
+  这是旧“全局下一条 + 跨 EU overlap”兼容基线，不声称复现作者未公开的静态排程器。
+- `static_streams` 消费编译期 `StaticControlProgram`。每个 EU 流只推进自己的 head command；
+  wait/fence 只阻塞当前流，set 等待真实 execution feedback。它不调用 Dynamic 的隐藏
+  dependency-ready 检查来替编译器补 wait，控制时序属于未校准项目假设。
 - `dynamic_ready_queue` 只在已接收 descriptor 的各 WQ 有界窗口中选择 ready 条目。默认
   `oldest_first` 使用接收队列年龄；`compiler_hint` 使用 descriptor 显式 hint；
   `oracle_critical_path` 使用完整图，仅作为离线参考。旧名称 `critical_path` 是该 oracle 的

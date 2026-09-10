@@ -15,6 +15,7 @@ from .execution import AccessType, ExecutionGraph
 from .memory import MemoryPlan
 
 if TYPE_CHECKING:
+    from .static import StaticControlProgram
     from .target import TargetPlan
 
 
@@ -484,6 +485,7 @@ class BackendArtifact:
     attributes: Mapping[str, Any] = field(default_factory=dict)
     memory_plan: MemoryPlan | None = None
     target_plan: TargetPlan | None = None
+    static_control: StaticControlProgram | None = None
 
     def validate(self) -> tuple[str, ...]:
         issues = list(self.program.validate())
@@ -684,6 +686,13 @@ class BackendArtifact:
                 and self.target_plan.memory_plan.to_dict() != self.memory_plan.to_dict()
             ):
                 issues.append("backend TargetPlan and MemoryPlan disagree")
+        if self.static_control is not None:
+            issues.extend(self.static_control.validate(set(instruction_ids)))
+            issues.extend(
+                self.static_control.validate_dependencies(self.program.instructions)
+            )
+            if self.static_control.workload_program_id != self.program.program_id:
+                issues.append("static control targets a different workload program")
         return tuple(issues)
 
     def to_dict(self) -> dict[str, Any]:
@@ -696,6 +705,11 @@ class BackendArtifact:
             "attributes": dict(self.attributes),
             "memory_plan": self.memory_plan.to_dict() if self.memory_plan is not None else None,
             "target_plan": self.target_plan.to_dict() if self.target_plan is not None else None,
+            "static_control": (
+                self.static_control.to_dict()
+                if self.static_control is not None
+                else None
+            ),
         }
 
     @classmethod
@@ -703,6 +717,7 @@ class BackendArtifact:
         if not isinstance(payload, Mapping):
             raise ValueError("backend artifact payload must be an object")
         try:
+            from .static import StaticControlProgram
             from .target import TargetPlan
 
             value = cls(
@@ -723,6 +738,11 @@ class BackendArtifact:
                 target_plan=(
                     TargetPlan.from_dict(payload["target_plan"])
                     if payload.get("target_plan") is not None
+                    else None
+                ),
+                static_control=(
+                    StaticControlProgram.from_dict(payload["static_control"])
+                    if payload.get("static_control") is not None
                     else None
                 ),
             )

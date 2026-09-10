@@ -140,6 +140,7 @@ def load_device_program(
         launch_latency_cycles=submission.launch_latency_cycles,
         synchronization_cycles=submission.synchronization_cycles,
         static_schedule=_static_schedule(artifact.program.program_id, descriptors),
+        static_control=artifact.static_control,
         attributes={
             "runtime_submission_id": submission.submission_id,
             "runtime_policy": submission.policy,
@@ -420,6 +421,7 @@ def load_implicit_device_program(
         static_schedule=_static_schedule(
             artifact.program.program_id, tuple(descriptors)
         ),
+        static_control=artifact.static_control,
         attributes={"runtime_policy": "implicit_static", "command_chunk_count": 0},
     )
     loaded_issues = loaded.validate()

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from .runtime import RuntimeOperandBinding
+from .static import StaticControlProgram
 from .tisa import TISAInstruction
 
 
@@ -343,6 +344,7 @@ class LoadedDeviceProgram:
     launch_latency_cycles: float = 0.0
     synchronization_cycles: float = 0.0
     static_schedule: StaticSchedulePlan | None = None
+    static_control: StaticControlProgram | None = None
     schema_version: int = DEVICE_PROGRAM_SCHEMA_VERSION
     attributes: Mapping[str, Any] = field(default_factory=dict)
 
@@ -382,6 +384,10 @@ class LoadedDeviceProgram:
                 item.instruction.tisa_id for item in self.descriptors
             }:
                 issues.append("static schedule must cover every loaded descriptor")
+        if self.static_control is not None:
+            issues.extend(self.static_control.validate(known_tisa))
+            if self.static_control.workload_program_id != self.program_id:
+                issues.append("loaded static control program id does not match")
         return tuple(issues)
 
     def descriptor(self, descriptor_id: str) -> BoundTISADescriptor:
@@ -411,6 +417,11 @@ class LoadedDeviceProgram:
                 if self.static_schedule is not None
                 else None
             ),
+            "static_control": (
+                self.static_control.to_dict()
+                if self.static_control is not None
+                else None
+            ),
             "attributes": dict(self.attributes),
         }
 
@@ -436,6 +447,11 @@ class LoadedDeviceProgram:
                 static_schedule=(
                     StaticSchedulePlan.from_dict(payload["static_schedule"])
                     if payload.get("static_schedule") is not None
+                    else None
+                ),
+                static_control=(
+                    StaticControlProgram.from_dict(payload["static_control"])
+                    if payload.get("static_control") is not None
                     else None
                 ),
                 schema_version=int(payload.get("schema_version", 0)),

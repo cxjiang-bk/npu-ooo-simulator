@@ -36,7 +36,7 @@ from npu_ooo.ir import (
 )
 from npu_ooo.scheduler import schedule_tisa_program, schedule_tisa_sequence
 from npu_ooo.simulator import SimulatorConfig
-from npu_ooo.trace import write_instruction_csv, write_json
+from npu_ooo.trace import write_instruction_csv, write_json, write_svg
 from npu_ooo.simulator.tisa import _access_banks
 
 
@@ -160,6 +160,19 @@ class CycleSchedulerTest(unittest.TestCase):
         self.assertNotIn("address_hazards", payload["metrics"])
         self.assertFalse(payload["trace"]["events_embedded"])
         self.assertEqual(payload["trace"]["event_count"], len(result.events))
+
+    def test_default_swimlane_hides_duplicate_tisa_spans(self):
+        result = run(artifact((("a", "DMA", 2, ()),)))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "07_trace"
+            physical = root / "physical.svg"
+            detailed = root / "detailed.svg"
+            write_svg(result, physical)
+            write_svg(result, detailed, include_tisa_lanes=True)
+            physical_text = physical.read_text(encoding="utf-8")
+            detailed_text = detailed.read_text(encoding="utf-8")
+        self.assertNotIn("TISA instruction</text>", physical_text)
+        self.assertIn("TISA instruction</text>", detailed_text)
 
     def test_seeded_dags_preserve_dependencies_and_bandwidth_limits(self):
         for seed in range(20):

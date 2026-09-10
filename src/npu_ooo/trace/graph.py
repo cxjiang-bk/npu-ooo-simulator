@@ -3,7 +3,7 @@ from __future__ import annotations
 import html
 from pathlib import Path
 
-from npu_ooo.ir import ExecutionGraph, OperatorGraph, TileGraph
+from npu_ooo.ir import BackendArtifact, ExecutionGraph, OperatorGraph, TileGraph
 
 from .layout import artifact_path, finalize_artifact
 
@@ -36,15 +36,184 @@ def write_operator_graph_dot(graph: OperatorGraph, path: str | Path) -> None:
 
 
 def write_tile_graph_dot(graph: TileGraph, path: str | Path) -> None:
-    lines = ["digraph tile_graph {", "  rankdir=LR;", "  node [shape=box,fontname=Helvetica,fontsize=9];"]
+    lines = ["digraph tile_graph {", "  rankdir=LR;", "  compound=true;", "  node [shape=box,fontname=Helvetica,fontsize=9];"]
+    by_operator: dict[str, list] = {}
     for tile in graph.tiles:
-        bounds = ", ".join(f"{name}=[{start},{stop})" for name, start, stop in tile.bounds)
-        label = f"{tile.tile_id}\n{bounds}"
-        lines.append(f"  {_quote(tile.tile_id)} [label={_quote(label)}];")
+        by_operator.setdefault(tile.operator_id, []).append(tile)
+    for operator_id, tiles in by_operator.items():
+        lines.append(f"  subgraph {_quote('cluster_' + operator_id)} {{")
+        lines.append(f"    label={_quote(operator_id)};")
+        for tile in tiles:
+            bounds = ", ".join(
+                f"{name}=[{start},{stop})" for name, start, stop in tile.bounds
+            )
+            coordinates = ", ".join(
+                f"{name}={value}" for name, value in tile.coordinates
+            )
+            label = (
+                f"{tile.tile_id}\niter: {coordinates}\nrange: {bounds}"
+                f"\nstage={tile.stage_id}"
+            )
+            lines.append(f"    {_quote(tile.tile_id)} [label={_quote(label)}];")
+        lines.append("  }")
+    colors = {
+        "region_data": "#2563eb",
+        "data": "#2563eb",
+        "state": "#7c3aed",
+        "accumulate": "#ea580c",
+        "buffer_reuse": "#dc2626",
+        "control": "#475569",
+    }
     for dependency in graph.dependencies:
-        label = dependency.tensor or dependency.kind
+        label = (
+            f"{dependency.kind}/{dependency.hazard_kind}"
+            f"\n{dependency.tensor or ''}\n{dependency.condition}"
+        )
         lines.append(
-            f"  {_quote(dependency.producer)} -> {_quote(dependency.consumer)} [label={_quote(label)},fontsize=8];"
+            f"  {_quote(dependency.producer)} -> {_quote(dependency.consumer)} "
+            f"[label={_quote(label)},fontsize=8,color={_quote(colors.get(dependency.kind, '#64748b'))}];"
+        )
+    lines.append("}")
+    target, compatibility = artifact_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    finalize_artifact(target, compatibility)
+
+
+def program_hierarchy(artifact: BackendArtifact) -> dict:
+    """Return bounded model/operator/tile/TISA/payload navigation data."""
+
+    tasks = {item.task_id: item for item in artifact.execution_graph.tasks}
+    operators: dict[str, dict] = {}
+    for instruction in artifact.program.instructions:
+        operator = operators.setdefault(
+            instruction.operator_id,
+            {"operator_id": instruction.operator_id, "tiles": {}},
+        )
+        tile = operator["tiles"].setdefault(
+            instruction.tile_id,
+            {"tile_id": instruction.tile_id, "instructions": []},
+        )
+        tile["instructions"].append(
+            {
+                "tisa_id": instruction.tisa_id,
+                "op_type": instruction.op_type,
+                "unit": instruction.unit_map.unit,
+                "abstract_tisa_id": instruction.attributes.get("abstract_tisa_id"),
+                "target_stage_kind": instruction.attributes.get("target_stage_kind"),
+                "operands": [
+                    {
+                        "name": operand.name,
+                        "access": operand.normalized_access,
+                        "memory": operand.tile_mem.physical_space,
+                        "buffer_id": operand.tile_mem.buffer_id,
+                        "allocation_id": operand.tile_mem.allocation_id,
+                    }
+                    for operand in instruction.operands
+                ],
+                "dependencies": [item.to_dict() for item in instruction.dependencies],
+                "payload": [
+                    {
+                        "task_id": task_id,
+                        "primitive": tasks[task_id].primitive,
+                        "resource": tasks[task_id].resource,
+                    }
+                    for task_id in artifact.payloads[instruction.tisa_id]
+                ],
+            }
+        )
+    return {
+        "schema_version": 1,
+        "artifact_id": artifact.artifact_id,
+        "program_id": artifact.program.program_id,
+        "shared_workload_hash": artifact.attributes.get("shared_workload_hash"),
+        "operators": [
+            {
+                "operator_id": item["operator_id"],
+                "tiles": list(item["tiles"].values()),
+            }
+            for item in operators.values()
+        ],
+        "static_control": (
+            artifact.static_control.to_dict()
+            if artifact.static_control is not None
+            else None
+        ),
+    }
+
+
+def write_tisa_graph_dot(
+    artifact: BackendArtifact,
+    path: str | Path,
+    *,
+    max_nodes: int = 256,
+    include_static_control: bool = True,
+) -> None:
+    instructions = artifact.program.instructions[:max_nodes]
+    visible = {item.tisa_id for item in instructions}
+    lines = [
+        "digraph tisa_program {",
+        "  rankdir=LR;",
+        "  compound=true;",
+        "  node [shape=box,fontname=Helvetica,fontsize=8];",
+    ]
+    by_operator: dict[str, list] = {}
+    for instruction in instructions:
+        by_operator.setdefault(instruction.operator_id, []).append(instruction)
+    for operator_id, rows in by_operator.items():
+        lines.append(f"  subgraph {_quote('cluster_' + operator_id)} {{")
+        lines.append(f"    label={_quote(operator_id)};")
+        for instruction in rows:
+            memories = ",".join(
+                sorted({item.tile_mem.physical_space for item in instruction.operands})
+            )
+            abstract = instruction.attributes.get("abstract_tisa_id", "")
+            label = (
+                f"{instruction.tisa_id}\n{instruction.op_type} @ {instruction.unit_map.unit}"
+                f"\nmem={memories}\nabstract={abstract}"
+            )
+            lines.append(
+                f"    {_quote(instruction.tisa_id)} [label={_quote(label)}];"
+            )
+        lines.append("  }")
+    edge_colors = {"RAW": "#2563eb", "WAR": "#ea580c", "WAW": "#dc2626", "BUFFER_REUSE": "#dc2626"}
+    for instruction in instructions:
+        for dependency in instruction.dependencies:
+            if dependency.source not in visible:
+                continue
+            label = f"{dependency.kind}\n{dependency.condition}"
+            lines.append(
+                f"  {_quote(dependency.source)} -> {_quote(instruction.tisa_id)} "
+                f"[label={_quote(label)},color={_quote(edge_colors.get(dependency.kind, '#64748b'))}];"
+            )
+    if include_static_control and artifact.static_control is not None:
+        control_colors = {"set": "#16a34a", "wait": "#ca8a04", "fence": "#dc2626"}
+        for stream in artifact.static_control.streams:
+            lines.append(f"  subgraph {_quote('cluster_control_' + stream.stream_id)} {{")
+            lines.append(f"    label={_quote('static stream ' + stream.stream_id)};")
+            previous = None
+            for command in stream.commands:
+                if command.tisa_id not in visible:
+                    continue
+                if command.kind == "issue":
+                    current = command.tisa_id if command.tisa_id in visible else None
+                else:
+                    current = command.command_id
+                    lines.append(
+                        f"    {_quote(current)} [shape=diamond,label={_quote(command.kind + ':' + ','.join(command.event_ids))},"
+                        f"color={_quote(control_colors[command.kind])}];"
+                    )
+                if previous is not None and current is not None:
+                    lines.append(
+                        f"    {_quote(previous)} -> {_quote(current)} "
+                        "[style=dashed,color=\"#64748b\",label=\"static order\"];"
+                    )
+                if current is not None:
+                    previous = current
+            lines.append("  }")
+    if len(artifact.program.instructions) > max_nodes:
+        lines.append(
+            f"  truncated [shape=note,label={_quote(f'truncated: showing {max_nodes}/{len(artifact.program.instructions)} TISA')}];"
         )
     lines.append("}")
     target, compatibility = artifact_path(path)

@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 class SchedulerPolicy(str, Enum):
     SEQUENTIAL = "sequential"
     STATIC_PIPELINE = "static_pipeline"
+    STATIC_STREAMS = "static_streams"
     DYNAMIC_READY_QUEUE = "dynamic_ready_queue"
 
 

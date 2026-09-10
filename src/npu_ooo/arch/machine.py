@@ -649,7 +649,7 @@ def lpu_like_machine_config() -> MachineConfig:
                 direct=True,
             ),
         ),
-        scheduler=SchedulerCapacityConfig(instruction_queue_depth=32, rob_entries=8, max_inflight_tiles=8, dependency_window=8),
+        scheduler=SchedulerCapacityConfig(instruction_queue_depth=32, rob_entries=16, max_inflight_tiles=8, dependency_window=8),
         attributes={"source": "analytical-lpu-like", "calibration_status": "analytical"},
     )
     _raise_if_invalid(config)

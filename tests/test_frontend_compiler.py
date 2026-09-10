@@ -78,6 +78,7 @@ class PyTorchFrontendTest(unittest.TestCase):
                 "tisa_generator",
                 "target_lowering",
                 "backend",
+                "static_scheduling",
             ],
         )
         self.assertEqual(compiled.source_frontend.frontend.value, "torch.export")

@@ -399,3 +399,25 @@ GC typed dependency 已完成，下一项转入 symbolic shape、dynamic index �
   runtime submission order；LLaMA2 decode 两 invocation 原失败用例和全量回归均通过。
 - 论文边界：Algorithm 1/2 的有界队列、依赖/资源检查、完成反馈已结构对齐；项目仍未获得
   作者 static baseline 的具体编排、在线优先级公式、partial-ready 粒度和真实控制时序。
+# 2026-09-09：编译期静态流、同步、分析与可视化
+
+- 编译链在 final target TISA、payload、MemoryPlan 和 physical correctness dependency 完成后，
+  新增 `StaticControlProgram`：资源约束 list scheduler 生成 per-EU 固定流及
+  `issue/set/wait/fence`。正文不复制，static/dynamic 共用 workload hash。
+- 新策略 `static_streams` 按各流 head command 推进；set 只在 matching physical/partial
+  feedback 后生效，wait 非消费，多消费者可共享代次化事件，fence 为 allocation scope。
+  旧 `static_pipeline` 全局下一条行为保持兼容。
+- Dynamic scheduler 不读取 static control；结果同时记录 shared workload、static control、
+  dynamic control 三个 hash 和 `static_controls_consumed`。
+- 新增 `analyze --run-dir [--compare-dir]`，从保存的 payload timing、生命周期、bound
+  descriptor、Perfetto 和 buffer report 提取 startup/steady/drain bubble、具体 blocker、
+  critical wait chain、资源利用率及公平性诊断；未知原因不强行归因。
+- 默认 `swimlane.svg` 只保留物理 EU，`swimlane-detailed.svg` 保存旧 TISA span；Tile DOT
+  按 operator 分组，TISA Static/Dynamic DOT 与 hierarchy JSON 可关联到 payload。
+- `buffer_lifecycle.json/csv` 按 allocation/TISA 保守粒度记录 protect/valid/release，按
+  allocation_id 去重并区分 allocated/protected/retained/padding/capacity。
+- Attention 同包实测：static_streams=1432、dynamic=1476；控制零成本=1408、4-cycle
+  control=1632、control width 4=1430。两层 DeepSeek MoE 同包：static_streams=51273、
+  dynamic=51024；旧 static_pipeline 基线为61640。均为 analytical、uncalibrated 结果。
+- 产物：`out/static-scheduling-20260909/`；设计边界见 `docs/static-scheduling.md`、
+  `docs/result-analysis.md`、`docs/visualization.md`。

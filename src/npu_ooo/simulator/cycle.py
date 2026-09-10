@@ -902,6 +902,15 @@ def simulate_cycle_artifact(
     runtime_submission=None,
     execution_backend=None,
 ):
+    if policy == "static_streams":
+        from .device import DeviceSimulator
+
+        return DeviceSimulator(
+            artifact,
+            machine,
+            runtime_submission,
+            timing_model,
+        ).run("static_streams", model="cycle", config=config)
     timing_model = timing_model or AnalyticalTimingModel()
     config = config or SimulatorConfig(dynamic_priority="oldest_first")
     issues = (*artifact.validate(), *machine.validate())
