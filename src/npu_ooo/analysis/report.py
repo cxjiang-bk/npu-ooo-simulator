@@ -284,7 +284,15 @@ def _task_parents(run_dir: Path) -> dict[str, str]:
 
 def _queue_transitions(run_dir: Path) -> list[dict[str, Any]]:
     perfetto = _read_json(run_dir / "07_trace" / "perfetto.json", required=False)
-    state = {"reception": 0, "wq": 0, "iq": 0, "rob": 0, "completion_pending": 0}
+    state = {
+        "reception": 0,
+        "wq": 0,
+        "iq": 0,
+        "rob": 0,
+        "completion_pending": 0,
+        "wq_by_unit": {},
+        "iq_by_unit": {},
+    }
     transitions: list[dict[str, Any]] = []
     relevant = (
         "TISA_RECEIVE",
@@ -302,22 +310,51 @@ def _queue_transitions(run_dir: Path) -> list[dict[str, Any]]:
         args = item.get("args", {})
         event = args.get("event") if isinstance(args, Mapping) else None
         if event in relevant:
-            events.append((float(item.get("ts", 0.0)), str(event), str(item.get("name"))))
+            resource = args.get("unit_map") if isinstance(args, Mapping) else None
+            if isinstance(resource, Mapping):
+                resource = resource.get("unit")
+            if not resource and isinstance(args, Mapping):
+                resource = args.get("resource")
+            if not resource:
+                category = str(item.get("cat", ""))
+                if "/" in category:
+                    resource = category.split("/", 1)[1].split("[", 1)[0]
+            events.append(
+                (
+                    float(item.get("ts", 0.0)),
+                    str(event),
+                    str(item.get("name")),
+                    str(resource) if resource else None,
+                )
+            )
     order = {name: index for index, name in enumerate(relevant)}
-    has_dispatch = any(event == "TISA_DISPATCH" for _cycle, event, _tid in events)
-    for cycle, event, tisa_id in sorted(events, key=lambda item: (item[0], order.get(item[1], 99))):
+    has_dispatch = any(event == "TISA_DISPATCH" for _cycle, event, _tid, _resource in events)
+    for cycle, event, tisa_id, resource in sorted(
+        events, key=lambda item: (item[0], order.get(item[1], 99))
+    ):
         if event == "TISA_RECEIVE":
             state["reception"] += 1
         elif event == "TISA_DISPATCH":
             state["reception"] = max(0, state["reception"] - 1)
             state["wq"] += 1
             state["rob"] += 1
+            if resource:
+                state["wq_by_unit"][resource] = state["wq_by_unit"].get(resource, 0) + 1
         elif event == "TISA_SELECT":
             state["wq"] = max(0, state["wq"] - 1)
             state["iq"] += 1
+            if resource:
+                state["wq_by_unit"][resource] = max(
+                    0, state["wq_by_unit"].get(resource, 0) - 1
+                )
+                state["iq_by_unit"][resource] = state["iq_by_unit"].get(resource, 0) + 1
         elif event == "TISA_ISSUE":
             if has_dispatch:
                 state["iq"] = max(0, state["iq"] - 1)
+                if resource:
+                    state["iq_by_unit"][resource] = max(
+                        0, state["iq_by_unit"].get(resource, 0) - 1
+                    )
             else:
                 state["reception"] = max(0, state["reception"] - 1)
                 state["rob"] += 1
@@ -327,8 +364,22 @@ def _queue_transitions(run_dir: Path) -> list[dict[str, Any]]:
             state["completion_pending"] = max(0, state["completion_pending"] - 1)
         elif event == "TISA_RETIRE":
             state["rob"] = max(0, state["rob"] - 1)
+        snapshot = {
+            "cycle": cycle,
+            "event": event,
+            "tisa_id": tisa_id,
+            "wq_by_unit": dict(state["wq_by_unit"]),
+            "iq_by_unit": dict(state["iq_by_unit"]),
+        }
+        snapshot.update(
+            {
+                key: value
+                for key, value in state.items()
+                if key not in {"wq_by_unit", "iq_by_unit"}
+            }
+        )
         transitions.append(
-            {"cycle": cycle, "event": event, "tisa_id": tisa_id, **state}
+            snapshot
         )
     return transitions
 
@@ -582,13 +633,32 @@ def _joint_timeline_svg(analysis: RunAnalysis) -> str:
     axis_top = 52
     physical_top = axis_top + 24
     queue_top = physical_top + len(lanes) * physical_height + section_gap
-    queue_fields = (
-        ("wq", "WQ occupancy", "#2563eb"),
-        ("iq", "IQ occupancy", "#16a34a"),
-        ("rob", "ROB occupancy", "#7c3aed"),
-        ("completion_pending", "Completion pending", "#ea580c"),
+    queue_units = sorted(
+        {
+            str(item.get("resource"))
+            for item in physical
+            if isinstance(item, Mapping) and item.get("resource")
+        }
+        | {
+            unit
+            for row in queue
+            if isinstance(row, Mapping)
+            for field in ("wq_by_unit", "iq_by_unit")
+            for unit in (row.get(field, {}) or {})
+        }
     )
-    buffer_top = queue_top + (len(queue_fields) * queue_height if queue else 0) + section_gap
+    queue_fields = [
+        ("wq_by_unit", unit, f"WQ[{unit}]", "#2563eb")
+        for unit in queue_units
+    ] + [
+        ("iq_by_unit", unit, f"IQ[{unit}]", "#16a34a")
+        for unit in queue_units
+    ] + [
+        ("rob", None, "ROB occupancy", "#7c3aed"),
+        ("completion_pending", None, "Completion pending", "#ea580c"),
+    ]
+    queue_visible = bool(queue_units or queue)
+    buffer_top = queue_top + (len(queue_fields) * queue_height if queue_visible else 0) + section_gap
     chart_bottom = buffer_top + len(buffers) * buffer_height
     height = int(chart_bottom + 46)
 
@@ -676,13 +746,31 @@ def _joint_timeline_svg(analysis: RunAnalysis) -> str:
                 f'fill="#3b82f6"><title>{html.escape(title)}</title></rect>'
             )
 
-    if queue:
+    if queue_visible:
         parts.append(
-            f'<text x="5" y="{queue_top - 8}" font-size="12" font-weight="600">Scheduler state</text>'
+            f'<text x="5" y="{queue_top - 8}" font-size="12" font-weight="600">'
+            'Scheduler state (WQ occupancy / IQ occupancy by EU)</text>'
         )
-        for row, (field, label, color) in enumerate(queue_fields):
+        for row, (field, unit, label, color) in enumerate(queue_fields):
             y = queue_top + row * queue_height
-            curve = _timeline_curve(queue, total_cycles=total_cycles, value_key=field)
+            if unit is None:
+                curve_values = queue
+                value_key = field
+            else:
+                curve_values = [
+                    {
+                        "cycle": item.get("cycle", 0.0),
+                        "value": (item.get(field, {}) or {}).get(unit, 0),
+                    }
+                    for item in queue
+                    if isinstance(item, Mapping)
+                ]
+                value_key = "value"
+            if not curve_values:
+                curve_values = [{"cycle": 0.0, value_key: 0.0}]
+            curve = _timeline_curve(
+                curve_values, total_cycles=total_cycles, value_key=value_key
+            )
             peak = max((value for _cycle, value in curve), default=0.0)
 
             def queue_y(value: float, *, top=y, maximum=max(1.0, peak)) -> float:

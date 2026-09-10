@@ -20,7 +20,8 @@
 
 - 纵向主/次网格标出周期坐标，所有面板使用相同的起止周期；
 - 上方：物理 EU 执行与 bubble；
-- 中间：由生命周期事件重构的 WQ、IQ、ROB、completion 独立面板；
+- 中间：由生命周期事件重构的每类 EU 独立 `WQ[EU]`、`IQ[EU]` 面板，以及 ROB、
+  completion 面板；
 - 下方：各 memory 的 protected/retained occupancy。每个 memory 使用自身观测峰值作为
   纵轴上限，同时在左侧保留 allocated/capacity 数值，避免小幅占用被总容量压平；
 - 点击物理区间可显示 parent TISA，表格和 JSON 可继续定位 blocker、slot 和 dependency。

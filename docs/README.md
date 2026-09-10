@@ -6,6 +6,7 @@
 
 - [总体架构](architecture/architecture.md)：从前端、GC/FC/TISA、Target Lowering 到 Runtime、Device Scheduler 和 Backend 的完整链路。
 - [Scheduler 架构与流程](architecture/scheduler.md)：论文 `Reception Buffer → WQ → IQ → Exec` 与当前 `cycle.py` 实现的对应关系，包含 ROB、wakeup、select、issue 和 complete/retire 流程。
+- [Scheduler 与论文对齐](architecture/scheduler-paper-alignment.md)：`SemanticConflict(I, Fu[u])`、per-EU Fu、全局跨 EU dependency notification，以及当前实现缺口。
 - [TISA 论文语义对齐](architecture/tisa-alignment.md)：论文概念与项目 IR、TargetPlan、payload 的映射。
 - [算子分类与覆盖](architecture/operator-taxonomy.md)：semantic operator、lowering primitive 和覆盖计划。
 - [Target lowering 覆盖](architecture/target-lowering-coverage.md)：不同算子的目标 memory、route、EU 和 payload 能力。

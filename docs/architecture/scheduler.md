@@ -4,6 +4,9 @@
 它对应论文中 `Reception Buffer -> WQ -> IQ -> Exec` 的语义路径，并补充项目中用于容量
 管理和顺序退休的 ROB、Fu、tile window 以及 runtime 地址依赖。
 
+论文 Semantic Conflict Detection、per-EU `Fu` 和跨 EU 依赖的对齐说明见
+[Scheduler 与论文对齐](scheduler-paper-alignment.md)。
+
 详细的配置字段、命令行示例、stall 统计口径和手算时间线见
 [周期仿真运行指南](../running/device-scheduler.md)。
 

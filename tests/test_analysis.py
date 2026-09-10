@@ -97,8 +97,11 @@ class OfflineAnalysisTest(unittest.TestCase):
             self.assertTrue((output / "report.html").is_file())
             report_html = (output / "report.html").read_text(encoding="utf-8")
             self.assertIn('class="cycle-grid-major"', report_html)
-            self.assertIn("WQ occupancy", report_html)
-            self.assertIn("IQ occupancy", report_html)
+            self.assertIn("WQ occupancy / IQ occupancy by EU", report_html)
+            resource_names = {str(item["resource"]) for item in static_analysis.resources}
+            for resource in resource_names:
+                self.assertIn(f"WQ[{resource}]", report_html)
+                self.assertIn(f"IQ[{resource}]", report_html)
             self.assertIn("ROB occupancy", report_html)
             self.assertIn("Completion pending", report_html)
             self.assertIn("Protected bytes", report_html)
