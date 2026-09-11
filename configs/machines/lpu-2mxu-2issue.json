@@ -1,0 +1,375 @@
+{
+  "attributes": {
+    "calibration_status": "analytical",
+    "experiment": "dynamic_replay_two_mxu_two_issue",
+    "softmax_algorithm": "materialized",
+    "source": "analytical-lpu-like-2mxu-2issue"
+  },
+  "config_id": "lpu-2mxu-2issue",
+  "execution_units": [
+    {
+      "attributes": {
+        "gather_timing": "root_bandwidth_proxy",
+        "hardware_mapping": "unvalidated"
+      },
+      "count": 1,
+      "initiation_interval_cycles": 1,
+      "issue_width": 1,
+      "latency_cycles": 4,
+      "name": "GDMA",
+      "pipeline_depth": 1,
+      "queue_depth": 8,
+      "supported_ops": [
+        "load",
+        "store",
+        "copy",
+        "transpose",
+        "gather"
+      ]
+    },
+    {
+      "attributes": {},
+      "count": 1,
+      "initiation_interval_cycles": 1,
+      "issue_width": 1,
+      "latency_cycles": 4,
+      "name": "LDMA",
+      "pipeline_depth": 1,
+      "queue_depth": 8,
+      "supported_ops": [
+        "load",
+        "store",
+        "transpose"
+      ]
+    },
+    {
+      "attributes": {
+        "cols": 8,
+        "k": 8,
+        "rows": 16
+      },
+      "count": 2,
+      "initiation_interval_cycles": 4,
+      "issue_width": 2,
+      "latency_cycles": 32,
+      "name": "MXU",
+      "pipeline_depth": 4,
+      "queue_depth": 8,
+      "supported_ops": [
+        "matmul",
+        "batched_matmul",
+        "gemv",
+        "conv2d"
+      ]
+    },
+    {
+      "attributes": {},
+      "count": 1,
+      "initiation_interval_cycles": 2,
+      "issue_width": 1,
+      "latency_cycles": 8,
+      "name": "ARU",
+      "pipeline_depth": 1,
+      "queue_depth": 8,
+      "supported_ops": [
+        "softmax",
+        "layernorm",
+        "rmsnorm",
+        "swiglu",
+        "reduce",
+        "elementwise",
+        "residual_add",
+        "kv_cache_update",
+        "batch_norm",
+        "pool"
+      ]
+    }
+  ],
+  "memory_levels": [
+    {
+      "alignment_bytes": 4096,
+      "attributes": {},
+      "bank_count": 1,
+      "bank_width_bytes": null,
+      "capacity_bytes": null,
+      "name": "GM",
+      "parent": null,
+      "read_bandwidth_bytes_per_cycle": 16,
+      "read_latency_cycles": 40,
+      "read_ports": 1,
+      "write_bandwidth_bytes_per_cycle": 16,
+      "write_latency_cycles": 40,
+      "write_ports": 1
+    },
+    {
+      "alignment_bytes": 1,
+      "attributes": {},
+      "bank_count": 16,
+      "bank_width_bytes": 16,
+      "capacity_bytes": 1048576,
+      "name": "UB",
+      "parent": "GM",
+      "read_bandwidth_bytes_per_cycle": 256,
+      "read_latency_cycles": 2,
+      "read_ports": 1,
+      "write_bandwidth_bytes_per_cycle": 256,
+      "write_latency_cycles": 2,
+      "write_ports": 1
+    },
+    {
+      "alignment_bytes": 1,
+      "attributes": {},
+      "bank_count": 16,
+      "bank_width_bytes": 16,
+      "capacity_bytes": 65536,
+      "name": "LMB",
+      "parent": "UB",
+      "read_bandwidth_bytes_per_cycle": 32,
+      "read_latency_cycles": 1,
+      "read_ports": 1,
+      "write_bandwidth_bytes_per_cycle": 32,
+      "write_latency_cycles": 1,
+      "write_ports": 1
+    },
+    {
+      "alignment_bytes": 1,
+      "attributes": {},
+      "bank_count": 8,
+      "bank_width_bytes": 16,
+      "capacity_bytes": 65536,
+      "name": "RMB",
+      "parent": "UB",
+      "read_bandwidth_bytes_per_cycle": 16,
+      "read_latency_cycles": 1,
+      "read_ports": 1,
+      "write_bandwidth_bytes_per_cycle": 16,
+      "write_latency_cycles": 1,
+      "write_ports": 1
+    },
+    {
+      "alignment_bytes": 1,
+      "attributes": {},
+      "bank_count": 4,
+      "bank_width_bytes": 128,
+      "capacity_bytes": 262144,
+      "name": "PSB",
+      "parent": "UB",
+      "read_bandwidth_bytes_per_cycle": 512,
+      "read_latency_cycles": 1,
+      "read_ports": 1,
+      "write_bandwidth_bytes_per_cycle": 512,
+      "write_latency_cycles": 1,
+      "write_ports": 1
+    },
+    {
+      "alignment_bytes": 1,
+      "attributes": {},
+      "bank_count": 1,
+      "bank_width_bytes": null,
+      "capacity_bytes": 2048,
+      "name": "ARB",
+      "parent": "UB",
+      "read_bandwidth_bytes_per_cycle": 8,
+      "read_latency_cycles": 1,
+      "read_ports": 1,
+      "write_bandwidth_bytes_per_cycle": 8,
+      "write_latency_cycles": 1,
+      "write_ports": 1
+    }
+  ],
+  "operation_class_placements": [
+    {
+      "class_id": "vector-local",
+      "direct": false,
+      "input_route": [
+        "GM",
+        "UB"
+      ],
+      "local_memory": "UB",
+      "operations": [
+        "elementwise",
+        "residual_add",
+        "reduce",
+        "softmax",
+        "rmsnorm",
+        "layernorm",
+        "swiglu",
+        "kv_cache_update",
+        "batch_norm",
+        "pool"
+      ],
+      "output_route": [
+        "UB",
+        "GM"
+      ],
+      "unit": "ARU"
+    },
+    {
+      "class_id": "tensor-local",
+      "direct": false,
+      "input_route": [
+        "GM",
+        "UB"
+      ],
+      "local_memory": "UB",
+      "operations": [
+        "conv2d"
+      ],
+      "output_route": [
+        "UB",
+        "GM"
+      ],
+      "unit": "MXU"
+    },
+    {
+      "class_id": "root-transfer",
+      "direct": true,
+      "input_route": [
+        "GM"
+      ],
+      "local_memory": "GM",
+      "operations": [
+        "reshape",
+        "transpose",
+        "slice",
+        "embedding"
+      ],
+      "output_route": [
+        "GM"
+      ],
+      "unit": "GDMA"
+    }
+  ],
+  "operation_placements": [
+    {
+      "operands": [
+        {
+          "alignment_bytes": null,
+          "direction": "input",
+          "layout": "packed",
+          "memory": "LMB",
+          "role": "lhs",
+          "route": [
+            "GM",
+            "UB",
+            "LMB"
+          ]
+        },
+        {
+          "alignment_bytes": null,
+          "direction": "input",
+          "layout": "packed",
+          "memory": "RMB",
+          "role": "rhs",
+          "route": [
+            "GM",
+            "UB",
+            "RMB"
+          ]
+        },
+        {
+          "alignment_bytes": null,
+          "direction": "output",
+          "layout": "packed",
+          "memory": "PSB",
+          "role": "output",
+          "route": [
+            "PSB",
+            "UB",
+            "GM"
+          ]
+        }
+      ],
+      "operation": "matmul",
+      "unit": "MXU"
+    }
+  ],
+  "scheduler": {
+    "dependency_window": 8,
+    "instruction_queue_depth": 32,
+    "max_inflight_tiles": 16,
+    "pipeline": {
+      "completion_latency": 0,
+      "completion_width": 2,
+      "control_latency": 1,
+      "control_width": 1,
+      "dispatch_latency": 1,
+      "dispatch_width": 2,
+      "fence_latency": 1,
+      "inflight_entries": 32,
+      "iq_entries": 16,
+      "issue_width": 2,
+      "max_cycles": 1000000,
+      "receive_width": 2,
+      "retire_latency": 1,
+      "retire_width": 2,
+      "select_latency": 1,
+      "select_width": 2,
+      "wait_latency": 1,
+      "wakeup_latency": 1
+    },
+    "rob_entries": 16
+  },
+  "transfer_paths": [
+    {
+      "attributes": {},
+      "bandwidth_bytes_per_cycle": 16,
+      "can_overlap": true,
+      "channel_count": 1,
+      "engine": "GDMA",
+      "setup_latency_cycles": 4,
+      "source": "GM",
+      "target": "UB",
+      "transform": null,
+      "transform_latency_cycles": 0.0
+    },
+    {
+      "attributes": {},
+      "bandwidth_bytes_per_cycle": 32,
+      "can_overlap": true,
+      "channel_count": 1,
+      "engine": "LDMA",
+      "setup_latency_cycles": 4,
+      "source": "UB",
+      "target": "LMB",
+      "transform": null,
+      "transform_latency_cycles": 0.0
+    },
+    {
+      "attributes": {},
+      "bandwidth_bytes_per_cycle": 16,
+      "can_overlap": true,
+      "channel_count": 1,
+      "engine": "LDMA",
+      "setup_latency_cycles": 4,
+      "source": "UB",
+      "target": "RMB",
+      "transform": "transpose",
+      "transform_latency_cycles": 4
+    },
+    {
+      "attributes": {},
+      "bandwidth_bytes_per_cycle": 8,
+      "can_overlap": true,
+      "channel_count": 1,
+      "engine": "ARU",
+      "setup_latency_cycles": 2,
+      "source": "PSB",
+      "target": "UB",
+      "transform": null,
+      "transform_latency_cycles": 0.0
+    },
+    {
+      "attributes": {},
+      "bandwidth_bytes_per_cycle": 16,
+      "can_overlap": true,
+      "channel_count": 1,
+      "engine": "GDMA",
+      "setup_latency_cycles": 4,
+      "source": "UB",
+      "target": "GM",
+      "transform": null,
+      "transform_latency_cycles": 0.0
+    }
+  ]
+}
