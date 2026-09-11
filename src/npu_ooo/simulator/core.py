@@ -353,6 +353,7 @@ def _summary_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
     omitted = {
         "queue_occupancy_timeline",
         "address_hazards",
+        "semantic_conflicts",
     }
     return {key: value for key, value in metrics.items() if key not in omitted}
 

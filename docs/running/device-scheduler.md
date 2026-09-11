@@ -55,7 +55,9 @@ PYTHONPATH=src python3.12 -m npu_ooo.cli simulate \
 | Tile window | `max_inflight_tiles` | 首条子 stage issue 占用，整 tile 所有 TISA complete 释放 |
 | EU 实例 | `unit.count` | 由 ExecutionBackend 独占；issue 接受后占用，物理执行结束后释放 |
 
-`Fu` 保存活动指令身份，operand 的范围、访问类型和依赖通过 descriptor 查得。
+`Fu` 保存活动指令身份，operand 的范围、访问类型和依赖通过 descriptor 查得。动态策略在
+select 和 issue 边界将候选与目标 resource 的本地 Fu 比较，按绑定 memory/allocation、
+byte range 和 READ/WRITE 方向检测保守 RAW/WAR/WAW SemanticConflict。
 一条 TISA 绑定一个具体 EU 资源类别。scheduler 只调用 can-accept/issue；payload 内部
 primitive 顺序、实例 busy/II、task trace 和 physical-done 都由 ExecutionBackend 实现，
 不会在 scheduler 中维护第二份 EU 状态。`pipeline_depth` 在 analytical execution backend
@@ -82,9 +84,9 @@ retire → complete → wakeup → issue → select → dispatch → receive
 | --- | --- |
 | receive | `ceil(descriptor availability + runtime launch)`，受接收宽度/容量限制 |
 | dispatch | receive 后一周期，受 WQ/ROB/dispatch width 限制 |
-| wakeup | `max(dispatch + dispatch_latency, 各 dependency feedback + wakeup_latency)` |
-| select | wakeup 当周期，受窗口、地址依赖、IQ 容量和 select width 限制 |
-| issue | `select + select_latency`，受 EU/Fu/tile/memory 资源和 issue width 限制 |
+| wakeup | completion-tag 广播清空 pending mask 后，`max(dispatch + dispatch_latency, 各 dependency feedback + wakeup_latency)` |
+| select | wakeup 当周期，受窗口、本地 Fu SemanticConflict、地址依赖、IQ 容量和 select width 限制 |
+| issue | `select + select_latency`，重新验证 SemanticConflict，并受 EU/Fu/tile/memory 资源和 issue width 限制 |
 | execution done | `ceil(issue + payload duration)` |
 | complete | `execution done + completion_latency`，受 completion width 仲裁限制 |
 | retire | `complete + retire_latency`，受 ROB 队首和 retire width 限制 |
@@ -97,6 +99,11 @@ done/complete@5、retire@6。其 RAW 消费者默认 wakeup@6、select@6、issue
 完成总线按 `(execution done cycle, descriptor order)` 仲裁。物理 EU 可以在反馈等待期间
 再次执行，而 Fu/ROB 持有对应条目直到 complete/retire。ROB 表示有序完成记账，不模拟
 CPU 推测执行、异常回滚或将内存写入延迟至退休。
+
+`TISA_COMPLETE` 广播完整 readiness condition，`TISA_PARTIAL_READY` 广播对应 partial
+condition；广播只携带 completion identity/condition，不传输 payload 数据。全部 per-EU WQ
+会 snoop tag 并清除匹配 bit。该互连是项目 correctness-first 选择，论文只规定 dependent
+notification，没有公开 Epoch 的 broadcast/scoreboard 实现。
 
 ## 调度与依赖
 
@@ -143,7 +150,7 @@ CPU 推测执行、异常回滚或将内存写入延迟至退休。
 - `device_finish_cycle` 为最终 retire，`completion_finish_cycle` 为最终 complete，
   `retirement_drain_cycles` 为差值；`total_cycles` 包含 runtime synchronization。
 
-原因包括 reception/WQ/IQ/ROB full、dependency wait、FU busy、Fu table full、tile window、
+原因包括 reception/WQ/IQ/ROB full、dependency wait、semantic conflict、FU busy、Fu table full、tile window、
 address hazard、bank/port conflict、completion bandwidth、retire backpressure 和各阶段
 带宽。多种阻塞可以在同一周期发生，因此各项 `stall_cycles` 不应相加解释为总运行周期。
 WQ 中达到 dispatch_latency 边界的条目参与 dependency stall 统计；select 仅扫描窗口。

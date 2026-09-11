@@ -96,6 +96,9 @@ static/dynamic 的差异来自 policy；小图的 tile、MAC、traffic 和 depen
 - reception availability、queue、ROB/window、资源占用和 completion feedback analytical
   模型；
 - typed RAW/WAR/WAW/STATE/ACCUMULATE、address scoreboard、partial-ready 原型；
+- condition-tag completion broadcast、per-entry pending dependency mask、late-consumer
+  completion history 和跨 EU wakeup；
+- 目标 EU 本地 Fu 的 scope/allocation/range/access SemanticConflict，并在 select/issue 双重检查；
 - 可选 memory bank/port structural-conflict 模型；
 - queue、dependency、resource、memory stall 计数和泳道事件。
 
@@ -106,9 +109,11 @@ stall taxonomy 和 micro-test 对账。配置与语义见
 [device scheduler 运行指南](../running/device-scheduler.md) 和
 [scheduler 架构](../architecture/scheduler.md)。
 
-1. 使用真实 scheduler profile 校准上述参数；
-2. 扩展 partial-ready 子区域协议、在线优先级更新与多核路由；
-3. 通过阶段 D 的硬件 timing 进一步验证控制和执行时序。
+1. 为 OpType compatibility、reduction/atomic/accumulation 建立经过证明的 safe-override 规则；
+2. 评估并隔离论文未描述的全局 ROB/max-inflight tile 对调度窗口的影响；
+3. 使用真实 scheduler profile 校准上述参数；
+4. 扩展 partial-ready 子区域协议、在线优先级更新与多核路由；
+5. 通过阶段 D 的硬件 timing 进一步验证控制和执行时序。
 
 ## 阶段 D：可插拔硬件 backend
 

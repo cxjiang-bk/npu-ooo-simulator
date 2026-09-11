@@ -13,6 +13,7 @@ import unittest
 from npu_ooo.arch import MachineConfig, SchedulerPipelineConfig, minimal_machine_config
 from npu_ooo.backend import CycleEventBackend
 from npu_ooo.cli import _simulation_config, build_parser, main
+from npu_ooo.execution import AnalyticalExecutionBackend
 from npu_ooo.ir import (
     BackendArtifact,
     BufferBinding,
@@ -34,8 +35,11 @@ from npu_ooo.ir import (
     create_runtime_sequence,
     create_runtime_state_registry,
 )
+from npu_ooo.runtime import load_implicit_device_program
 from npu_ooo.scheduler import schedule_tisa_program, schedule_tisa_sequence
+from npu_ooo.scheduler.semantics import semantic_conflict
 from npu_ooo.simulator import SimulatorConfig
+from npu_ooo.simulator.cycle import schedule_loaded_cycle_program
 from npu_ooo.trace import write_instruction_csv, write_json, write_svg
 from npu_ooo.simulator.tisa import _access_banks
 
@@ -158,6 +162,7 @@ class CycleSchedulerTest(unittest.TestCase):
         self.assertTrue(payload["instruction_timings"])
         self.assertNotIn("queue_occupancy_timeline", payload["metrics"])
         self.assertNotIn("address_hazards", payload["metrics"])
+        self.assertNotIn("semantic_conflicts", payload["metrics"])
         self.assertFalse(payload["trace"]["events_embedded"])
         self.assertEqual(payload["trace"]["event_count"], len(result.events))
 
@@ -271,6 +276,255 @@ class CycleSchedulerTest(unittest.TestCase):
         delayed = run(program, wakeup_latency=3)
         self.assertEqual(delayed.instruction_timing("consumer").issue, 9)
         self.assertEqual(result.total_cycles, 9)
+
+    def test_completion_tag_broadcast_wakes_cross_unit_dependents(self):
+        program = artifact(
+            (
+                ("source", "DMA", 2, ()),
+                ("tensor", "MXU", 1, ("source",)),
+                ("vector", "ARU", 1, ("source",)),
+            )
+        )
+        result = run(
+            program,
+            receive_width=3,
+            dispatch_width=3,
+            select_width=3,
+            issue_width=3,
+        )
+        source_complete = next(
+            event
+            for event in result.events
+            if event.event == "TISA_COMPLETE" and event.task_id == "source"
+        )
+        self.assertEqual(
+            source_complete.details["broadcast"], "global_completion_tag"
+        )
+        self.assertEqual(
+            source_complete.details["broadcast_conditions"],
+            ["full_region_ready"],
+        )
+        self.assertEqual(source_complete.details["matched_dependencies"], 2)
+        self.assertEqual(source_complete.details["cross_unit_notifications"], 2)
+        self.assertEqual(
+            source_complete.details["dependency_ready_consumer_count"], 2
+        )
+        stages = result.metrics["instruction_pipeline"]
+        for consumer in ("tensor", "vector"):
+            self.assertEqual(
+                stages[consumer]["wakeup"],
+                stages["source"]["completed"] + 1,
+            )
+        self.assertEqual(
+            result.metrics["dependency_tracking"],
+            "global_completion_tag_broadcast+pending_mask",
+        )
+        self.assertEqual(result.metrics["broadcast_match_count"], 2)
+        self.assertEqual(result.metrics["cross_unit_notification_count"], 2)
+
+    def test_broadcast_pending_mask_waits_for_every_dependency(self):
+        program = artifact(
+            (
+                ("short", "DMA", 2, ()),
+                ("long", "ARU", 4, ()),
+                ("join", "MXU", 1, ("short", "long")),
+            )
+        )
+        result = run(
+            program,
+            receive_width=3,
+            dispatch_width=3,
+            select_width=3,
+            issue_width=3,
+        )
+        stages = result.metrics["instruction_pipeline"]
+        self.assertEqual(
+            stages["join"]["wakeup"],
+            max(stages["short"]["completed"], stages["long"]["completed"]) + 1,
+        )
+        broadcasts = {
+            event.task_id: event.details
+            for event in result.events
+            if event.event == "TISA_COMPLETE"
+            and event.task_id in {"short", "long"}
+        }
+        self.assertEqual(
+            broadcasts["short"]["dependency_ready_consumer_count"], 0
+        )
+        self.assertEqual(
+            broadcasts["long"]["dependency_ready_consumer_count"], 1
+        )
+
+    def test_completed_tag_history_wakes_a_late_consumer(self):
+        program = artifact(
+            (("source", "DMA", 2, ()), ("consumer", "MXU", 1, ("source",)))
+        )
+        submission = create_runtime_submission(
+            program,
+            (
+                BufferBinding("source", 4096, 8, "SRAM", "SRAM"),
+                BufferBinding("consumer", 8192, 8, "SRAM", "SRAM"),
+            ),
+            chunk_size=1,
+            descriptor_available_cycles={"source": 0, "consumer": 10},
+        )
+        result = run(program, submission=submission)
+        stages = result.metrics["instruction_pipeline"]
+        self.assertLess(stages["source"]["completed"], stages["consumer"]["received"])
+        self.assertEqual(stages["consumer"]["wakeup"], 12)
+        self.assertGreaterEqual(result.metrics["late_ready_dependency_count"], 1)
+
+    def test_semantic_conflict_describes_and_blocks_local_fu_overlap(self):
+        program = artifact((("older", "DMA", 5, ()), ("younger", "DMA", 1, ())))
+
+        def shared(access):
+            return (
+                TISAOperand(
+                    "shared",
+                    (4,),
+                    TileMem("shared", "SRAM", offset_bytes=0, size_bytes=8),
+                    access,
+                ),
+            )
+
+        program = replace(
+            program,
+            program=replace(
+                program.program,
+                instructions=(
+                    replace(program.program.instructions[0], operands=shared("write")),
+                    replace(program.program.instructions[1], operands=shared("read")),
+                ),
+            ),
+        )
+        machine = minimal_machine_config()
+        machine = replace(
+            machine,
+            execution_units=tuple(
+                replace(unit, count=2, issue_width=2)
+                if unit.name == "DMA"
+                else unit
+                for unit in machine.execution_units
+            ),
+        )
+        loaded = load_implicit_device_program(program)
+        older = loaded.descriptor_for_tisa("older")
+        younger = loaded.descriptor_for_tisa("younger")
+        observation = semantic_conflict(older, younger)
+        self.assertIsNotNone(observation)
+        self.assertEqual(observation.kind, "RAW")
+        self.assertEqual(observation.memory, "SRAM")
+        self.assertEqual(observation.size_bytes, 8)
+
+        # Remove the loader's alias edge only to isolate the local Fu checker.
+        loaded = replace(
+            loaded,
+            descriptors=tuple(
+                replace(item, dependencies=())
+                if item.instruction.tisa_id == "younger"
+                else item
+                for item in loaded.descriptors
+            ),
+            static_schedule=None,
+        )
+        result = schedule_loaded_cycle_program(
+            loaded,
+            machine,
+            "dynamic_ready_queue",
+            AnalyticalExecutionBackend(program, machine),
+            config=SimulatorConfig(
+                dynamic_priority="oldest_first",
+                pipeline=SchedulerPipelineConfig(
+                    receive_width=2,
+                    dispatch_width=2,
+                    select_width=2,
+                    issue_width=2,
+                ),
+            ),
+            audit={
+                "timing_provider_name": "analytical",
+                "timing_calibration_status": "analytical",
+                "compile_package_sha256": "test",
+                "runtime_submission_present": False,
+            },
+        )
+        self.assertGreater(result.metrics["stall_cycles"]["semantic_conflict"], 0)
+        self.assertEqual(result.metrics["semantic_conflict_count"], 1)
+        self.assertGreaterEqual(
+            result.instruction_timing("younger").issue,
+            result.instruction_timing("older").finish,
+        )
+
+    def test_semantic_conflict_classifies_access_and_scope_rules(self):
+        def observation(
+            older_access,
+            younger_access,
+            *,
+            younger_scope="SRAM",
+            younger_offset=0,
+        ):
+            program = artifact(
+                (("older", "DMA", 2, ()), ("younger", "DMA", 1, ()))
+            )
+
+            def operand(access, scope, offset):
+                return (
+                    TISAOperand(
+                        "shared",
+                        (4,),
+                        TileMem(
+                            "shared",
+                            scope,
+                            offset_bytes=offset,
+                            size_bytes=8,
+                        ),
+                        access,
+                    ),
+                )
+
+            program = replace(
+                program,
+                program=replace(
+                    program.program,
+                    instructions=(
+                        replace(
+                            program.program.instructions[0],
+                            operands=operand(older_access, "SRAM", 0),
+                        ),
+                        replace(
+                            program.program.instructions[1],
+                            operands=operand(
+                                younger_access,
+                                younger_scope,
+                                younger_offset,
+                            ),
+                        ),
+                    ),
+                ),
+            )
+            loaded = load_implicit_device_program(program)
+            return semantic_conflict(
+                loaded.descriptor_for_tisa("older"),
+                loaded.descriptor_for_tisa("younger"),
+            )
+
+        for older_access, younger_access, kind in (
+            ("write", "read", "RAW"),
+            ("read", "write", "WAR"),
+            ("write", "write", "WAW"),
+        ):
+            with self.subTest(kind=kind):
+                self.assertEqual(
+                    observation(older_access, younger_access).kind,
+                    kind,
+                )
+        self.assertIsNone(observation("read", "read"))
+        self.assertIsNone(
+            observation("write", "read", younger_scope="OTHER_MEMORY")
+        )
+        self.assertIsNone(
+            observation("write", "read", younger_offset=16)
+        )
 
     def test_explicit_control_latencies_and_physical_rounding(self):
         program = artifact((("a", "DMA", 1.5, ()),))

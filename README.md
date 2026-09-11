@@ -245,6 +245,11 @@ CLI 默认是 **static + analytical_event**，不是 dynamic + cycle_event；需
 | `inflight_entries` | 16 | 每类 EU 的语义表 Fu 容量，**按 operand 条目数计，不按指令数计** |
 | `max_cycles` | 1000000 | 运行周期上限，用于诊断长期无法完成的仿真 |
 
+Dynamic `cycle_event` 使用 condition-tag completion broadcast：所有 per-EU WQ snoop
+`(invocation, source TISA, condition)` 并更新 pending dependency mask；mask 清零后支付
+`wakeup_latency`。之后候选还要通过目标 EU 本地 Fu 的 scope/allocation/range/access
+SemanticConflict。广播互连及全局 ROB 均为论文未公开细节上的项目实现选择。
+
 字段均为整数；除 `wakeup_latency`、`completion_latency` 可以为 0 外，其余至少为 1。
 示例：将下列内容保存为 `cycle-tuned.json`，然后传入 `--scheduler-config cycle-tuned.json`：
 

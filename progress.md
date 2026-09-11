@@ -421,3 +421,24 @@ GC typed dependency 已完成，下一项转入 symbolic shape、dynamic index �
   dynamic=51024；旧 static_pipeline 基线为61640。均为 analytical、uncalibrated 结果。
 - 产物：`out/static-scheduling-20260909/`；设计边界见 `docs/static-scheduling.md`、
   `docs/result-analysis.md`、`docs/visualization.md`。
+
+# 2026-09-10：跨 EU Completion Broadcast 与本地 Fu SemanticConflict
+
+- `cycle_event` 将逐周期轮询 `source.completed` 改为 condition-tag completion broadcast。
+  每条已接收 descriptor 保存 `(source token, condition)` pending mask；全部 per-EU WQ
+  snoop complete/partial-ready tag，所有 bit 清零并支付 wakeup latency 后才产生
+  `TISA_WAKE_UP`。
+- ready condition 保留完成周期，覆盖 producer 先完成、consumer 后到达的情况；多前驱、
+  partial-ready、跨 EU fan-out 分别有回归测试。Trace 在 `TISA_COMPLETE`/
+  `TISA_PARTIAL_READY` 中记录广播 condition、WQ snoop、匹配数和跨 EU notification 数，
+  summary 默认只保留聚合指标。
+- 新增 per-resource 本地 Fu SemanticConflict，在 select 和 issue 两个边界检查 runtime-bound
+  physical memory/allocation、byte range 和 READ/WRITE，保守识别 RAW/WAR/WAW。Fu 保留
+  descriptor id 索引，semantic fields 从 `BoundTISADescriptor` 读取。
+- 该广播互连是项目 correctness-first 选择；论文只要求跨 EU dependent notification，未公开
+  Epoch 的 broadcast/scoreboard 结构。OpType compatibility safe override 尚未定义；全局
+  ROB 和 `max_inflight_tiles` 仍是非论文扩展。
+- 全量回归 256 项全部通过，`compileall`、相关 Ruff 检查和 `git diff --check` 通过。
+  Attention 使用既有 compile package 重新运行仍为 1476 cycles；28 次完整广播匹配 76 个
+  dependency bit，其中 46 个为跨 EU notification，产物位于
+  `out/scheduler-paper-alignment-20260910/attention-dynamic/`。

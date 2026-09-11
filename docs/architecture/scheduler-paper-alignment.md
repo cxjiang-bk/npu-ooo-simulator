@@ -9,7 +9,8 @@
 
 ## 1. 结论先行
 
-论文中的正确分层应理解为：
+本项目采用以下与论文公开语义相容的实现分层。全局 completion-tag 广播是为了补齐论文
+没有公开的跨 EU notification 细节所作的项目选择，不声称 Epoch 使用相同互连：
 
 ```text
 全局 typed dependency readiness
@@ -26,8 +27,9 @@ issue
 1. `Fu` 是每个调度 unit `u` 一个，即 `Fu[Tensor]`、`Fu[Vector]`、`Fu[DMA]`；不是所有 EU 共用一个 Fu。
 2. 位于 `WQ[u]` 的候选在执行论文 Algorithm 2 时，主要检查目标 unit 的 `Fu[u]`。
 3. 这不意味着候选只检查同 EU 依赖。`Deps` 的 source 是另一条 TISA instruction，依赖可以跨 EU。
-4. Tensor producer 完成后，必须通过全局 completion/dependency notification 唤醒 Vector WQ 中的 consumer。
-5. 当前代码已经有跨 EU 的显式 dependency 等待，但还没有真正实现 `SemanticConflict(I, Fu[u])`。
+4. Tensor producer 完成后，必须让 Vector WQ 中依赖它的 consumer 获得 condition-ready 通知。
+5. 当前 `cycle_event` 用全局 completion-tag 广播实现该通知，并实现了本地
+   `SemanticConflict(I, Fu[u])` 的保守子集。
 
 ## 2. 论文明确给出的机制
 
@@ -92,13 +94,13 @@ update scheduling state
 
 ## 3. 论文没有详细说明、但算法成立所必需的部分
 
-论文没有画出完整的 global dependency notification 结构，也没有说明依赖等待者是通过
-全局表、completion broadcast、token scoreboard 还是 reverse dependency list 管理。
+论文没有画出完整的 cross-unit dependency notification 结构，也没有说明依赖等待者是
+通过广播、定向 multicast、completion scoreboard 还是 reverse dependency list 管理。
 
 但从 `Deps = {(src, type, condition)}` 和“completion 后通知 dependent instructions”可以确定：
 
 ```text
-跨 EU 依赖必须是全局可见的
+跨 EU source condition 必须能被 consumer 所在 WQ 观察到
 ```
 
 例如：
@@ -117,7 +119,7 @@ T → WQ[Tensor] → IQ[Tensor] → Exec[Tensor]
                                       |
                                       | completion(T)
                                       v
-                               global dependency state
+                         completion-tag broadcast/state
                                       |
                                       v
                               wake V in WQ[Vector]
@@ -132,10 +134,10 @@ T → WQ[Tensor] → IQ[Tensor] → Exec[Tensor]
 `V` 不需要检查 `Fu[Tensor]` 来等待 T；它通过自己的 typed dependency 等待 T 的完成。
 但是，如果没有全局依赖状态，单纯检查 `Fu[Vector]` 会错误地让 V 提前读取 PSB[P]。
 
-因此必须区分：
+本项目选择让所有 WQ snoop completion tag，因此必须区分：
 
 ```text
-跨 EU 数据依赖：global Deps / completion notification
+跨 EU 数据依赖：typed Deps / completion-tag broadcast
 本 EU 语义冲突：candidate vs Fu[u]
 ```
 
@@ -180,30 +182,37 @@ WQ[DMA] / IQ[DMA] / Fu[DMA]
 
 这与论文 Figure 4 的 unit-class 粒度一致。
 
-但当前 Fu entry 只是：
+当前 Fu entry 是：
 
 ```text
 set(tisa_id)
 ```
 
-它只用于计算：
+TISA id 可以反查 `BoundTISADescriptor` 中的 OpType、绑定 operand 和地址，所以无需在 Fu
+中复制一份 descriptor。Fu 同时用于计算：
 
 ```text
 当前 resource 类别占用了多少 operand entry
 ```
 
-它不是论文定义的 semantic table，还没有保存地址区间、access type、OpType 和重排属性。
+当前实现已经通过 descriptor 反查执行 Algorithm 2 的保守子集：physical memory/allocation
+建立 alias domain，地址重叠和 READ/WRITE 方向产生 RAW/WAR/WAW。尚未假设任何 OpType
+组合可以安全覆盖真实的 write-bearing conflict，因此 reduction、atomic、accumulation 默认保守。
 
 ### 4.3 当前 `wakeup()`
 
-`wakeup()` 遍历 descriptor 的全部 dependencies，不限制 source 和 consumer 是否属于同一 EU：
+每条已接收 descriptor 建立 `(source completion token, condition)` 的 pending mask。
+`TISA_COMPLETE` 发布完整 condition，`TISA_PARTIAL_READY` 发布对应 partial condition；每次
+发布会让所有 per-EU WQ snoop tag：
 
 ```text
 consumer ∈ WQ[Vector]
 producer ∈ Fu[Tensor]
 ```
 
-只要 consumer 的 dependency source 尚未 complete，consumer 就不能 wakeup。
+只有 consumer 的全部 pending bit 清零，并支付 `wakeup_latency` 后，才记录
+`TISA_WAKE_UP`。已经完成的 tag 会保留 ready cycle，保证晚于 producer 完成才到达的
+consumer 不会错过广播。
 
 因此，当前实现已经可以表达：
 
@@ -213,7 +222,8 @@ ARU → DMA
 DMA → MXU
 ```
 
-但这属于预先生成的 explicit dependency readiness，不是 Semantic Conflict Detection。
+这属于显式 dependency readiness，不是 Semantic Conflict Detection。广播只携带 source
+identity 和 condition，不传输 payload 数据。
 
 ### 4.4 当前 `_address_block()`
 
@@ -251,22 +261,25 @@ reduction / atomic / psum special semantics
 | Routing | 按 UnitMap 路由到 WQ[u] | dispatch 时写入 `wq[resource]` | 基本一致 |
 | WQ/IQ | 每 unit 独立 WQ/IQ | 每 resource 独立 WQ/IQ | 基本一致 |
 | Fu 粒度 | 每 unit 一个 `Fu[u]` | 每 resource 一个 Fu | 粒度基本一致 |
-| Fu 内容 | semantic in-flight records | `set(tisa_id)` | 不一致 |
-| 显式依赖 | typed Deps，可跨 EU | `wakeup()` 检查全部 dependencies | 基本一致 |
-| completion 通知 | 完成后通知 dependent instructions | completion 后通过 `source.completed` 间接唤醒 | 语义近似，结构未显式建模 |
-| SemanticConflict | candidate vs `Fu[u]` | 未实现 | 关键缺口 |
+| Fu 内容 | semantic in-flight records | `set(tisa_id)`，经 descriptor 反查 semantic operand | 实现等价索引，未复制字段 |
+| 显式依赖 | typed Deps，可跨 EU | condition-tag pending mask | 基本一致 |
+| completion 通知 | 完成后通知 dependent instructions；互连未公开 | 所有 WQ snoop completion tag | 项目实现选择 |
+| SemanticConflict | candidate vs `Fu[u]` | scope/allocation/range/access 保守检查 | 核心子集已实现，OpType safe override 待定义 |
 | 地址冲突 | 与 semantic compatibility 共同判断 | optional global address scoreboard | 不能替代论文机制 |
 | 资源检查 | unit/resource availability | issue 阶段检查 | 基本一致 |
 | 跨 EU address hazard | 依赖语义应全局可见 | global older-descriptor scan | 可作为项目保守扩展，但不是 Fu 检查 |
+| 全局 ROB | 论文未描述 | dispatch 分配、按 submission order retire | 非论文项目扩展，会产生全局反压 |
+| 全局 tile window | 论文未描述同名结构 | `max_inflight_tiles` | 非论文项目扩展 |
 
 ## 6. 应采用的对齐后架构
 
 推荐把 scheduler 状态拆成三层：
 
 ```text
-GlobalDependencyState
-  dependency token → pending / ready
-  dependency token → waiting instructions in any WQ
+CompletionBroadcastState
+  (source completion token, condition) → pending / ready cycle
+  每个 WQ entry 保存 pending dependency mask
+  全部 WQ snoop completion tag
 
 PerUnitFu
   Fu[unit] = semantic entries currently issued to that unit
@@ -314,7 +327,7 @@ flowchart LR
     IQV --> EV["Exec[Vector]"]
     IQD --> ED["Exec[DMA]"]
 
-    ET --> F["Global completion / dependency notification"]
+    ET --> F["Global completion-tag broadcast"]
     EV --> F
     ED --> F
     F -. "wake dependents in any WQ" .-> WT
@@ -339,6 +352,13 @@ SemanticConflict:
 一个指令可能已经满足所有显式依赖，但仍然因为 `Fu[u]` 中的语义冲突不能 issue。
 反过来，Fu[u] 没有冲突，也不能绕过尚未满足的跨 EU dependency。
 
+### 7.1.1 广播的精确定义
+
+完整 TISA 在 `TISA_COMPLETE`（scheduler 接受 completion feedback）时广播，不等待全局
+ROB retire；partial condition 在对应 `TISA_PARTIAL_READY` 时广播。一条 consumer 有多个
+Deps 时，每次匹配只清除对应 bit，全部清零后才进入 wakeup latency。广播 tag 的 key 包含
+invocation、source TISA 和 condition，避免重复 invocation 使用旧完成状态。
+
 ### 7.2 SemanticConflict 应在 ready-window/select 阶段执行
 
 论文 Algorithm 1 是从 WQ 选择 ready window 后执行 Algorithm 2，再把通过的指令提升到 IQ。
@@ -360,10 +380,10 @@ WQ → ready window → dependency ready → SemanticConflict → IQ
 - 增加无意义的阻塞；
 - 混淆“数据依赖”和“本地 semantic conflict”。
 
-正确做法是：
+本项目采用：
 
 ```text
-跨 EU：通过 global dependency token / waiter notification
+跨 EU：通过 typed dependency mask / global completion-tag broadcast
 本 EU：通过 Fu[u] 做 SemanticConflict
 ```
 
@@ -425,7 +445,9 @@ V0 ∈ Fu[Vector]
 V1 ∈ WQ[Vector]
 ```
 
-预期：`SemanticConflict(V1, Fu[Vector])` 为 true，V1 等待 V0 完成或相应的安全边界。
+如果 `Deps(V1)=RAW(V0)` 已经存在，V1 会先由 dependency mask 阻塞，V0 complete 并从 Fu
+删除后才 wakeup，此时该案例主要验证广播。为单独验证 SemanticConflict，测试会暂时隔离
+loader 自动增加的 alias edge，让两个候选同时 ready；V1 必须被本地 Fu 的 RAW 检查阻塞。
 
 ### Case D：跨 EU 但无显式 dependency
 
@@ -457,14 +479,14 @@ V: younger Vector read A，已经 ready
 
 ## 9. 对当前代码的修改边界
 
-后续实现应优先遵循以下边界：
+当前实现遵循以下边界：
 
 1. 保留 `loaded` 作为 scheduler 输入，保留 `execution` 作为 payload/EU backend。
-2. 保留 `wakeup()` 的跨 EU dependency readiness 语义。
-3. 将 `self.fu[resource]` 从 `set(tid)` 扩展为包含 semantic operand/range 的 entry。
-4. 在 `select()` 的 WQ ready-window 检查中增加 `semantic_conflict(candidate, fu[resource])`。
-5. `issue()` 保留资源和 backend `can_accept()` 检查，并可重新验证 semantic conflict。
-6. completion 时同时执行：释放 `Fu[resource]`、更新 completion token、通知所有 WQ 的等待者。
+2. 用 completion-tag broadcast + pending mask 实现跨 EU dependency readiness。
+3. `self.fu[resource]` 保留 descriptor id 索引，通过 `BoundTISADescriptor` 读取 semantic operand。
+4. 在 `select()` 的 WQ ready-window 检查中执行 `semantic_conflict(candidate, fu[resource])`。
+5. `issue()` 保留资源和 backend `can_accept()` 检查，并重新验证 semantic conflict。
+6. completion 时同时执行：释放 `Fu[resource]`、记录 condition ready cycle、广播给所有 WQ。
 7. 不把所有 EU 的 Fu 合并为单一全局 Fu。
 8. 不把当前 address scoreboard 直接命名为论文 Semantic Conflict Detection。
 9. 对 runtime alias 生成的硬依赖保留 provenance，区分 `typed_dependency`、`runtime_alias` 和 `semantic_conflict`。
@@ -479,7 +501,7 @@ LoadedDeviceProgram
 Reception FIFO
         ↓ semantic routing
 WQ[u] for each execution unit
-        ↓ global typed dependency readiness
+        ↓ global completion-tag broadcast / pending mask
 ready candidate
         ↓ local SemanticConflict(candidate, Fu[u])
         ↓ structural resource checks
@@ -494,7 +516,10 @@ ExecutionBackend / Exec[u]
 
 一句话概括：
 
-> 论文是“全局依赖唤醒 + per-EU Fu 语义冲突检查”；当前项目目前是“全局显式依赖唤醒 + 跨 EU 地址 scoreboard + per-EU Fu 容量统计”，尚未实现中间的 SemanticConflict 层。
+> 论文要求 typed dependency readiness、per-EU Fu semantic conflict 和 completion feedback，
+> 但未公开跨 EU notification 互连；本项目选择“让全部 WQ snoop completion tag，并已实现
+> pending mask 与本地 scope/allocation/range/access SemanticConflict。OpType compatibility 的
+> 安全放宽仍需建立明确规则”，全局 ROB/tile window 仍是非论文扩展。
 
 相关代码入口：
 

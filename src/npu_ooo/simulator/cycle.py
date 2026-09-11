@@ -22,6 +22,7 @@ from npu_ooo.scheduler.semantics import (
     dependency_details,
     memory_accesses,
     memory_port_conflict,
+    semantic_conflict,
     unit_map_matches,
 )
 
@@ -40,6 +41,7 @@ STALL_REASONS = (
     "iq_full",
     "rob_full",
     "dependency_wait",
+    "semantic_conflict",
     "fu_busy",
     "fu_table_full",
     "tile_window_full",
@@ -170,6 +172,37 @@ class _CycleScheduler:
         self.feedback_ready = {}
         self.pending_done = {}
         self.pending_partial = {}
+        self.dependency_keys = {
+            tid: tuple(
+                (dependency.source.token_id, dependency.condition)
+                for dependency in descriptor.dependencies
+            )
+            for tid, descriptor in self.descriptors.items()
+        }
+        self.dependency_conditions_by_source = {
+            tid: {
+                dependency.condition
+                for descriptor in self.descriptors.values()
+                for dependency in descriptor.dependencies
+                if dependency.source.token_id
+                == self.descriptors[tid].completion_token.token_id
+            }
+            for tid in self.descriptors
+        }
+        self.ready_dependency_conditions: dict[tuple[str, str], float] = {}
+        self.pending_dependencies: dict[str, set[tuple[str, str]]] = {
+            tid: set() for tid in self.descriptors
+        }
+        self.latest_dependency_ready: dict[str, float] = {}
+        self.registered_dependencies: set[str] = set()
+        self.completion_broadcast_count = 0
+        self.partial_broadcast_count = 0
+        self.broadcast_snoop_count = 0
+        self.broadcast_match_count = 0
+        self.cross_unit_notification_count = 0
+        self.late_ready_dependency_count = 0
+        self.semantic_conflict_checks = 0
+        self.semantic_conflicts = {}
         self.now = 0
         self.progress = 0
 
@@ -297,6 +330,121 @@ class _CycleScheduler:
             if key not in self.stall_seen:
                 self._close_stall(key, end)
 
+    def _register_dependencies(self, tid: str) -> None:
+        """Install one WQ entry's condition mask, including late-ready tags."""
+
+        if tid in self.registered_dependencies:
+            return
+        self.registered_dependencies.add(tid)
+        pending = self.pending_dependencies[tid]
+        for key in self.dependency_keys[tid]:
+            ready_cycle = self.ready_dependency_conditions.get(key)
+            if ready_cycle is None:
+                pending.add(key)
+                continue
+            self.latest_dependency_ready[tid] = max(
+                self.latest_dependency_ready.get(tid, ready_cycle), ready_cycle
+            )
+            self.late_ready_dependency_count += 1
+
+    def _refresh_dependency_mask(self, tid: str) -> int:
+        """Consume tags that became ready before this entry reached a WQ."""
+
+        matched = 0
+        pending = self.pending_dependencies[tid]
+        for key in tuple(pending):
+            ready_cycle = self.ready_dependency_conditions.get(key)
+            if ready_cycle is None:
+                continue
+            pending.remove(key)
+            self.latest_dependency_ready[tid] = max(
+                self.latest_dependency_ready.get(tid, ready_cycle), ready_cycle
+            )
+            matched += 1
+        self.late_ready_dependency_count += matched
+        return matched
+
+    def _broadcast_conditions(
+        self,
+        source_tid: str,
+        conditions: tuple[str, ...],
+        *,
+        cycle: float,
+        partial: bool,
+    ) -> dict[str, object]:
+        """Publish one completion tag to every per-unit WQ.
+
+        This is the project's correctness-first implementation of the paper's
+        cross-unit dependent notification.  The broadcast carries identity and
+        condition only; payload data remains in the target memory hierarchy.
+        """
+
+        token_id = self.descriptors[source_tid].completion_token.token_id
+        published = []
+        for condition in conditions:
+            key = (token_id, condition)
+            if key in self.ready_dependency_conditions:
+                continue
+            self.ready_dependency_conditions[key] = cycle
+            published.append(key)
+        if partial:
+            self.partial_broadcast_count += 1
+        else:
+            self.completion_broadcast_count += 1
+
+        snooped = matched = cross_unit = 0
+        dependency_ready_consumers = 0
+        source_resource = self.entries[source_tid].resource
+        published_set = set(published)
+        for queue in self.wq.values():
+            for consumer_tid in queue:
+                snooped += 1
+                pending = self.pending_dependencies[consumer_tid]
+                hits = pending.intersection(published_set)
+                if not hits:
+                    continue
+                was_pending = bool(pending)
+                pending.difference_update(hits)
+                matched += len(hits)
+                latest = max(self.ready_dependency_conditions[key] for key in hits)
+                self.latest_dependency_ready[consumer_tid] = max(
+                    self.latest_dependency_ready.get(consumer_tid, latest), latest
+                )
+                if self.entries[consumer_tid].resource != source_resource:
+                    cross_unit += len(hits)
+                if was_pending and not pending:
+                    dependency_ready_consumers += 1
+
+        self.broadcast_snoop_count += snooped
+        self.broadcast_match_count += matched
+        self.cross_unit_notification_count += cross_unit
+        return {
+            "broadcast": "global_completion_tag",
+            "broadcast_token": token_id,
+            "broadcast_conditions": [condition for _token, condition in published],
+            "wq_entries_snooped": snooped,
+            "matched_dependencies": matched,
+            "cross_unit_notifications": cross_unit,
+            "dependency_ready_consumer_count": dependency_ready_consumers,
+        }
+
+    def _semantic_block(self, tid: str):
+        """Check a candidate against the target unit's local in-flight Fu."""
+
+        resource = self.entries[tid].resource
+        candidate = self.descriptors[tid]
+        for active_tid in sorted(
+            self.fu[resource], key=self.submission_order.__getitem__
+        ):
+            self.semantic_conflict_checks += 1
+            conflict = semantic_conflict(self.descriptors[active_tid], candidate)
+            if conflict is None:
+                continue
+            key = (conflict.predecessor, conflict.successor, conflict.kind)
+            self.semantic_conflicts.setdefault(key, conflict.to_dict())
+            return conflict
+        return None
+
     def retire(self):
         for _ in range(self.pipe.retire_width):
             if not self.rob:
@@ -345,7 +493,20 @@ class _CycleScheduler:
             self.tile_remaining[self.instructions[tid].tile_id] -= 1
             if not self.tile_remaining[self.instructions[tid].tile_id]:
                 self.active_tiles.discard(self.instructions[tid].tile_id)
-            self.event("TISA_COMPLETE", tid)
+            conditions = tuple(
+                sorted(
+                    condition
+                    for condition in self.dependency_conditions_by_source[tid]
+                    if not condition.startswith("payload_ready:")
+                )
+            ) or ("complete",)
+            broadcast = self._broadcast_conditions(
+                tid,
+                conditions,
+                cycle=self.now,
+                partial=False,
+            )
+            self.event("TISA_COMPLETE", tid, **broadcast)
             self.instruction_timings[tid] = TaskTiming(
                 tid,
                 f"TISA/{entry.resource}",
@@ -359,11 +520,23 @@ class _CycleScheduler:
         for tid in due[self.pipe.completion_width :]:
             self.stall(tid, "completion_bandwidth", "complete")
         # Partial readiness is a sideband path but still observes modeled feedback latency.
-        for key, physical_ready in self.pending_partial.items():
+        for key, physical_ready in tuple(self.pending_partial.items()):
             source, condition = key
             if key not in self.feedback_ready and physical_ready + self.pipe.completion_latency <= self.now:
                 self.feedback_ready[key] = self.now
-                self.event("TISA_PARTIAL_READY", source, condition=condition)
+                broadcast = self._broadcast_conditions(
+                    source,
+                    (condition,),
+                    cycle=self.now,
+                    partial=True,
+                )
+                self.event(
+                    "TISA_PARTIAL_READY",
+                    source,
+                    condition=condition,
+                    **broadcast,
+                )
+                del self.pending_partial[key]
 
     def wakeup(self):
         for queue in self.wq.values():
@@ -375,18 +548,23 @@ class _CycleScheduler:
                 ):
                     continue
                 ready = entry.dispatched + self.pipe.dispatch_latency
-                for dependency in self.descriptors[tid].dependencies:
-                    source = self.entries[dependency.source.tisa_id]
-                    feedback = self.feedback_ready.get(
-                        (dependency.source.tisa_id, dependency.condition), source.completed
+                self._refresh_dependency_mask(tid)
+                if self.pending_dependencies[tid]:
+                    ready = math.inf
+                elif self.dependency_keys[tid]:
+                    ready = max(
+                        ready,
+                        self.latest_dependency_ready[tid]
+                        + self.pipe.wakeup_latency,
                     )
-                    if feedback is None:
-                        ready = math.inf
-                        break
-                    ready = max(ready, feedback + self.pipe.wakeup_latency)
                 if ready <= self.now:
                     entry.wakeup = self.now
-                    self.event("TISA_WAKE_UP", tid)
+                    self.event(
+                        "TISA_WAKE_UP",
+                        tid,
+                        dependency_broadcast_ready=bool(self.dependency_keys[tid]),
+                        dependency_count=len(self.dependency_keys[tid]),
+                    )
                 else:
                     self.stall(tid, "dependency_wait", "wakeup")
 
@@ -453,6 +631,10 @@ class _CycleScheduler:
                 > self.pipe.inflight_entries
             ):
                 self.stall(tid, "fu_table_full", "issue")
+                continue
+            conflict = self._semantic_block(tid)
+            if conflict is not None:
+                self.stall(tid, "semantic_conflict", "issue")
                 continue
             hazard = self._address_block(tid)
             if hazard:
@@ -529,6 +711,10 @@ class _CycleScheduler:
         iq_capacity = min(self.pipe.iq_entries, self.config.ready_queue_depth)
         for tid in candidates:
             entry = self.entries[tid]
+            conflict = self._semantic_block(tid)
+            if conflict is not None:
+                self.stall(tid, "semantic_conflict", "select")
+                continue
             hazard = self._address_block(tid)
             if hazard:
                 self.stall(tid, "address_hazard", "select", hazard=hazard)
@@ -572,8 +758,13 @@ class _CycleScheduler:
             self.rob.append(tid)
             self.wq[resource].append(tid)
             self.entries[tid].dispatched = self.now
+            self._refresh_dependency_mask(tid)
             dispatched += 1
-            self.event("TISA_DISPATCH", tid)
+            self.event(
+                "TISA_DISPATCH",
+                tid,
+                pending_dependency_count=len(self.pending_dependencies[tid]),
+            )
         if self.reception and dispatched == self.pipe.dispatch_width:
             self.stall(self.reception[0], "dispatch_bandwidth", "dispatch")
 
@@ -591,10 +782,15 @@ class _CycleScheduler:
                 break
             self.reception.append(tid)
             self.entries[tid].received = self.now
+            self._register_dependencies(tid)
             self.next_receive += 1
             received += 1
             self.event(
-                "TISA_RECEIVE", tid, runtime_ready_cycle=ready, runtime_chunk_id=chunk
+                "TISA_RECEIVE",
+                tid,
+                runtime_ready_cycle=ready,
+                runtime_chunk_id=chunk,
+                pending_dependency_count=len(self.pending_dependencies[tid]),
             )
 
     def snapshot(self):
@@ -604,6 +800,11 @@ class _CycleScheduler:
             "reception_queue": len(self.reception),
             "rob": len(self.rob),
             "inflight_tiles": len(self.active_tiles),
+            "pending_dependencies": sum(
+                len(self.pending_dependencies[tid])
+                for tid in self.registered_dependencies
+                if self.entries[tid].wakeup is None
+            ),
             "wq": {name: len(queue) for name, queue in self.wq.items()},
             "iq": {name: len(queue) for name, queue in self.iq.items()},
             "fu": {
@@ -713,9 +914,8 @@ class _CycleScheduler:
             ):
                 return True
             for dep in self.descriptors[entry.tisa_id].dependencies:
-                feedback = self.feedback_ready.get(
-                    (dep.source.tisa_id, dep.condition),
-                    self.entries[dep.source.tisa_id].completed,
+                feedback = self.ready_dependency_conditions.get(
+                    (dep.source.token_id, dep.condition)
                 )
                 if (
                     feedback is not None
@@ -765,7 +965,10 @@ class _CycleScheduler:
             "retirement_order": "descriptor_submission_order",
             "payload_execution": "run_to_completion",
             "primitive_reordering_scope": "instruction_local",
+            "dependency_tracking": "global_completion_tag_broadcast+pending_mask",
+            "dependency_broadcast_scope": "all_per_unit_wq_entries",
             "fu_capacity_unit": "operand_entries_per_unit_class",
+            "fu_semantics": "descriptor_indexed_tilemem_conflict",
             "tisa_instruction_count": len(self.instructions),
             "payload_task_count": len(self.timings),
             "issued_instruction_count": len(self.issued),
@@ -819,6 +1022,15 @@ class _CycleScheduler:
             "address_hazards": list(self.hazards.values()),
             "address_hazard_count": len(self.hazards),
             "address_dependency_count": len(self.hazards),
+            "semantic_conflict_checks": self.semantic_conflict_checks,
+            "semantic_conflict_count": len(self.semantic_conflicts),
+            "semantic_conflicts": list(self.semantic_conflicts.values()),
+            "completion_broadcast_count": self.completion_broadcast_count,
+            "partial_broadcast_count": self.partial_broadcast_count,
+            "broadcast_snoop_count": self.broadcast_snoop_count,
+            "broadcast_match_count": self.broadcast_match_count,
+            "cross_unit_notification_count": self.cross_unit_notification_count,
+            "late_ready_dependency_count": self.late_ready_dependency_count,
             "partial_ready_event_count": len(self.feedback_ready),
             "partial_ready_dependency_count": sum(
                 len(item.attributes.get("feedback_conditions", ()))
@@ -842,6 +1054,7 @@ class _CycleScheduler:
             ("rob_peak", "rob"),
             ("reception_queue_peak", "reception_queue"),
             ("inflight_tile_peak", "inflight_tiles"),
+            ("pending_dependency_peak", "pending_dependencies"),
         ):
             metrics[name] = max((row[field] for row in self.snapshots), default=0)
         for name in ("wq", "iq", "fu"):

@@ -85,12 +85,13 @@ Exec[unit]       --(4)--> wakeup / dependency feedback
 | `WQTensor` / `WQVector` / `WQDMA` | `self.wq[resource]` | 按 EU 类别划分的等待队列 |
 | `IQTensor` / `IQVector` / `IQDMA` | `self.iq[resource]` | 已经 ready、等待 issue 的队列 |
 | `Exec[unit]` | `ExecutionBackend` 的 EU instance | 负责 payload 内部执行和物理完成 |
-| 反馈 4 | `ExecutionFeedback` | `execution_done` 或 `partial_ready` |
+| 反馈 4 | `ExecutionFeedback` + completion-tag broadcast | `execution_done` 或 condition-specific `partial_ready`；全部 WQ snoop tag |
 
 项目额外维护：
 
 - `ROB`：保存已经 dispatch、尚未 retire 的 TISA 指令，按 descriptor submission order 退休；
-- `Fu`：保存已经 issue 的 TISA 身份，容量按 operand entry 计算；
+- `Fu`：保存已经 issue 的 TISA 身份，通过 descriptor 读取绑定 scope/range/access/OpType；
+  容量按 operand entry 计算；
 - `tile window`：限制同时活跃的 tile 数；
 - address/memory scoreboard：限制物理地址 alias 和 bank/port 冲突。
 
@@ -244,13 +245,16 @@ backend 的 physical done 先进入 scheduler 的 pending feedback；之后经�
 - 释放 Fu entry；
 - 减少对应 tile 的剩余指令数；
 - 必要时释放 tile window；
-- 允许依赖该指令的后继执行 wakeup。
+- 广播 `(invocation, source TISA, condition)` completion tag；
+- 清除所有 per-EU WQ 中匹配的 pending dependency bit。
 
 `partial_ready` 是独立 sideband，不占用完整 completion 总线，可提前唤醒指定依赖。
 
 ### 5.3 Wakeup
 
-指令必须满足所有依赖。其最早 ready 时间可以概括为：
+每条已接收指令保存 pending dependency mask。所有 WQ snoop complete/partial-ready tag；
+只有全部 pending bit 清零才可 wakeup。已经发布的 tag 保留 ready cycle，以支持 producer
+先完成、consumer 后到达。其最早 ready 时间可以概括为：
 
 ```text
 ready(i) = max(
@@ -269,6 +273,11 @@ partial-ready feedback。
 ```python
 queue[:dependency_window]
 ```
+
+候选全部显式依赖 ready 后，对目标 resource 的本地 `Fu[resource]` 执行 SemanticConflict：
+physical memory/allocation 确定 alias domain，地址区间与 access type 确定 RAW/WAR/WAW。
+当前没有假设任何 write-bearing OpType 组合可安全重排，因此特殊语义默认保守。通过检查
+后才能进入 IQ；issue 前再次验证，覆盖 select→issue 间的 Fu 状态变化。
 
 候选必须已经 wakeup，然后按照 priority 排序。默认是 `oldest_first`；也可以使用
 descriptor 的 `compiler_hint`，或者使用完整依赖图计算的 `oracle_critical_path`。
@@ -337,6 +346,9 @@ TISA instruction-level analytical scheduling baseline
 原因包括：
 
 - WQ/IQ/Fu 容量和各阶段控制 latency 是项目显式参数；
+- completion-tag 全 WQ 广播是论文未公开 notification 互连上的项目实现选择；
+- 当前 SemanticConflict 实现 scope/allocation/range/access 核心子集，OpType safe override
+  尚未定义；
 - scheduler 的控制开销尚未完成硬件校准；
 - `AnalyticalExecutionBackend` 提供 payload timing 和物理 EU busy/II；
 - 当前 analytical backend 尚未利用 `pipeline_depth` 实现同一 EU instance 上的多条 TISA 重叠；
@@ -352,7 +364,8 @@ TISA instruction-level analytical scheduling baseline
 | `simulator/device.py` | 连接 loader、scheduler 和 ExecutionBackend |
 | `runtime/loader.py` | 生成 `LoadedDeviceProgram` 和 runtime alias dependency |
 | `simulator/cycle.py:300` | retire / complete / wakeup |
-| `simulator/cycle.py:393` | address scoreboard |
+| `simulator/cycle.py` | completion broadcast、pending mask、per-unit Fu SemanticConflict |
+| `scheduler/semantics.py` | TileMem alias/range/access conflict rules |
 | `simulator/cycle.py:414` | issue |
 | `simulator/cycle.py:514` | select |
 | `simulator/cycle.py:557` | dispatch |

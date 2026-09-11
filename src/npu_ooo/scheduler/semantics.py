@@ -19,6 +19,44 @@ class MemoryAccess:
     mode: str
 
 
+@dataclass(frozen=True)
+class SemanticConflict:
+    """One conservative Algorithm-2 conflict against a local in-flight entry."""
+
+    predecessor: str
+    successor: str
+    kind: str
+    memory: str
+    address: int
+    size_bytes: int
+    predecessor_operand: str
+    successor_operand: str
+    predecessor_op_type: str
+    successor_op_type: str
+    predecessor_logical_scope: str
+    successor_logical_scope: str
+    declared_dependency: bool
+    rule: str = "tilemem_overlap_without_safe_semantic_override"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "predecessor": self.predecessor,
+            "successor": self.successor,
+            "kind": self.kind,
+            "memory": self.memory,
+            "address": self.address,
+            "size_bytes": self.size_bytes,
+            "predecessor_operand": self.predecessor_operand,
+            "successor_operand": self.successor_operand,
+            "predecessor_op_type": self.predecessor_op_type,
+            "successor_op_type": self.successor_op_type,
+            "predecessor_logical_scope": self.predecessor_logical_scope,
+            "successor_logical_scope": self.successor_logical_scope,
+            "declared_dependency": self.declared_dependency,
+            "rule": self.rule,
+        }
+
+
 def access_banks(
     address: int,
     size: int,
@@ -132,10 +170,10 @@ def _writes(operand: RuntimeOperandBinding) -> bool:
     return operand.access_type in {AccessType.WRITE.value, AccessType.READ_WRITE.value}
 
 
-def address_conflict(
+def _operand_conflict(
     older: BoundTISADescriptor,
     younger: BoundTISADescriptor,
-) -> tuple[str, RuntimeOperandBinding] | None:
+) -> tuple[str, RuntimeOperandBinding, RuntimeOperandBinding] | None:
     for left in older.operands:
         for right in younger.operands:
             if left.physical_scope != right.physical_scope:
@@ -154,12 +192,70 @@ def address_conflict(
             ):
                 continue
             if _writes(left) and _reads(right):
-                return "RAW", left
+                return "RAW", left, right
             if _reads(left) and _writes(right):
-                return "WAR", left
+                return "WAR", left, right
             if _writes(left) and _writes(right):
-                return "WAW", left
+                return "WAW", left, right
     return None
+
+
+def address_conflict(
+    older: BoundTISADescriptor,
+    younger: BoundTISADescriptor,
+) -> tuple[str, RuntimeOperandBinding] | None:
+    """Return the first conservative physical-address conflict in program order."""
+
+    conflict = _operand_conflict(older, younger)
+    if conflict is None:
+        return None
+    kind, older_operand, _younger_operand = conflict
+    return kind, older_operand
+
+
+def semantic_conflict(
+    active: BoundTISADescriptor,
+    candidate: BoundTISADescriptor,
+) -> SemanticConflict | None:
+    """Apply the implemented subset of TISA Algorithm 2.
+
+    The runtime-bound memory space and allocation identity establish the
+    alias domain.  Range overlap plus a write-bearing access establishes a
+    RAW/WAR/WAW conflict.  No OpType pair is assumed reorder-safe without an
+    explicit project contract, so reductions, accumulation and atomics remain
+    conservative.  Cross-unit declared dependency readiness is handled by the
+    completion-tag broadcast; this function checks only the entries supplied
+    by the caller's local ``Fu[u]``.
+    """
+
+    conflict = _operand_conflict(active, candidate)
+    if conflict is None:
+        return None
+    kind, predecessor_operand, successor_operand = conflict
+    overlap_start = max(predecessor_operand.address, successor_operand.address)
+    overlap_end = min(
+        predecessor_operand.address + predecessor_operand.size_bytes,
+        successor_operand.address + successor_operand.size_bytes,
+    )
+    predecessor_id = active.instruction.tisa_id
+    return SemanticConflict(
+        predecessor=predecessor_id,
+        successor=candidate.instruction.tisa_id,
+        kind=kind,
+        memory=predecessor_operand.physical_scope,
+        address=overlap_start,
+        size_bytes=overlap_end - overlap_start,
+        predecessor_operand=predecessor_operand.operand_name,
+        successor_operand=successor_operand.operand_name,
+        predecessor_op_type=active.instruction.op_type,
+        successor_op_type=candidate.instruction.op_type,
+        predecessor_logical_scope=predecessor_operand.logical_scope,
+        successor_logical_scope=successor_operand.logical_scope,
+        declared_dependency=any(
+            dependency.source.tisa_id == predecessor_id
+            for dependency in candidate.dependencies
+        ),
+    )
 
 
 def dependency_details(descriptor: BoundTISADescriptor) -> list[dict[str, Any]]:
@@ -254,6 +350,7 @@ def unit_map_matches(descriptor: BoundTISADescriptor, resource: str) -> bool:
 
 __all__ = [
     "MemoryAccess",
+    "SemanticConflict",
     "access_banks",
     "address_conflict",
     "address_observation",
@@ -261,5 +358,6 @@ __all__ = [
     "dependency_details",
     "memory_accesses",
     "memory_port_conflict",
+    "semantic_conflict",
     "unit_map_matches",
 ]
