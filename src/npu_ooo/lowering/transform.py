@@ -16,6 +16,11 @@ from npu_ooo.ir import (
     build_tile_graph,
     tensor_layout,
 )
+from npu_ooo.ir.tile import (
+    concatenate_tile_mappings,
+    reshape_tile_mappings,
+    slice_tile_mapping,
+)
 
 from .matmul import LoweringResult, _region, _root_memory, _unit_for
 
@@ -118,73 +123,66 @@ def lower_transform_graph(
                 raise ValueError(
                     f"concatenate operator '{operator.op_id}' requires multiple inputs and one output"
                 )
+            dimension = operator.attributes.get("concatenate_dimension")
+            if not isinstance(dimension, int):
+                raise ValueError(
+                    f"concatenate operator '{operator.op_id}' is missing concatenate_dimension"
+                )
             operator_tiles = tuple(
                 tile for tile in tile_graph.tiles if tile.operator_id == operator_id
             )
-            if len(operator_tiles) != 1:
-                raise ValueError(
-                    f"concatenate operator '{operator.op_id}' requires a full-tensor schedule"
-                )
             output_tensor = tensors[operator.outputs[0]]
-            input_regions = tuple(
-                _region(
-                    tensors[input_name],
-                    root,
-                    (0,) * len(tensors[input_name].shape),
-                    tuple(tensors[input_name].shape),
-                    AccessType.READ,
-                )
-                for input_name in operator.inputs
-            )
-            output_region = _region(
-                output_tensor,
-                root,
-                (0,) * len(output_tensor.shape),
-                tuple(output_tensor.shape),
-                AccessType.WRITE,
-            )
+            input_shapes = tuple(tuple(tensors[name].shape) for name in operator.inputs)
             unit = _unit_for(machine, "copy")
-            transfer_cycles = sum(
-                math.ceil(region.size_bytes / memory.read_bandwidth_bytes_per_cycle)
-                for region in input_regions
-            ) + math.ceil(
-                output_region.size_bytes / memory.write_bandwidth_bytes_per_cycle
-            )
-            tile = operator_tiles[0]
-            tasks.append(
-                ExecutionTask(
-                    task_id=f"{tile.tile_id}.copy",
-                    tile_id=tile.tile_id,
-                    operator_id=operator_id,
-                    primitive="copy",
-                    resource=unit.name,
-                    reads=input_regions,
-                    writes=(output_region,),
-                    duration_cycles=float(
-                        unit.latency_cycles
-                        + memory.read_latency_cycles
-                        + memory.write_latency_cycles
-                        + transfer_cycles
-                    ),
-                    initiation_interval_cycles=float(unit.initiation_interval_cycles),
-                    stage_id=tile.stage_id,
-                    program_order=len(tasks),
-                    attributes={
-                        "semantic_family": "concatenate",
-                        "frontend_target": operator.attributes.get(
-                            "frontend_target", ""
-                        ),
-                        "concatenate_dimension": operator.attributes.get(
-                            "concatenate_dimension"
-                        ),
-                        "input_count": len(input_regions),
-                        "full_tensor_transform": True,
-                        "transform_granularity": "full_tensor",
-                    },
+            dimensions = tuple(name for name, _ in operator.iteration_dims)
+            for tile in operator_tiles:
+                mappings = concatenate_tile_mappings(
+                    tile, dimensions, input_shapes, tuple(output_tensor.shape), dimension
                 )
-            )
-            bytes_moved += sum(region.size_bytes for region in input_regions)
-            bytes_moved += output_region.size_bytes
+                for segment, (input_index, output_geometry, input_geometry) in enumerate(mappings):
+                    input_name = operator.inputs[input_index]
+                    input_tensor = tensors[input_name]
+                    output_region = _region(
+                        output_tensor, root, output_geometry[0], output_geometry[1], AccessType.WRITE
+                    )
+                    input_region = _region(
+                        input_tensor, root, input_geometry[0], input_geometry[1], AccessType.READ
+                    )
+                    transfer_cycles = (
+                        math.ceil(input_region.size_bytes / memory.read_bandwidth_bytes_per_cycle)
+                        + math.ceil(output_region.size_bytes / memory.write_bandwidth_bytes_per_cycle)
+                    )
+                    tasks.append(
+                        ExecutionTask(
+                            task_id=f"{tile.tile_id}.copy.seg{segment:04d}",
+                            tile_id=tile.tile_id,
+                            operator_id=operator_id,
+                            primitive="copy",
+                            resource=unit.name,
+                            reads=(input_region,),
+                            writes=(output_region,),
+                            duration_cycles=float(
+                                unit.latency_cycles
+                                + memory.read_latency_cycles
+                                + memory.write_latency_cycles
+                                + transfer_cycles
+                            ),
+                            initiation_interval_cycles=float(unit.initiation_interval_cycles),
+                            stage_id=tile.stage_id,
+                            program_order=len(tasks),
+                            attributes={
+                                "semantic_family": "concatenate",
+                                "frontend_target": operator.attributes.get("frontend_target", ""),
+                                "concatenate_dimension": dimension,
+                                "input_index": input_index,
+                                "input_count": len(operator.inputs),
+                                "segment": segment,
+                                "full_tensor_transform": False,
+                                "transform_granularity": "output_tile",
+                            },
+                        )
+                    )
+                    bytes_moved += input_region.size_bytes + output_region.size_bytes
             continue
         if len(operator.inputs) != 1 or len(operator.outputs) != 1:
             raise ValueError(
@@ -247,30 +245,17 @@ def lower_transform_graph(
                 reshape_materialization = "contiguous_view_compatible"
             else:
                 reshape_materialization = "strided_materialize_copy"
-                source_extent = input_tensor.shape[source_axis]
-                result_extent = output_tensor.shape[result_axis]
-                if source_extent != 1 and source_extent != result_extent:
-                    raise ValueError(
-                        f"broadcast operator '{operator.op_id}' cannot map input dimension "
-                        f"{source_axis}={source_extent} to output dimension {result_axis}={result_extent}"
-                    )
 
         operator_tiles = tuple(
             tile for tile in tile_graph.tiles if tile.operator_id == operator_id
         )
-        if (
-            not is_broadcast
-            and not is_dynamic_slice
-            and operator.normalized_type not in {"transpose"}
-            and len(operator_tiles) != 1
-        ):
-            raise ValueError(
-                f"transform operator '{operator.op_id}' requires a full-tensor schedule"
-            )
         primitive = "copy" if operator.normalized_type in {"reshape", "slice"} else "transpose"
         unit = _unit_for(machine, primitive)
         dimensions = tuple(name for name, _ in operator.iteration_dims)
         for tile in operator_tiles:
+            input_regions: tuple[BufferRegion, ...]
+            output_regions: tuple[BufferRegion, ...]
+            segment_attributes: dict[str, Any] = {}
             if is_broadcast:
                 broadcast_dimensions = operator.attributes.get("broadcast_dimensions")
                 if not isinstance(broadcast_dimensions, (tuple, list)):
@@ -295,30 +280,28 @@ def lower_transform_graph(
                         )
                 output_starts = tuple(tile.bound_map[name][0] for name in dimensions)
                 output_shape = tuple(tile.bound_map[name][1] - tile.bound_map[name][0] for name in dimensions)
-                input_region = _region(
-                    input_tensor, root, tuple(source_starts), tuple(source_shape), AccessType.READ
+                input_regions = (
+                    _region(input_tensor, root, tuple(source_starts), tuple(source_shape), AccessType.READ),
                 )
-                output_region = _region(
-                    output_tensor, root, output_starts, output_shape, AccessType.WRITE
+                output_regions = (
+                    _region(output_tensor, root, output_starts, output_shape, AccessType.WRITE),
                 )
             elif is_dynamic_slice:
                 output_starts = tuple(tile.bound_map[name][0] for name in dimensions)
                 output_shape = tuple(
                     tile.bound_map[name][1] - tile.bound_map[name][0] for name in dimensions
                 )
-                input_region = _region(
-                    input_tensor,
-                    root,
-                    (0,) * len(input_tensor.shape),
-                    tuple(int(value) for value in operator.attributes.get("slice_sizes", input_tensor.shape)),
-                    AccessType.READ,
+                input_regions = (
+                    _region(
+                        input_tensor,
+                        root,
+                        (0,) * len(input_tensor.shape),
+                        tuple(int(value) for value in operator.attributes.get("slice_sizes", input_tensor.shape)),
+                        AccessType.READ,
+                    ),
                 )
-                output_region = _region(
-                    output_tensor,
-                    root,
-                    output_starts,
-                    output_shape,
-                    AccessType.WRITE,
+                output_regions = (
+                    _region(output_tensor, root, output_starts, output_shape, AccessType.WRITE),
                 )
             elif is_slice:
                 starts = operator.attributes.get("slice_starts")
@@ -335,69 +318,88 @@ def lower_transform_graph(
                     raise ValueError(
                         f"slice operator '{operator.op_id}' is missing complete static bounds"
                     )
-                source_shape = tuple(
-                    (int(limit) - int(start) + int(stride) - 1) // int(stride)
-                    for start, limit, stride in zip(starts, limits, strides)
+                slice_starts = tuple(int(value) for value in starts)
+                slice_strides = tuple(int(value) for value in strides)
+                output_geometry, input_geometry = slice_tile_mapping(
+                    tile, dimensions, slice_starts, slice_strides
                 )
-                input_region = _slice_region(
-                    input_tensor,
-                    root,
-                    tuple(int(value) for value in starts),
-                    source_shape,
-                    tuple(int(value) for value in strides),
-                    AccessType.READ,
+                input_regions = (
+                    _slice_region(
+                        input_tensor,
+                        root,
+                        input_geometry[0],
+                        input_geometry[1],
+                        slice_strides,
+                        AccessType.READ,
+                    ),
                 )
-                output_region = _region(
-                    output_tensor,
-                    root,
-                    (0,) * len(output_tensor.shape),
-                    tuple(int(value) for value in output_tensor.shape),
-                    AccessType.WRITE,
+                output_regions = (
+                    _region(
+                        output_tensor,
+                        root,
+                        output_geometry[0],
+                        output_geometry[1],
+                        AccessType.WRITE,
+                    ),
                 )
             elif operator.normalized_type == "transpose":
                 source_starts, source_shape = _transpose_geometry(
                     tile, dimensions, tuple(permutation)
                 )
-                input_region = _region(
-                    input_tensor,
-                    root,
-                    source_starts,
-                    source_shape,
-                    AccessType.READ,
+                input_regions = (
+                    _region(
+                        input_tensor,
+                        root,
+                        source_starts,
+                        source_shape,
+                        AccessType.READ,
+                    ),
                 )
                 output_starts = tuple(tile.bound_map[name][0] for name in dimensions)
                 output_shape = tuple(
                     tile.bound_map[name][1] - tile.bound_map[name][0] for name in dimensions
                 )
-                output_region = _region(
-                    output_tensor,
-                    root,
-                    output_starts,
-                    output_shape,
-                    AccessType.WRITE,
+                output_regions = (
+                    _region(
+                        output_tensor,
+                        root,
+                        output_starts,
+                        output_shape,
+                        AccessType.WRITE,
+                    ),
                 )
             else:
                 # A reshape is a view only when both tensors have a concrete
                 # contiguous layout.  Non-contiguous layouts are materialized
                 # through the same copy primitive with conservative regions.
-                input_region = _region(
-                    input_tensor,
-                    root,
-                    (0,) * len(input_tensor.shape),
-                    tuple(input_tensor.shape),
-                    AccessType.READ,
+                mappings = reshape_tile_mappings(
+                    tile, dimensions, tuple(input_tensor.shape), tuple(output_tensor.shape)
                 )
-                output_region = _region(
-                    output_tensor,
-                    root,
-                    (0,) * len(output_tensor.shape),
-                    tuple(output_tensor.shape),
-                    AccessType.WRITE,
+                input_regions = tuple(
+                    _region(input_tensor, root, input_geometry[0], input_geometry[1], AccessType.READ)
+                    for _output_geometry, input_geometry in mappings
                 )
-            transfer_cycles = math.ceil(
-                input_region.size_bytes / memory.read_bandwidth_bytes_per_cycle
-            ) + math.ceil(
-                output_region.size_bytes / memory.write_bandwidth_bytes_per_cycle
+                output_regions = tuple(
+                    _region(output_tensor, root, output_geometry[0], output_geometry[1], AccessType.WRITE)
+                    for output_geometry, _input_geometry in mappings
+                )
+                segment_attributes = {
+                    "reshape_segments": [
+                        {
+                            "output_starts": list(output_geometry[0]),
+                            "output_shape": list(output_geometry[1]),
+                            "input_starts": list(input_geometry[0]),
+                            "input_shape": list(input_geometry[1]),
+                        }
+                        for output_geometry, input_geometry in mappings
+                    ]
+                }
+            transfer_cycles = sum(
+                math.ceil(region.size_bytes / memory.read_bandwidth_bytes_per_cycle)
+                for region in input_regions
+            ) + sum(
+                math.ceil(region.size_bytes / memory.write_bandwidth_bytes_per_cycle)
+                for region in output_regions
             )
             duration = (
                 unit.latency_cycles
@@ -412,8 +414,8 @@ def lower_transform_graph(
                     operator_id=operator_id,
                     primitive=primitive,
                     resource=unit.name,
-                    reads=(input_region,),
-                    writes=(output_region,),
+                    reads=input_regions,
+                    writes=output_regions,
                     duration_cycles=float(duration),
                     initiation_interval_cycles=float(unit.initiation_interval_cycles),
                     stage_id=tile.stage_id,
@@ -422,27 +424,29 @@ def lower_transform_graph(
                         "semantic_family": operator.normalized_type,
                         "frontend_target": operator.attributes.get("frontend_target", ""),
                         "transpose_dims": operator.attributes.get("transpose_dims"),
-                        "input_strides_bytes": list(input_region.strides_bytes)
-                        if input_region.strides_bytes is not None
+                        "input_strides_bytes": list(input_regions[0].strides_bytes)
+                        if input_regions and input_regions[0].strides_bytes is not None
                         else None,
-                        "output_strides_bytes": list(output_region.strides_bytes)
-                        if output_region.strides_bytes is not None
+                        "output_strides_bytes": list(output_regions[0].strides_bytes)
+                        if output_regions and output_regions[0].strides_bytes is not None
                         else None,
                         "stride_aware": bool(
-                            input_region.strides_bytes is not None
-                            or output_region.strides_bytes is not None
+                            input_regions and input_regions[0].strides_bytes is not None
+                            or output_regions and output_regions[0].strides_bytes is not None
                         ),
                         "reshape_materialization": reshape_materialization,
                         "broadcast": is_broadcast,
                         "broadcast_dimensions": operator.attributes.get("broadcast_dimensions"),
-                        "full_tensor_transform": not is_broadcast,
-                        "transform_granularity": "output_tile" if (is_broadcast or is_dynamic_slice) else "full_tensor",
+                        "full_tensor_transform": False,
+                        "transform_granularity": "output_tile",
+                        **segment_attributes,
                         "dynamic_index": operator.attributes.get("dynamic_index"),
                         "dynamic_address": is_dynamic_slice,
                     },
                 )
             )
-            bytes_moved += input_region.size_bytes + output_region.size_bytes
+            bytes_moved += sum(region.size_bytes for region in input_regions)
+            bytes_moved += sum(region.size_bytes for region in output_regions)
 
     execution = ExecutionGraph(
         graph_id=f"{graph.graph_id}.execution",

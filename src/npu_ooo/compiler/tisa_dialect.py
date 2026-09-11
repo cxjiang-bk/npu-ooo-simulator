@@ -31,6 +31,7 @@ from npu_ooo.ir import (
     tensor_layout,
 )
 from npu_ooo.lowering import LoweringRegistry, default_lowering_registry, lower_mixed_graph
+from npu_ooo.ir.tile import _tile_tensor_regions
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,15 @@ def _tile_region_to_dict(
         return None
     starts, shape = region
     return {"starts": list(starts), "shape": list(shape)}
+
+
+def _tile_regions_to_dict(
+    regions: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...],
+) -> list[dict[str, list[int]]]:
+    return [
+        {"starts": list(starts), "shape": list(shape)}
+        for starts, shape in regions
+    ]
 
 
 def _unit_map(primitive: str) -> UnitMap:
@@ -725,6 +735,32 @@ def _packed_strides(shape: tuple[int, ...], dtype: str) -> tuple[int, ...]:
     return tuple(reversed(result))
 
 
+def _operand_geometries(
+    operator: Any,
+    tile: TileInstance,
+    tensor: Any,
+    tensors: Mapping[str, Any],
+) -> tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]:
+    """Return all logical regions touched by one tiled operand.
+
+    Transforms can map one output tile to several disjoint source segments
+    (reshape crossing a row boundary, or concatenate crossing an input
+    boundary).  Keep those segments distinct so payload binding can resolve
+    each region to one planned TileMem operand.
+    """
+    mapped = _tile_tensor_regions(
+        operator,
+        tile,
+        tuple(tensor.shape),
+        tensor.name,
+        tensor_shapes={name: tuple(value.shape) for name, value in tensors.items()},
+    )
+    if mapped is not None:
+        return tuple(mapped)
+    geometry = _operand_geometry(operator, tile, tensor, tensors)
+    return (geometry,) if geometry is not None else ()
+
+
 def _abstract_operand(
     operator: Any,
     tile: TileInstance,
@@ -737,8 +773,10 @@ def _abstract_operand(
     domain: str,
     is_output: bool,
     suffix: str,
+    geometry: tuple[tuple[int, ...], tuple[int, ...]] | None = None,
 ) -> TISAOperand:
-    geometry = _operand_geometry(operator, tile, tensor, tensors)
+    if geometry is None:
+        geometry = _operand_geometry(operator, tile, tensor, tensors)
     operand_shape = geometry[1] if geometry is not None else tuple(
         stop - start for _name, start, stop in tile.bounds
     ) or (1,)
@@ -833,6 +871,7 @@ def _stage_operands(
         access: AccessType,
         visibility: str,
         suffix: str,
+        geometry: tuple[tuple[int, ...], tuple[int, ...]] | None = None,
     ) -> None:
         role = _abstract_operand_role(operator, name)
         is_output = name in operator.outputs
@@ -848,6 +887,7 @@ def _stage_operands(
                 domain="program" if visibility == "Shared" else compute_domain,
                 is_output=is_output,
                 suffix=suffix,
+                geometry=geometry,
             )
         )
 
@@ -873,13 +913,26 @@ def _stage_operands(
             )
             append(name, access, local_visibility, "tile")
     else:
-        # A transform/gather is itself an abstract transfer.  It explicitly
-        # names both externally visible ends; target lowering may introduce
-        # internal copies or scratch declarations later.
-        for name in operator.inputs:
-            append(name, AccessType.READ, "Shared", "source")
-        for name in operator.outputs:
-            append(name, AccessType.WRITE, "Shared", "destination")
+        # A transform/gather is itself an abstract transfer.  A tiled
+        # transform may touch multiple logical regions for one tensor, so
+        # materialize one operand per region.  Gather keeps its historical
+        # single-region geometry when no transform mapping is available.
+        if stage.key == "transform":
+            for name in operator.inputs:
+                for index, geometry in enumerate(
+                    _operand_geometries(operator, tile, tensors[name], tensors)
+                ):
+                    append(name, AccessType.READ, "Shared", f"source{index}", geometry)
+            for name in operator.outputs:
+                for index, geometry in enumerate(
+                    _operand_geometries(operator, tile, tensors[name], tensors)
+                ):
+                    append(name, AccessType.WRITE, "Shared", f"destination{index}", geometry)
+        else:
+            for name in operator.inputs:
+                append(name, AccessType.READ, "Shared", "source")
+            for name in operator.outputs:
+                append(name, AccessType.WRITE, "Shared", "destination")
     return tuple(operands)
 
 
@@ -1042,6 +1095,8 @@ class TISASemanticBuilder:
                     "consumer_tile": dependency.consumer,
                     "producer_region": _tile_region_to_dict(dependency.producer_region),
                     "consumer_region": _tile_region_to_dict(dependency.consumer_region),
+                    "producer_regions": _tile_regions_to_dict(dependency.producer_regions),
+                    "consumer_regions": _tile_regions_to_dict(dependency.consumer_regions),
                     **dict(dependency.provenance),
                 },
             )

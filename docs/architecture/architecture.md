@@ -247,21 +247,9 @@ traffic 和 local working-set 计算候选分数，选择分数最低的候选�
 逐跳 route。planner 将其写入 residency/ping-pong intent；CodegenBackend 才负责实际
 allocation 与复用，Runtime 不重新选择 placement。
 
-`build_tile_graph()` 为每个 `TileInstance` 记录 tile id、operator id、coordinates、
-bounds 和 semantic metadata。跨算子边使用 `logical_tensor_region_v1`：producer 与
-consumer tile 的逻辑 region 重叠时建立 `TileDependency`，并保存 hazard kind、两侧
-logical region、ready condition 和 provenance。数据流边使用 RAW；reduction、state、
-accumulate 和 buffer-reuse 分别使用项目扩展关系。Matmul 的 M/N/K、broadcast
-elementwise、reduce/norm、卷积/池化 halo 和 full-tensor transform 各有对应投影规则。
-映射信息不足时采用记录在统计中的 conservative overlap。
+build_tile_graph() records tile id, operator id, coordinates, bounds and semantic metadata. Cross-operator edges use logical_tensor_region_v2: each TileDependency stores exact producer/consumer region lists and is emitted when any region pair overlaps; the bounding region remains for compatibility and audit. Data edges use RAW; reduction, state, accumulate and buffer-reuse use the project extension relations. Matmul M/N/K, broadcast elementwise, reduce/norm, convolution/pooling halos and transforms have dedicated projection rules. Unknown mappings fall back to the recorded conservative overlap policy.
 
-普通 reshape/transpose 使用 full-tensor DMA transform。slice 使用 output-tile copy，
-其 source operand 记录动态索引表达式；runtime 绑定后使用动态窗口的具体物理区间。静态 `broadcast_in_dim` 按
-输出域切 tile，并依据 `broadcast_dimensions` 投影源 operand region。卷积和 pooling
-输入 region 包含 window/kernel halo。FC `TileMem` 保存 scope、logical address
-expression、concrete offset/size、`strides_bytes`、`stride_expr`、layout 和 dtype
-metadata；可验证 stride 生成 concrete interval，opaque encoding 保留 logical region
-并使用 conservative overlap。
+Static slice, reshape, concatenate and transpose use output-domain tile lowering. A slice maps each output-tile origin through its stride. Reshape splits the row-major linear interval and can emit multiple source segments when an output tile crosses an original-shape boundary. Concatenate splits the tile at cumulative input boundaries. Each segment has its own TileMem/TISA operand, so target binding covers every payload region exactly; only dynamic state operations retain a necessary full-tensor contract.
 
 ## 5. Fusion Compiler（FC）
 

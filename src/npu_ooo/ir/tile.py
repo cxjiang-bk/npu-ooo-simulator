@@ -59,6 +59,8 @@ class TileDependency:
     hazard_kind: str = "RAW"
     producer_region: tuple[tuple[int, ...], tuple[int, ...]] | None = None
     consumer_region: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+    producer_regions: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...] = ()
+    consumer_regions: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...] = ()
     condition: str = "full_region_ready"
     provenance: Mapping[str, Any] = field(default_factory=dict)
 
@@ -121,6 +123,10 @@ class TileDependency:
             issues.append("tile dependency condition must not be empty")
         issues.extend(self._validate_region(self.producer_region, label="producer"))
         issues.extend(self._validate_region(self.consumer_region, label="consumer"))
+        for index, region in enumerate(self.producer_regions):
+            issues.extend(self._validate_region(region, label=f"producer[{index}]"))
+        for index, region in enumerate(self.consumer_regions):
+            issues.extend(self._validate_region(region, label=f"consumer[{index}]"))
         return tuple(issues)
 
     def to_dict(self) -> dict[str, Any]:
@@ -131,6 +137,12 @@ class TileDependency:
             "kind": self.kind,
             "hazard_kind": self.hazard_kind,
             "relation": self.relation,
+            "producer_regions": [
+                self._region_to_dict(region) for region in self.producer_regions
+            ],
+            "consumer_regions": [
+                self._region_to_dict(region) for region in self.consumer_regions
+            ],
             "producer_region": self._region_to_dict(self.producer_region),
             "consumer_region": self._region_to_dict(self.consumer_region),
             "condition": self.condition,
@@ -302,13 +314,200 @@ def _dimension_region(
     )
 
 
+LogicalRegion = tuple[tuple[int, ...], tuple[int, ...]]
+
+def _shape_elements(shape):
+    result = 1
+    for extent in shape:
+        result *= int(extent)
+    return result
+
+def _linear_to_coords(shape, index):
+    if index < 0 or index >= _shape_elements(shape):
+        raise ValueError(f"linear index {index} is outside shape {shape}")
+    if not shape:
+        return ()
+    coordinates = [0] * len(shape)
+    remaining = index
+    for axis in range(len(shape) - 1, -1, -1):
+        coordinates[axis] = remaining % int(shape[axis])
+        remaining //= int(shape[axis])
+    return tuple(coordinates)
+
+def _tile_row_intervals(tile, dimensions, tensor_shape):
+    starts, extents = _dimension_region(tile, dimensions)
+    if len(starts) != len(tensor_shape):
+        raise ValueError(f"tile dimensions rank {len(starts)} does not match tensor rank {len(tensor_shape)}")
+    if not tensor_shape:
+        return (((), 0, 1),)
+    prefix_ranges = [range(starts[axis], starts[axis] + extents[axis]) for axis in range(len(tensor_shape) - 1)]
+    rows = []
+    for prefix in product(*prefix_ranges) if prefix_ranges else [()]:
+        coordinate = (*prefix, starts[-1])
+        linear_start = sum(int(value) * _shape_elements(tensor_shape[axis + 1 :]) for axis, value in enumerate(coordinate))
+        rows.append((coordinate, linear_start, extents[-1]))
+    return tuple(rows)
+
+def reshape_tile_mappings(tile, dimensions, input_shape, output_shape):
+    if _shape_elements(input_shape) != _shape_elements(output_shape):
+        raise ValueError(f"reshape element count mismatch: {input_shape} -> {output_shape}")
+    mappings = []
+    for output_coordinate, linear_start, row_length in _tile_row_intervals(tile, dimensions, output_shape):
+        consumed = 0
+        while consumed < row_length:
+            source_coordinate = _linear_to_coords(input_shape, linear_start + consumed)
+            source_available = input_shape[-1] - source_coordinate[-1] if input_shape else 1
+            length = min(row_length - consumed, source_available)
+            output_start = (*output_coordinate[:-1], output_coordinate[-1] + consumed) if output_shape else ()
+            output_segment_shape = (*((1,) * (len(output_shape) - 1)), length) if output_shape else ()
+            input_segment_shape = (*((1,) * (len(input_shape) - 1)), length) if input_shape else ()
+            mappings.append(((output_start, output_segment_shape), (source_coordinate, input_segment_shape)))
+            consumed += length
+    return tuple(mappings)
+
+def slice_tile_mapping(tile, dimensions, starts, strides):
+    output_region = _dimension_region(tile, dimensions)
+    output_starts, output_shape = output_region
+    input_starts = tuple(int(start) + int(offset) * int(stride) for start, offset, stride in zip(starts, output_starts, strides))
+    return output_region, (input_starts, output_shape)
+
+def concatenate_tile_mappings(tile, dimensions, input_shapes, output_shape, dimension):
+    if dimension < 0:
+        dimension += len(output_shape)
+    if dimension < 0 or dimension >= len(output_shape):
+        raise ValueError(f"concatenate dimension {dimension} is out of range")
+    output_starts, output_extents = _dimension_region(tile, dimensions)
+    output_begin, output_end = output_starts[dimension], output_starts[dimension] + output_extents[dimension]
+    mappings, cursor = [], 0
+    for input_index, shape in enumerate(input_shapes):
+        input_begin, input_end = cursor, cursor + shape[dimension]
+        cursor = input_end
+        overlap_begin, overlap_end = max(output_begin, input_begin), min(output_end, input_end)
+        if overlap_begin >= overlap_end:
+            continue
+        output_start, output_extent = list(output_starts), list(output_extents)
+        output_start[dimension], output_extent[dimension] = overlap_begin, overlap_end - overlap_begin
+        input_start, input_extent = list(output_starts), list(output_extents)
+        input_start[dimension], input_extent[dimension] = overlap_begin - input_begin, overlap_end - overlap_begin
+        mappings.append((input_index, (tuple(output_start), tuple(output_extent)), (tuple(input_start), tuple(input_extent))))
+    if not mappings:
+        raise ValueError("concatenate tile does not intersect any input")
+    return tuple(mappings)
+
+def _bounding_region(regions):
+    if not regions:
+        return None
+    rank = len(regions[0][0])
+    starts = tuple(min(region[0][axis] for region in regions) for axis in range(rank))
+    stops = tuple(max(region[0][axis] + region[1][axis] for region in regions) for axis in range(rank))
+    return starts, tuple(stop - start for start, stop in zip(starts, stops))
+
+def _tile_tensor_regions(operator, tile, tensor_shape, tensor_name, *, tensor_shapes=None):
+    iteration = tuple(name for name, _extent in operator.iteration_dims)
+    op_type = operator.normalized_type
+    shapes = tensor_shapes or {}
+    output_shape = tuple(shapes.get(operator.outputs[0], tensor_shape))
+    if op_type == "reshape" and (operator.attributes.get("broadcast") or operator.attributes.get("stablehlo_op") == "stablehlo.broadcast_in_dim"):
+        if tensor_name == operator.outputs[0]:
+            return (_dimension_region(tile, iteration),)
+        if tensor_name != operator.inputs[0]:
+            return None
+        dimensions = operator.attributes.get("broadcast_dimensions")
+        if not isinstance(dimensions, (tuple, list)):
+            return None
+        source_shape = tuple(shapes.get(operator.inputs[0], tensor_shape))
+        if len(dimensions) != len(source_shape):
+            return None
+        starts, shape = [], []
+        for source_axis, output_axis in enumerate(dimensions):
+            if not isinstance(output_axis, int) or output_axis < 0 or output_axis >= len(iteration):
+                return None
+            source_extent = source_shape[source_axis]
+            output_start, output_stop = tile.bound_map[iteration[output_axis]]
+            if source_extent == 1:
+                starts.append(0); shape.append(1)
+            elif output_stop <= source_extent:
+                starts.append(output_start); shape.append(output_stop - output_start)
+            else:
+                return None
+        return ((tuple(starts), tuple(shape)),)
+    if op_type == "reshape":
+        if tensor_name not in {operator.inputs[0], operator.outputs[0]}:
+            return None
+        input_shape = tuple(shapes.get(operator.inputs[0], tensor_shape))
+        mappings = reshape_tile_mappings(tile, iteration, input_shape, output_shape)
+        if tensor_name == operator.outputs[0]:
+            return tuple(output_region for output_region, _input_region in mappings)
+        return tuple(input_region for _output_region, input_region in mappings)
+    if op_type == "slice":
+        if tensor_name == operator.outputs[0]:
+            return (_dimension_region(tile, iteration),)
+        if tensor_name != operator.inputs[0]:
+            return None
+        dynamic_index = operator.attributes.get("dynamic_index")
+        if isinstance(dynamic_index, Mapping):
+            sizes = operator.attributes.get("slice_sizes")
+            if isinstance(sizes, (tuple, list)) and len(sizes) == len(tensor_shape):
+                return (((0,) * len(tensor_shape), tuple(int(value) for value in sizes)),)
+            return (((0,) * len(tensor_shape), tensor_shape),)
+        starts = operator.attributes.get("slice_starts")
+        strides = operator.attributes.get("slice_strides")
+        if isinstance(starts, (tuple, list)) and isinstance(strides, (tuple, list)) and len(starts) == len(tensor_shape) and len(strides) == len(tensor_shape):
+            return (slice_tile_mapping(tile, iteration, tuple(int(value) for value in starts), tuple(int(value) for value in strides))[1],)
+        return (((0,) * len(tensor_shape), tensor_shape),)
+    if op_type == "concatenate":
+        if tensor_name not in (*operator.inputs, *operator.outputs):
+            return None
+        dimension = operator.attributes.get("concatenate_dimension")
+        if not isinstance(dimension, int):
+            return None
+        input_shapes = tuple(tuple(shapes.get(name, tensor_shape)) for name in operator.inputs)
+        mappings = concatenate_tile_mappings(
+            tile, iteration, input_shapes, output_shape, int(dimension)
+        )
+        if tensor_name == operator.outputs[0]:
+            return tuple(output_region for _index, output_region, _input_region in mappings)
+        input_index = operator.inputs.index(tensor_name)
+        return tuple(
+            input_region
+            for index, _output_region, input_region in mappings
+            if index == input_index
+        )
+    if op_type == "transpose":
+        if tensor_name == operator.outputs[0]:
+            return (_dimension_region(tile, iteration),)
+        if tensor_name != operator.inputs[0]:
+            return None
+        permutation = operator.attributes.get("transpose_dims")
+        if not isinstance(permutation, (tuple, list)):
+            return None
+        output_starts, output_shape_tile = _dimension_region(tile, iteration)
+        source_starts, source_shape = [0] * len(permutation), [0] * len(permutation)
+        for output_axis, source_axis in enumerate(permutation):
+            source_starts[int(source_axis)], source_shape[int(source_axis)] = output_starts[output_axis], output_shape_tile[output_axis]
+        return ((tuple(source_starts), tuple(source_shape)),)
+    # Only transform operators have multi-region projections here. Returning
+    # None for compute operators preserves their specialized projections
+    # in the legacy single-region fallback below.
+    return None
+
 def _tile_tensor_region(
     operator: OperatorSpec,
     tile: TileInstance,
     tensor_shape: tuple[int, ...],
     tensor_name: str,
+    *,
+    tensor_shapes: Mapping[str, tuple[int, ...]] | None = None,
 ) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
     """Project one operator tile onto a logical tensor region."""
+
+    mapped = _tile_tensor_regions(
+        operator, tile, tensor_shape, tensor_name, tensor_shapes=tensor_shapes
+    )
+    if mapped is not None:
+        if mapped and isinstance(mapped[0], tuple) and mapped[0] and isinstance(mapped[0][0], int):
+            mapped = (mapped,)
+        return _bounding_region(tuple(mapped))
 
     iteration = tuple(name for name, _extent in operator.iteration_dims)
     reduction = tuple(name for name, _extent in operator.reduction_dims)
@@ -606,6 +805,7 @@ def build_tile_graph(graph: OperatorGraph, schedule: ScheduleSpec) -> TileGraph:
         tiles.extend(current)
     operators = {operator.op_id: operator for operator in graph.operators}
     tensors = {tensor.name: tensor for tensor in graph.tensors}
+    tensor_shapes = {name: tuple(tensor.shape) for name, tensor in tensors.items()}
     dependencies: list[TileDependency] = []
     conservative_edge_count = 0
     avoided_all_to_all_dependencies = 0
@@ -613,20 +813,39 @@ def build_tile_graph(graph: OperatorGraph, schedule: ScheduleSpec) -> TileGraph:
         producer_tiles = by_operator[edge.producer]
         consumer_tiles = by_operator[edge.consumer]
         tensor_shape = tuple(tensors[edge.tensor].shape)
-        producer_regions = {
-            tile.tile_id: _tile_tensor_region(
-                operators[edge.producer], tile, tensor_shape, edge.tensor
+        def edge_regions(operator, tile):
+            mapped = _tile_tensor_regions(
+                operator,
+                tile,
+                tensor_shape,
+                edge.tensor,
+                tensor_shapes=tensor_shapes,
             )
+            if mapped is not None:
+                return tuple(mapped)
+            fallback = _tile_tensor_region(
+                operator,
+                tile,
+                tensor_shape,
+                edge.tensor,
+                tensor_shapes=tensor_shapes,
+            )
+            return (fallback,) if fallback is not None else None
+
+        producer_regions = {
+            tile.tile_id: edge_regions(operators[edge.producer], tile)
             for tile in producer_tiles
         }
         consumer_regions = {
-            tile.tile_id: _tile_tensor_region(
-                operators[edge.consumer], tile, tensor_shape, edge.tensor
-            )
+            tile.tile_id: edge_regions(operators[edge.consumer], tile)
             for tile in consumer_tiles
         }
         full_count = len(producer_tiles) * len(consumer_tiles)
-        if any(region is None for region in (*producer_regions.values(), *consumer_regions.values())):
+        unresolved = any(
+            regions is None
+            for regions in (*producer_regions.values(), *consumer_regions.values())
+        )
+        if unresolved:
             selected = tuple(
                 (producer, consumer)
                 for producer in producer_tiles
@@ -634,17 +853,28 @@ def build_tile_graph(graph: OperatorGraph, schedule: ScheduleSpec) -> TileGraph:
             )
             conservative_edge_count += 1
         else:
+            # Empty region tuples mean that a tiled transform does not touch
+            # this edge on that tile (for example, a concat tile entirely
+            # belonging to another input).  Such a tile needs no data edge.
             selected = tuple(
                 (producer, consumer)
                 for producer in producer_tiles
                 for consumer in consumer_tiles
-                if _regions_overlap(
-                    producer_regions[producer.tile_id],  # type: ignore[arg-type]
-                    consumer_regions[consumer.tile_id],  # type: ignore[arg-type]
+                if producer_regions[producer.tile_id]
+                and consumer_regions[consumer.tile_id]
+                and any(
+                    _regions_overlap(producer_region, consumer_region)
+                    for producer_region in producer_regions[producer.tile_id]
+                    for consumer_region in consumer_regions[consumer.tile_id]
                 )
             )
+            active_consumers = {
+                tile.tile_id
+                for tile in consumer_tiles
+                if consumer_regions[tile.tile_id]
+            }
             consumers_with_producer = {consumer.tile_id for _producer, consumer in selected}
-            if consumers_with_producer != {tile.tile_id for tile in consumer_tiles}:
+            if consumers_with_producer != active_consumers:
                 selected = tuple(
                     (producer, consumer)
                     for producer in producer_tiles
@@ -659,14 +889,24 @@ def build_tile_graph(graph: OperatorGraph, schedule: ScheduleSpec) -> TileGraph:
                 tensor=edge.tensor,
                 kind="region_data",
                 hazard_kind="RAW",
-                producer_region=producer_regions[producer.tile_id],
-                consumer_region=consumer_regions[consumer.tile_id],
+                producer_region=_bounding_region(producer_regions[producer.tile_id] or ()),
+                consumer_region=_bounding_region(consumer_regions[consumer.tile_id] or ()),
+                producer_regions=tuple(producer_regions[producer.tile_id] or ()),
+                consumer_regions=tuple(consumer_regions[consumer.tile_id] or ()),
                 condition="full_region_ready",
                 provenance={
                     "source": "operator_graph_edge",
                     "producer_operator": edge.producer,
                     "consumer_operator": edge.consumer,
-                    "dependency_model": "logical_tensor_region_v1",
+                    "dependency_model": "logical_tensor_region_v2",
+                    "producer_regions": [
+                        {"starts": list(region[0]), "shape": list(region[1])}
+                        for region in (producer_regions[producer.tile_id] or ())
+                    ],
+                    "consumer_regions": [
+                        {"starts": list(region[0]), "shape": list(region[1])}
+                        for region in (consumer_regions[consumer.tile_id] or ())
+                    ],
                 },
             )
             for producer, consumer in selected
@@ -732,7 +972,7 @@ def build_tile_graph(graph: OperatorGraph, schedule: ScheduleSpec) -> TileGraph:
         tuple(tiles),
         tuple(dependencies),
         attributes={
-            "dependency_model": "logical_tensor_region_v1",
+            "dependency_model": "logical_tensor_region_v2",
             "conservative_edge_count": conservative_edge_count,
             "avoided_all_to_all_dependencies": avoided_all_to_all_dependencies,
         },

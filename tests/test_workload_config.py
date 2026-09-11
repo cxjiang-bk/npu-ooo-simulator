@@ -600,8 +600,8 @@ class WorkloadFrontendIntegrationTest(unittest.TestCase):
                     )
                     if family == "flash_attention":
                         self.assertEqual(regions[0]["query_block_count"], 2)
-                        self.assertEqual(regions[0]["kv_block_count"], 2)
-                        self.assertEqual(regions[0]["score_block_count"], 4)
+                        self.assertEqual(regions[0]["kv_block_count"], 1)
+                        self.assertEqual(regions[0]["score_block_count"], 2)
                         self.assertFalse(
                             regions[0]["materializes_full_attention_matrix"]
                         )
@@ -614,6 +614,41 @@ class WorkloadFrontendIntegrationTest(unittest.TestCase):
                         }
                         self.assertIn("stablehlo.compare", targets)
                         self.assertIn("stablehlo.select", targets)
+
+    def test_flash_attention_long_sequences_compile_with_sub_head_tile(self) -> None:
+        from examples.configurable_models import build_flash_attention_workload
+        from npu_ooo.arch import lpu_like_machine_config
+        from npu_ooo.compiler import compile_torch_module
+
+        workload = build_flash_attention_workload(
+            batch_size=1,
+            num_heads=2,
+            query_length=16,
+            key_length=24,
+            head_dim=16,
+            query_block_size=4,
+            kv_block_size=6,
+            causal=True,
+            dtype="float32",
+        )
+        compiled = compile_torch_module(
+            workload.module,
+            workload.args,
+            lpu_like_machine_config(),
+            model_id="flash-attention-long-sequence",
+            tile_size=4,
+        )
+        self.assertEqual(compiled.validate(), ())
+        transform_tasks = [
+            task
+            for task in compiled.backend_artifact.execution_graph.tasks
+            if task.attributes.get("semantic_family") in {"slice", "reshape", "concatenate"}
+        ]
+        self.assertTrue(transform_tasks)
+        self.assertTrue(
+            all(task.attributes.get("transform_granularity") == "output_tile" for task in transform_tasks)
+        )
+        self.assertGreater(len(compiled.tile_graph.tiles), 16)
 
     def test_gptj_model_proxy_recovers_layernorm_after_embedding_reshape(self) -> None:
         from npu_ooo.cli import main

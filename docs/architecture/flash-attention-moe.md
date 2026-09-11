@@ -21,9 +21,8 @@ O_new = O_old * exp(m_old - m_new) + P_j V_j
 output = O / l
 ```
 
-当前默认 shape 为 `Q/K/V=[1,2,8,4]`，Q/KV block 都为 4，因此 GC 记录 2 个 query
-block、2 个 KV block 和 4 个 score block。配置使用 `tile_size=8`，让 shape-only transform
-保持完整张量调度；Flash block 边界来自算子本身，而不是用 tile_size 假冒。
+The shipped configuration uses Q/K/V=[1,2,8,16], query_block_size=4 and kv_block_size=8, producing 2 query blocks, 1 KV block and 2 score blocks. tile_size=8 splits head_dim into two tiles. Static slice, reshape and concatenate map output tiles to one or more source segments, so head_dim, query_length or key_length larger than tile_size does not require a full-tensor transform.
+
 
 ## Top-2 MoE
 

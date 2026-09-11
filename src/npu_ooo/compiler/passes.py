@@ -2507,13 +2507,17 @@ class FlashAttentionRegionPass:
             slices = [
                 operation for operation in members if operation.normalized_type == "slice"
             ]
+            # The recurrence has two matmuls per query block (QK and PV)
+            # and one max/sum/exponential path per query block.  Derive the
+            # lower bounds from the recovered output block count so a single
+            # KV block remains a valid FlashAttention region.
+            minimum_query_blocks = 2 * query_block_count
             if (
-                len(matmuls) < 4
-                or len(reduce_max) < 2
-                or len(reduce_sum) < 2
-                or len(exponentials) < 3
-                or not running_max_updates
-                or len(slices) < 4
+                len(matmuls) < minimum_query_blocks
+                or len(reduce_max) < query_block_count
+                or len(reduce_sum) < query_block_count
+                or len(exponentials) < query_block_count
+                or len(slices) < 2 * query_block_count
                 or claimed.intersection(member_set)
             ):
                 continue

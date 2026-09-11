@@ -410,7 +410,7 @@ class PyTorchFrontendTest(unittest.TestCase):
         self.assertTrue({"copy", "transpose"}.issubset(primitives))
         self.assertEqual(
             compiled.tile_graph.attributes["dependency_model"],
-            "logical_tensor_region_v1",
+            "logical_tensor_region_v2",
         )
         self.assertGreater(
             compiled.tile_graph.attributes["avoided_all_to_all_dependencies"],

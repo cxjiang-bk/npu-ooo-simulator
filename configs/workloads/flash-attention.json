@@ -11,14 +11,14 @@
       "key_length": 8,
       "head_dim": 16,
       "query_block_size": 4,
-      "kv_block_size": 4,
+      "kv_block_size": 8,
       "causal": true,
       "dtype": "float32"
     }
   },
   "compile": {
     "arch": "lpu-like",
-    "tile_size": 16
+    "tile_size": 8
   },
   "runtime": {
     "event_backend": "cycle_event",
