@@ -550,6 +550,24 @@ def _is_elementwise(operator: OperatorSpec, *names: str) -> bool:
     return any(name in target for name in names)
 
 
+def _upstream_closure(
+    tensor: str,
+    producer: dict[str, OperatorSpec],
+) -> set[str]:
+    """Return every operation contributing to one output tensor."""
+
+    result: set[str] = set()
+    pending = [tensor]
+    while pending:
+        current = pending.pop()
+        operation = producer.get(current)
+        if operation is None or operation.op_id in result:
+            continue
+        result.add(operation.op_id)
+        pending.extend(operation.inputs)
+    return result
+
+
 def _is_passthrough_convert(operator: OperatorSpec) -> bool:
     """Return whether an elementwise StableHLO convert is shape-preserving."""
 
@@ -2410,6 +2428,214 @@ class AttentionRegionPass:
         )
 
 
+class FlashAttentionRegionPass:
+    """Annotate an unrolled online-softmax FlashAttention dataflow.
+
+    The pass deliberately preserves every block Matmul, reduction and state
+    update as a scheduler-visible operation.  It recognizes the exact
+    recurrence emitted by ``examples.configurable_models.FlashAttention``
+    without replacing it by an opaque composite.
+    """
+
+    name = "recover_flash_attention_region"
+
+    def run(self, graph: OperatorGraph) -> PassResult:
+        operators = list(graph.operators)
+        producer = _producer_map(operators)
+        consumers = _consumer_map(operators)
+        graph_outputs = tuple(dict(graph.attributes).get("graph_outputs", ()))
+        if not graph_outputs:
+            graph_outputs = tuple(
+                output
+                for operation in operators
+                for output in operation.outputs
+                if not consumers.get(output)
+            )
+        regions: list[dict[str, object]] = []
+        roles_by_operator: dict[str, tuple[str, str]] = {}
+        claimed: set[str] = set()
+
+        for output in graph_outputs:
+            final = producer.get(output)
+            if final is None:
+                continue
+            if final.normalized_type == "concatenate":
+                final_normalizers = [
+                    producer.get(tensor) for tensor in final.inputs
+                ]
+                if not final_normalizers or any(
+                    operation is None
+                    or not _is_elementwise(operation, "stablehlo.divide")
+                    for operation in final_normalizers
+                ):
+                    continue
+                query_block_count = len(final_normalizers)
+            elif _is_elementwise(final, "stablehlo.divide"):
+                final_normalizers = [final]
+                query_block_count = 1
+            else:
+                continue
+            member_set = _upstream_closure(output, producer)
+            members = [operation for operation in operators if operation.op_id in member_set]
+            matmuls = [
+                operation
+                for operation in members
+                if operation.normalized_type in {"matmul", "batched_matmul"}
+            ]
+            reduce_max = [
+                operation
+                for operation in members
+                if operation.normalized_type == "reduce"
+                and operation.attributes.get("reducer") == "maximum"
+            ]
+            reduce_sum = [
+                operation
+                for operation in members
+                if operation.normalized_type == "reduce"
+                and operation.attributes.get("reducer") == "add"
+            ]
+            exponentials = [
+                operation
+                for operation in members
+                if _is_elementwise(operation, "stablehlo.exponential")
+            ]
+            running_max_updates = [
+                operation
+                for operation in members
+                if _is_elementwise(operation, "stablehlo.maximum")
+            ]
+            slices = [
+                operation for operation in members if operation.normalized_type == "slice"
+            ]
+            if (
+                len(matmuls) < 4
+                or len(reduce_max) < 2
+                or len(reduce_sum) < 2
+                or len(exponentials) < 3
+                or not running_max_updates
+                or len(slices) < 4
+                or claimed.intersection(member_set)
+            ):
+                continue
+            if len(reduce_max) % query_block_count:
+                continue
+
+            region_id = f"flash_attention_region_{len(regions):04d}"
+            claimed.update(member_set)
+            role_lists: dict[str, list[str]] = {}
+            for operation in members:
+                target = _frontend_target(operation)
+                if operation in final_normalizers:
+                    role = "final_normalize"
+                elif operation.op_id == final.op_id:
+                    role = "output_stitch"
+                elif operation.normalized_type in {"matmul", "batched_matmul"}:
+                    role = "block_matmul"
+                elif operation.normalized_type == "reduce":
+                    role = (
+                        "block_row_max"
+                        if operation.attributes.get("reducer") == "maximum"
+                        else "block_row_sum"
+                    )
+                elif operation.normalized_type == "slice":
+                    role = "kv_or_mask_block"
+                elif operation.normalized_type == "transpose":
+                    role = "key_block_transpose"
+                elif "stablehlo.exponential" in target:
+                    role = "online_exponential"
+                elif "stablehlo.maximum" in target:
+                    role = "running_max_update"
+                else:
+                    role = "online_state_update"
+                roles_by_operator[operation.op_id] = (region_id, role)
+                role_lists.setdefault(role, []).append(operation.op_id)
+
+            external_inputs = tuple(
+                dict.fromkeys(
+                    tensor
+                    for operation in members
+                    for tensor in operation.inputs
+                    if producer.get(tensor) is None
+                    or producer[tensor].op_id not in member_set
+                )
+            )
+            regions.append(
+                {
+                    "region_id": region_id,
+                    "semantic_family": "flash_attention",
+                    "algorithm": "online_softmax_m_l_o_recurrence",
+                    "members": [operation.op_id for operation in members],
+                    "roles": role_lists,
+                    "inputs": list(external_inputs),
+                    "outputs": [output],
+                    "query_block_count": query_block_count,
+                    "kv_block_count": len(reduce_max) // query_block_count,
+                    "score_block_count": len(reduce_max),
+                    "materializes_full_attention_matrix": False,
+                    "scheduler_visibility": "member_tisa_instructions",
+                    "opaque": False,
+                }
+            )
+
+        if not regions:
+            return PassResult(
+                graph,
+                (
+                    PassDiagnostic(
+                        "info", self.name, "no supported FlashAttention recurrence found"
+                    ),
+                ),
+            )
+        annotated = tuple(
+            replace(
+                operation,
+                attributes={
+                    **dict(operation.attributes),
+                    "semantic_region_id": roles_by_operator[operation.op_id][0],
+                    "semantic_region_family": "flash_attention",
+                    "semantic_region_role": roles_by_operator[operation.op_id][1],
+                    "semantic_region_opaque": False,
+                },
+            )
+            if operation.op_id in roles_by_operator
+            else operation
+            for operation in operators
+        )
+        result = OperatorGraph(
+            graph_id=graph.graph_id,
+            tensors=graph.tensors,
+            operators=annotated,
+            edges=graph.edges,
+            attributes={
+                **dict(graph.attributes),
+                "canonical_passes": [
+                    *dict(graph.attributes).get("canonical_passes", ()),
+                    self.name,
+                ],
+                "semantic_regions": [
+                    *dict(graph.attributes).get("semantic_regions", ()),
+                    *regions,
+                ],
+            },
+        )
+        issues = result.validate()
+        if issues:
+            raise ValueError(
+                "recover_flash_attention_region produced an invalid graph: "
+                + "; ".join(issues)
+            )
+        return PassResult(
+            result,
+            (
+                PassDiagnostic(
+                    "info",
+                    self.name,
+                    f"recovered {len(regions)} online FlashAttention region(s)",
+                ),
+            ),
+        )
+
+
 class SwiGLUFusionPass:
     """Recover ``silu(gate) * up`` as a vector semantic operator."""
 
@@ -2531,6 +2757,179 @@ class SwiGLUFusionPass:
         return PassResult(
             graph,
             (PassDiagnostic("info", self.name, "no supported SwiGLU pattern found"),),
+        )
+
+
+class Top2MoERegionPass:
+    """Annotate an internally routed top-2 MoE without hiding expert branches."""
+
+    name = "recover_top2_moe_region"
+
+    def run(self, graph: OperatorGraph) -> PassResult:
+        operators = list(graph.operators)
+        producer = _producer_map(operators)
+        consumers = _consumer_map(operators)
+        graph_outputs = tuple(dict(graph.attributes).get("graph_outputs", ()))
+        if not graph_outputs:
+            graph_outputs = tuple(
+                output
+                for operation in operators
+                for output in operation.outputs
+                if not consumers.get(output)
+            )
+        regions: list[dict[str, object]] = []
+        roles_by_operator: dict[str, tuple[str, str]] = {}
+        claimed: set[str] = set()
+
+        for output in graph_outputs:
+            member_set = _upstream_closure(output, producer)
+            members = [operation for operation in operators if operation.op_id in member_set]
+            softmax = [
+                operation for operation in members if operation.normalized_type == "softmax"
+            ]
+            compares = [
+                operation
+                for operation in members
+                if _is_elementwise(operation, "stablehlo.compare")
+            ]
+            selects = [
+                operation
+                for operation in members
+                if _is_elementwise(operation, "stablehlo.select")
+            ]
+            experts = [
+                operation for operation in members if operation.normalized_type == "swiglu"
+            ]
+            matmuls = [
+                operation
+                for operation in members
+                if operation.normalized_type in {"matmul", "batched_matmul"}
+            ]
+            slices = [
+                operation for operation in members if operation.normalized_type == "slice"
+            ]
+            if (
+                len(softmax) != 1
+                or len(compares) < 2
+                or not selects
+                or len(experts) < 2
+                or len(matmuls) < 1 + 3 * len(experts)
+                or len(slices) < len(experts)
+                or claimed.intersection(member_set)
+            ):
+                continue
+
+            region_id = f"top2_moe_region_{len(regions):04d}"
+            claimed.update(member_set)
+            role_lists: dict[str, list[str]] = {}
+            for operation in members:
+                target = _frontend_target(operation)
+                if operation.normalized_type == "softmax":
+                    role = "router_softmax"
+                elif any(
+                    token in target
+                    for token in (
+                        "stablehlo.compare",
+                        "stablehlo.select",
+                        "stablehlo.convert",
+                    )
+                ) or operation.normalized_type == "reduce":
+                    role = "top2_selection"
+                elif operation.normalized_type == "swiglu":
+                    role = "expert_swiglu"
+                elif operation.normalized_type in {"matmul", "batched_matmul"}:
+                    role = "router_or_expert_projection"
+                elif operation.normalized_type == "slice":
+                    role = "dispatch_weight"
+                elif _is_elementwise_mul(operation):
+                    role = "expert_weight"
+                elif _is_elementwise_add(operation):
+                    role = "combine"
+                else:
+                    role = "routing_transform"
+                roles_by_operator[operation.op_id] = (region_id, role)
+                role_lists.setdefault(role, []).append(operation.op_id)
+
+            external_inputs = tuple(
+                dict.fromkeys(
+                    tensor
+                    for operation in members
+                    for tensor in operation.inputs
+                    if producer.get(tensor) is None
+                    or producer[tensor].op_id not in member_set
+                )
+            )
+            regions.append(
+                {
+                    "region_id": region_id,
+                    "semantic_family": "moe",
+                    "members": [operation.op_id for operation in members],
+                    "roles": role_lists,
+                    "inputs": list(external_inputs),
+                    "outputs": [output],
+                    "routing_contract": "internal_router+normalized_top2",
+                    "top_k": 2,
+                    "expert_count": len(experts),
+                    "dispatch_contract": "sparse_weights+dense_reference_expert_branches",
+                    "dynamic_token_compaction": False,
+                    "expert_capacity": None,
+                    "scheduler_visibility": "member_tisa_instructions",
+                    "opaque": False,
+                }
+            )
+
+        if not regions:
+            return PassResult(
+                graph,
+                (PassDiagnostic("info", self.name, "no internal top-2 MoE region found"),),
+            )
+        annotated = tuple(
+            replace(
+                operation,
+                attributes={
+                    **dict(operation.attributes),
+                    "semantic_region_id": roles_by_operator[operation.op_id][0],
+                    "semantic_region_family": "moe",
+                    "semantic_region_role": roles_by_operator[operation.op_id][1],
+                    "semantic_region_opaque": False,
+                },
+            )
+            if operation.op_id in roles_by_operator
+            else operation
+            for operation in operators
+        )
+        result = OperatorGraph(
+            graph_id=graph.graph_id,
+            tensors=graph.tensors,
+            operators=annotated,
+            edges=graph.edges,
+            attributes={
+                **dict(graph.attributes),
+                "canonical_passes": [
+                    *dict(graph.attributes).get("canonical_passes", ()),
+                    self.name,
+                ],
+                "semantic_regions": [
+                    *dict(graph.attributes).get("semantic_regions", ()),
+                    *regions,
+                ],
+            },
+        )
+        issues = result.validate()
+        if issues:
+            raise ValueError(
+                "recover_top2_moe_region produced an invalid graph: "
+                + "; ".join(issues)
+            )
+        return PassResult(
+            result,
+            (
+                PassDiagnostic(
+                    "info",
+                    self.name,
+                    f"recovered {len(regions)} internal top-2 MoE region(s)",
+                ),
+            ),
         )
 
 
@@ -2910,6 +3309,7 @@ def default_pass_manager(
 
 __all__ = [
     "AttentionRegionPass",
+    "FlashAttentionRegionPass",
     "CanonicalizeGraphPass",
     "GraphPass",
     "PassDiagnostic",
@@ -2925,5 +3325,6 @@ __all__ = [
     "RMSNormFusionPass",
     "SoftmaxFusionPass",
     "SwiGLUFusionPass",
+    "Top2MoERegionPass",
     "default_pass_manager",
 ]

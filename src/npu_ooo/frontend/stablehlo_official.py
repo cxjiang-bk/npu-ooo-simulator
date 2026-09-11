@@ -215,6 +215,22 @@ def _project_module(module: Any) -> str:
             dense = str(operation.attributes["value"]).split(":", 1)[0].strip()
             lines.append(f"    %{result_name} = stablehlo.constant {dense} : {result_type}")
             continue
+        if name == "stablehlo.compare":
+            direction_text = str(operation.attributes["comparison_direction"])
+            direction_match = re.search(
+                r"\b(EQ|NE|GE|GT|LE|LT)\b", direction_text.upper()
+            )
+            if direction_match is None:
+                raise FrontendImportError(
+                    "official StableHLO compare projection has an unknown direction"
+                )
+            lines.append(
+                f"    %{result_name} = stablehlo.compare "
+                f"direction = {direction_match.group(1)} "
+                f"{', '.join('%' + item for item in operands)} : "
+                f"({', '.join(operand_types)}) -> {result_type}"
+            )
+            continue
         if name == "stablehlo.reduce":
             dims_text = str(operation.attributes["dimensions"])
             dims_match = re.search(r"array<i64:\s*([^>]*)>", dims_text)

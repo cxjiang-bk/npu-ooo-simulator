@@ -7,6 +7,26 @@ from npu_ooo.frontend.stablehlo_official import _project_module
 
 
 class StableHLOCapabilityBoundaryTest(unittest.TestCase):
+    def test_compare_and_select_preserve_topk_mask_semantics(self) -> None:
+        imported = StableHLOAdapter.from_text(
+            """
+            module {
+              func.func @main(%lhs: tensor<2x4xf32>, %rhs: tensor<2x4xf32>, %fallback: tensor<2x4xf32>) -> tensor<2x4xf32> {
+                %predicate = stablehlo.compare direction = EQ %lhs, %rhs : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xi1>
+                %result = stablehlo.select %predicate, %lhs, %fallback : (tensor<2x4xi1>, tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+                return %result : tensor<2x4xf32>
+              }
+            }
+            """,
+            model_id="compare-select",
+        )
+
+        compare, select = imported.graph.operators
+        self.assertEqual(compare.normalized_type, "elementwise")
+        self.assertEqual(compare.attributes["comparison_direction"], "EQ")
+        self.assertEqual(select.normalized_type, "elementwise")
+        self.assertEqual(len(select.inputs), 3)
+
     def test_embedding_gather_preserves_table_and_runtime_indices(self) -> None:
         imported = StableHLOAdapter.from_text(
             """

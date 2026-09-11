@@ -48,7 +48,7 @@ semantic operator
 |---|---|---|---|
 | Dense linear algebra | GEMM、batched GEMM、GEMV、linear | BERT/GPT-J/LLaMA/DeepSeek | P0 |
 | CNN | Conv2D、1x1 Conv、depthwise Conv | ResNet50 | P0 |
-| Attention | QKV projection、QK^T、scale/mask、softmax、PV | Transformer family | P0 |
+| Attention | QKV projection、QK^T、scale/mask、materialized softmax 或 Flash online m/l/o、PV | Transformer family | P0 |
 | Normalization | LayerNorm、RMSNorm、BatchNorm inference | BERT/decoder/ResNet | P0 |
 | Vector activation | ReLU、GELU、SiLU/Swish、clamp | ResNet/BERT/LLaMA | P0 |
 | Elementwise/fusion | add、mul、sub、div、bias、residual add | all | P0 |
@@ -57,7 +57,7 @@ semantic operator
 | Embedding/state | embedding lookup、gather、position embedding、KV-cache read/write | decoder/BERT | P1 |
 | Positional encoding | RoPE、ALiBi、causal mask | GPT-J/LLaMA/decoder | P1 |
 | Pooling | max-pool、avg-pool、global-avg-pool | ResNet50 | P1 |
-| MoE/routing | top-k、token dispatch、expert GEMM、combine | optional MoE | P1 |
+| MoE/routing | 内部 normalized top-2、expert SwiGLU、weighted combine；token compaction/capacity 待实现 | optional MoE | P1 |
 | Quantization | cast、dequant、quant、scale/zero-point | future BF16/INT8 | P2 |
 | Distributed | all-reduce、all-gather、all-to-all | future multi-chip | P2 |
 
@@ -138,7 +138,9 @@ P2: quantization and distributed communication
   DeepSeek 使用 RoPE；
 - causal mask：decoder proxy 使用 additive upper-triangle mask，decode 使用 past/current
   cache-window mask；
-- MoE：router softmax 位于图内，request 提供 top-k mask，expert GEMM 与 weighted combine
+- 旧 DeepSeek MoE proxy：router softmax 位于图内，request 提供 top-k mask，expert GEMM 与 weighted combine；
+- 独立 Top-2 MoE：router 和 top-2 selection 均在图内，当前以 dense reference expert branches
+  实现数值等价 sparse weighting，尚未声称支持动态 token compaction/capacity；
   保持独立 TISA；动态 top-k、token compaction 与 capacity 是后续精确路由能力。
 
 新增算子从真实 PyTorch module 经 Torch-XLA 导入，semantic taxonomy 保持模型无关。

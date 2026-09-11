@@ -136,9 +136,9 @@ def _stages_for_tile(
         stages = [("load", "load"), ("compute", "swiglu"), ("store", "store")]
     elif op_type == "kv_cache_update":
         stages = [("load", "load"), ("compute", "kv_cache_update"), ("store", "store")]
-    elif op_type in {"reshape", "transpose", "slice"}:
+    elif op_type in {"reshape", "transpose", "slice", "concatenate"}:
         primitive = "copy" if op_type == "reshape" else "transpose"
-        if op_type == "slice":
+        if op_type in {"slice", "concatenate"}:
             primitive = "copy"
         stages = [("transform", primitive)]
     elif op_type == "embedding":
@@ -461,6 +461,11 @@ def _operand_geometry(
                 )
             return (0,) * len(full_shape), full_shape
         return None
+    if op_type == "concatenate":
+        full_shape = _resolved_tensor_shape(tensor)
+        if full_shape is None:
+            return None
+        return (0,) * len(full_shape), full_shape
     if op_type == "embedding":
         full_shape = _resolved_tensor_shape(tensor)
         if full_shape is None or len(operator.inputs) != 2 or len(operator.outputs) != 1:

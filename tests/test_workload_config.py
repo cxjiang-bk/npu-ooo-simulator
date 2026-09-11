@@ -43,12 +43,14 @@ class WorkloadConfigTest(unittest.TestCase):
         "deepseek-prefill-2layer-model-proxy.json",
         "deepseek-prefill-dense-oneblock.json",
         "deepseek-prefill-moe-oneblock.json",
+        "flash-attention.json",
         "gptj-prefill-2layer-model-proxy.json",
         "gptj-prefill-oneblock.json",
         "llama-decode-fixed-window.json",
         "llama-prefill-2layer-model-proxy.json",
         "llama-prefill-oneblock.json",
         "matmul.json",
+        "moe-top2.json",
         "resnet50-2block-model-proxy.json",
         "resnet50-bottleneck.json",
     }
@@ -64,6 +66,49 @@ class WorkloadConfigTest(unittest.TestCase):
                 outputs = output if isinstance(output, tuple) else (output,)
                 self.assertTrue(outputs)
                 self.assertTrue(all(isinstance(item, torch.Tensor) for item in outputs))
+
+    def test_flash_attention_uses_exact_online_softmax(self) -> None:
+        workload = load_workload_config("configs/workloads/flash-attention.json").workload
+        q, k, v, mask = workload.args
+        with torch.no_grad():
+            actual = workload.module(q, k, v, mask)
+            reference = torch.matmul(
+                torch.softmax(
+                    torch.matmul(q, k.transpose(-2, -1)) * (q.shape[-1] ** -0.5)
+                    + mask,
+                    dim=-1,
+                ),
+                v,
+            )
+        self.assertTrue(torch.allclose(actual, reference, atol=1e-6, rtol=1e-5))
+        self.assertEqual(
+            workload.provenance["algorithm"], "flash_attention_online_softmax"
+        )
+        self.assertFalse(workload.provenance["materializes_full_attention_matrix"])
+
+    def test_top2_moe_owns_routing_and_normalizes_selected_experts(self) -> None:
+        workload = load_workload_config("configs/workloads/moe-top2.json").workload
+        value = workload.args[0]
+        module = workload.module
+        with torch.no_grad():
+            weights = module.routing_weights(value)
+            output = module(value)
+            ranking = module.router(value) + module.ranking_tie_break
+            expected_indices = torch.topk(ranking, 2, dim=-1).indices
+            expected_mask = torch.zeros_like(weights, dtype=torch.bool).scatter(
+                -1, expected_indices, True
+            )
+        self.assertEqual(torch.count_nonzero(weights).item(), value.shape[1] * 2)
+        self.assertTrue(torch.equal(weights > 0, expected_mask))
+        self.assertTrue(
+            torch.allclose(
+                torch.sum(weights, dim=-1),
+                torch.ones_like(weights[..., 0]),
+            )
+        )
+        self.assertEqual(tuple(output.shape), tuple(value.shape))
+        self.assertEqual(workload.provenance["routing_contract"], "internal_router+internal_top2")
+        self.assertFalse(workload.provenance["dynamic_token_compaction"])
 
     def test_kwargs_positionalization_does_not_append_unused_defaults(self) -> None:
         class OptionalInput(torch.nn.Module):
@@ -500,6 +545,76 @@ class WorkloadCliResolutionTest(unittest.TestCase):
 
 @unittest.skipUnless(FRONTEND_AVAILABLE, "requires PyTorch, Torch-XLA and official StableHLO")
 class WorkloadFrontendIntegrationTest(unittest.TestCase):
+    def test_flash_attention_and_top2_moe_reach_scheduler_visible_tisa(self) -> None:
+        from npu_ooo.cli import main
+
+        cases = (
+            ("flash-attention.json", "flash_attention"),
+            ("moe-top2.json", "moe"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            for filename, family in cases:
+                with self.subTest(workload=filename):
+                    output = Path(directory) / family
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(
+                            main(
+                                [
+                                    "compile",
+                                    "--config",
+                                    str(Path("configs/workloads") / filename),
+                                    "--output-dir",
+                                    str(output),
+                                ]
+                            ),
+                            0,
+                        )
+                    graph = json.loads(
+                        (output / "01_gc" / "canonical_graph.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                    regions = [
+                        item
+                        for item in graph["attributes"].get("semantic_regions", [])
+                        if item.get("semantic_family") == family
+                    ]
+                    self.assertEqual(len(regions), 1)
+                    self.assertFalse(regions[0]["opaque"])
+                    self.assertEqual(
+                        regions[0]["scheduler_visibility"],
+                        "member_tisa_instructions",
+                    )
+                    tisa = json.loads(
+                        (output / "03_tisa" / "tisa_program.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                    self.assertGreater(len(tisa["instructions"]), 1)
+                    self.assertTrue(
+                        any(
+                            item["attributes"].get("semantic_region_family")
+                            == family
+                            for item in tisa["instructions"]
+                        )
+                    )
+                    if family == "flash_attention":
+                        self.assertEqual(regions[0]["query_block_count"], 2)
+                        self.assertEqual(regions[0]["kv_block_count"], 2)
+                        self.assertEqual(regions[0]["score_block_count"], 4)
+                        self.assertFalse(
+                            regions[0]["materializes_full_attention_matrix"]
+                        )
+                    else:
+                        self.assertEqual(regions[0]["top_k"], 2)
+                        self.assertEqual(regions[0]["expert_count"], 4)
+                        targets = {
+                            item["attributes"].get("frontend_target")
+                            for item in graph["operators"]
+                        }
+                        self.assertIn("stablehlo.compare", targets)
+                        self.assertIn("stablehlo.select", targets)
+
     def test_gptj_model_proxy_recovers_layernorm_after_embedding_reshape(self) -> None:
         from npu_ooo.cli import main
 

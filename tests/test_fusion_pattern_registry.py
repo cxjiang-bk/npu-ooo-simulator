@@ -87,7 +87,9 @@ class SemanticFusionPatternRegistryTest(unittest.TestCase):
                 "recover_stablehlo_kv_cache",
                 "recover_rotary_embedding",
                 "recover_attention_region",
+                "recover_flash_attention_region",
                 "fuse_swiglu",
+                "recover_top2_moe_region",
                 "recover_moe_dispatch_region",
             ],
         )
@@ -101,7 +103,9 @@ class SemanticFusionPatternRegistryTest(unittest.TestCase):
                 "kv_cache",
                 "rotary_embedding",
                 "attention",
+                "flash_attention",
                 "swiglu",
+                "moe",
                 "moe_dispatch",
             ],
         )
@@ -163,7 +167,9 @@ class SemanticFusionPatternRegistryTest(unittest.TestCase):
                 "recover_stablehlo_kv_cache",
                 "recover_rotary_embedding",
                 "recover_attention_region",
+                "recover_flash_attention_region",
                 "fuse_swiglu",
+                "recover_top2_moe_region",
                 "recover_moe_dispatch_region",
             ],
         )

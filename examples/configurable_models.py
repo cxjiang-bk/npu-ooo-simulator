@@ -32,6 +32,152 @@ class MultiInputAttention(torch.nn.Module):
         return torch.matmul(probabilities, v)
 
 
+class FlashAttention(torch.nn.Module):
+    """Exact block-streaming attention with online softmax state.
+
+    Only one ``QK`` score block is materialized at a time.  The running row
+    maximum, normalization sum and output accumulator follow the FlashAttention
+    recurrence, and the Python loop is statically unrolled by ``torch.export``.
+    """
+
+    def __init__(
+        self,
+        query_block_size: int = 4,
+        kv_block_size: int = 4,
+    ) -> None:
+        super().__init__()
+        if query_block_size <= 0 or kv_block_size <= 0:
+            raise ValueError("FlashAttention block sizes must be positive")
+        self.query_block_size = query_block_size
+        self.kv_block_size = kv_block_size
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+            raise ValueError("FlashAttention expects rank-4 [batch, heads, sequence, head] tensors")
+        if k.shape != v.shape or q.shape[:2] != k.shape[:2] or q.shape[-1] != k.shape[-1]:
+            raise ValueError("FlashAttention Q/K/V shapes are incompatible")
+        if attention_mask.shape[-2:] != (q.shape[-2], k.shape[-2]):
+            raise ValueError("attention_mask must cover query and key sequence dimensions")
+
+        scale = q.shape[-1] ** -0.5
+        output_blocks: list[torch.Tensor] = []
+        for query_start in range(0, q.shape[-2], self.query_block_size):
+            query_stop = min(query_start + self.query_block_size, q.shape[-2])
+            query_block = q[..., query_start:query_stop, :]
+            running_max: torch.Tensor | None = None
+            running_sum: torch.Tensor | None = None
+            output_accumulator: torch.Tensor | None = None
+            for key_start in range(0, k.shape[-2], self.kv_block_size):
+                key_stop = min(key_start + self.kv_block_size, k.shape[-2])
+                key_block = k[..., key_start:key_stop, :]
+                value_block = v[..., key_start:key_stop, :]
+                scores = torch.matmul(query_block, key_block.transpose(-2, -1)) * scale
+                scores = scores + attention_mask[
+                    ..., query_start:query_stop, key_start:key_stop
+                ]
+                block_max = torch.amax(scores, dim=-1, keepdim=True)
+                if running_max is None:
+                    running_max = block_max
+                    probabilities = torch.exp(scores - running_max)
+                    running_sum = torch.sum(probabilities, dim=-1, keepdim=True)
+                    output_accumulator = torch.matmul(probabilities, value_block)
+                    continue
+                new_max = torch.maximum(running_max, block_max)
+                previous_scale = torch.exp(running_max - new_max)
+                probabilities = torch.exp(scores - new_max)
+                assert running_sum is not None and output_accumulator is not None
+                running_sum = running_sum * previous_scale + torch.sum(
+                    probabilities, dim=-1, keepdim=True
+                )
+                output_accumulator = output_accumulator * previous_scale + torch.matmul(
+                    probabilities, value_block
+                )
+                running_max = new_max
+            if running_sum is None or output_accumulator is None:
+                raise ValueError("FlashAttention requires a non-empty key sequence")
+            output_blocks.append(output_accumulator / running_sum)
+        if not output_blocks:
+            raise ValueError("FlashAttention requires a non-empty query sequence")
+        return torch.cat(output_blocks, dim=-2)
+
+
+class Top2MoE(torch.nn.Module):
+    """Router-owned normalized top-2 MoE with SwiGLU experts.
+
+    Selection is internal to the operator; callers do not supply a routing
+    mask.  All expert branches remain in the exported graph and are combined
+    with exact sparse weights.  Dynamic token compaction and expert capacity
+    are deliberately separate backend/runtime contracts.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int = 8,
+        intermediate_size: int = 16,
+        expert_count: int = 4,
+    ) -> None:
+        super().__init__()
+        if hidden_size <= 0 or intermediate_size <= 0:
+            raise ValueError("MoE hidden and intermediate sizes must be positive")
+        if expert_count < 2:
+            raise ValueError("Top2MoE requires at least two experts")
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.expert_count = expert_count
+        self.router = torch.nn.Linear(hidden_size, expert_count, bias=False)
+        self.gate_proj = torch.nn.ModuleList(
+            torch.nn.Linear(hidden_size, intermediate_size, bias=False)
+            for _ in range(expert_count)
+        )
+        self.up_proj = torch.nn.ModuleList(
+            torch.nn.Linear(hidden_size, intermediate_size, bias=False)
+            for _ in range(expert_count)
+        )
+        self.down_proj = torch.nn.ModuleList(
+            torch.nn.Linear(intermediate_size, hidden_size, bias=False)
+            for _ in range(expert_count)
+        )
+        self.register_buffer(
+            "ranking_tie_break",
+            torch.arange(expert_count, dtype=torch.float32) * 1e-7,
+        )
+
+    def routing_weights(self, value: torch.Tensor) -> torch.Tensor:
+        logits = self.router(value)
+        probabilities = torch.softmax(logits, dim=-1)
+        ranking = logits + self.ranking_tie_break
+        first = torch.amax(ranking, dim=-1, keepdim=True)
+        first_mask = ranking == first
+        remaining = torch.where(
+            first_mask,
+            torch.full_like(ranking, float("-inf")),
+            ranking,
+        )
+        second = torch.amax(remaining, dim=-1, keepdim=True)
+        second_mask = remaining == second
+        selected = first_mask.to(dtype=value.dtype) + second_mask.to(dtype=value.dtype)
+        sparse_weights = probabilities * selected
+        return sparse_weights / torch.sum(sparse_weights, dim=-1, keepdim=True)
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        if value.shape[-1] != self.hidden_size:
+            raise ValueError("Top2MoE input hidden dimension does not match hidden_size")
+        weights = self.routing_weights(value)
+        combined = torch.zeros_like(value)
+        for expert in range(self.expert_count):
+            gate = torch.nn.functional.silu(self.gate_proj[expert](value))
+            hidden = gate * self.up_proj[expert](value)
+            expert_output = self.down_proj[expert](hidden)
+            combined = combined + weights[..., expert : expert + 1] * expert_output
+        return combined
+
+
 class InputContractProbe(torch.nn.Module):
     """Forward signature used to exercise mixed and nested static inputs."""
 
@@ -195,6 +341,105 @@ def build_attention_workload(
     )
 
 
+def build_flash_attention_workload(
+    batch_size: int = 1,
+    num_heads: int = 2,
+    query_length: int = 8,
+    key_length: int = 8,
+    head_dim: int = 4,
+    query_block_size: int = 4,
+    kv_block_size: int = 4,
+    causal: bool = True,
+    dtype: str = "float32",
+) -> Workload:
+    """Build a true online-softmax FlashAttention workload."""
+
+    selected_dtype = getattr(torch, dtype)
+    query_shape = (batch_size, num_heads, query_length, head_dim)
+    key_shape = (batch_size, num_heads, key_length, head_dim)
+    module = FlashAttention(
+        query_block_size=query_block_size,
+        kv_block_size=kv_block_size,
+    ).eval()
+    q = torch.randn(*query_shape, dtype=selected_dtype)
+    k = torch.randn(*key_shape, dtype=selected_dtype)
+    v = torch.randn(*key_shape, dtype=selected_dtype)
+    if causal:
+        query_positions = torch.arange(query_length).reshape(query_length, 1)
+        key_positions = torch.arange(key_length).reshape(1, key_length)
+        visible = key_positions <= query_positions + max(0, key_length - query_length)
+        mask = torch.where(
+            visible,
+            torch.tensor(0.0, dtype=selected_dtype),
+            torch.tensor(float("-inf"), dtype=selected_dtype),
+        ).reshape(1, 1, query_length, key_length)
+    else:
+        mask = torch.zeros(1, 1, query_length, key_length, dtype=selected_dtype)
+    return make_workload(
+        module,
+        (q, k, v, mask),
+        experiment_id="flash-attention-online",
+        provenance={
+            "algorithm": "flash_attention_online_softmax",
+            "query_block_size": query_block_size,
+            "kv_block_size": kv_block_size,
+            "materializes_full_attention_matrix": False,
+            "causal": causal,
+            "static_dimensions": {
+                "batch_size": batch_size,
+                "num_heads": num_heads,
+                "query_length": query_length,
+                "key_length": key_length,
+                "head_dim": head_dim,
+            },
+        },
+    )
+
+
+def build_top2_moe_workload(
+    batch_size: int = 1,
+    sequence_length: int = 8,
+    hidden_size: int = 8,
+    intermediate_size: int = 16,
+    expert_count: int = 4,
+    dtype: str = "float32",
+) -> Workload:
+    """Build an internally routed top-2 MoE functional workload."""
+
+    selected_dtype = getattr(torch, dtype)
+    module = Top2MoE(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        expert_count=expert_count,
+    ).eval().to(dtype=selected_dtype)
+    value = torch.randn(
+        batch_size,
+        sequence_length,
+        hidden_size,
+        dtype=selected_dtype,
+    )
+    return make_workload(
+        module,
+        (value,),
+        experiment_id="top2-moe",
+        provenance={
+            "algorithm": "normalized_top2_router_swiglu_experts",
+            "routing_contract": "internal_router+internal_top2",
+            "top_k": 2,
+            "expert_count": expert_count,
+            "dispatch_contract": "sparse_weights+dense_reference_expert_branches",
+            "dynamic_token_compaction": False,
+            "expert_capacity": None,
+            "static_dimensions": {
+                "batch_size": batch_size,
+                "sequence_length": sequence_length,
+                "hidden_size": hidden_size,
+                "intermediate_size": intermediate_size,
+            },
+        },
+    )
+
+
 def build_paper_model_workload(
     case_id: str,
     variant: str = "micro",
@@ -245,6 +490,10 @@ __all__ = [
     "Matmul",
     "MultiInputAttention",
     "ScalarTensorProbe",
+    "FlashAttention",
+    "Top2MoE",
     "build_attention_workload",
+    "build_flash_attention_workload",
     "build_paper_model_workload",
+    "build_top2_moe_workload",
 ]

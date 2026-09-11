@@ -442,3 +442,21 @@ GC typed dependency 已完成，下一项转入 symbolic shape、dynamic index �
   Attention 使用既有 compile package 重新运行仍为 1476 cycles；28 次完整广播匹配 76 个
   dependency bit，其中 46 个为跨 EU notification，产物位于
   `out/scheduler-paper-alignment-20260910/attention-dynamic/`。
+
+# 2026-09-11：真实 FlashAttention 与内部 Top-2 MoE 算子
+
+- 新增 `FlashAttention` PyTorch 算子，按 KV block 执行 QK、mask、online row-max/sum 和
+  output accumulator recurrence；最终结果与 materialized attention 数值对齐，不保存完整
+  score/probability matrix。默认 workload 将 Q/KV 都按 4 切分，形成 2×2 score blocks。
+- 新增 `Top2MoE`：router、softmax、内部确定性 top-2、选中权重重新归一化、四个 SwiGLU
+  expert 和 weighted combine 全部位于图内，不再要求 caller 提供 routing mask。
+- StableHLO capability 增加 compare/select，并保存 compare direction；GC 增加非 opaque
+  `flash_attention` 和 `moe` semantic region，内部 member TISA 保持 scheduler-visible。
+- MoE 当前执行全部固定 shape expert branches 后应用稀疏权重；dynamic token compaction、
+  expert capacity/overflow 和 routed-token timing 尚未实现，因此不将该周期解释为真实稀疏
+  dispatch 硬件性能。
+- 真实前端 compile-and-sim 产物位于 `out/real-operators-20260911/`：Q/KV 双分块
+  FlashAttention 111 operators/223 TISA，dynamic=9718、static=9606 cycles；Top-2 MoE 71 operators/
+  235 TISA，dynamic=12765、static=12457 cycles。两组 static/dynamic 都复用相同 compile
+  package，当前数值属于未校准 analytical timing。
+- 全量 260 项测试通过；`compileall`、Ruff F 类检查和 `git diff --check` 通过。

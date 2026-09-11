@@ -184,6 +184,11 @@ PYTHONPATH=src python3.12 -m npu_ooo.cli paper-matrix --help
 prefill/decode，并用文件名区分 one-block、两层 model proxy 和固定窗口 decode；这些配置
 可以脱离 `paper-matrix` 单独 `compile`，但不会因此被解释成论文完整尺寸模型。
 
+独立真实算子包括 `flash-attention.json`（KV-block online softmax，不物化完整 attention
+矩阵）和 `moe-top2.json`（内部 router、normalized top-2、四个 SwiGLU expert）。MoE 当前
+执行全部固定 shape expert branch 后做稀疏加权，动态 token compaction/capacity 尚未建模，
+详见[算子说明](docs/architecture/flash-attention-moe.md)。
+
 ### 2. 设备调度：先选模型，再选策略
 
 适用于 `simulate`、`compile-and-sim`。`paper-matrix` 用 `--device-policies` 指定策略列表。
@@ -520,5 +525,6 @@ git diff --check
 ```
 
 前端端到端测试依赖完整环境；后端、runtime 和 scheduler 测试可从所属 IR 层验证契约。
-被跳过的前端测试不代表前端验证通过。完整 online Softmax 数值实现、精确 MoE 数据流、
-全模型数值等价及 scheduler RTL 校准仍应按各自能力边界单独验收。
+被跳过的前端测试不代表前端验证通过。FlashAttention online-softmax 数值路径已有独立验收；
+MoE 动态 token compaction/capacity、全模型数值等价及 scheduler RTL 校准仍应按各自能力
+边界单独验收。

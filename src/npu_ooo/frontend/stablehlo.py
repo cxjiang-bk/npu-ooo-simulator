@@ -414,7 +414,22 @@ def _graph_from_text(text: str, *, graph_id: str) -> OperatorGraph:
         op_type = capability.semantic_family
         input_shapes = [tensors[name.removeprefix("%")].shape for name in input_names]
         operation_attributes: dict[str, Any] = {}
-        if normalized_target == "stablehlo.dynamic_slice":
+        if normalized_target == "stablehlo.compare":
+            direction = re.search(
+                r"\bdirection\s*=\s*(EQ|NE|GE|GT|LE|LT)\b",
+                body,
+                flags=re.IGNORECASE,
+            )
+            if direction is None:
+                raise FrontendImportError(
+                    f"StableHLO compare '{result_name}' is missing comparison direction"
+                )
+            operation_attributes["comparison_direction"] = direction.group(1).upper()
+            iteration_dims = tuple(
+                (f"d{axis}", value) for axis, value in enumerate(result_shape)
+            )
+            reduction_dims = ()
+        elif normalized_target == "stablehlo.dynamic_slice":
             source_name = input_names[0].removeprefix("%")
             source_shape = input_shapes[0]
             sizes = _named_integer_list(body, "sizes") or _named_integer_list(body, "slice_sizes")

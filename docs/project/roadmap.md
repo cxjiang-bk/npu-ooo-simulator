@@ -18,7 +18,7 @@ PyTorch nn.Module
 ```
 
 当前基线包含真实 PyTorch module 入口、Matmul/elementwise/reduce/Softmax/LayerNorm/
-RMSNorm/Attention/SwiGLU/RoPE/Conv2D/BatchNorm/pooling 语义、TISA instruction 粒度
+RMSNorm/Attention/FlashAttention/Top-2 MoE/SwiGLU/RoPE/Conv2D/BatchNorm/pooling 语义、TISA instruction 粒度
 static/dynamic 调度、runtime 地址与四组合 policy、可配置 MachineConfig、可替换
 codegen/timing/event backend、RTL completion profile importer，以及分阶段 artifact。
 
@@ -36,16 +36,19 @@ FC -> TISA 链路进入 simulator。
 - LLaMA2 RoPE、固定窗口 KV-cache 和多步 RuntimeSequence；
 - ResNet bottleneck micro 的 Conv2D、BatchNorm inference、ReLU、pooling；
 - StableHLO capability registry 与 semantic fusion registry。
+- KV-block online-softmax FlashAttention，内部 router/normalized top-2/SwiGLU/combine MoE；
 
 已交付的 model-proxy 扩展：
 
 1. ResNet、BERT、GPT-J、LLaMA2、DeepSeek 的显式 block repetition 与模型 shell；
 2. token/position/type embedding gather、RoPE、causal mask 和 output head；
-3. DeepSeek router、外部 top-k mask、expert GEMM、weighted dispatch/combine region；
+3. DeepSeek router、外部 top-k mask、expert GEMM、weighted dispatch/combine region；另有独立
+   internal-router Top-2 MoE 数值合同；
 4. DeepSeek one-token fixed-window decode 和 stateful/stateless request replay；
 5. model component、parameter/input bytes、scope、层数、模式和请求数 manifest。
 
-精确模型扩展项包括动态 top-k、token compaction、expert capacity、多层 decode cache、
+精确模型扩展项包括动态 token compaction、expert capacity/overflow、按实际 routed token
+count 计时、多层 decode cache、
 论文 channel/hidden width 和完整 stage topology。
 
 每个新能力遵循：

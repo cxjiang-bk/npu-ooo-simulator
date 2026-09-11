@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "seed": 211,
+  "experiment_id": "flash-attention-online-block4",
+  "workload": {
+    "factory": "examples.configurable_models:build_flash_attention_workload",
+    "kwargs": {
+      "batch_size": 1,
+      "num_heads": 2,
+      "query_length": 8,
+      "key_length": 8,
+      "head_dim": 4,
+      "query_block_size": 4,
+      "kv_block_size": 4,
+      "causal": true,
+      "dtype": "float32"
+    }
+  },
+  "compile": {
+    "arch": "lpu-like",
+    "tile_size": 8
+  },
+  "runtime": {
+    "event_backend": "cycle_event",
+    "policy": "dynamic_ready_queue",
+    "runtime_policy": "static",
+    "address_scoreboard": true
+  }
+}

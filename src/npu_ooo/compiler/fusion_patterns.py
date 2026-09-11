@@ -15,6 +15,7 @@ from typing import Iterable
 
 from .passes import (
     AttentionRegionPass,
+    FlashAttentionRegionPass,
     GraphPass,
     LayerNormFusionPass,
     MoEDispatchRegionPass,
@@ -24,6 +25,7 @@ from .passes import (
     RMSNormFusionPass,
     SoftmaxFusionPass,
     SwiGLUFusionPass,
+    Top2MoERegionPass,
 )
 
 
@@ -147,10 +149,22 @@ def default_semantic_fusion_registry() -> SemanticFusionPatternRegistry:
                 priority=80,
             ),
             SemanticFusionPattern(
+                name="recover_flash_attention_region",
+                semantic_family="flash_attention",
+                graph_pass=FlashAttentionRegionPass(),
+                priority=82,
+            ),
+            SemanticFusionPattern(
                 name="fuse_swiglu",
                 semantic_family="swiglu",
                 graph_pass=SwiGLUFusionPass(),
                 priority=90,
+            ),
+            SemanticFusionPattern(
+                name="recover_top2_moe_region",
+                semantic_family="moe",
+                graph_pass=Top2MoERegionPass(),
+                priority=92,
             ),
             SemanticFusionPattern(
                 name="recover_moe_dispatch_region",

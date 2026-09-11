@@ -104,10 +104,88 @@ def lower_transform_graph(
 
     for operator_id in graph.topological_order():
         operator = next(item for item in graph.operators if item.op_id == operator_id)
-        if operator.normalized_type not in {"reshape", "transpose", "slice"}:
+        if operator.normalized_type not in {
+            "reshape",
+            "transpose",
+            "slice",
+            "concatenate",
+        }:
             raise NotImplementedError(
                 f"transform lowering does not support '{operator.normalized_type}'"
             )
+        if operator.normalized_type == "concatenate":
+            if len(operator.inputs) < 2 or len(operator.outputs) != 1:
+                raise ValueError(
+                    f"concatenate operator '{operator.op_id}' requires multiple inputs and one output"
+                )
+            operator_tiles = tuple(
+                tile for tile in tile_graph.tiles if tile.operator_id == operator_id
+            )
+            if len(operator_tiles) != 1:
+                raise ValueError(
+                    f"concatenate operator '{operator.op_id}' requires a full-tensor schedule"
+                )
+            output_tensor = tensors[operator.outputs[0]]
+            input_regions = tuple(
+                _region(
+                    tensors[input_name],
+                    root,
+                    (0,) * len(tensors[input_name].shape),
+                    tuple(tensors[input_name].shape),
+                    AccessType.READ,
+                )
+                for input_name in operator.inputs
+            )
+            output_region = _region(
+                output_tensor,
+                root,
+                (0,) * len(output_tensor.shape),
+                tuple(output_tensor.shape),
+                AccessType.WRITE,
+            )
+            unit = _unit_for(machine, "copy")
+            transfer_cycles = sum(
+                math.ceil(region.size_bytes / memory.read_bandwidth_bytes_per_cycle)
+                for region in input_regions
+            ) + math.ceil(
+                output_region.size_bytes / memory.write_bandwidth_bytes_per_cycle
+            )
+            tile = operator_tiles[0]
+            tasks.append(
+                ExecutionTask(
+                    task_id=f"{tile.tile_id}.copy",
+                    tile_id=tile.tile_id,
+                    operator_id=operator_id,
+                    primitive="copy",
+                    resource=unit.name,
+                    reads=input_regions,
+                    writes=(output_region,),
+                    duration_cycles=float(
+                        unit.latency_cycles
+                        + memory.read_latency_cycles
+                        + memory.write_latency_cycles
+                        + transfer_cycles
+                    ),
+                    initiation_interval_cycles=float(unit.initiation_interval_cycles),
+                    stage_id=tile.stage_id,
+                    program_order=len(tasks),
+                    attributes={
+                        "semantic_family": "concatenate",
+                        "frontend_target": operator.attributes.get(
+                            "frontend_target", ""
+                        ),
+                        "concatenate_dimension": operator.attributes.get(
+                            "concatenate_dimension"
+                        ),
+                        "input_count": len(input_regions),
+                        "full_tensor_transform": True,
+                        "transform_granularity": "full_tensor",
+                    },
+                )
+            )
+            bytes_moved += sum(region.size_bytes for region in input_regions)
+            bytes_moved += output_region.size_bytes
+            continue
         if len(operator.inputs) != 1 or len(operator.outputs) != 1:
             raise ValueError(
                 f"transform operator '{operator.op_id}' requires one input and one output"

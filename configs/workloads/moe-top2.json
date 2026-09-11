@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "seed": 223,
+  "experiment_id": "moe-top2-internal-router",
+  "workload": {
+    "factory": "examples.configurable_models:build_top2_moe_workload",
+    "kwargs": {
+      "batch_size": 1,
+      "sequence_length": 8,
+      "hidden_size": 8,
+      "intermediate_size": 16,
+      "expert_count": 4,
+      "dtype": "float32"
+    }
+  },
+  "compile": {
+    "arch": "lpu-like",
+    "tile_size": 8
+  },
+  "runtime": {
+    "event_backend": "cycle_event",
+    "policy": "dynamic_ready_queue",
+    "runtime_policy": "static",
+    "address_scoreboard": true
+  }
+}

@@ -9,6 +9,7 @@
 - [Scheduler 与论文对齐](architecture/scheduler-paper-alignment.md)：`SemanticConflict(I, Fu[u])`、per-EU Fu、全局跨 EU dependency notification，以及当前实现缺口。
 - [TISA 论文语义对齐](architecture/tisa-alignment.md)：论文概念与项目 IR、TargetPlan、payload 的映射。
 - [算子分类与覆盖](architecture/operator-taxonomy.md)：semantic operator、lowering primitive 和覆盖计划。
+- [FlashAttention 与 Top-2 MoE](architecture/flash-attention-moe.md)：online softmax、内部 top-2 router、scheduler-visible 数据流及当前稀疏执行边界。
 - [Target lowering 覆盖](architecture/target-lowering-coverage.md)：不同算子的目标 memory、route、EU 和 payload 能力。
 
 ## 运行与配置

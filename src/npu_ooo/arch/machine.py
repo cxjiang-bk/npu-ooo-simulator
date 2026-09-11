@@ -516,7 +516,7 @@ def minimal_machine_config() -> MachineConfig:
             ),
             OperationClassPlacementConfig(
                 "root-transfer",
-                ("reshape", "transpose", "slice", "embedding"),
+                ("reshape", "transpose", "slice", "concatenate", "embedding"),
                 "DMA",
                 "DRAM",
                 ("DRAM",),
@@ -641,7 +641,7 @@ def lpu_like_machine_config() -> MachineConfig:
             ),
             OperationClassPlacementConfig(
                 "root-transfer",
-                ("reshape", "transpose", "slice", "embedding"),
+                ("reshape", "transpose", "slice", "concatenate", "embedding"),
                 "GDMA",
                 "GM",
                 ("GM",),

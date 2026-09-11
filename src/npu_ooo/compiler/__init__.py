@@ -9,6 +9,7 @@ from .pipeline import (
 from .passes import (
     AttentionRegionPass,
     CanonicalizeGraphPass,
+    FlashAttentionRegionPass,
     FoldTransposeIntoMatmulPass,
     LayerNormFusionPass,
     LinearDecompositionPass,
@@ -24,6 +25,7 @@ from .passes import (
     RMSNormFusionPass,
     SoftmaxFusionPass,
     SwiGLUFusionPass,
+    Top2MoERegionPass,
     default_pass_manager,
 )
 from .planner import SchedulePlanner, default_schedule_planner
@@ -55,6 +57,7 @@ __all__ = [
     "compile_torch_module",
     "CanonicalizeGraphPass",
     "AttentionRegionPass",
+    "FlashAttentionRegionPass",
     "FoldTransposeIntoMatmulPass",
     "LayerNormFusionPass",
     "LinearDecompositionPass",
@@ -70,6 +73,7 @@ __all__ = [
     "RMSNormFusionPass",
     "SoftmaxFusionPass",
     "SwiGLUFusionPass",
+    "Top2MoERegionPass",
     "default_pass_manager",
     "SchedulePlanner",
     "default_schedule_planner",

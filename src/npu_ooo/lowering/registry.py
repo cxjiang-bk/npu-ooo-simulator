@@ -250,7 +250,7 @@ def default_lowering_registry() -> LoweringRegistry:
     registry.register(("conv2d",), lower_conv2d_graph)
     registry.register(("batch_norm",), lower_batch_norm_graph)
     registry.register(("pool",), lower_pool_graph)
-    registry.register(("reshape", "transpose", "slice"), lower_transform_graph)
+    registry.register(("reshape", "transpose", "slice", "concatenate"), lower_transform_graph)
     registry.register(("embedding",), lower_embedding_graph)
     return registry
 

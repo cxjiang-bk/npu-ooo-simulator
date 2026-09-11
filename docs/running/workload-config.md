@@ -17,13 +17,15 @@ JSON / Python workload factory
 
 ## 1. 可运行示例
 
-仓库首先提供五份通用、固定 shape 配置：
+仓库首先提供七份通用、固定 shape 配置：
 
 | 文件 | 构造方式 | 主要输入 |
 | --- | --- | --- |
 | `configs/workloads/matmul.json` | 声明式模型 | 两个命名 float tensor |
 | `configs/workloads/attention.json` | 声明式模型 | 命名 Q/K/V 和 additive mask |
 | `configs/workloads/attention-causal-factory.json` | Python factory | Q/K/V 与 Python 构造的 causal mask |
+| `configs/workloads/flash-attention.json` | Python factory | 分块 K/V、causal mask、online `m/l/o` softmax 状态 |
+| `configs/workloads/moe-top2.json` | Python factory | 内部 router、normalized top-2、四个 SwiGLU expert 和 combine |
 | `configs/workloads/bert-multilayer.json` | 声明式模型 | 两层真实 block、int64 token/position/type IDs、float mask |
 | `configs/workloads/llama-decode-fixed-window.json` | 声明式模型 | seqlen=1、固定 window=4 的 K/V cache、RoPE 和 mask |
 
@@ -61,6 +63,9 @@ PYTHONPATH=src python3.12 -m npu_ooo.cli compile-and-sim \
   --config configs/workloads/attention.json \
   --output-dir out/attention
 ```
+
+FlashAttention 和 Top-2 MoE 的算法、semantic region 与稀疏执行边界见
+[算子说明](../architecture/flash-attention-moe.md)。
 
 独立 `simulate` 只读取 compile package，不会重新导入配置中的模型工厂，也不依赖 PyTorch
 前端。比较 static/dynamic 时应复用同一个 compile package。

@@ -59,6 +59,7 @@ _CAPABILITIES = {
             _pointwise(name, 2)
             for name in (
                 "add",
+                "compare",
                 "divide",
                 "maximum",
                 "minimum",
@@ -67,6 +68,7 @@ _CAPABILITIES = {
                 "subtract",
             )
         ),
+        _pointwise("select", 3),
         StableHLOOpCapability(
             op_name="stablehlo.dot_general",
             semantic_family=SemanticOpType.MATMUL.value,
