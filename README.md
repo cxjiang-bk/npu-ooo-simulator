@@ -13,23 +13,35 @@ Runtime 绑定本次调用的地址并提交 descriptor；设备 scheduler 决�
 execution backend 执行并反馈完成。
 
 ```mermaid
-flowchart LR
-    A[Workload: PyTorch module + static args/kwargs] --> B[torch.export + Torch-XLA + StableHLO]
-    B --> C[GC: Canonical IR 与 TileGraph]
-    C --> D[FC: 符号 TISA 方言]
-    D --> E[TISA Generator: 虚拟 TISA]
-    E --> I[Target Lowering: TargetPlan]
-    I --> J[最终 TISA、BackendArtifact 与 MemoryPlan]
-    J --> S[Static scheduling: per-EU streams + set/wait/fence]
-    J --> F[Runtime Loader: 地址绑定与 descriptor envelope]
-    S --> F
-    F --> G[LoadedDeviceProgram: 已绑定的设备描述符]
-    G --> K[Static / Dynamic device scheduler]
-    K -->|issue| L[Execution backend]
+flowchart TD
+    subgraph COMPILE["Compile-time: compiler stages"]
+        direction TB
+        A[Workload: PyTorch module + static args/kwargs]
+        B[torch.export + Torch-XLA + StableHLO]
+        C[GC: Canonical IR 与 TileGraph]
+        D[FC: 符号 TISA 方言]
+        E[TISA Generator: 虚拟 TISA]
+        I[Target Lowering: TargetPlan]
+        J[最终 TISA、BackendArtifact 与 MemoryPlan]
+        A --> B --> C --> D --> E --> I --> J
+    end
+    subgraph SUBMIT["Submission-time: runtime and device"]
+        direction TB
+        S[Static scheduling: per-EU streams + set/wait/fence]
+        F[Runtime Loader: 地址绑定与 descriptor envelope]
+        G[LoadedDeviceProgram: 已绑定的设备描述符]
+        K[Static / Dynamic device scheduler]
+        L[Execution backend: payload + EU instances]
+        H[周期、stall、泳道图、Perfetto]
+        S --> F --> G --> K
+        K -->|issue| L
+        L -->|completion feedback| K
+        K --> H
+        L --> H
+    end
+    J --> S
+    J --> F
     J -.->|加载 payload| L
-    L -->|completion feedback| K
-    K --> H[周期、stall、泳道图、Perfetto]
-    L --> H
 ```
 
 其中，FC 保留抽象 scope/role，Target Lowering 才根据机器配置选择具体 memory、route 和 EU。
@@ -211,6 +223,7 @@ prefill/decode，并用文件名区分 one-block、两层 model proxy 和固定�
 | 同上 | `oracle_critical_path` | 使用完整程序的参考策略；旧名 `critical_path` 是兼容别名，不是硬件在线策略 |
 | `--address-scoreboard` | 关闭 | 开启额外地址冲突检查；cycle 设备模型检查已接收的较老未完成 descriptor，runtime loader 另负责将绑定后的 alias 转为显式依赖 |
 | `--memory-bank-scoreboard` | 关闭 | 按 MachineConfig 的 bank/读写端口建模结构冲突；当前为 payload 占用期间的保守模型，不是逐 transaction DRAM 仿真 |
+| `--swimlane-start-cycle` / `--swimlane-end-cycle` | 不指定 | 限制泳道图显示的周期窗口；不改变调度、依赖或 `total_cycles`，适合放大查看短任务 |
 | `--scheduler-config` | 不指定 | 读取控制流水 JSON，**必须同时选择 `cycle_event`**；格式见下一节 |
 
 CLI 默认是 **static + analytical_event**，不是 dynamic + cycle_event；需要后者时必须显式指定。
@@ -389,6 +402,8 @@ JSON 中的 `runtime_base_address` 应写十进制数；availability 文件在 J
 | 总共多少周期？卡在哪里？ | `06_simulation/summary.json`；cycle 模型保存 stall 聚合、队列峰值和生命周期 timing，不嵌入逐周期事件 |
 | 哪条 TISA 何时接收、发射、完成、退休？ | `06_simulation/tisa_instructions.csv` |
 | 哪些执行单元发生重叠？ | `07_trace/swimlane.svg` 默认只画物理 EU；旧 TISA 重复层见 `swimlane-detailed.svg` |
+| 配置的 EU 实例是否实际使用？ | 泳道图按编译包中的 `MachineConfig` 展示全部实例；没有任务的实例标记为 `idle` |
+| 计算任务太短看不清？ | 使用 `--swimlane-start-cycle` 与 `--swimlane-end-cycle` 生成局部时间窗口；只影响显示，不改变仿真 |
 | 本次实际给 scheduler 的指令和地址是什么？ | `05_runtime/bound_device_program.json` |
 | Host 如何分块、绑定地址、提交？ | `05_runtime/runtime_submission.json`；地址依赖见同目录 `address_dependencies.json` |
 | 数据为什么在 UB/LMB/RMB？搬运经过哪里？ | `04_backend/target_plan.json`；实际 buffer/allocation 见 `memory_plan.json` |

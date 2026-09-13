@@ -372,6 +372,16 @@ def _add_simulation_options(
     )
     if include_output_dir:
         parser.add_argument("--output-dir", type=Path, default=Path("out/simulate"))
+    parser.add_argument(
+        "--swimlane-start-cycle",
+        type=float,
+        help="optional first cycle shown in generated swimlane SVG/PNG",
+    )
+    parser.add_argument(
+        "--swimlane-end-cycle",
+        type=float,
+        help="optional exclusive cycle bound shown in generated swimlane SVG/PNG",
+    )
     parser.add_argument("--instruction-queue-depth", type=int, action=_StoreSpecified)
     parser.add_argument("--rob-entries", type=int, action=_StoreSpecified)
     parser.add_argument("--max-inflight-tiles", type=int, action=_StoreSpecified)
@@ -588,6 +598,16 @@ def _add_paper_matrix_arguments(parser: argparse.ArgumentParser) -> None:
         "--continue-on-error",
         action="store_true",
         help="record an explicit error row and continue compiling other cases",
+    )
+    parser.add_argument(
+        "--swimlane-start-cycle",
+        type=float,
+        help="optional first cycle shown in generated swimlane SVG/PNG",
+    )
+    parser.add_argument(
+        "--swimlane-end-cycle",
+        type=float,
+        help="optional exclusive cycle bound shown in generated swimlane SVG/PNG",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("out/paper-matrix"))
 
@@ -971,13 +991,28 @@ def _write_policy_matrix(
         write_json(case.result, case_dir / "summary.json")
         write_csv(case.result, case_dir / "tasks.csv")
         write_instruction_csv(case.result, case_dir / "tisa_instructions.csv")
-        write_svg(case.result, case_dir / "swimlane.svg")
+        write_svg(
+            case.result,
+            case_dir / "swimlane.svg",
+            machine=machine,
+            start_cycle=args.swimlane_start_cycle,
+            end_cycle=args.swimlane_end_cycle,
+        )
         write_svg(
             case.result,
             case_dir / "swimlane-detailed.svg",
             include_tisa_lanes=True,
+            machine=machine,
+            start_cycle=args.swimlane_start_cycle,
+            end_cycle=args.swimlane_end_cycle,
         )
-        write_png(case.result, case_dir / "swimlane.png")
+        write_png(
+            case.result,
+            case_dir / "swimlane.png",
+            machine=machine,
+            start_cycle=args.swimlane_start_cycle,
+            end_cycle=args.swimlane_end_cycle,
+        )
         write_artifact_json(case.result.perfetto_trace(), case_dir / "perfetto.json")
         record = {
             **case.to_dict(),
@@ -1055,7 +1090,14 @@ def _write_compiled_case_artifacts(compiled, case_dir: Path, machine) -> None:
     write_execution_graph_dot(compiled.backend_artifact.execution_graph, case_dir / "execution_graph.dot")
 
 
-def _write_paper_policy_artifacts(case_dir: Path, case) -> None:
+def _write_paper_policy_artifacts(
+    case_dir: Path,
+    case,
+    machine,
+    *,
+    start_cycle: float | None = None,
+    end_cycle: float | None = None,
+) -> None:
     """Write one policy's runtime, simulation and trace artifacts."""
 
     policy_dir = case_dir / "policy_matrix" / case.case_id
@@ -1071,13 +1113,28 @@ def _write_paper_policy_artifacts(case_dir: Path, case) -> None:
     write_json(case.result, policy_dir / "06_simulation" / "summary.json")
     write_csv(case.result, policy_dir / "06_simulation" / "tasks.csv")
     write_instruction_csv(case.result, policy_dir / "06_simulation" / "tisa_instructions.csv")
-    write_svg(case.result, policy_dir / "07_trace" / "swimlane.svg")
+    write_svg(
+        case.result,
+        policy_dir / "07_trace" / "swimlane.svg",
+        machine=machine,
+        start_cycle=start_cycle,
+        end_cycle=end_cycle,
+    )
     write_svg(
         case.result,
         policy_dir / "07_trace" / "swimlane-detailed.svg",
         include_tisa_lanes=True,
+        machine=machine,
+        start_cycle=start_cycle,
+        end_cycle=end_cycle,
     )
-    write_png(case.result, policy_dir / "07_trace" / "swimlane.png")
+    write_png(
+        case.result,
+        policy_dir / "07_trace" / "swimlane.png",
+        machine=machine,
+        start_cycle=start_cycle,
+        end_cycle=end_cycle,
+    )
     write_artifact_json(case.result.perfetto_trace(), policy_dir / "07_trace" / "perfetto.json")
 
 
@@ -1106,7 +1163,14 @@ def _paper_profile_name(run) -> str:
     return "__".join(fields)
 
 
-def _write_paper_matrix(root: Path, matrix, machine) -> list[dict[str, Any]]:
+def _write_paper_matrix(
+    root: Path,
+    matrix,
+    machine,
+    *,
+    start_cycle: float | None = None,
+    end_cycle: float | None = None,
+) -> list[dict[str, Any]]:
     root.mkdir(parents=True, exist_ok=True)
     records: list[dict[str, Any]] = []
     index_entries: list[dict[str, Any]] = []
@@ -1117,7 +1181,13 @@ def _write_paper_matrix(root: Path, matrix, machine) -> list[dict[str, Any]]:
         if run.compiled is not None:
             _write_compiled_case_artifacts(run.compiled, case_dir, machine)
         for case in run.cases:
-            _write_paper_policy_artifacts(case_dir, case)
+            _write_paper_policy_artifacts(
+                case_dir,
+                case,
+                machine,
+                start_cycle=start_cycle,
+                end_cycle=end_cycle,
+            )
         case_records = [dict(record) for record in run.to_records()]
         for record in case_records:
             record["case_output_dir"] = str(case_dir.relative_to(root))
@@ -1290,7 +1360,13 @@ def run_paper_matrix(args: argparse.Namespace) -> int:
         request_count=args.request_count,
         inter_request_gap_cycles=args.inter_request_gap,
     )
-    records = _write_paper_matrix(args.output_dir, matrix, machine)
+    records = _write_paper_matrix(
+        args.output_dir,
+        matrix,
+        machine,
+        start_cycle=args.swimlane_start_cycle,
+        end_cycle=args.swimlane_end_cycle,
+    )
     manifest = {
         "schema_version": 1,
         "variant": args.variant,
@@ -1873,13 +1949,28 @@ def run_compile_and_sim(args: argparse.Namespace) -> int:
     write_json(result, args.output_dir / "summary.json")
     write_csv(result, args.output_dir / "tasks.csv")
     write_instruction_csv(result, args.output_dir / "tisa_instructions.csv")
-    write_svg(result, args.output_dir / "swimlane.svg")
+    write_svg(
+        result,
+        args.output_dir / "swimlane.svg",
+        machine=machine,
+        start_cycle=args.swimlane_start_cycle,
+        end_cycle=args.swimlane_end_cycle,
+    )
     write_svg(
         result,
         args.output_dir / "swimlane-detailed.svg",
         include_tisa_lanes=True,
+        machine=machine,
+        start_cycle=args.swimlane_start_cycle,
+        end_cycle=args.swimlane_end_cycle,
     )
-    write_png(result, args.output_dir / "swimlane.png")
+    write_png(
+        result,
+        args.output_dir / "swimlane.png",
+        machine=machine,
+        start_cycle=args.swimlane_start_cycle,
+        end_cycle=args.swimlane_end_cycle,
+    )
     write_artifact_json(result.perfetto_trace(), args.output_dir / "perfetto.json")
     write_artifact_json(
         result.metrics.get("address_hazards", []),
@@ -2223,13 +2314,28 @@ def run_simulate(args: argparse.Namespace) -> int:
     write_json(result, args.output_dir / "summary.json")
     write_csv(result, args.output_dir / "tasks.csv")
     write_instruction_csv(result, args.output_dir / "tisa_instructions.csv")
-    write_svg(result, args.output_dir / "swimlane.svg")
+    write_svg(
+        result,
+        args.output_dir / "swimlane.svg",
+        machine=machine,
+        start_cycle=args.swimlane_start_cycle,
+        end_cycle=args.swimlane_end_cycle,
+    )
     write_svg(
         result,
         args.output_dir / "swimlane-detailed.svg",
         include_tisa_lanes=True,
+        machine=machine,
+        start_cycle=args.swimlane_start_cycle,
+        end_cycle=args.swimlane_end_cycle,
     )
-    write_png(result, args.output_dir / "swimlane.png")
+    write_png(
+        result,
+        args.output_dir / "swimlane.png",
+        machine=machine,
+        start_cycle=args.swimlane_start_cycle,
+        end_cycle=args.swimlane_end_cycle,
+    )
     write_artifact_json(result.perfetto_trace(), args.output_dir / "perfetto.json")
     write_artifact_json(
         result.metrics.get("address_hazards", []),

@@ -13,14 +13,17 @@
 ## 1. 模块边界
 
 ```mermaid
-flowchart LR
-    RS["RuntimeSubmission\ncommands / arrival / address"]
-    LOADER["runtime.loader\nload_device_program()"]
-    LD["LoadedDeviceProgram\ndescriptors + envelopes"]
+flowchart TD
+    subgraph INPUT["1. Runtime input"]
+        direction TB
+        RS["RuntimeSubmission\ncommands / arrival / address"]
+        LOADER["runtime.loader\nload_device_program()"]
+        LD["LoadedDeviceProgram\ndescriptors + envelopes"]
+        RS --> LOADER --> LD
+    end
 
-    RS --> LOADER --> LD
-
-    subgraph DS["Device scheduler / cycle.py"]
+    subgraph DS["2. Device scheduler / cycle.py"]
+        direction TB
         RF["Reception FIFO\nself.reception"]
         DISPATCH["dispatch\n同时分配 ROB 和 WQ"]
         ROB["ROB\n有序退休记录"]
@@ -41,17 +44,24 @@ flowchart LR
         COMPLETE -. "唤醒后继指令" .-> WAKE
     end
 
-    LD --> RF
-
-    subgraph EB["ExecutionBackend"]
-        ACCEPT["can_accept()"]
+    subgraph EB["3. ExecutionBackend"]
+        direction TB
+        ACCEPT["can_accept()\nunit + instance availability"]
         EXEC["EU instance\npayload execution"]
-        FEEDBACK["execution_done\npartial_ready"]
+        FEEDBACK["execution_done / partial_ready"]
         ACCEPT --> EXEC --> FEEDBACK
     end
 
+    subgraph OUTPUT["4. Observability"]
+        direction TB
+        TRACE["summary / tasks.csv\nswimlane / Perfetto"]
+    end
+
+    LD --> RF
     ISSUE -->|"IssueRequest"| ACCEPT
     FEEDBACK -->|"execution.advance()"| COMPLETE
+    RETIRE --> TRACE
+    EXEC --> TRACE
 ```
 
 三层职责分别是：

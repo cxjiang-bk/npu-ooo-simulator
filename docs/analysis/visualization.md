@@ -14,7 +14,15 @@
 ## 时间线
 
 默认 `swimlane.svg/png` 只画 Runtime 和物理 EU payload，矩形标签保留 parent TISA；不再
-重复画 TISA issue→complete 轨道。需要旧层级时打开 `swimlane-detailed.svg`。
+重复画 TISA issue→complete 轨道。需要旧层级时打开 `swimlane-detailed.svg`。导出时使用本次
+运行的 `MachineConfig` 补齐所有配置的物理实例：没有任务的实例也会显示，并标记为 `idle`，
+从而区分“硬件未配置”与“硬件已配置但本次没有被调度使用”。未传入机器配置的库调用保持旧的
+active-only 行为，兼容直接构造 `ScheduleResult` 的调用方。
+
+全局时间轴适合观察端到端吞吐；当短计算任务在长 DMA 时间轴上难以辨认时，可以在 `simulate`、
+`compile-and-sim` 或 `paper-matrix` 中使用 `--swimlane-start-cycle` 与
+`--swimlane-end-cycle` 生成局部窗口。窗口只裁剪显示，不改变仿真结果、依赖或周期统计；
+矩形悬浮提示仍保留任务的完整 issue/start/finish 周期。
 
 `report.html` 是可独立打开的离线联合视图，共享一条 cycle 轴：
 

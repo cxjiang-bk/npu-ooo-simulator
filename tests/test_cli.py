@@ -143,6 +143,26 @@ class CliSurfaceTest(unittest.TestCase):
         self.assertEqual(args.runtime_config, Path("runtime.json"))
         self.assertEqual(args.policy, "dynamic_ready_queue")
 
+    def test_swimlane_window_options_are_available_to_simulation_and_matrix(self) -> None:
+        simulate_args = build_parser().parse_args(
+            [
+                "simulate",
+                "--compile-dir",
+                "out/attention-compile",
+                "--swimlane-start-cycle",
+                "10",
+                "--swimlane-end-cycle",
+                "20",
+            ]
+        )
+        self.assertEqual(simulate_args.swimlane_start_cycle, 10)
+        self.assertEqual(simulate_args.swimlane_end_cycle, 20)
+        matrix_args = build_parser().parse_args(
+            ["paper-matrix", "--swimlane-start-cycle", "10", "--swimlane-end-cycle", "20"]
+        )
+        self.assertEqual(matrix_args.swimlane_start_cycle, 10)
+        self.assertEqual(matrix_args.swimlane_end_cycle, 20)
+
     def test_compile_only_exposes_compiler_options(self) -> None:
         args = build_parser().parse_args(
             [
@@ -345,6 +365,9 @@ class CompileAndSimCliTest(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertTrue((output / "06_simulation" / "summary.json").exists())
             self.assertTrue((output / "07_trace" / "swimlane.svg").exists())
+            swimlane = (output / "07_trace" / "swimlane.svg").read_text(encoding="utf-8")
+            self.assertIn("DMA[0]", swimlane)
+            self.assertIn('data-state="idle"', swimlane)
             self.assertTrue((output / "05_runtime" / "runtime_submission.json").exists())
             self.assertFalse((output / "00_frontend" / "generated.mlir").exists())
             self.assertFalse((output / "04_backend" / "backend_artifact.json").exists())

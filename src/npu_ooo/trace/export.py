@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 from typing import Any, Mapping
 
+from npu_ooo.arch import MachineConfig
 from npu_ooo.scheduler import ScheduleResult
 
 from .layout import artifact_path, finalize_artifact
@@ -287,8 +288,11 @@ def write_svg(
     width: int = 1600,
     row_height: int = 28,
     include_tisa_lanes: bool = False,
+    machine: MachineConfig | None = None,
+    start_cycle: float | None = None,
+    end_cycle: float | None = None,
 ) -> None:
-    """Write physical EU lanes; optionally restore the legacy TISA spans."""
+    """Write physical EU lanes, including configured instances that stayed idle."""
 
     target, compatibility = artifact_path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -297,8 +301,38 @@ def write_svg(
         *(result.instruction_timings if include_tisa_lanes else ()),
         *result.timings,
     )
-    lanes = sorted({(timing.resource, timing.instance) for timing in all_timings})
+    timeline_end = max(float(result.total_cycles), 1.0)
+    window_start = 0.0 if start_cycle is None else float(start_cycle)
+    window_end = timeline_end if end_cycle is None else float(end_cycle)
+    if not math.isfinite(window_start) or window_start < 0:
+        raise ValueError("swimlane start_cycle must be finite and non-negative")
+    if result.total_cycles > 0 and window_start >= result.total_cycles:
+        raise ValueError(
+            f"swimlane start_cycle {window_start:g} must be below total cycles "
+            f"{result.total_cycles:g}"
+        )
+    if not math.isfinite(window_end) or window_end <= window_start:
+        raise ValueError("swimlane end_cycle must be finite and greater than start_cycle")
+    if result.total_cycles > 0 and window_end > result.total_cycles:
+        raise ValueError(
+            f"swimlane end_cycle {window_end:g} exceeds total cycles "
+            f"{result.total_cycles:g}"
+        )
+
+    active_lanes = {(timing.resource, timing.instance) for timing in all_timings}
+    configured_lanes = {
+        (unit.name, instance)
+        for unit in (machine.execution_units if machine is not None else ())
+        for instance in range(unit.count)
+    }
+    lanes = sorted(active_lanes | configured_lanes)
+    idle_lanes = configured_lanes - active_lanes
     lane_index = {lane: index for index, lane in enumerate(lanes)}
+    visible_timings = tuple(
+        timing
+        for timing in all_timings
+        if timing.finish > window_start and timing.start < window_end
+    )
     primitive_issue_details = {
         event.task_id: dict(event.details)
         for event in result.events
@@ -327,7 +361,9 @@ def write_svg(
     primitive_by_task.update(
         {timing.task_id: "runtime_submit" for timing in result.runtime_timings}
     )
-    present_primitives = set(primitive_by_task.values())
+    present_primitives = {
+        primitive_by_task[timing.task_id] for timing in visible_timings
+    }
     primitive_rank = {primitive: index for index, primitive in enumerate(_PRIMITIVE_ORDER)}
     primitives = tuple(
         sorted(
@@ -337,7 +373,8 @@ def write_svg(
     )
     label_width = 180
     chart_width = max(1, width - label_width - 20)
-    scale = chart_width / max(result.total_cycles, 1.0)
+    window_cycles = window_end - window_start
+    scale = chart_width / window_cycles
     legend_positions, legend_rows = _legend_layout(primitives, width)
     legend_top = 34
     legend_row_height = 22
@@ -345,14 +382,20 @@ def write_svg(
     lane_top = axis_top + 30
     chart_bottom = lane_top + row_height * len(lanes)
     height = chart_bottom + 16
-    major_step = _nice_tick_step(result.total_cycles, chart_width)
+    major_step = _nice_tick_step(window_cycles, chart_width)
     minor_step = major_step / 5
+    window_description = (
+        f"  window={window_start:g}..{window_end:g}"
+        if window_start != 0 or window_end != timeline_end
+        else ""
+    )
     elements: list[str] = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         f'<title>{html.escape(result.policy)} scheduling swimlane</title>',
-        f'<desc>{len(result.runtime_timings)} runtime chunks, {len(result.instruction_timings)} TISA instructions and {len(result.timings)} payload tasks over {result.total_cycles:g} cycles.</desc>',
+        f'<desc>{len(result.runtime_timings)} runtime chunks, {len(result.instruction_timings)} TISA instructions and {len(result.timings)} payload tasks over {result.total_cycles:g} cycles; displaying {window_start:g} through {window_end:g}.</desc>',
         '<rect width="100%" height="100%" fill="#ffffff"/>',
-        f'<text x="12" y="22" font-family="sans-serif" font-size="16" fill="#1f2933">policy={html.escape(result.policy)}  total={result.total_cycles:g} cycles  runtime={len(result.runtime_timings)}  TISA={len(result.instruction_timings)}  payload={len(result.timings)}</text>',
+        f'<text x="12" y="22" font-family="sans-serif" font-size="16" fill="#1f2933">policy={html.escape(result.policy)}  total={result.total_cycles:g} cycles{window_description}  runtime={len(result.runtime_timings)}  TISA={len(result.instruction_timings)}  payload={len(result.timings)}</text>',
+        f'<defs><clipPath id="timeline-clip"><rect x="{label_width}" y="{lane_top}" width="{chart_width}" height="{max(0, chart_bottom - lane_top)}"/></clipPath></defs>',
         '<g id="legend" font-family="sans-serif" font-size="11" fill="#27313a">',
         f'<text x="12" y="{legend_top + 13}" font-weight="600">Primitive</text>',
     ]
@@ -382,18 +425,18 @@ def write_svg(
             f'<line x1="{label_width}" y1="{axis_top + 10}" x2="{label_width + chart_width}" y2="{axis_top + 10}" stroke="#64748b" stroke-width="1"/>',
         )
     )
-    minor_tick = 0.0
-    while minor_tick <= result.total_cycles + 1e-9:
-        x = label_width + minor_tick * scale
+    minor_tick = math.ceil((window_start - 1e-9) / minor_step) * minor_step
+    while minor_tick <= window_end + 1e-9:
+        x = label_width + (minor_tick - window_start) * scale
         is_major = abs((minor_tick / major_step) - round(minor_tick / major_step)) < 1e-8
         if not is_major:
             elements.append(
                 f'<line x1="{x:.2f}" y1="{axis_top + 7}" x2="{x:.2f}" y2="{chart_bottom}" stroke="#edf1f5" stroke-width="1"/>'
             )
         minor_tick += minor_step
-    major_tick = 0.0
-    while major_tick <= result.total_cycles + 1e-9:
-        x = label_width + major_tick * scale
+    major_tick = math.ceil((window_start - 1e-9) / major_step) * major_step
+    while major_tick <= window_end + 1e-9:
+        x = label_width + (major_tick - window_start) * scale
         elements.append(
             f'<line x1="{x:.2f}" y1="{axis_top + 6}" x2="{x:.2f}" y2="{chart_bottom}" stroke="#d5dce3" stroke-width="1"/>'
         )
@@ -406,12 +449,21 @@ def write_svg(
     for index, (resource, instance) in enumerate(lanes):
         y = lane_top + index * row_height
         elements.append(f'<line x1="{label_width}" y1="{y + row_height}" x2="{label_width + chart_width}" y2="{y + row_height}" stroke="#d9e0e6"/>')
-        elements.append(f'<text x="12" y="{y + 18}" font-family="sans-serif" font-size="12" fill="#27313a">{html.escape(resource)}[{instance}]</text>')
-    for task in all_timings:
+        state = "idle" if (resource, instance) in idle_lanes else "active"
+        idle_suffix = (
+            '<tspan fill="#7b8794" font-size="10"> idle</tspan>'
+            if state == "idle"
+            else ""
+        )
+        elements.append(f'<text data-state="{state}" x="12" y="{y + 18}" font-family="sans-serif" font-size="12" fill="#27313a">{html.escape(resource)}[{instance}]{idle_suffix}</text>')
+    elements.append('<g id="task-spans" clip-path="url(#timeline-clip)">')
+    for task in visible_timings:
         lane = (task.resource, task.instance)
         y = lane_top + lane_index[lane] * row_height + 4
-        x = label_width + task.start * scale
-        rect_width = max(1.0, task.duration * scale)
+        visible_start = max(task.start, window_start)
+        visible_finish = min(task.finish, window_end)
+        x = label_width + (visible_start - window_start) * scale
+        rect_width = max(1.0, (visible_finish - visible_start) * scale)
         primitive = primitive_by_task[task.task_id]
         color = _primitive_color(primitive)
         details = (
@@ -431,12 +483,22 @@ def write_svg(
         elements.append(
             f'<rect x="{x:.2f}" y="{y}" width="{rect_width:.2f}" height="{row_height - 8}" fill="{color}" stroke="#ffffff" stroke-width="0.6" rx="2"><title>{html.escape(task.task_id)} | {html.escape(primitive)}{html.escape(extra)} | issue={task.issue:g} start={task.start:g} finish={task.finish:g} duration={task.duration:g}</title></rect>'
         )
+    elements.append("</g>")
     elements.append("</svg>")
     target.write_text("\n".join(elements), encoding="utf-8")
     finalize_artifact(target, compatibility)
 
 
-def write_png(result: ScheduleResult, path: str | Path, *, width: int = 1600, row_height: int = 28) -> None:
+def write_png(
+    result: ScheduleResult,
+    path: str | Path,
+    *,
+    width: int = 1600,
+    row_height: int = 28,
+    machine: MachineConfig | None = None,
+    start_cycle: float | None = None,
+    end_cycle: float | None = None,
+) -> None:
     """Rasterize the swimlane SVG using an installed ImageMagick or librsvg binary."""
 
     converter = shutil.which("convert") or shutil.which("magick") or shutil.which("rsvg-convert")
@@ -447,7 +509,15 @@ def write_png(result: ScheduleResult, path: str | Path, *, width: int = 1600, ro
     with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as handle:
         temporary_svg = Path(handle.name)
     try:
-        write_svg(result, temporary_svg, width=width, row_height=row_height)
+        write_svg(
+            result,
+            temporary_svg,
+            width=width,
+            row_height=row_height,
+            machine=machine,
+            start_cycle=start_cycle,
+            end_cycle=end_cycle,
+        )
         if Path(converter).name == "rsvg-convert":
             command = [converter, str(temporary_svg), "-o", str(target)]
         else:

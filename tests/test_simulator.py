@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 
@@ -57,6 +58,59 @@ class EventSimulatorTest(unittest.TestCase):
         self.assertIn(">Cycle</text>", svg)
         self.assertIn(">5</text>", svg)
         self.assertIn("issue=", svg)
+
+    def test_swimlane_includes_configured_idle_instances_and_window(self) -> None:
+        graph = ExecutionGraph(
+            graph_id="trace_machine_topology",
+            tasks=(
+                ExecutionTask(
+                    "compute",
+                    "tile0",
+                    "micro",
+                    "matmul",
+                    "MXU",
+                    duration_cycles=12,
+                ),
+            ),
+        )
+        base_machine = minimal_machine_config()
+        machine = replace(
+            base_machine,
+            execution_units=tuple(
+                replace(unit, count=2) if unit.name == "MXU" else unit
+                for unit in base_machine.execution_units
+            ),
+        )
+        result = schedule_execution_graph(
+            graph,
+            machine,
+            SchedulerPolicy.STATIC_PIPELINE,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "swimlane.svg"
+            write_svg(
+                result,
+                output,
+                machine=machine,
+                start_cycle=0,
+                end_cycle=8,
+            )
+            svg = (output.parent / "07_trace" / output.name).read_text(encoding="utf-8")
+
+        self.assertIn("MXU[0]", svg)
+        self.assertIn('data-state="idle"', svg)
+        self.assertIn("MXU[1]", svg)
+        self.assertIn("window=0..8", svg)
+        self.assertIn('id="task-spans"', svg)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "start_cycle"):
+                write_svg(
+                    result,
+                    Path(directory) / "swimlane.svg",
+                    machine=machine,
+                    start_cycle=result.total_cycles,
+                )
 
     def test_timing_table_overrides_primitive_and_keeps_backend_name(self) -> None:
         graph = ExecutionGraph(
