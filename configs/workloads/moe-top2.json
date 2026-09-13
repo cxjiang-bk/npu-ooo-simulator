@@ -7,7 +7,7 @@
     "kwargs": {
       "batch_size": 1,
       "sequence_length": 8,
-      "hidden_size": 8,
+      "hidden_size": 256,
       "intermediate_size": 16,
       "expert_count": 4,
       "dtype": "float32"
@@ -15,6 +15,7 @@
   },
   "compile": {
     "arch": "lpu-like",
+    "machine_config": "../machines/lpu-2mxu-2aru.json",
     "tile_size": 8
   },
   "runtime": {

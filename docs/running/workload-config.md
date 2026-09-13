@@ -99,6 +99,11 @@ FlashAttention 和 Top-2 MoE 的算法、semantic region 与稀疏执行边界�
 
 目标机器是一个整体选择：显式 CLI `--arch` 会替换 JSON 继承的 `machine_config`；若命令行
 同时显式给出 `--arch` 和 `--machine-config`，则沿用既有规则，由完整 machine 文件优先。
+`compile.machine_config` 的相对路径以 workload JSON 所在目录为基准，编译时会把解析后的
+完整配置写入 `04_backend/machine.json`，并将 machine hash/topology hash 写入 compile manifest。
+独立 `simulate --compile-dir` 默认读取这份编译机配置，不需要再次传 `--machine-config`；只有
+明确研究兼容硬件覆盖时才传该参数。若覆盖改变存储拓扑、transfer engine 或 operand placement，
+命令会拒绝运行，必须按新 MachineConfig 重新编译。
 
 ## 3. 声明式模型与输入
 

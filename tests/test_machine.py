@@ -4,6 +4,7 @@ from npu_ooo.arch import (
     MachineConfig,
     MemoryLevelConfig,
     lpu_like_machine_config,
+    load_machine_config,
     minimal_machine_config,
     machine_config_from_dict,
     wide_mxu_machine_config,
@@ -11,6 +12,20 @@ from npu_ooo.arch import (
 
 
 class MachineConfigTest(unittest.TestCase):
+    def test_lpu_machine_json_covers_generic_transform_targets(self) -> None:
+        config = load_machine_config("configs/machines/lpu-2mxu-2aru.json")
+        self.assertEqual(config.validate(), ())
+        root_transfer = next(
+            item
+            for item in config.operation_class_placements
+            if item.class_id == "root-transfer"
+        )
+        self.assertTrue(
+            {"reshape", "transpose", "slice", "concatenate", "embedding"}
+            <= set(root_transfer.operations)
+        )
+        self.assertEqual(config.scheduler.pipeline.inflight_entries, 64)
+
     def test_profiles_validate_and_have_stable_hashes(self) -> None:
         for factory in (minimal_machine_config, wide_mxu_machine_config, lpu_like_machine_config):
             config = factory()

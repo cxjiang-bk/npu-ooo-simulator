@@ -514,5 +514,33 @@ class CompileAndSimCliTest(unittest.TestCase):
             self.assertEqual({record["artifact_id"] for record in records}, {records[0]["artifact_id"]})
 
 
+
+    def test_simulate_rejects_incompatible_machine_override(self) -> None:
+        from npu_ooo.arch import lpu_like_machine_config
+
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            root = Path(directory)
+            compile_dir = root / "compile"
+            machine_path = root / "machine.json"
+            self._write_minimal_compile_package(compile_dir)
+            machine_path.write_text(
+                json.dumps(lpu_like_machine_config().to_dict()), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                r"compile package machine 'minimal' -> requested 'lpu-like'.*recompile",
+            ):
+                main(
+                    [
+                        "simulate",
+                        "--compile-dir",
+                        str(compile_dir),
+                        "--machine-config",
+                        str(machine_path),
+                        "--output-dir",
+                        str(root / "simulation"),
+                    ]
+                )
+
 if __name__ == "__main__":
     unittest.main()

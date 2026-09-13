@@ -121,7 +121,11 @@ for policy in static_streams dynamic_ready_queue; do
 done
 ```
 
-`simulate` 默认读取编译包内的 `04_backend/machine.json`，无需再写 `--arch`。
+`simulate` 默认读取编译包内的 `04_backend/machine.json`，无需再写 `--arch` 或
+`--machine-config`。若要使用另一份硬件配置，应在 compile 阶段通过 `--machine-config` 或
+workload JSON 的 `compile.machine_config` 选定后重新生成 package；simulate 阶段的显式覆盖只
+允许 topology-compatible 的容量/带宽等参数，改变存储拓扑、transfer engine 或 operand placement
+会明确要求重新编译。
 两次运行只改变设备 policy；输入、编译包、runtime 提交配置、硬件和 timing source 均相同。
 对照 `compile_package_sha256`、周期和 stall，而不是只看泳道图是否更紧凑。
 

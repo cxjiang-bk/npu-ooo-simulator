@@ -231,6 +231,7 @@
         "reshape",
         "transpose",
         "slice",
+        "concatenate",
         "embedding"
       ],
       "output_route": [
@@ -295,7 +296,7 @@
       "dispatch_latency": 1,
       "dispatch_width": 1,
       "fence_latency": 1,
-      "inflight_entries": 16,
+      "inflight_entries": 64,
       "iq_entries": 8,
       "issue_width": 1,
       "max_cycles": 1000000,

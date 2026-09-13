@@ -2059,15 +2059,19 @@ def run_simulate(args: argparse.Namespace) -> int:
         if args.runtime_config is not None
         else {}
     )
+    machine_override = args.arch is not None or args.machine_config is not None
     machine = (
         _machine(args.arch, args.machine_config)
-        if args.arch is not None or args.machine_config is not None
+        if machine_override
         else compiled_machine
     )
     if machine.topology_hash() != artifact.memory_plan.machine_topology_hash:
         raise ValueError(
-            "simulate MachineConfig changes storage topology, transfer engines, or operand "
-            "placement; target lowering must be rerun"
+            "simulate MachineConfig is incompatible with compile package machine "
+            f"'{compiled_machine.config_id}' -> requested '{machine.config_id}': "
+            "storage topology, transfer engines, or operand placement differ; "
+            "target lowering must be rerun. Omit --arch/--machine-config to use the "
+            "compile package machine, or recompile with the selected MachineConfig"
         )
     runtime_policy = args.runtime_policy or str(runtime_payload.get("runtime_policy", "static"))
     chunk_size = args.runtime_chunk_size
@@ -2245,7 +2249,10 @@ def run_simulate(args: argparse.Namespace) -> int:
             "static_control_busy_cycles", 0
         ),
         "compile_manifest": compile_manifest,
+        "compile_machine_config_id": compiled_machine.config_id,
+        "compile_machine_topology_hash": artifact.memory_plan.machine_topology_hash,
         "architecture": machine.config_id,
+        "machine_source": "explicit_override" if machine_override else "compile_package",
         "machine_hash": machine.stable_hash(),
         "timing_provider": getattr(timing_model, "name", "analytical"),
         "event_backend": event_backend.name,

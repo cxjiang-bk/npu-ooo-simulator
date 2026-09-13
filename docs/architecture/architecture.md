@@ -430,6 +430,8 @@ package，对比兼容的 MachineConfig 参数、timing provider、runtime polic
 memory identity/parent、alignment、transfer connectivity/engine/transform 或 operand
 placement 会改变 topology hash，因此必须重新编译。旧 package 若没有 TargetPlan v1 或
 MemoryPlan v2，独立 simulate 会明确拒绝，避免把符号 TISA 默认为某个目标存储。
+其中 `04_backend/machine.json` 是该 package 的硬件契约：未指定 simulate 覆盖时直接使用它；显式
+覆盖会与 `machine_topology_hash` 校验，若不兼容则必须以新 MachineConfig 重新 compile。
 
 命令参数遵循同一边界：`compile` 只接受前端、shape、tile/GC 和 codegen 选项；`simulate`
 接受 runtime、scheduler、MachineConfig 覆盖和 timing/event backend；`compile-and-sim` 将

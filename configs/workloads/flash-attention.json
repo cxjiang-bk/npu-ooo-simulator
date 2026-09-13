@@ -9,7 +9,7 @@
       "num_heads": 2,
       "query_length": 8,
       "key_length": 8,
-      "head_dim": 16,
+      "head_dim": 32,
       "query_block_size": 4,
       "kv_block_size": 8,
       "causal": true,
@@ -18,6 +18,7 @@
   },
   "compile": {
     "arch": "lpu-like",
+    "machine_config": "../machines/lpu-2mxu-2aru.json",
     "tile_size": 8
   },
   "runtime": {
