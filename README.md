@@ -224,7 +224,7 @@ prefill/decode，并用文件名区分 one-block、两层 model proxy 和固定�
 | `--address-scoreboard` | 关闭 | 开启额外地址冲突检查；cycle 设备模型检查已接收的较老未完成 descriptor，runtime loader 另负责将绑定后的 alias 转为显式依赖 |
 | `--memory-bank-scoreboard` | 关闭 | 按 MachineConfig 的 bank/读写端口建模结构冲突；当前为 payload 占用期间的保守模型，不是逐 transaction DRAM 仿真 |
 | `--swimlane-start-cycle` / `--swimlane-end-cycle` | 不指定 | 限制泳道图显示的周期窗口；不改变调度、依赖或 `total_cycles`，适合放大查看短任务 |
-| `--scheduler-config` | 不指定 | 读取控制流水 JSON，**必须同时选择 `cycle_event`**；格式见下一节 |
+| `--scheduler-config` | 不指定 | 读取 `cycle_event` 的 pipeline JSON 或 scheduler profile JSON；格式见下一节 |
 
 CLI 默认是 **static + analytical_event**，不是 dynamic + cycle_event；需要后者时必须显式指定。
 `static_pipeline` 保留为旧全局下一条兼容基线；论文式编译期静态流实验应显式选择
@@ -232,7 +232,7 @@ CLI 默认是 **static + analytical_event**，不是 dynamic + cycle_event；需
 
 ### 3. 队列容量与逐周期控制参数
 
-命令行容量覆盖以下默认值；未提供时沿用所选机器配置。
+命令行容量和 scheduler profile 容量覆盖以下默认值；未提供时沿用编译包中的机器配置。
 
 | CLI 参数 | 默认来源 | `cycle_event` 中的含义 |
 | --- | --- | --- |
@@ -245,8 +245,8 @@ CLI 默认是 **static + analytical_event**，不是 dynamic + cycle_event；需
 **WQ 容量不由 `--dependency-window` 设置**：每类 EU 的 WQ 容量为
 `execution_units[].queue_depth × count`，需要在 MachineConfig 中配置。
 
-控制流水模板：[configs/scheduler/cycle_baseline.json](configs/scheduler/cycle_baseline.json)。
-文件顶层直接放以下字段，不要再包一层 `pipeline`：
+控制流水模板（legacy pipeline JSON）：[configs/scheduler/cycle_baseline.json](configs/scheduler/cycle_baseline.json)。
+文件顶层直接放以下字段：
 
 | JSON 字段 | 默认值 | 单位与含义 |
 | --- | ---: | --- |
@@ -284,9 +284,31 @@ SemanticConflict。广播互连及全局 ROB 均为论文未公开细节上的�
 }
 ```
 
-配置优先级：命令行容量覆盖 MachineConfig 对应容量；`--scheduler-config` 替换所选机器的
-整组 `scheduler.pipeline`。该文件省略的字段取上表默认值，**不是继承机器中同名字段**。
-没有传文件时才完整使用 `machine.scheduler.pipeline`。
+需要比较队列、ROB、tile window、WQ window 和 IQ 容量时，使用 scheduler profile：
+
+~~~json
+{
+  "schema_version": 1,
+  "profile": "dynamic_window_baseline",
+  "capacities": {
+    "instruction_queue_depth": 32,
+    "rob_entries": 16,
+    "max_inflight_tiles": 8,
+    "dependency_window": 8,
+    "ready_queue_depth": 32
+  }
+}
+~~~
+
+预置 profile：
+
+- [dynamic_window_narrow](configs/scheduler/dynamic_window_narrow.json)
+- [dynamic_window_baseline](configs/scheduler/dynamic_window_baseline.json)
+- [dynamic_window_wide](configs/scheduler/dynamic_window_wide.json)
+
+每个容量字段的生效优先级为 `CLI capacity > profile capacities > compile machine scheduler defaults`。profile 省略 `pipeline` 时使用编译包 `machine.scheduler.pipeline`；profile 提供
+`pipeline` 时使用该对象的控制流水值。legacy pipeline JSON 的字段省略时使用
+`SchedulerPipelineConfig` 默认值。
 
 物理执行结束、反馈接受、依赖唤醒和退休是不同事件。逐周期顺序与手算示例见
 [Device scheduler 周期模型](docs/running/device-scheduler.md)。
@@ -296,7 +318,7 @@ SemanticConflict。广播互连及全局 ROB 均为论文未公开细节上的�
 | 配置选项 | 配置内容 | 示例/来源 |
 | --- | --- | --- |
 | `--machine-config` | memory 层级/容量/bank/端口、EU、合法 transfer path、operand placement、scheduler 默认值 | 编译输出 `04_backend/machine.json` 是完整模板；内置定义见 [arch/machine.py](src/npu_ooo/arch/machine.py) |
-| `--scheduler-config` | 上节列出的周期控制字段 | [cycle_baseline.json](configs/scheduler/cycle_baseline.json) |
+| `--scheduler-config` | 周期控制字段，或 scheduler profile 的容量与可选 pipeline | [cycle_baseline.json](configs/scheduler/cycle_baseline.json)、[scheduler profiles](configs/scheduler/) |
 | `--timing-config` | payload 内部任务的执行时长/发射间隔或 MXU profile | [attention_probe.json](configs/timing/attention_probe.json) |
 
 内置机器的区别：

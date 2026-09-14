@@ -9,7 +9,13 @@ from types import SimpleNamespace
 
 from npu_ooo.arch import minimal_machine_config
 from npu_ooo.backend.memory import materialize_target_memory
-from npu_ooo.cli import _load_torch_module, _paper_profile_name, build_parser, main
+from npu_ooo.cli import (
+    _load_torch_module,
+    _paper_profile_name,
+    _simulation_config,
+    build_parser,
+    main,
+)
 from npu_ooo.frontend import official_stablehlo_available, torch_xla_available
 from npu_ooo.ir import (
     AccessType,
@@ -39,6 +45,67 @@ FRONTEND_AVAILABLE = bool(
 
 
 class CliSurfaceTest(unittest.TestCase):
+    def test_scheduler_profile_overrides_machine_capacities(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "simulate",
+                "--compile-dir",
+                "out/compile",
+                "--event-backend",
+                "cycle_event",
+                "--scheduler-config",
+                "configs/scheduler/dynamic_window_narrow.json",
+            ]
+        )
+        config = _simulation_config(args)
+        self.assertEqual(config.instruction_queue_depth, 8)
+        self.assertEqual(config.rob_entries, 8)
+        self.assertEqual(config.max_inflight_tiles, 4)
+        self.assertEqual(config.dependency_window, 4)
+        self.assertEqual(config.ready_queue_depth, 8)
+        self.assertIsNone(config.pipeline)
+
+        resolved = config.resolved(minimal_machine_config())
+        self.assertEqual(resolved.pipeline, minimal_machine_config().scheduler.pipeline)
+
+    def test_scheduler_profile_capacity_cli_override_wins(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "simulate",
+                "--compile-dir",
+                "out/compile",
+                "--event-backend",
+                "cycle_event",
+                "--scheduler-config",
+                "configs/scheduler/dynamic_window_narrow.json",
+                "--instruction-queue-depth",
+                "99",
+            ]
+        )
+        config = _simulation_config(args)
+        self.assertEqual(config.instruction_queue_depth, 99)
+
+    def test_scheduler_pipeline_json_remains_supported(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "simulate",
+                "--compile-dir",
+                "out/compile",
+                "--event-backend",
+                "cycle_event",
+                "--scheduler-config",
+                "configs/scheduler/cycle_baseline.json",
+            ]
+        )
+        config = _simulation_config(args)
+        self.assertEqual(config.pipeline.receive_width, 1)
+        self.assertEqual(config.pipeline.iq_entries, 8)
+        self.assertIsNone(config.instruction_queue_depth)
+
+
     @unittest.skipUnless(importlib.util.find_spec("torch"), "requires PyTorch")
     def test_torch_module_loader_applies_requested_dtype_to_module_and_inputs(self):
         import torch

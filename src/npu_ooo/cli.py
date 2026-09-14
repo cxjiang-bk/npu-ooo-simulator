@@ -488,8 +488,70 @@ def _add_simulation_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+_SCHEDULER_CAPACITY_FIELDS = (
+    "instruction_queue_depth",
+    "rob_entries",
+    "max_inflight_tiles",
+    "dependency_window",
+    "ready_queue_depth",
+)
+
+
+def _load_scheduler_config(
+    path: Path,
+) -> tuple[dict[str, int], SchedulerPipelineConfig | None]:
+    """Load a legacy pipeline JSON or a capacity-plus-pipeline profile."""
+
+    payload = _read_json_object(path, description="scheduler config")
+    if "capacities" not in payload and "pipeline" not in payload:
+        return {}, SchedulerPipelineConfig.from_dict(payload)
+
+    allowed = {
+        "schema_version",
+        "profile",
+        "description",
+        "capacities",
+        "pipeline",
+    }
+    unknown = set(payload) - allowed
+    if unknown:
+        raise ValueError(
+            "unknown scheduler profile fields: " + ", ".join(sorted(unknown))
+        )
+    if payload.get("schema_version", 1) != 1:
+        raise ValueError("scheduler profile schema_version must be 1")
+    capacities_payload = payload.get("capacities", {})
+    if not isinstance(capacities_payload, Mapping):
+        raise ValueError("scheduler profile capacities must be a JSON object")
+    unknown_capacities = set(capacities_payload) - set(_SCHEDULER_CAPACITY_FIELDS)
+    if unknown_capacities:
+        raise ValueError(
+            "unknown scheduler capacity fields: "
+            + ", ".join(sorted(unknown_capacities))
+        )
+    capacities = {
+        name: _positive_integer(
+            capacities_payload[name],
+            path=f"scheduler.capacities.{name}",
+        )
+        for name in _SCHEDULER_CAPACITY_FIELDS
+        if name in capacities_payload
+    }
+    pipeline_payload = payload.get("pipeline")
+    pipeline = (
+        SchedulerPipelineConfig.from_dict(pipeline_payload)
+        if pipeline_payload is not None
+        else None
+    )
+    return capacities, pipeline
+
+
 def _add_paper_matrix_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--scheduler-config", type=Path, help="cycle_event control pipeline JSON")
+    parser.add_argument(
+        "--scheduler-config",
+        type=Path,
+        help="cycle_event pipeline or scheduler profile JSON",
+    )
     parser.add_argument(
         "--benchmarks",
         default="all",
@@ -2122,18 +2184,22 @@ def _load_compile_package(root: Path):
 
 def _simulation_config(args: argparse.Namespace) -> SimulatorConfig:
     pipeline = None
+    profile_capacities: dict[str, int] = {}
     if args.scheduler_config is not None:
         if args.event_backend != "cycle_event":
             raise ValueError("--scheduler-config requires --event-backend cycle_event")
-        pipeline = SchedulerPipelineConfig.from_dict(
-            _read_json_object(args.scheduler_config, description="scheduler pipeline")
-        )
+        profile_capacities, pipeline = _load_scheduler_config(args.scheduler_config)
+
+    def capacity(name: str) -> int | None:
+        value = getattr(args, name)
+        return value if value is not None else profile_capacities.get(name)
+
     return SimulatorConfig(
-        instruction_queue_depth=args.instruction_queue_depth,
-        rob_entries=args.rob_entries,
-        max_inflight_tiles=args.max_inflight_tiles,
-        dependency_window=args.dependency_window,
-        ready_queue_depth=args.ready_queue_depth,
+        instruction_queue_depth=capacity("instruction_queue_depth"),
+        rob_entries=capacity("rob_entries"),
+        max_inflight_tiles=capacity("max_inflight_tiles"),
+        dependency_window=capacity("dependency_window"),
+        ready_queue_depth=capacity("ready_queue_depth"),
         address_scoreboard=args.address_scoreboard,
         memory_bank_scoreboard=args.memory_bank_scoreboard,
         dynamic_priority=args.dynamic_priority,

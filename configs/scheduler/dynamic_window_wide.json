@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "profile": "dynamic_window_wide",
+  "description": "Expanded device queues and ready window for dynamic sensitivity analysis",
+  "capacities": {
+    "instruction_queue_depth": 64,
+    "rob_entries": 32,
+    "max_inflight_tiles": 16,
+    "dependency_window": 16,
+    "ready_queue_depth": 64
+  }
+}

@@ -185,3 +185,42 @@ completion token 包含 invocation id，重复调用不会串扰。`execution_do
 cycle scheduler 之后仍经过 completion latency/width 仲裁才标记 complete，再经 wakeup latency
 唤醒依赖，最后按 ROB 规则 retire。execution backend 拒绝 issue 时 scheduler 不产生假 issue。
 模块边界测试禁止 event/cycle scheduler 读取 `BackendArtifact.execution_graph` 或 payload map。
+
+## Scheduler profile
+
+scheduler-config 为 cycle_event 提供两种 JSON 形式：
+
+- Pipeline JSON 直接使用 SchedulerPipelineConfig 字段。[cycle baseline](../../configs/scheduler/cycle_baseline.json) 是标准模板，省略字段采用 pipeline 默认值。
+- Profile JSON 包含 schema_version、profile、capacities 和可选 pipeline。capacities 仅调整 scheduler 仿真结构容量，编译包的机器拓扑保持一致；profile 省略 pipeline 时沿用编译包 machine.scheduler.pipeline，显式提供 pipeline 时采用该次运行的控制流水参数。
+
+Profile 容量字段与仿真结构一一对应：
+
+| 字段 | 仿真结构 |
+| --- | --- |
+| instruction_queue_depth | Reception FIFO 容量 |
+| rob_entries | Active ROB credit 容量 |
+| max_inflight_tiles | tile window 容量 |
+| dependency_window | 固定 WQ 扫描窗口 |
+| ready_queue_depth | IQ 容量上限 |
+
+仓库提供三档容量 profile 用于受控敏感性分析：
+
+- [dynamic_window_narrow](../../configs/scheduler/dynamic_window_narrow.json)：Reception 8、ROB 8、tile window 4、WQ window 4、IQ 8。
+- [dynamic_window_baseline](../../configs/scheduler/dynamic_window_baseline.json)：Reception 32、ROB 16、tile window 8、WQ window 8、IQ 32。
+- [dynamic_window_wide](../../configs/scheduler/dynamic_window_wide.json)：Reception 64、ROB 32、tile window 16、WQ window 16、IQ 64。
+
+先完成一次 compile，再让所有 profile 消费同一编译包：
+
+~~~bash
+for profile in dynamic_window_narrow dynamic_window_baseline dynamic_window_wide; do
+  PYTHONPATH=src python3.12 -m npu_ooo.cli simulate \
+    --compile-dir out/attention-compile \
+    --event-backend cycle_event \
+    --scheduler-config configs/scheduler/$profile.json \
+    --policy dynamic_ready_queue \
+    --dynamic-priority oldest_first \
+    --output-dir out/attention-$profile
+done
+~~~
+
+每个容量字段按 CLI capacity > profile capacities > compile machine scheduler defaults 生效。profile 负责本次运行的 scheduler 容量和可选控制流水，编译包继续提供机器资源、placement、transfer path 和 payload timing，从而让 Static Streams 与 Dynamic 的参数对照保持同一硬件基础。
