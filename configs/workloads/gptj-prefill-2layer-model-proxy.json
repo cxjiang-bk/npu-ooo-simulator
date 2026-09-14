@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "seed": 113,
+  "experiment_id": "gptj-prefill-2layer-model-proxy",
+  "workload": {
+    "factory": "examples.configurable_models:build_paper_model_workload",
+    "kwargs": {
+      "case_id": "gpt-j-6b-oneblk",
+      "variant": "micro",
+      "layer_count": 2,
+      "model_scope": "model_proxy"
+    }
+  },
+  "compile": {
+    "arch": "lpu-like",
+    "tile_size": 4
+  }
+}

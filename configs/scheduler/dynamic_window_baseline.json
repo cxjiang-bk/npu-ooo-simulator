@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "profile": "dynamic_window_baseline",
+  "description": "Baseline dynamic capacities used by the standard machine profiles",
+  "capacities": {
+    "instruction_queue_depth": 32,
+    "rob_entries": 16,
+    "max_inflight_tiles": 8,
+    "dependency_window": 8,
+    "ready_queue_depth": 32
+  }
+}

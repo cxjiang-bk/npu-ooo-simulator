@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "seed": 31,
+  "experiment_id": "llama-decode-seqlen1-window4",
+  "model": {
+    "factory": "examples.paper_benchmarks.llama2:LLaMA2DecodeOneBlock",
+    "kwargs": {
+      "hidden_size": 8,
+      "num_heads": 2,
+      "intermediate_size": 16,
+      "cache_window": 4
+    },
+    "dtype": "float16"
+  },
+  "inputs": {
+    "kwargs": {
+      "x": {
+        "kind": "tensor",
+        "shape": [1, 1, 8],
+        "dtype": "float16",
+        "init": {"kind": "randn"}
+      },
+      "key_cache": {
+        "kind": "tensor",
+        "shape": [1, 2, 4, 4],
+        "dtype": "float16",
+        "init": {"kind": "randn"}
+      },
+      "value_cache": {
+        "kind": "tensor",
+        "shape": [1, 2, 4, 4],
+        "dtype": "float16",
+        "init": {"kind": "randn"}
+      },
+      "rope_cos": {
+        "kind": "tensor",
+        "shape": [1, 1, 1, 4],
+        "dtype": "float16",
+        "init": {"kind": "ones"}
+      },
+      "rope_sin": {
+        "kind": "tensor",
+        "shape": [1, 1, 1, 4],
+        "dtype": "float16",
+        "init": {"kind": "zeros"}
+      },
+      "attention_mask": {
+        "kind": "tensor",
+        "shape": [1, 1, 1, 4],
+        "dtype": "float16",
+        "init": {"kind": "zeros"}
+      }
+    }
+  },
+  "compile": {
+    "arch": "lpu-like",
+    "tile_size": 4
+  }
+}

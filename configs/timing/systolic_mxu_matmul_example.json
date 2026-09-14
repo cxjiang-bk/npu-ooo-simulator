@@ -1,0 +1,27 @@
+{
+  "format": "npu_ooo.systolic_mxu_profile.v1",
+  "name": "systolic_mxu_example_4x12x8",
+  "metadata": {
+    "source": "example external systolic profile; not a measured SCALE-Sim or RTL result",
+    "calibration_status": "source-derived-example",
+    "array_rows": 16,
+    "array_cols": 16,
+    "dataflow": "output_stationary"
+  },
+  "unmatched_matmul": "analytical",
+  "matmul_profiles": [
+    {
+      "shape": {
+        "batch": 1,
+        "m": 4,
+        "n": 12,
+        "k": 8
+      },
+      "duration_cycles": 23,
+      "initiation_interval_cycles": 3,
+      "attributes": {
+        "source_record": "example.0"
+      }
+    }
+  ]
+}

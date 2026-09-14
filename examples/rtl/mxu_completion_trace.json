@@ -1,0 +1,34 @@
+{
+  "format": "npu_ooo.rtl_completion_trace.v1",
+  "metadata": {
+    "source": "example-only",
+    "git_revision": "not-a-measurement",
+    "testbench_config": "mxu-small",
+    "clock_period_ns": 1.0,
+    "calibration_status": "source-derived-example"
+  },
+  "records": [
+    {
+      "instruction_id": "mxu-4x12x8-0",
+      "batch": 1,
+      "m": 4,
+      "n": 12,
+      "k": 8,
+      "descriptor_issue_cycle": 10,
+      "compute_start_cycle": 14,
+      "compute_done_cycle": 37,
+      "psb_write_done_cycle": 41
+    },
+    {
+      "instruction_id": "mxu-4x12x8-1",
+      "batch": 1,
+      "m": 4,
+      "n": 12,
+      "k": 8,
+      "descriptor_issue_cycle": 20,
+      "compute_start_cycle": 24,
+      "compute_done_cycle": 47,
+      "psb_write_done_cycle": 51
+    }
+  ]
+}

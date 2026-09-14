@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "seed": 11,
+  "experiment_id": "json-attention",
+  "model": {
+    "factory": "examples.configurable_models:MultiInputAttention",
+    "kwargs": {},
+    "dtype": "float32"
+  },
+  "inputs": {
+    "kwargs": {
+      "q": {
+        "kind": "tensor",
+        "shape": [1, 2, 4, 4],
+        "dtype": "float32",
+        "init": {"kind": "randn"}
+      },
+      "k": {
+        "kind": "tensor",
+        "shape": [1, 2, 4, 4],
+        "dtype": "float32",
+        "init": {"kind": "randn"}
+      },
+      "v": {
+        "kind": "tensor",
+        "shape": [1, 2, 4, 4],
+        "dtype": "float32",
+        "init": {"kind": "randn"}
+      },
+      "attention_mask": {
+        "kind": "tensor",
+        "shape": [1, 1, 4, 4],
+        "dtype": "float32",
+        "init": {"kind": "zeros"}
+      }
+    }
+  },
+  "compile": {
+    "arch": "lpu-like",
+    "tile_size": 4,
+    "softmax_algorithm": "materialized"
+  },
+  "runtime": {
+    "event_backend": "cycle_event",
+    "policy": "dynamic_ready_queue",
+    "runtime_policy": "static",
+    "address_scoreboard": true
+  }
+}

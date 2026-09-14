@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "profile": "dynamic_window_narrow",
+  "description": "Small device queues and ready window for dynamic sensitivity analysis",
+  "capacities": {
+    "instruction_queue_depth": 8,
+    "rob_entries": 8,
+    "max_inflight_tiles": 4,
+    "dependency_window": 4,
+    "ready_queue_depth": 8
+  }
+}

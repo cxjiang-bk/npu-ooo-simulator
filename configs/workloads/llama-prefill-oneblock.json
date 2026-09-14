@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "seed": 127,
+  "experiment_id": "llama-prefill-oneblock-micro",
+  "workload": {
+    "factory": "examples.configurable_models:build_paper_model_workload",
+    "kwargs": {
+      "case_id": "llama2-13b-oneblk",
+      "variant": "micro",
+      "layer_count": 1,
+      "model_scope": "one_block"
+    }
+  },
+  "compile": {
+    "arch": "lpu-like",
+    "tile_size": 4
+  }
+}

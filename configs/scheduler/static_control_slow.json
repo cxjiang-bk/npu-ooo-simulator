@@ -1,0 +1,6 @@
+{
+  "control_width": 1,
+  "control_latency": 4,
+  "wait_latency": 4,
+  "fence_latency": 4
+}
