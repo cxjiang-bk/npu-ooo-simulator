@@ -268,7 +268,7 @@ reduction / atomic / psum special semantics
 | 地址冲突 | 与 semantic compatibility 共同判断 | optional global address scoreboard | 不能替代论文机制 |
 | 资源检查 | unit/resource availability | issue 阶段检查 | 基本一致 |
 | 跨 EU address hazard | 依赖语义应全局可见 | global older-descriptor scan | 可作为项目保守扩展，但不是 Fu 检查 |
-| 全局 ROB | 论文未描述 | dispatch 分配、按 submission order retire | 非论文项目扩展，会产生全局反压 |
+| 全局 ROB | 论文公开路径之外 | active credit 在 dispatch 分配、complete 回收；ledger 按 submission order retire | 项目容量与观测扩展 |
 | 全局 tile window | 论文未描述同名结构 | `max_inflight_tiles` | 非论文项目扩展 |
 
 ## 6. 应采用的对齐后架构

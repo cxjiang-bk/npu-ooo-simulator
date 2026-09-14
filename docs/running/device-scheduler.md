@@ -1,7 +1,7 @@
 # Device scheduler 周期仿真运行指南
 
 调度器的模块边界、论文 Figure 4 对应关系以及
-`RuntimeSubmission → LoadedDeviceProgram → Reception FIFO → ROB/WQ → IQ → ExecutionBackend`
+`RuntimeSubmission → LoadedDeviceProgram → Reception FIFO → WQ/IQ → ExecutionBackend`
 架构见 [Scheduler 架构与流程](../architecture/scheduler.md)。本文聚焦如何运行和解释
 `cycle_event` 模型。
 
@@ -51,7 +51,8 @@ PYTHONPATH=src python3.12 -m npu_ooo.cli simulate \
 | 每类 EU 的 WQ | `unit.queue_depth × unit.count` | dispatch 分配，select 释放 |
 | 每类 EU 的 IQ | `min(pipeline.iq_entries, ready_queue_depth)` | select 分配，issue 释放 |
 | 每类 EU 的语义表 Fu | `pipeline.inflight_entries`，按 operand 条目计数 | issue 分配，完成反馈接受后释放 |
-| ROB | `rob_entries`，按 TISA 指令计数 | dispatch 分配，按 descriptor 提交顺序 retire |
+| Active ROB credit | `rob_entries`，按 TISA 指令计数 | dispatch 分配，complete 回收 |
+| Retirement ledger | descriptor submission order | dispatch 追加，completed ledger head retire |
 | Tile window | `max_inflight_tiles` | 首条子 stage issue 占用，整 tile 所有 TISA complete 释放 |
 | EU 实例 | `unit.count` | 由 ExecutionBackend 独占；issue 接受后占用，物理执行结束后释放 |
 
@@ -78,7 +79,7 @@ retire → complete → wakeup → issue → select → dispatch → receive
 ```
 
 逆向处理流水线保证新接收/新选出的条目经过寄存边界。容量释放可供同周期后面的阶段使用：
-如 retire 释放 ROB 后 dispatch 可以补入，issue 释放 IQ 后 select 可以补入。
+如 complete 回收 active ROB credit 后 dispatch 可以补入，issue 释放 IQ 后 select 可以补入。
 
 | 事件 | 最早周期 |
 | --- | --- |
@@ -89,7 +90,7 @@ retire → complete → wakeup → issue → select → dispatch → receive
 | issue | `select + select_latency`，重新验证 SemanticConflict，并受 EU/Fu/tile/memory 资源和 issue width 限制 |
 | execution done | `ceil(issue + payload duration)` |
 | complete | `execution done + completion_latency`，受 completion width 仲裁限制 |
-| retire | `complete + retire_latency`，受 ROB 队首和 retire width 限制 |
+| retire | `complete + retire_latency`，受 retirement ledger 队首和 retire width 限制 |
 
 默认 receive@0 的独立指令会 dispatch@1、select@2、issue@3。若 duration=2，则
 done/complete@5、retire@6。其 RAW 消费者默认 wakeup@6、select@6、issue@7。
@@ -97,8 +98,9 @@ done/complete@5、retire@6。其 RAW 消费者默认 wakeup@6、select@6、issue
 `completion_latency` 可为 0。同一时刻的 trace 保留实际阶段处理顺序。
 
 完成总线按 `(execution done cycle, descriptor order)` 仲裁。物理 EU 可以在反馈等待期间
-再次执行，而 Fu/ROB 持有对应条目直到 complete/retire。ROB 表示有序完成记账，不模拟
-CPU 推测执行、异常回滚或将内存写入延迟至退休。
+再次执行。Fu 和 active ROB credit 持有对应条目直到 complete；retirement ledger 持有
+descriptor order record 直到 retire。该 ledger 用于调度结果的有序退休与观测，
+执行效果在 complete 阶段生效。
 
 `TISA_COMPLETE` 广播完整 readiness condition，`TISA_PARTIAL_READY` 广播对应 partial
 condition；广播只携带 completion identity/condition，不传输 payload 数据。全部 per-EU WQ
@@ -139,8 +141,10 @@ notification，没有公开 Epoch 的 broadcast/scoreboard 实现。
 
 - `instruction_pipeline`：每条指令的 received/dispatched/wakeup/selected/issued/done/
   completed/retired 周期；
-- `wq_peak/iq_peak/fu_peak/rob_peak`：队列和表项峰值；逐周期
-  `queue_occupancy_timeline` 仍可在进程内结果中检查，但不再嵌入默认 summary；
+- `wq_peak/iq_peak/fu_peak/rob_peak`：WQ、IQ、Fu 和 active ROB credit 峰值；
+- `retirement_backlog_peak/completed_retirement_backlog_peak`：retirement ledger 总记录
+  及其中 completed record 的峰值；逐周期 `queue_occupancy_timeline` 可在进程内结果中检查；
+  默认 summary 保存聚合指标；
 - `stall_cycles`：每种原因发生的周期数；同周期多条指令计 1；
 - `stall_instruction_cycles`：按 `(instruction, reason, cycle)` 去重后计数；
 - `compile_package_sha256`：本次消费的 BackendArtifact 规范 JSON hash；

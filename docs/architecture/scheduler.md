@@ -1,8 +1,13 @@
 # Device Scheduler 架构与流程
 
-本文说明当前 `cycle_event` TISA device scheduler 的模块边界、队列结构和逐周期数据流。
-它对应论文中 `Reception Buffer -> WQ -> IQ -> Exec` 的语义路径，并补充项目中用于容量
-管理和顺序退休的 ROB、Fu、tile window 以及 runtime 地址依赖。
+本文说明当前 `cycle_event` TISA device scheduler 的模块边界、队列结构和执行数据流。
+文档同时描述两条 scheduler 路径：
+
+- Dynamic 沿用论文 Figure 4 的 `Reception Buffer -> WQ -> IQ -> Exec` 语义路径；
+- Static Streams 使用编译器生成的 per-EU 固定流和 `set/wait/fence` 同步。
+
+两条路径共享最终 target TISA、payload、MemoryPlan、依赖语义和 ExecutionBackend。
+Dynamic 路径补充项目中的 ROB、Fu、tile window 和 runtime 地址依赖容量模型。
 
 论文 Semantic Conflict Detection、per-EU `Fu` 和跨 EU 依赖的对齐说明见
 [Scheduler 与论文对齐](scheduler-paper-alignment.md)。
@@ -13,7 +18,7 @@
 ## 1. 模块边界
 
 ```mermaid
-flowchart TD
+flowchart TB
     subgraph INPUT["1. Runtime input"]
         direction TB
         RS["RuntimeSubmission\ncommands / arrival / address"]
@@ -22,35 +27,66 @@ flowchart TD
         RS --> LOADER --> LD
     end
 
-    subgraph DS["2. Device scheduler / cycle.py"]
+        subgraph DS["3a. Dynamic scheduler / cycle.py"]
         direction TB
         RF["Reception FIFO\nself.reception"]
-        DISPATCH["dispatch\n同时分配 ROB 和 WQ"]
-        ROB["ROB\n有序退休记录"]
+        DISPATCH["dispatch\n分配 active credit / WQ / ledger"]
+        ROB_CREDIT["active ROB credit\ncomplete 回收"]
+        RETIRE_LEDGER["retirement ledger\ndescriptor 顺序"]
         WQ["WQ[EU]\nMXU / ARU / DMA"]
         WAKE["wakeup\n依赖反馈检查"]
-        SELECT["select\nwindow + priority"]
+        SELECT["select\nfixed ready window + priority"]
         IQ["IQ[EU]\n等待 issue"]
         ISSUE["issue\n资源约束检查"]
         COMPLETE["complete\nfeedback 仲裁"]
-        RETIRE["retire\nROB head"]
+        RETIRE["retire\nledger head"]
 
         RF --> DISPATCH
-        DISPATCH --> ROB
+        DISPATCH --> ROB_CREDIT
+        DISPATCH --> RETIRE_LEDGER
         DISPATCH --> WQ
         WQ --> WAKE --> SELECT --> IQ --> ISSUE
         COMPLETE --> RETIRE
-        ROB --> RETIRE
+        RETIRE_LEDGER --> RETIRE
+        COMPLETE -. "回收 active credit" .-> ROB_CREDIT
         COMPLETE -. "唤醒后继指令" .-> WAKE
     end
 
-    subgraph EB["3. ExecutionBackend"]
+    subgraph SS["3b. Static Streams / static.py"]
+        direction TB
+        STATIC_CONTROL["StaticControlProgram\nper-EU fixed streams"]
+        STATIC_STREAM["stream\nper-EU fixed commands"]
+        STATIC_ISSUE["issue\nfixed stream order"]
+        STATIC_SYNC["set/wait table\nevent state + fence"]
+        STATIC_FEEDBACK["feedback state\nexecution_done / partial_ready"]
+        STATIC_COMPLETE["complete + trace"]
+
+        STATIC_CONTROL --> STATIC_STREAM
+        STATIC_STREAM -->|"issue"| STATIC_ISSUE
+        STATIC_STREAM -->|"set / wait / fence"| STATIC_SYNC
+        STATIC_ISSUE -->|"advance stream"| STATIC_STREAM
+        STATIC_SYNC -->|"advance stream"| STATIC_STREAM
+        STATIC_FEEDBACK --> STATIC_SYNC
+        STATIC_FEEDBACK --> STATIC_COMPLETE
+        STATIC_STREAM ~~~ STATIC_SYNC
+        STATIC_STREAM ~~~ STATIC_FEEDBACK
+        STATIC_ISSUE ~~~ STATIC_SYNC
+        STATIC_ISSUE ~~~ STATIC_FEEDBACK
+        STATIC_ISSUE ~~~ STATIC_COMPLETE
+        STATIC_SYNC ~~~ STATIC_FEEDBACK
+    end
+
+        DS ~~~ SS
+
+    subgraph EB["2. Shared ExecutionBackend"]
         direction TB
         ACCEPT["can_accept()\nunit + instance availability"]
         EXEC["EU instance\npayload execution"]
-        FEEDBACK["execution_done / partial_ready"]
+        FEEDBACK["execution_done / partial_ready\nfeedback to Dynamic + Static"]
         ACCEPT --> EXEC --> FEEDBACK
     end
+
+    SS ~~~ EB
 
     subgraph OUTPUT["4. Observability"]
         direction TB
@@ -58,22 +94,32 @@ flowchart TD
     end
 
     LD --> RF
+    LD --> STATIC_CONTROL
     ISSUE -->|"IssueRequest"| ACCEPT
+    STATIC_ISSUE -->|"IssueRequest"| ACCEPT
     FEEDBACK -->|"execution.advance()"| COMPLETE
+    FEEDBACK --> STATIC_FEEDBACK
     RETIRE --> TRACE
+    STATIC_COMPLETE --> TRACE
     EXEC --> TRACE
+
+    style EB fill:#fff7ed,stroke:#c2410c,stroke-width:2px
+    style DS fill:#eff6ff,stroke:#2563eb,stroke-width:2px
+    style SS fill:#f0fdf4,stroke:#16a34a,stroke-width:2px
+    style OUTPUT fill:#f9fafb,stroke:#9ca3af,stroke-width:1px
 ```
 
-三层职责分别是：
+各模块职责如下：
 
 | 层 | 输入 | 主要职责 |
 | --- | --- | --- |
 | Runtime / loader | `RuntimeSubmission`、最终 TISA、`MemoryPlan` | 绑定地址、动态参数、descriptor arrival 和 completion token，生成 `LoadedDeviceProgram` |
-| Device scheduler | `LoadedDeviceProgram`、policy、`MachineConfig`、backend feedback | 管理 Reception/WQ/IQ/ROB，检查依赖，执行 select/issue/completion/retire 仲裁 |
+| Static-control compiler | `BackendArtifact`、`MachineConfig` | 生成资源约束的 per-EU 指令流和 `set/wait/fence` 控制 |
+| Device scheduler | `LoadedDeviceProgram`、policy、`MachineConfig`、backend feedback | Dynamic 管理 Reception/WQ/IQ/ROB，Static Streams 管理固定流 head 和事件同步 |
 | ExecutionBackend | payload handle、`IssueRequest` | 管理 EU instance、payload timing、busy/II，并返回 physical completion 或 partial-ready |
 
-`DeviceSimulator` 负责把 loader、scheduler 和 backend 连接起来；scheduler 不直接读取
-`BackendArtifact.execution_graph` 或 payload primitive。整体编译链和公共契约见
+`DeviceSimulator` 负责连接 loader、scheduler 和 backend。scheduler 读取
+`LoadedDeviceProgram`，ExecutionBackend 持有 execution graph 和 payload primitive。整体编译链和公共契约见
 [总体架构](architecture.md) 与 [TISA 论文语义对齐](tisa-alignment.md)。
 
 ## 2. 与论文 Figure 4 的对应
@@ -99,7 +145,9 @@ Exec[unit]       --(4)--> wakeup / dependency feedback
 
 项目额外维护：
 
-- `ROB`：保存已经 dispatch、尚未 retire 的 TISA 指令，按 descriptor submission order 退休；
+- active ROB credit：统计已经 dispatch、等待 complete 的 TISA 指令，complete 时回收；
+- retirement ledger：保存已经 dispatch、等待 retire 的 TISA 指令，按 descriptor submission
+  order 退休；
 - `Fu`：保存已经 issue 的 TISA 身份，通过 descriptor 读取绑定 scope/range/access/OpType；
   容量按 operand entry 计算；
 - `tile window`：限制同时活跃的 tile 数；
@@ -110,7 +158,8 @@ cycle-level 建模选择。
 
 ## 3. `RuntimeSubmission`、`loaded` 和 `execution` 的关系
 
-`RuntimeSubmission` 不会直接传给 `_CycleScheduler`。真实调用链是：
+`runtime.loader` 将 `RuntimeSubmission` 转换为 `LoadedDeviceProgram`，`_CycleScheduler`
+接收转换后的设备可见描述：
 
 ```text
 RuntimeSubmission
@@ -138,87 +187,172 @@ LoadedDeviceProgram
 - `execution` 是 scheduler 外部的执行后端，拥有 payload 和 EU 物理资源状态；
 - scheduler 通过 `IssueRequest` 请求执行，通过 `ExecutionFeedback` 接收完成信息。
 
-## 4. 指令生命周期：ROB 不是 Reception Buffer
+## 4. Static Streams 路径（论文 Static 对应）
 
-当前项目的准确数据流是：
+`static_streams` 对应论文中的 Static strategy。编译器在最终 target TISA、payload 和
+`MemoryPlan` 确定后完成资源约束排程，将每个 logical EU stream 的执行顺序编码为固定流，
+并使用 `set/wait/fence` 表达跨阶段依赖和 buffer reuse 同步。
+
+论文与项目实现按以下边界对应：
+
+| 层次 | 定义 |
+| --- | --- |
+| 论文 Static 语义 | 编译期重排、多阶段流水 overlap、fence-based dependency management |
+| 项目控制表示 | `StaticInstructionStream` 和 `issue/set/wait/fence` command |
+| 项目事件身份 | invocation scope、generation、source TISA 和 condition |
+| 项目控制时序 | control/wait/fence width 与 latency 参数 |
+| 项目 instance 语义 | logical stream instance 用于编译期分流和 trace identity；ExecutionBackend 按 resource 分配可用 physical instance |
+
+per-EU 固定流和 fence 同步承载论文 Static 的公开语义。command 编码、event generation、
+控制带宽/延迟及 logical-to-physical instance 映射属于项目的 cycle-level 表达，后续通过
+论文补充材料或 RTL 数据校准。
+
+```text
+BackendArtifact + MachineConfig
+        |
+        v
+resource-constrained list scheduling
+        |
+        v
+StaticControlProgram
+  per-EU StaticInstructionStream
+        |
+        v
+stream head: wait/fence -> issue -> set
+        |
+        v
+ExecutionBackend -> execution_done / partial_ready
+```
+
+### 4.1 编译期生成
+
+`static_scheduler.py` 读取共享 workload 的 TISA dependency、EU 数量和 payload 声明时长，
+为每条指令选择 `(resource, logical instance)` stream 和估计开始/结束时间。每个
+`StaticInstructionStream` 保存该 logical stream 的固定 command 顺序；每条 `issue`
+command 引用共享 workload 中的一条 target TISA 指令。
+
+编译器为每条跨指令依赖建立 `StaticEvent`：
+
+- `wait` 表达 true dependency 的 ready condition；
+- `fence` 表达 allocation/buffer reuse 的释放 condition；
+- `set` 在 source 的匹配 feedback 到达后发布 event；
+- event 使用 invocation scope、generation 和 condition 标识数据版本。
+
+Static control 的 estimated timing 用于排程和观测，运行期仍以 ExecutionBackend 的实际
+接受条件和 feedback 为准。stream head 按固定顺序前进，控制 command 的延迟由
+`control_width`、`control_latency`、`wait_latency` 和 `fence_latency` 参数建模。
+
+### 4.2 运行期执行
+
+Static Streams 直接从 `LoadedDeviceProgram` 和 `StaticControlProgram` 建立执行状态。
+每个 stream 每次处理自己的 head command：
+
+1. `issue` 等待 descriptor arrival，并向 ExecutionBackend 请求目标 resource 的执行；
+2. `wait` 读取 event state，event ready 后推进 stream；
+3. `fence` 读取 allocation release event，buffer slot 可安全复用后推进 stream；
+4. `set` 等待 source 的 `execution_done` 或指定 `partial_ready`，然后发布 event。
+
+各 stream 独立推进，因此不同 EU、不同 iteration 和不同 pipeline stage 可以按编译期安排
+形成 overlap。ExecutionBackend 统一负责 payload、EU busy/II、physical completion 和
+partial-ready feedback；Static executor 负责 stream head、event state 和 control trace。
+
+### 4.3 Static correctness contract
+
+Static Streams 的正确性由共享 dependency graph、静态 control validation 和 runtime alias
+准入验证共同定义：
+
+- 每条 TISA dependency 对应一个 typed `StaticEvent`；
+- consumer issue 前存在对应的 `wait` 或 `fence`；
+- producer feedback 到达后执行对应的 `set`；
+- runtime alias 绑定经过 required condition 的 happens-before 证明；
+- 执行结束时逐条验证 bound dependency 的 required condition ready cycle 和 consumer issue。
+
+condition-aware happens-before graph 使用 static command 顺序和 typed event 建立因果边：
+
+- `physical_range_released`、`allocation_released` 和普通完成条件从 source full completion 开始；
+- `payload_ready:<task>` 从 source 的指定 partial feedback 开始；
+- `set -> wait/fence -> target issue` 和 stream 内 command 顺序传播 happens-before 关系。
+
+因此 full-completion alias 由 full completion 路径证明，partial-ready 路径只证明对应的
+partial condition。这套 contract 将编译期固定流、运行期地址绑定和执行反馈连接为一个
+完整的 correctness 路径。
+
+## 5. Static Streams 与 Dynamic 对照
+
+| 维度 | Static Streams（论文 Static） | Dynamic ready queue |
+| --- | --- | --- |
+| 决策位置 | 编译期资源约束 list scheduling | 运行期 scheduler cycle |
+| 输入 | target TISA、payload、MemoryPlan、MachineConfig | Loaded descriptor、runtime address、backend feedback |
+| 控制表示 | per-EU 固定 stream + `set/wait/fence` | 单一 Reception FIFO + per-EU WQ/IQ + dependency state |
+| 候选选择 | stream head 的固定顺序 | 固定大小 ready window 内的 ready candidate |
+| 依赖同步 | 静态 event、wait、fence、set | completion/partial-ready tag 与 pending dependency mask |
+| 资源判断 | 编译期 EU instance 排程，运行期 `can_accept()` 校验 | 运行期 Fu、tile、地址、bank/port 和 `can_accept()` 校验 |
+| 地址变化 | runtime alias 通过 condition-aware 顺序准入 | runtime physical alias 进入 address scoreboard |
+| 执行后端 | 共享 ExecutionBackend | 共享 ExecutionBackend |
+
+Static Streams 为论文 Static 提供编译期固定流语义；Dynamic ready queue 为同一 TISA workload
+提供运行期 ready-window 选择语义。两条路径共享 payload timing、EU instance 和 completion
+feedback，因此性能差异直接反映控制位置、可见窗口和容量模型的差异。
+
+## 6. Dynamic 指令生命周期：ROB 与 Reception Buffer
+
+Dynamic 路径使用一个 Reception FIFO 保持 descriptor 接收顺序。FIFO head 在 dispatch
+阶段同时进入目标 WQ、active ROB credit 集合和 ordered retirement ledger：
 
 ```text
 Runtime arrival
       |
       v
-Reception FIFO
+single Reception FIFO
       |
-      | receive_width / instruction_queue_depth
       v
 dispatch
-      |
-      +--------------------> ROB allocation
-      |
-      +--------------------> WQ[resource] enqueue
-                                      |
-                                      v
-                               wakeup / select
-                                      |
-                                      v
-                                  IQ[resource]
-                                      |
-                                      v
-                                     issue
-                                      |
-                                      v
-                              ExecutionBackend
-                                      |
-                                      v
-                             execution_done/partial_ready
-                                      |
-                              complete + wakeup
-                                      |
-                                      v
-                              ROB head -> retire
+      +------> active ROB credit
+      +------> ordered retirement ledger
+      +------> WQ[resource] -> wakeup/select -> IQ[resource] -> issue
+                                                           |
+                                                           v
+                                                   ExecutionBackend
+                                                           |
+                                                           v
+                                                        complete
+                                      +--------------------+------------------+
+                                      |                    |                  |
+                                      v                    v                  v
+                           release active credit    dependency wakeup    ledger retire
 ```
 
-这里 `dispatch` 是一个阶段，而不是两个连续阶段：代码会从 Reception FIFO 弹出一条指令，
-然后同时执行：
+dispatch、complete 和 retire 分别执行以下状态转换：
 
 ```python
+# dispatch
+self.rob_active.add(tid)
 self.rob.append(tid)
 self.wq[resource].append(tid)
+
+# complete
+self.rob_active.remove(tid)
+
+# retire
+tid = self.rob.popleft()  # completed ledger head
 ```
 
-因此不能理解成：
-
-```text
-Reception FIFO -> ROB -> WQ
-```
-
-而应理解成：
-
-```text
-Reception FIFO -> dispatch -> ROB + WQ
-```
-
-二者职责不同：
-
-| 结构 | 解决的问题 | 释放时机 |
+| 结构 | 状态含义 | 容量或推进规则 |
 | --- | --- | --- |
-| Reception FIFO | descriptor 已到达但还没有 dispatch | dispatch 时释放 |
-| WQ | 指令等待依赖、等待被 select | select 时释放 |
-| IQ | 指令已经 ready，等待 issue | issue 时释放 |
-| ROB | 指令是否仍在设备内，以及退休顺序 | 按队首完成后 retire |
+| Reception FIFO | 已到达且等待 dispatch 的 descriptor | FIFO head dispatch 后释放 slot |
+| WQ | 等待依赖 ready 和 select 的指令 | select 后释放 WQ slot |
+| IQ | ready 且等待 issue 的指令 | issue 后释放 IQ slot |
+| Active ROB credit | 已 dispatch 且等待 complete 的指令 | complete 回收 credit，容量为 `rob_entries` |
+| Retirement ledger | 已 dispatch 且等待有序 retire 的指令 | completed ledger head 按 `retire_width/latency` 推进 |
 
-所以 scheduler 允许年轻指令先执行或先完成，但仍要求按照 ROB 顺序退休：
+active credit 控制 scheduler 同时跟踪的未完成指令数量，retirement ledger 保留 descriptor
+submission order。年轻指令可以先 complete 并回收 active credit，其 retirement record
+持续等待老指令完成，最终按 ledger 顺序退休。
 
-```text
-younger issue/complete
-        ↓
-older complete
-        ↓
-ROB head retire
-        ↓
-younger retire
-```
+全局 ROB credit 和 ordered retirement ledger 属于项目的 cycle-level 容量与观测模型。
+论文 Figure 4 的公开路径由单一 Reception Buffer、per-EU WQ/IQ、Exec 和 feedback 构成。
 
-## 5. 逐周期流程
+## 7. Dynamic 逐周期流程
 
 `cycle.py` 每个 cycle 使用固定顺序：
 
@@ -229,17 +363,18 @@ retire → complete → wakeup → issue → select → dispatch → receive
 这是逆向评估流水线，目的是让同一周期早期阶段释放的容量可以供后续阶段使用，同时
 保持 receive、select、issue 之间存在寄存边界。
 
-### 5.1 Retire
+### 7.1 Retire
 
-只检查 ROB 队首：
+Retire 每周期检查 ordered retirement ledger 的队首：
 
 ```text
-ROB head.completed + retire_latency <= now
+ledger head.completed + retire_latency <= now
 ```
 
-年轻指令即使已经 complete，也不能绕过老指令退休。
+完成条件满足后，ledger head 按 `retire_width` 退休。年轻指令保留 retirement record，
+直到前面的 record 依次退休。
 
-### 5.2 Complete
+### 7.2 Complete
 
 调用：
 
@@ -253,14 +388,15 @@ backend 的 physical done 先进入 scheduler 的 pending feedback；之后经�
 成为 complete 后，scheduler 才会：
 
 - 释放 Fu entry；
+- 回收 active ROB credit；
 - 减少对应 tile 的剩余指令数；
 - 必要时释放 tile window；
 - 广播 `(invocation, source TISA, condition)` completion tag；
 - 清除所有 per-EU WQ 中匹配的 pending dependency bit。
 
-`partial_ready` 是独立 sideband，不占用完整 completion 总线，可提前唤醒指定依赖。
+`partial_ready` 使用独立 sideband，可提前唤醒指定依赖；完整 completion 使用 completion 总线。
 
-### 5.3 Wakeup
+### 7.3 Wakeup
 
 每条已接收指令保存 pending dependency mask。所有 WQ snoop complete/partial-ready tag；
 只有全部 pending bit 清零才可 wakeup。已经发布的 tag 保留 ready cycle，以支持 producer
@@ -276,9 +412,9 @@ ready(i) = max(
 普通依赖使用 producer 的 TISA complete；`payload_ready:<task>` 使用 backend 返回的
 partial-ready feedback。
 
-### 5.4 Select
+### 7.4 Select
 
-动态策略只在每个 EU WQ 的有限窗口内寻找候选：
+Dynamic 在每个 EU WQ 的固定大小 ready window 内寻找候选：
 
 ```python
 queue[:dependency_window]
@@ -286,8 +422,8 @@ queue[:dependency_window]
 
 候选全部显式依赖 ready 后，对目标 resource 的本地 `Fu[resource]` 执行 SemanticConflict：
 physical memory/allocation 确定 alias domain，地址区间与 access type 确定 RAW/WAR/WAW。
-当前没有假设任何 write-bearing OpType 组合可安全重排，因此特殊语义默认保守。通过检查
-后才能进入 IQ；issue 前再次验证，覆盖 select→issue 间的 Fu 状态变化。
+write-bearing OpType 使用保守冲突规则。候选通过检查后进入 IQ；issue 前再次验证，
+覆盖 select→issue 间的 Fu 状态变化。
 
 候选必须已经 wakeup，然后按照 priority 排序。默认是 `oldest_first`；也可以使用
 descriptor 的 `compiler_hint`，或者使用完整依赖图计算的 `oracle_critical_path`。
@@ -304,10 +440,10 @@ Select 阶段检查：
 WQ[resource] -> IQ[resource]
 ```
 
-### 5.5 Issue
+### 7.5 Issue
 
-动态策略不会要求候选必须是全局 program-order 的下一条指令。它只要求候选已经在 IQ
-中并经过 `select_latency`，然后检查：
+Dynamic issue eligibility 由 IQ residence、`select_latency` 和运行期资源状态确定。
+候选经过以下检查：
 
 - 全局和 EU 类型的 issue width；
 - `max_inflight_tiles`；
@@ -322,63 +458,56 @@ WQ[resource] -> IQ[resource]
 execution.issue(IssueRequest(descriptor, now))
 ```
 
-## 6. Dynamic 与 Static 的分界
+## 8. Dynamic 在线决策边界
 
-两种策略共享同一份最终 target TISA、payload 和 MemoryPlan：
+Dynamic ready queue 的在线可见状态由以下信息构成：
 
-```text
-同一份 TISA instruction stream
-       |
-       +--> static_pipeline：按全局静态顺序推进
-       |
-       +--> dynamic_ready_queue：在已到达、ready、可见窗口内乱序选择
-```
+- 已经进入单一 Reception FIFO 的 descriptor；
+- 每个 EU WQ 的固定大小 ready window；
+- 显式 TISA dependency 和 runtime physical alias dependency；
+- WQ/IQ、active ROB credit、Fu 和 tile window 容量；
+- ExecutionBackend 的 resource availability 和 completion feedback。
 
-Dynamic 不消费 `StaticControlProgram`，只使用：
+每轮 candidate set 严格来自已经到达且位于固定 ready window 内的 descriptor。默认
+`oldest_first`、`compiler_hint` 和其他在线 priority 都在同一个 candidate set 内排序。
+完整图 critical path 作为离线 oracle 生成对照结果，并在 metrics 中标记 oracle 信息来源。
 
-- 已经 receive 的 descriptor；
-- 显式 TISA dependency；
-- runtime physical alias dependency；
-- WQ/IQ/ROB/Fu 等容量；
-- ExecutionBackend feedback。
+`StaticControlProgram` 由 Static Streams executor 执行。`static_pipeline` 保留全局固定顺序的
+兼容/reference 行为；论文 Static 的主要映射策略是 `static_streams`。
 
-因此 scheduler 不会查看尚未到达的未来 descriptor 来做在线决策。完整图 critical path
-只用于离线 oracle 对照，不能当作真实在线硬件信息。
+## 9. 当前建模边界
 
-## 7. 当前建模边界
-
-当前结果应标记为：
+当前结果统一标记为：
 
 ```text
 TISA instruction-level analytical scheduling baseline
 ```
 
-原因包括：
+模型边界如下：
 
-- WQ/IQ/Fu 容量和各阶段控制 latency 是项目显式参数；
-- completion-tag 全 WQ 广播是论文未公开 notification 互连上的项目实现选择；
-- 当前 SemanticConflict 实现 scope/allocation/range/access 核心子集，OpType safe override
-  尚未定义；
-- scheduler 的控制开销尚未完成硬件校准；
-- `AnalyticalExecutionBackend` 提供 payload timing 和物理 EU busy/II；
-- 当前 analytical backend 尚未利用 `pipeline_depth` 实现同一 EU instance 上的多条 TISA 重叠；
-- memory bank scoreboard 是保守的 payload 级结构冲突模型，不是逐 transaction 的 DRAM/SRAM 时序。
+- WQ/IQ/Fu 容量和各阶段 control latency 使用项目显式参数；
+- completion-tag 全 WQ 广播实现论文的 dependent notification 语义；
+- SemanticConflict 覆盖 scope/allocation/range/access 核心规则，write-bearing OpType 使用保守规则；
+- scheduler control timing 的 calibration status 为 `uncalibrated`；
+- `AnalyticalExecutionBackend` 提供 payload timing、物理 EU busy 和 initiation interval；
+- same-instance TISA 接受采用当前 ExecutionBackend 的 run-to-completion 规则；
+- memory bank scoreboard 使用 payload 级 bank/port reservation 粒度；
+- active ROB credit 和 ordered retirement ledger 属于项目扩展。
 
 运行参数和统计解释见 [周期仿真运行指南](../running/device-scheduler.md)，后续校准说明见
 [RTL 校准](../analysis/rtl-calibration.md)。
 
-## 8. 代码索引
+## 10. 代码索引
 
 | 代码位置 | 作用 |
 | --- | --- |
 | `simulator/device.py` | 连接 loader、scheduler 和 ExecutionBackend |
 | `runtime/loader.py` | 生成 `LoadedDeviceProgram` 和 runtime alias dependency |
-| `simulator/cycle.py:300` | retire / complete / wakeup |
-| `simulator/cycle.py` | completion broadcast、pending mask、per-unit Fu SemanticConflict |
+| `compiler/static_scheduler.py` | 生成 per-EU fixed streams 和 typed static events |
+| `ir/static.py` | 定义 StaticControlProgram、stream、command 和 validation contract |
+| `scheduler/static.py` | 执行 Static Streams、验证 condition-aware happens-before |
+| `simulator/cycle.py` | Dynamic receive/dispatch/select/issue/complete/retire 主循环 |
+| `simulator/cycle.py` | active ROB credit、retirement ledger、completion broadcast 和 per-unit Fu |
+| `scheduler/event.py` | Dynamic event-reference backend 和 completion-time ROB credit 回收 |
 | `scheduler/semantics.py` | TileMem alias/range/access conflict rules |
-| `simulator/cycle.py:414` | issue |
-| `simulator/cycle.py:514` | select |
-| `simulator/cycle.py:557` | dispatch |
-| `simulator/cycle.py:580` | receive |
-| `simulator/cycle.py:646` | 逐周期主循环 |
 | `execution/analytical.py` | payload timing、EU instance 和 completion feedback |

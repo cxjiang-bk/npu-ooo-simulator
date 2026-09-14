@@ -7,7 +7,7 @@
     "kwargs": {
       "batch_size": 1,
       "sequence_length": 8,
-      "hidden_size": 256,
+      "hidden_size": 32,
       "intermediate_size": 16,
       "expert_count": 4,
       "dtype": "float32"

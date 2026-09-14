@@ -1,5 +1,8 @@
 # 整体架构
 
+当前 scheduler-visible TISA 的指令格式、资源映射、stage 清单和 payload 边界见
+[TISA 指令集](tisa-instruction-set.md)。
+
 ## 总体流程图
 
 ```mermaid

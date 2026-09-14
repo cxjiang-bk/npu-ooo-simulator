@@ -576,6 +576,40 @@ class CycleSchedulerTest(unittest.TestCase):
         self.assertGreater(constrained.metrics["stall_cycles"]["rob_full"], 0)
         self.assertLessEqual(constrained.metrics["rob_peak"], 1)
 
+    def test_completed_instruction_releases_credit_before_ordered_retirement(self):
+        program = artifact(
+            (
+                ("old", "DMA", 20, ()),
+                ("young", "MXU", 1, ()),
+                ("following", "ARU", 1, ()),
+            )
+        )
+        result = run(
+            program,
+            config=SimulatorConfig(rob_entries=2),
+            receive_width=3,
+            dispatch_width=3,
+            select_width=3,
+            issue_width=3,
+        )
+        stages = result.metrics["instruction_pipeline"]
+
+        self.assertLess(stages["following"]["dispatched"], stages["old"]["completed"])
+        self.assertLess(stages["old"]["retired"], stages["young"]["retired"])
+        self.assertLess(stages["young"]["retired"], stages["following"]["retired"])
+        self.assertEqual(result.metrics["rob_credit_release"], "completion")
+        self.assertEqual(
+            result.metrics["rob_occupancy_semantics"],
+            "dispatched_incomplete_instructions",
+        )
+        self.assertLessEqual(result.metrics["rob_peak"], 2)
+        self.assertGreater(result.metrics["retirement_backlog_peak"], 2)
+        self.assertGreaterEqual(
+            result.metrics["completed_retirement_backlog_peak"],
+            2,
+        )
+        self.assertGreater(result.metrics["stall_cycles"]["rob_full"], 0)
+
     def test_dynamic_bypasses_blocked_same_unit_candidate_with_identical_artifact(self):
         program = artifact(
             (

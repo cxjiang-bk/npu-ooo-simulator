@@ -237,7 +237,7 @@ CLI 默认是 **static + analytical_event**，不是 dynamic + cycle_event；需
 | CLI 参数 | 默认来源 | `cycle_event` 中的含义 |
 | --- | --- | --- |
 | `--instruction-queue-depth` | `machine.scheduler.instruction_queue_depth` | Reception FIFO 的 TISA 指令容量 |
-| `--rob-entries` | `machine.scheduler.rob_entries` | ROB 指令容量；dispatch 分配，按顺序 retire 释放，不模拟 CPU 推测回滚 |
+| `--rob-entries` | `machine.scheduler.rob_entries` | Active ROB credit 容量；dispatch 分配，complete 回收；retirement ledger 保持有序 retire |
 | `--max-inflight-tiles` | `machine.scheduler.max_inflight_tiles` | 同时活动的 tile 数，不是 TISA 条数；一个 tile 可以有多条 transfer/compute 指令 |
 | `--dependency-window` | `machine.scheduler.dependency_window` | 每个 WQ 的候选扫描窗口，不是整个程序长度 |
 | `--ready-queue-depth` | 最终生效的 `instruction_queue_depth` | 每类 EU 的 IQ 上限之一；实际容量为它与 `pipeline.iq_entries` 的较小值 |

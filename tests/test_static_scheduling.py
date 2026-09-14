@@ -289,7 +289,114 @@ class StaticStreamExecutionTest(unittest.TestCase):
             for index, item in enumerate(artifact.program.instructions)
         )
         submission = create_runtime_submission(artifact, buffers)
-        with self.assertRaisesRegex(ValueError, "runtime binding introduces alias"):
+        with self.assertRaisesRegex(ValueError, "alias condition lacks"):
+            schedule_tisa_program(
+                artifact,
+                minimal_machine_config(),
+                "static_streams",
+                runtime_submission=submission,
+                event_backend=CycleEventBackend(),
+            )
+
+    def test_partial_ready_chain_does_not_cover_full_completion_alias(self):
+        source = replace(
+            _instruction("source", "DMA"),
+            operands=(
+                replace(
+                    _instruction("source", "DMA").operands[0],
+                    access_type="write",
+                ),
+            ),
+        )
+        middle = replace(
+            _instruction("middle", "ARU"),
+            dependencies=(
+                TISADependency(
+                    "source",
+                    "RAW",
+                    "payload_ready:source.head",
+                    {"source": "partial_test"},
+                ),
+            ),
+        )
+        target = replace(
+            _instruction("target", "MXU", ("middle",)),
+            operands=(
+                replace(
+                    _instruction("target", "MXU").operands[0],
+                    access_type="write",
+                ),
+            ),
+        )
+        artifact = attach_static_control(
+            BackendArtifact(
+                "partial-alias.static",
+                TISAProgram(
+                    "partial-alias.static.program",
+                    (source, middle, target),
+                ),
+                ExecutionGraph(
+                    "partial-alias.static.execution",
+                    (
+                        ExecutionTask(
+                            "source.head",
+                            source.tile_id,
+                            source.operator_id,
+                            "load",
+                            "DMA",
+                            duration_cycles=3,
+                            program_order=0,
+                        ),
+                        ExecutionTask(
+                            "source.tail",
+                            source.tile_id,
+                            source.operator_id,
+                            "load",
+                            "DMA",
+                            predecessors=("source.head",),
+                            duration_cycles=20,
+                            program_order=1,
+                        ),
+                        ExecutionTask(
+                            "middle.task",
+                            middle.tile_id,
+                            middle.operator_id,
+                            "elementwise",
+                            "ARU",
+                            duration_cycles=1,
+                            program_order=2,
+                        ),
+                        ExecutionTask(
+                            "target.task",
+                            target.tile_id,
+                            target.operator_id,
+                            "matmul",
+                            "MXU",
+                            duration_cycles=1,
+                            program_order=3,
+                        ),
+                    ),
+                ),
+                {
+                    "source": ("source.head", "source.tail"),
+                    "middle": ("middle.task",),
+                    "target": ("target.task",),
+                },
+            ),
+            minimal_machine_config(),
+        )
+        submission = create_runtime_submission(
+            artifact,
+            (
+                BufferBinding("source", 0x1000, 8, "SRAM", "SRAM"),
+                BufferBinding("middle", 0x2000, 8, "SRAM", "SRAM"),
+                BufferBinding("target", 0x1000, 8, "SRAM", "SRAM"),
+            ),
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            r"source-\[physical_range_released\]->target",
+        ):
             schedule_tisa_program(
                 artifact,
                 minimal_machine_config(),
@@ -452,6 +559,7 @@ class StaticStreamExecutionTest(unittest.TestCase):
         )
         self.assertEqual(result.metrics["static_control_counts"]["wait"], 3)
         self.assertTrue(result.metrics["static_controls_consumed"])
+        self.assertEqual(result.metrics["dependency_timing_validated_count"], 3)
         wait_events = [
             event for event in result.events if event.event == "STATIC_WAIT_SATISFIED"
         ]

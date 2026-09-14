@@ -164,6 +164,7 @@ class _CycleScheduler:
         self.fu = {name: set() for name in self.units}
         self.running = {}
         self.rob = deque()
+        self.rob_active = set()
         self.completed, self.retired, self.issued = set(), set(), set()
         self.tile_remaining = Counter(
             item.tile_id for item in self.instructions.values()
@@ -488,6 +489,7 @@ class _CycleScheduler:
         for tid in due[: self.pipe.completion_width]:
             entry = self.entries[tid]
             entry.completed = self.now
+            self.rob_active.remove(tid)
             self.completed.add(tid)
             self.fu[entry.resource].remove(tid)
             self.tile_remaining[self.instructions[tid].tile_id] -= 1
@@ -745,7 +747,7 @@ class _CycleScheduler:
         while self.reception and dispatched < self.pipe.dispatch_width:
             tid = self.reception[0]
             resource = self.entries[tid].resource
-            if len(self.rob) >= self.config.rob_entries:
+            if len(self.rob_active) >= self.config.rob_entries:
                 self.stall(tid, "rob_full", "dispatch")
                 break
             if (
@@ -756,6 +758,7 @@ class _CycleScheduler:
                 break
             self.reception.popleft()
             self.rob.append(tid)
+            self.rob_active.add(tid)
             self.wq[resource].append(tid)
             self.entries[tid].dispatched = self.now
             self._refresh_dependency_mask(tid)
@@ -798,7 +801,12 @@ class _CycleScheduler:
             "timestamp": self.now,
             "event": "CYCLE_END",
             "reception_queue": len(self.reception),
-            "rob": len(self.rob),
+            "rob": len(self.rob_active),
+            "retirement_backlog": len(self.rob),
+            "completed_retirement_backlog": sum(
+                self.entries[tid].completed is not None
+                for tid in self.rob
+            ),
             "inflight_tiles": len(self.active_tiles),
             "pending_dependencies": sum(
                 len(self.pending_dependencies[tid])
@@ -816,7 +824,7 @@ class _CycleScheduler:
                 for tid in self.issued - self.completed
             ),
         }
-        assert row["rob"] <= self.config.rob_entries
+        assert len(self.rob_active) <= self.config.rob_entries
         assert row["reception_queue"] <= self.config.instruction_queue_depth
         assert all(value <= self.pipe.inflight_entries for value in row["fu"].values())
         assert all(
@@ -835,11 +843,18 @@ class _CycleScheduler:
         assert len(queued) == len(set(queued)) and not set(queued).intersection(
             self.issued
         )
-        assert set(self.rob) == {
+        retirement_entries = {
             tid
             for tid, entry in self.entries.items()
             if entry.dispatched is not None and entry.retired is None
         }
+        active_entries = {
+            tid
+            for tid in retirement_entries
+            if self.entries[tid].completed is None
+        }
+        assert set(self.rob) == retirement_entries
+        assert self.rob_active == active_entries
         self.snapshots.append(row)
         for reason in self.cycle_reasons:
             self.stall_cycles[reason] += 1
@@ -963,6 +978,12 @@ class _CycleScheduler:
                 "receive",
             ],
             "retirement_order": "descriptor_submission_order",
+            "rob_credit_allocation": "dispatch",
+            "rob_credit_release": "completion",
+            "rob_occupancy_semantics": "dispatched_incomplete_instructions",
+            "retirement_ledger_semantics": (
+                "dispatched_instructions_pending_ordered_retirement"
+            ),
             "payload_execution": "run_to_completion",
             "primitive_reordering_scope": "instruction_local",
             "dependency_tracking": "global_completion_tag_broadcast+pending_mask",
@@ -1052,6 +1073,8 @@ class _CycleScheduler:
         }
         for name, field in (
             ("rob_peak", "rob"),
+            ("retirement_backlog_peak", "retirement_backlog"),
+            ("completed_retirement_backlog_peak", "completed_retirement_backlog"),
             ("reception_queue_peak", "reception_queue"),
             ("inflight_tile_peak", "inflight_tiles"),
             ("pending_dependency_peak", "pending_dependencies"),

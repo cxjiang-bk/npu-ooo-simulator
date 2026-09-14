@@ -1505,7 +1505,13 @@ def simulate_tisa_sequence(
         for field in ("retired_instruction_count", "issued_instruction_count", "completed_instruction_count",
                       "tisa_decision_count", "issued_task_count", "completed_task_count", "partial_ready_event_count"):
             metrics[field] = sum(result.metrics[field] for result in invocation_results)
-        for field in ("rob_peak", "reception_queue_peak", "inflight_tile_peak"):
+        for field in (
+            "rob_peak",
+            "retirement_backlog_peak",
+            "completed_retirement_backlog_peak",
+            "reception_queue_peak",
+            "inflight_tile_peak",
+        ):
             metrics[field] = max(result.metrics[field] for result in invocation_results)
         for field in ("wq_peak", "iq_peak", "fu_peak"):
             metrics[field] = {unit.name: max(result.metrics[field][unit.name] for result in invocation_results)

@@ -57,6 +57,7 @@ class _StaticStreamExecutor:
         self.pointers = {stream_id: 0 for stream_id in self.streams}
         self.pending_control: dict[str, tuple[StaticControlCommand, float]] = {}
         self.feedback: set[tuple[str, str]] = set()
+        self.condition_ready: dict[tuple[str, str], float] = {}
         self.signaled: set[str] = set()
         self.issued: dict[str, float] = {}
         self.physical_done: dict[str, float] = {}
@@ -130,35 +131,87 @@ class _StaticStreamExecutor:
             )
 
     def _validate_runtime_aliases(self) -> None:
-        """Reject bindings whose new alias edges are not compile-time ordered."""
+        """Prove every runtime alias edge from typed static-control causality."""
 
-        successors: dict[str, set[str]] = {item: set() for item in self.descriptors}
-        for target, descriptor in self.descriptors.items():
-            for dependency in descriptor.instruction.dependencies:
-                successors[dependency.source].add(target)
-        descendants: dict[str, set[str]] = {}
+        Node = tuple[str, ...]
+        successors: dict[Node, set[Node]] = {}
 
-        def visit(source: str) -> set[str]:
-            if source in descendants:
-                return descendants[source]
-            result: set[str] = set()
-            for target in successors[source]:
-                result.add(target)
-                result.update(visit(target))
-            descendants[source] = result
-            return result
+        def connect(source: Node, target: Node) -> None:
+            successors.setdefault(source, set()).add(target)
+            successors.setdefault(target, set())
+
+        def condition_node(source: str, condition: str) -> Node:
+            if condition.startswith("payload_ready:"):
+                return ("condition", source, condition)
+            return ("complete", source)
+
+        command_nodes: dict[str, Node] = {}
+        issue_nodes: dict[str, Node] = {}
+        set_nodes: dict[str, list[Node]] = {}
+        event_by_id = {event.event_id: event for event in self.control.events}
+
+        for stream in self.control.streams:
+            previous: Node | None = None
+            for command in stream.commands:
+                node = ("command", command.command_id)
+                command_nodes[command.command_id] = node
+                successors.setdefault(node, set())
+                if previous is not None:
+                    connect(previous, node)
+                previous = node
+                if command.kind == "issue":
+                    assert command.tisa_id is not None
+                    issue_nodes[command.tisa_id] = node
+                    connect(node, ("complete", command.tisa_id))
+                elif command.kind == "set":
+                    for event_id in command.event_ids:
+                        set_nodes.setdefault(event_id, []).append(node)
+
+        for event_id, event in event_by_id.items():
+            source_issue = issue_nodes[event.source_tisa_id]
+            ready = condition_node(event.source_tisa_id, event.condition)
+            connect(source_issue, ready)
+            for node in set_nodes.get(event_id, ()):
+                connect(ready, node)
+
+        for stream in self.control.streams:
+            for command in stream.commands:
+                if command.kind not in {"wait", "fence"}:
+                    continue
+                wait_node = command_nodes[command.command_id]
+                for event_id in command.event_ids:
+                    for set_node in set_nodes.get(event_id, ()):
+                        connect(set_node, wait_node)
+
+        def happens_before(source: Node, target: Node) -> bool:
+            pending = [source]
+            visited = {source}
+            while pending:
+                current = pending.pop()
+                if current == target:
+                    return True
+                for successor in successors.get(current, ()):
+                    if successor not in visited:
+                        visited.add(successor)
+                        pending.append(successor)
+            return False
 
         uncovered: list[str] = []
         for target, descriptor in self.descriptors.items():
             for dependency in descriptor.dependencies:
                 if dependency.provenance.get("source") != "runtime_binding_alias":
                     continue
-                if target not in visit(dependency.source.tisa_id):
-                    uncovered.append(f"{dependency.source.tisa_id}->{target}")
+                source = dependency.source.tisa_id
+                required = condition_node(source, dependency.condition)
+                if not happens_before(required, issue_nodes[target]):
+                    uncovered.append(
+                        f"{source}-[{dependency.condition}]->{target}"
+                    )
         if uncovered:
             raise ValueError(
-                "runtime binding introduces alias ordering absent from compiler static "
-                "control; recompile for this binding or use dynamic_ready_queue: "
+                "runtime binding alias condition lacks compiler static-control "
+                "happens-before proof; recompile for this binding or use "
+                "dynamic_ready_queue: "
                 + ", ".join(uncovered[:8])
             )
 
@@ -310,6 +363,7 @@ class _StaticStreamExecutor:
             tisa_id = self.loaded.descriptor(feedback.descriptor_id).instruction.tisa_id
             if feedback.kind == "partial_ready":
                 self.feedback.add((tisa_id, feedback.condition))
+                self.condition_ready[(tisa_id, feedback.condition)] = feedback.cycle
                 self.events.append(
                     TraceEvent(
                         feedback.cycle,
@@ -373,6 +427,32 @@ class _StaticStreamExecutor:
                 issue,
                 issue,
             )
+
+    def _validate_dependency_timing(self) -> int:
+        """Verify the executed schedule against every bound dependency condition."""
+
+        violations: list[str] = []
+        validated = 0
+        for target, descriptor in self.descriptors.items():
+            target_issue = self.issued[target]
+            for dependency in descriptor.dependencies:
+                source = dependency.source.tisa_id
+                if dependency.condition.startswith("payload_ready:"):
+                    ready = self.condition_ready.get((source, dependency.condition))
+                else:
+                    ready = self.completed.get(source)
+                validated += 1
+                if ready is None or ready > target_issue:
+                    violations.append(
+                        f"{source}-[{dependency.condition}]->{target} "
+                        f"ready={ready} issue={target_issue}"
+                    )
+        if violations:
+            raise RuntimeError(
+                "static stream dependency timing invariant failed: "
+                + ", ".join(violations[:8])
+            )
+        return validated
 
     def _complete_controls(self) -> None:
         for stream_id, (command, finish) in tuple(self.pending_control.items()):
@@ -502,6 +582,7 @@ class _StaticStreamExecutor:
                 break
             self.now += 1
 
+        dependency_timing_validated_count = self._validate_dependency_timing()
         for stream_id, command in (
             (stream_id, self._head(stream_id)) for stream_id in self.streams
         ):
@@ -534,6 +615,7 @@ class _StaticStreamExecutor:
             "static_controls_consumed": True,
             "tisa_instruction_count": len(self.descriptors),
             "issued_instruction_count": len(self.issued),
+            "dependency_timing_validated_count": dependency_timing_validated_count,
             "completed_instruction_count": len(self.completed),
             "payload_task_count": len(execution_timings),
             "resource_busy_cycles": dict(busy),

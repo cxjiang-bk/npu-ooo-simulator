@@ -4,6 +4,9 @@
 `TISAInstruction` 在此基础上携带 scheduler 所需的 operand、地址、访问类型、依赖和
 execution-unit 映射。DMA、MXU、Vector 微指令属于 TISA payload 的下一层。
 
+当前指令格式、stage primitive、semantic operator 映射和 payload primitive 清单见
+[TISA 指令集](tisa-instruction-set.md)。
+
 ## 1. 抽象层次
 
 论文字段：
