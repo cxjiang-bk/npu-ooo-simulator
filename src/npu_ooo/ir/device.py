@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Any, Mapping
 
 from .runtime import RuntimeOperandBinding
@@ -257,6 +258,59 @@ class DescriptorEnvelope:
 
 
 @dataclass(frozen=True)
+class StaticCommandEnvelope:
+    command_id: str
+    chunk_id: str
+    queue: str
+    arrival_cycle: float
+    chunk_order: int
+    command_order: int
+
+    def validate(self) -> tuple[str, ...]:
+        issues: list[str] = []
+        if not self.command_id or not self.chunk_id or not self.queue:
+            issues.append("static command envelope identities must not be empty")
+        if (
+            not math.isfinite(self.arrival_cycle)
+            or self.arrival_cycle < 0
+            or self.chunk_order < 0
+            or self.command_order < 0
+        ):
+            issues.append("static command envelope cycle/orders must be non-negative")
+        return tuple(issues)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "command_id": self.command_id,
+            "chunk_id": self.chunk_id,
+            "queue": self.queue,
+            "arrival_cycle": self.arrival_cycle,
+            "chunk_order": self.chunk_order,
+            "command_order": self.command_order,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "StaticCommandEnvelope":
+        try:
+            result = cls(
+                command_id=str(payload["command_id"]),
+                chunk_id=str(payload["chunk_id"]),
+                queue=str(payload["queue"]),
+                arrival_cycle=float(payload["arrival_cycle"]),
+                chunk_order=int(payload["chunk_order"]),
+                command_order=int(payload["command_order"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid static command envelope") from exc
+        issues = result.validate()
+        if issues:
+            raise ValueError(
+                "invalid static command envelope: " + "; ".join(issues)
+            )
+        return result
+
+
+@dataclass(frozen=True)
 class StaticScheduleEntry:
     tisa_id: str
     order: int
@@ -345,6 +399,7 @@ class LoadedDeviceProgram:
     synchronization_cycles: float = 0.0
     static_schedule: StaticSchedulePlan | None = None
     static_control: StaticControlProgram | None = None
+    static_command_envelopes: tuple[StaticCommandEnvelope, ...] = ()
     schema_version: int = DEVICE_PROGRAM_SCHEMA_VERSION
     attributes: Mapping[str, Any] = field(default_factory=dict)
 
@@ -388,6 +443,34 @@ class LoadedDeviceProgram:
             issues.extend(self.static_control.validate(known_tisa))
             if self.static_control.workload_program_id != self.program_id:
                 issues.append("loaded static control program id does not match")
+            known_commands = {
+                command.command_id
+                for stream in self.static_control.streams
+                for command in stream.commands
+            }
+            submitted_commands = [
+                envelope.command_id for envelope in self.static_command_envelopes
+            ]
+            runtime_policy = self.attributes.get("runtime_policy")
+            requires_static_program = runtime_policy in {"static", "implicit_static"}
+            if requires_static_program and not submitted_commands:
+                issues.append(
+                    "loaded static program must include the unified TISA/control command program"
+                )
+            elif submitted_commands and set(submitted_commands) != known_commands:
+                issues.append(
+                    "loaded static program must cover every static control command"
+                )
+            if len(set(submitted_commands)) != len(submitted_commands):
+                issues.append("loaded static program commands must be unique")
+            if [item.command_order for item in self.static_command_envelopes] != list(
+                range(len(self.static_command_envelopes))
+            ):
+                issues.append("loaded static program order must be contiguous")
+            for envelope in self.static_command_envelopes:
+                issues.extend(envelope.validate())
+        elif self.static_command_envelopes:
+            issues.append("loaded static program requires static control")
         return tuple(issues)
 
     def descriptor(self, descriptor_id: str) -> BoundTISADescriptor:
@@ -422,6 +505,9 @@ class LoadedDeviceProgram:
                 if self.static_control is not None
                 else None
             ),
+            "static_command_envelopes": [
+                item.to_dict() for item in self.static_command_envelopes
+            ],
             "attributes": dict(self.attributes),
         }
 
@@ -454,6 +540,10 @@ class LoadedDeviceProgram:
                     if payload.get("static_control") is not None
                     else None
                 ),
+                static_command_envelopes=tuple(
+                    StaticCommandEnvelope.from_dict(item)
+                    for item in payload.get("static_command_envelopes", ())
+                ),
                 schema_version=int(payload.get("schema_version", 0)),
                 attributes=payload.get("attributes", {}),
             )
@@ -472,6 +562,7 @@ __all__ = [
     "CompletionToken",
     "DescriptorEnvelope",
     "LoadedDeviceProgram",
+    "StaticCommandEnvelope",
     "StaticScheduleEntry",
     "StaticSchedulePlan",
 ]

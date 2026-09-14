@@ -69,8 +69,9 @@ primitive 顺序、实例 busy/II、task trace 和 physical-done 都由 Executio
 `dependency_window` 是每个 WQ 的扫描窗口。IQ、Fu 在同一类 EU 实例间共享。
 `static_streams` 另使用 `control_width`（默认 1）以及 `control_latency`、`wait_latency`、
 `fence_latency`（默认均为 1）；三种 latency 可显式设 0 做隔离实验，但默认不假设免费同步。
-Static dispatch 为每个逻辑 EU 独立维护 WQ，每周期向每个 EU 的 WQ 放入一条编译 stream
-预期指令。
+Static dispatch 从统一 program 的 Reception FIFO 队首取 entry，按目标 EU 放入对应 WQ；
+在全局 `dispatch_width` 约束下，每个 EU 每周期接收一条 entry，WQ 队首由
+`set_wait_table`、EU ready 和 ExecutionBackend 接收状态共同推进。
 
 ## 时钟边界
 
@@ -113,9 +114,10 @@ notification，没有公开 Epoch 的 broadcast/scoreboard 实现。
 - `static_pipeline` 消费 `StaticSchedulePlan`，按本次 runtime 已选择的提交顺序 admission；前一条 issue
   后下一条可在不同 EU 上重叠。计划显式记录 resource、dependency token 和 reservation。
   这是旧“全局下一条 + 跨 EU overlap”兼容基线，不声称复现作者未公开的静态排程器。
-- `static_streams` 消费编译期 `StaticControlProgram`。descriptor 先进入共享 Reception FIFO，
-  再按编译 stream 路由到各 EU WQ；每个 EU 只推进自己的 WQ 和 head command。wait/fence
-  只阻塞当前流，set 等待真实 execution feedback，控制时序属于未校准项目假设。
+- `static_streams` 消费编译期 `StaticControlProgram` 生成的统一 TISA/control program。program
+  entry 先进入唯一 Reception FIFO，再按目标 EU 路由到各 EU WQ；每个 EU 只推进自己的 WQ
+  队首，每周期接收一个 entry。wait/fence 保留在对应 WQ 队首，set 等待真实 execution
+  feedback，控制时序属于未校准项目假设。
 - `dynamic_ready_queue` 只在已接收 descriptor 的各 WQ 有界窗口中选择 ready 条目。默认
   `oldest_first` 使用接收队列年龄；`compiler_hint` 使用 descriptor 显式 hint；
   `oracle_critical_path` 使用完整图，仅作为离线参考。旧名称 `critical_path` 是该 oracle 的

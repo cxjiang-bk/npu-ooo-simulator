@@ -51,24 +51,18 @@ class _StaticStreamExecutor:
             item.instruction.tisa_id: item for item in loaded.descriptors
         }
         self.streams = {item.stream_id: item for item in self.control.streams}
-        self.stream_by_tisa = {
-            command.tisa_id: stream.stream_id
+        self.commands = {
+            command.command_id: command
             for stream in self.control.streams
             for command in stream.commands
-            if command.kind == "issue" and command.tisa_id is not None
         }
-        if set(self.stream_by_tisa) != set(self.descriptors):
-            raise ValueError("static control streams must cover every loaded descriptor")
-        self.pointers = {stream_id: 0 for stream_id in self.streams}
-        self.stream_issue_order = {
-            stream_id: tuple(
-                command.tisa_id
-                for command in stream.commands
-                if command.kind == "issue" and command.tisa_id is not None
+        if {
+            envelope.command_id for envelope in loaded.static_command_envelopes
+        } != set(self.commands):
+            raise ValueError(
+                "static_streams requires one runtime-submitted TISA/control program; "
+                "regenerate the runtime submission"
             )
-            for stream_id, stream in self.streams.items()
-        }
-        self.next_stream_dispatch = {stream_id: 0 for stream_id in self.streams}
         self.wq = {stream_id: deque() for stream_id in self.streams}
         self.reception = deque()
         self.next_receive = 0
@@ -79,14 +73,27 @@ class _StaticStreamExecutor:
         self.dispatch_counts = Counter()
         self.stall_cycles = Counter()
         self.snapshots: list[dict[str, Any]] = []
-        self.stream_input = [
-            (
-                envelope.arrival_cycle,
-                loaded.descriptor(envelope.descriptor_id).instruction.tisa_id,
-                envelope.chunk_id,
+        self.program_input = []
+        for envelope in sorted(
+            loaded.static_command_envelopes, key=lambda item: item.command_order
+        ):
+            command_id = envelope.command_id
+            self.program_input.append(
+                (envelope.arrival_cycle, command_id, envelope.chunk_id)
             )
-            for envelope in sorted(loaded.envelopes, key=lambda item: item.descriptor_order)
-        ]
+        for stream in self.control.streams:
+            positions = [
+                next(
+                    envelope.command_order
+                    for envelope in loaded.static_command_envelopes
+                    if envelope.command_id == command.command_id
+                )
+                for command in stream.commands
+            ]
+            if positions != sorted(positions):
+                raise ValueError(
+                    f"runtime static program changes command order for '{stream.stream_id}'"
+                )
         self.pending_control: dict[str, tuple[StaticControlCommand, float]] = {}
         self.feedback: set[tuple[str, str]] = set()
         self.condition_ready: dict[tuple[str, str], float] = {}
@@ -102,11 +109,14 @@ class _StaticStreamExecutor:
         self.control_records: list[dict[str, Any]] = []
         self.open_intervals: dict[tuple[str, str], _OpenInterval] = {}
         self.control_counts = Counter()
+        self.completed_commands: set[str] = set()
         self.control_busy_cycles = 0.0
         self.now = 0
         self._validate_runtime_aliases()
         chunks: dict[str, list[Any]] = {}
         for envelope in loaded.envelopes:
+            chunks.setdefault(envelope.chunk_id, []).append(envelope)
+        for envelope in loaded.static_command_envelopes:
             chunks.setdefault(envelope.chunk_id, []).append(envelope)
         for chunk_id, envelopes in sorted(
             chunks.items(), key=lambda item: min(row.chunk_order for row in item[1])
@@ -126,7 +136,12 @@ class _StaticStreamExecutor:
                 )
             )
             details = {
-                "descriptor_count": len(envelopes),
+                "descriptor_count": sum(
+                    hasattr(item, "descriptor_id") for item in envelopes
+                ),
+                "command_count": sum(
+                    hasattr(item, "command_id") for item in envelopes
+                ),
                 "runtime_policy": loaded.attributes.get("runtime_policy"),
             }
             self.events.extend(
@@ -233,9 +248,8 @@ class _StaticStreamExecutor:
             )
 
     def _head(self, stream_id: str) -> StaticControlCommand | None:
-        stream = self.streams[stream_id]
-        pointer = self.pointers[stream_id]
-        return stream.commands[pointer] if pointer < len(stream.commands) else None
+        queue = self.wq[stream_id]
+        return self.commands[queue[0]] if queue else None
 
     def _event_runtime_id(self, event_id: str) -> str:
         event = next(item for item in self.control.events if item.event_id == event_id)
@@ -391,7 +405,13 @@ class _StaticStreamExecutor:
                 },
             )
         )
-        self.pointers[stream_id] += 1
+        queue = self.wq[stream_id]
+        if not queue or queue[0] != command.command_id:
+            raise RuntimeError(
+                f"static control '{command.command_id}' is not the WQ head"
+            )
+        queue.popleft()
+        self.completed_commands.add(command.command_id)
         self.pending_control.pop(stream_id, None)
 
     def _accept_feedback(self) -> None:
@@ -496,11 +516,11 @@ class _StaticStreamExecutor:
                 self._finish_control(stream_id, command)
 
     def _receive(self) -> None:
-        """Admit runtime envelopes into the single shared Reception FIFO."""
+        """Admit the unified TISA/control program into one Reception FIFO."""
 
         received = 0
-        while self.next_receive < len(self.stream_input):
-            ready, tisa_id, chunk_id = self.stream_input[self.next_receive]
+        while self.next_receive < len(self.program_input):
+            ready, command_id, chunk_id = self.program_input[self.next_receive]
             if ready > self.now:
                 break
             if len(self.reception) >= self.config.instruction_queue_depth:
@@ -509,73 +529,91 @@ class _StaticStreamExecutor:
             if received >= self.pipe.receive_width:
                 self.stall_cycles["receive_bandwidth"] += 1
                 break
-            self.reception.append(tisa_id)
-            self.received.add(tisa_id)
-            self.receive_cycles[tisa_id] = self.now
+            self.reception.append(command_id)
+            command = self.commands[command_id]
+            if command.kind == "issue":
+                assert command.tisa_id is not None
+                self.received.add(command.tisa_id)
+                self.receive_cycles[command.tisa_id] = self.now
             self.next_receive += 1
             received += 1
-            descriptor = self.descriptors[tisa_id]
+            descriptor = (
+                self.descriptors[command.tisa_id]
+                if command.tisa_id is not None
+                else None
+            )
             self.events.append(
                 TraceEvent(
                     self.now,
                     "TISA_RECEIVE",
-                    tisa_id,
-                    f"Static/{descriptor.instruction.unit_map.unit}",
+                    command_id,
+                    (
+                        f"Static/{descriptor.instruction.unit_map.unit}"
+                        if descriptor is not None
+                        else f"Static/{command.stream_id}"
+                    ),
                     details={
                         "runtime_ready_cycle": ready,
                         "runtime_chunk_id": chunk_id,
-                        "operator_id": descriptor.instruction.operator_id,
-                        "tile_id": descriptor.instruction.tile_id,
-                        "dependencies": dependency_details(descriptor),
-                        "runtime_operands": [
-                            item.to_dict() for item in descriptor.operands
-                        ],
+                        "program_command_id": command_id,
+                        "kind": command.kind,
+                        "tisa_id": command.tisa_id,
+                        **(
+                            {
+                                "operator_id": descriptor.instruction.operator_id,
+                                "tile_id": descriptor.instruction.tile_id,
+                                "dependencies": dependency_details(descriptor),
+                                "runtime_operands": [
+                                    item.to_dict() for item in descriptor.operands
+                                ],
+                            }
+                            if descriptor is not None
+                            else {}
+                        ),
                         "static_streams": True,
                     },
                 )
             )
 
     def _dispatch(self) -> None:
-        """Route the next fixed-stream instruction to each EU queue."""
+        """Route the Reception FIFO head to its owning EU WQ."""
 
         dispatched_streams: set[str] = set()
-        for stream_id in sorted(self.streams):
-            if stream_id in dispatched_streams:
-                continue
-            index = self.next_stream_dispatch[stream_id]
-            issue_order = self.stream_issue_order[stream_id]
-            if index >= len(issue_order):
-                continue
-            tisa_id = issue_order[index]
-            try:
-                reception_index = self.reception.index(tisa_id)
-            except ValueError:
-                continue
-            stream = self.streams[stream_id]
+        for _ in range(self.pipe.dispatch_width):
+            if not self.reception:
+                break
+            command_id = self.reception[0]
+            command = self.commands[command_id]
+            stream = self.streams[command.stream_id]
+            if stream.stream_id in dispatched_streams:
+                self.stall_cycles["dispatch_per_eu"] += 1
+                break
             capacity = self.machine.unit(stream.resource).queue_depth
-            if len(self.wq[stream_id]) >= capacity:
+            if len(self.wq[stream.stream_id]) >= capacity:
                 self.stall_cycles["wq_full"] += 1
-                continue
-            del self.reception[reception_index]
-            self.wq[stream_id].append(tisa_id)
-            dispatched_streams.add(stream_id)
-            self.dispatched.add(tisa_id)
-            self.dispatch_cycles[tisa_id] = self.now
-            self.dispatch_counts[stream_id] += 1
-            self.next_stream_dispatch[stream_id] += 1
-            descriptor = self.descriptors[tisa_id]
+                break
+            self.reception.popleft()
+            self.wq[stream.stream_id].append(command_id)
+            dispatched_streams.add(stream.stream_id)
+            self.dispatch_counts[stream.stream_id] += 1
+            if command.kind == "issue":
+                assert command.tisa_id is not None
+                self.dispatched.add(command.tisa_id)
+                self.dispatch_cycles[command.tisa_id] = self.now
             self.events.append(
                 TraceEvent(
                     self.now,
                     "TISA_DISPATCH",
-                    tisa_id,
+                    command_id,
                     f"Static/{stream.resource}",
                     stream.instance,
                     {
-                        "static_stream_id": stream_id,
-                        "static_dispatch": "per_eu_one",
+                        "static_stream_id": stream.stream_id,
+                        "static_dispatch": "reception_fifo_head",
+                        "program_command_id": command_id,
+                        "command_kind": command.kind,
+                        "tisa_id": command.tisa_id,
                         "queue_depth": capacity,
-                        "reception_index": reception_index,
                     },
                 )
             )
@@ -584,7 +622,7 @@ class _StaticStreamExecutor:
         assert command.tisa_id is not None
         descriptor = self.descriptors[command.tisa_id]
         queue = self.wq[stream_id]
-        if not queue or queue[0] != command.tisa_id:
+        if not queue or queue[0] != command.command_id:
             self._open_wait(
                 stream_id,
                 command,
@@ -624,7 +662,7 @@ class _StaticStreamExecutor:
         assert receipt.instance is not None
         self.instances[command.tisa_id] = receipt.instance
         queue.popleft()
-        self.pointers[stream_id] += 1
+        self.completed_commands.add(command.command_id)
         self.events.append(
             TraceEvent(
                 self.now,
@@ -712,10 +750,7 @@ class _StaticStreamExecutor:
                     "pending_control": len(self.pending_control),
                 }
             )
-            done_commands = all(
-                self.pointers[stream_id] == len(stream.commands)
-                for stream_id, stream in self.streams.items()
-            )
+            done_commands = len(self.completed_commands) == len(self.commands)
             if done_commands and len(self.completed) == len(self.descriptors):
                 break
             self.now += 1

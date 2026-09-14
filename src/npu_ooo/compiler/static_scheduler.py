@@ -316,6 +316,39 @@ def build_static_control_program(
             )
         )
 
+    # The device receives one ordered static program. Merge the per-EU command
+    # lists by compile-time schedule while preserving each EU's local order.
+    unified_program_order: list[str] = []
+    stream_positions = {stream.stream_id: 0 for stream in streams}
+    while True:
+        heads = []
+        for stream in streams:
+            position = stream_positions[stream.stream_id]
+            if position >= len(stream.commands):
+                continue
+            command = stream.commands[position]
+            assert command.tisa_id is not None
+            estimate = (
+                command.estimated_start
+                if command.estimated_start is not None
+                else 0.0
+            )
+            heads.append(
+                (
+                    estimate,
+                    program_order[command.tisa_id],
+                    stream.resource,
+                    stream.instance,
+                    stream.stream_id,
+                    command,
+                )
+            )
+        if not heads:
+            break
+        *_key, stream_id, command = min(heads)
+        unified_program_order.append(command.command_id)
+        stream_positions[stream_id] += 1
+
     control = StaticControlProgram(
         control_id=f"{artifact.program.program_id}.static-control",
         workload_program_id=artifact.program.program_id,
@@ -332,6 +365,8 @@ def build_static_control_program(
             "wait_consumes_event": True,
             "finalization": "invocation completes after all shared workload instructions",
             "dynamic_control_hash": dynamic_control_hash(workload_hash),
+            "program_order": unified_program_order,
+            "program_format": "unified_tisa_control_stream_v1",
         },
     )
     issues = control.validate(set(instructions))

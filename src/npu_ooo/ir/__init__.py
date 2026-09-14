@@ -54,6 +54,7 @@ from .device import (
     CompletionToken,
     DescriptorEnvelope,
     LoadedDeviceProgram,
+    StaticCommandEnvelope,
     StaticScheduleEntry,
     StaticSchedulePlan,
 )
@@ -124,6 +125,7 @@ __all__ = [
     "CompletionToken",
     "DescriptorEnvelope",
     "LoadedDeviceProgram",
+    "StaticCommandEnvelope",
     "StaticScheduleEntry",
     "StaticSchedulePlan",
     "CONTROL_KINDS",

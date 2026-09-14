@@ -521,7 +521,7 @@ ExecutionBackend / Exec[u]
 > 但未公开跨 EU notification 互连；本项目选择“让全部 WQ snoop completion tag，并已实现
 > pending mask 与本地 scope/allocation/range/access SemanticConflict。OpType compatibility 的
 > 安全放宽仍需建立明确规则”；Dynamic 的 retire 路径沿用 completion feedback，Static 的
-> per-EU stream 使用 set/wait/fence 控制。tile window 仍是项目容量扩展。
+> 统一静态 program 按 per-EU ownership 使用 set/wait/fence 控制。tile window 仍是项目容量扩展。
 
 相关代码入口：
 

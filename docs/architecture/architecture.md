@@ -401,7 +401,7 @@ BoundTISADescriptor = instruction + physical operands + bound dependencies
                     + invocation completion token + payload handle
 DescriptorEnvelope  = chunk + arrival + launch/submission order
 StaticSchedulePlan  = 固定 submission order、resource、dependency token、reservation
-StaticControlProgram = 编译期 per-EU stream + generation-scoped set/wait/fence
+StaticControlProgram = 统一静态 program entry + 编译期 per-EU ownership + generation-scoped set/wait/fence
 ```
 
 loader 还将只有绑定物理地址后才可见的 RAW/WAR/WAW alias 关系转换为显式 dependency token。
@@ -444,8 +444,9 @@ MemoryPlan v2，独立 simulate 会明确拒绝，避免把符号 TISA 默认为
 Runtime policy 表示 descriptor 的生成和提交顺序；device policy 表示已到达 TISA
 instruction 的 issue 选择。四种组合由 `--runtime-device-matrix` 一次编译后运行。
 
-新的 `static_streams` 与兼容 `static_pipeline` 分开：前者执行编译期控制程序，每个 EU 流
-只推进自己的 head command；后者仍是旧的全局下一条基线。Dynamic 完全过滤
+新的 `static_streams` 与兼容 `static_pipeline` 分开：前者执行包含 TISA issue 与
+`set/wait/fence` 的统一编译期 program，从唯一 Reception FIFO 路由到 per-EU WQ，并推进
+各自的 head command；后者仍是旧的全局下一条基线。Dynamic 完全过滤
 `StaticControlProgram`，只使用共享 target TISA、operand/MemoryPlan、runtime alias 和反馈。
 三种身份分别记录为 `shared_workload_hash`、`static_control_hash` 和
 `dynamic_control_hash`。

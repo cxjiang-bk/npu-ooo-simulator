@@ -110,7 +110,7 @@ def _root_readme() -> str:
             "root-memory traffic 和 region dependency 数量。",
             "`02_fc/tisa_dialect.json` 是符号 FC 输出；`03_tisa/virtual_tisa_program.json` 是 Generator 输出，`tisa_program.json` 是 device scheduler 输入；`04_backend/` 保存",
             "`target_plan.json`、与每条 target TISA 绑定的 payload 和 `memory_plan.json`。",
-            "`04_backend/static_control_program.json` 保存编译期 per-EU 流与 set/wait/fence；",
+            "`04_backend/static_control_program.json` 保存统一静态 program、编译期 per-EU 归属与 set/wait/fence；",
             "Dynamic 运行不会执行这些控制命令。",
             "`06_simulation/summary.json` 默认只保存聚合指标和 timing；连续 stall 在",
             "`07_trace/perfetto.json` 中压缩为 duration interval，完整依赖见",

@@ -4,7 +4,8 @@
 文档同时描述两条 scheduler 路径：
 
 - Dynamic 沿用论文 Figure 4 的 `Reception Buffer -> WQ -> IQ -> Exec` 语义路径；
-- Static Streams 使用同一个 `Reception Buffer`、编译器生成的 per-EU 固定流和 `set/wait/fence` 同步。
+- Static Streams 将 TISA issue 与 `set/wait/fence` 合并为一个有序 program，使用同一个
+  `Reception Buffer`、per-EU WQ 和 `set_wait_table`。
 
 两条路径共享最终 target TISA、payload、MemoryPlan、依赖语义和 ExecutionBackend。
 Dynamic 路径使用 Fu、tile window 和 runtime 地址依赖容量模型，完成反馈直接驱动
@@ -96,7 +97,7 @@ flowchart TB
         direction TB
         RS["RuntimeSubmission\ncommands / arrival / address"]
         LOADER["runtime.loader\nload_device_program()"]
-        LD["LoadedDeviceProgram\ndescriptors + envelopes"]
+        LD["LoadedDeviceProgram\ndescriptors + unified program envelopes"]
         RS --> LOADER --> LD
     end
 
@@ -122,28 +123,28 @@ flowchart TB
         COMPLETE -. "唤醒后继指令" .-> WAKE
     end
 
-    subgraph SS["3b. Static Streams / static.py"]
+    subgraph SS["3b. Static unified program / static.py"]
         direction TB
-        STATIC_CONTROL["StaticControlProgram\nper-EU fixed streams"]
-        STATIC_RECEPTION["shared Reception FIFO\nruntime envelopes"]
+        STATIC_PROGRAM["Unified static program\nTISA issue + SET/WAIT/FENCE\nStaticControlProgram metadata"]
+        STATIC_RECEPTION["shared Reception FIFO\nprogram entries"]
         STATIC_WQ["WQ[EU]\nper-EU fixed queue"]
-        STATIC_STREAM["stream\nper-EU fixed commands"]
-        STATIC_ISSUE["issue\nfixed stream order"]
+        STATIC_HEAD["WQ head decoder\nset_wait_table + EU ready"]
+        STATIC_ISSUE["issue\nhead command"]
         STATIC_SYNC["set/wait table\nevent state + fence"]
         STATIC_FEEDBACK["feedback state\nexecution_done / partial_ready"]
         STATIC_COMPLETE["complete + trace"]
 
-        STATIC_CONTROL --> STATIC_STREAM
-        STATIC_RECEPTION -->|"compiled stream route"| STATIC_WQ
-        STATIC_WQ --> STATIC_STREAM
-        STATIC_STREAM -->|"issue"| STATIC_ISSUE
-        STATIC_STREAM -->|"set / wait / fence"| STATIC_SYNC
-        STATIC_ISSUE -->|"advance stream"| STATIC_STREAM
-        STATIC_SYNC -->|"advance stream"| STATIC_STREAM
+        STATIC_PROGRAM --> STATIC_RECEPTION
+        STATIC_RECEPTION -->|"FIFO head / target EU"| STATIC_WQ
+        STATIC_WQ --> STATIC_HEAD
+        STATIC_HEAD -->|"issue"| STATIC_ISSUE
+        STATIC_HEAD -->|"set / wait / fence"| STATIC_SYNC
+        STATIC_ISSUE -->|"pop WQ head"| STATIC_HEAD
+        STATIC_SYNC -->|"pop WQ head"| STATIC_HEAD
         STATIC_FEEDBACK --> STATIC_SYNC
         STATIC_FEEDBACK --> STATIC_COMPLETE
-        STATIC_STREAM ~~~ STATIC_SYNC
-        STATIC_STREAM ~~~ STATIC_FEEDBACK
+        STATIC_HEAD ~~~ STATIC_SYNC
+        STATIC_HEAD ~~~ STATIC_FEEDBACK
         STATIC_ISSUE ~~~ STATIC_SYNC
         STATIC_ISSUE ~~~ STATIC_FEEDBACK
         STATIC_ISSUE ~~~ STATIC_COMPLETE
@@ -167,9 +168,10 @@ flowchart TB
         TRACE["summary / tasks.csv\nswimlane / Perfetto"]
     end
 
-    LD --> RF
-    LD --> STATIC_RECEPTION
-    LD --> STATIC_CONTROL
+    POLICY["scheduler policy\nselect one device path"]
+    LD --> POLICY
+    POLICY --> RF
+    POLICY --> STATIC_PROGRAM
     ISSUE -->|"IssueRequest"| ACCEPT
     STATIC_ISSUE -->|"IssueRequest"| ACCEPT
     FEEDBACK -->|"execution.advance()"| COMPLETE
@@ -190,55 +192,58 @@ flowchart TB
 | --- | --- | --- |
 | Runtime / loader | `RuntimeSubmission`、最终 TISA、`MemoryPlan` | 绑定地址、动态参数、descriptor arrival 和 completion token，生成 `LoadedDeviceProgram` |
 | Static-control compiler | `BackendArtifact`、`MachineConfig` | 生成资源约束的 per-EU 指令流和 `set/wait/fence` 控制 |
-| Device scheduler | `LoadedDeviceProgram`、policy、`MachineConfig`、backend feedback | Dynamic 管理 Reception/WQ/IQ，Static Streams 管理共享 Reception、per-EU WQ、固定流 command 和事件同步 |
+| Device scheduler | `LoadedDeviceProgram`、policy、`MachineConfig`、backend feedback | Dynamic 管理 Reception/WQ/IQ，Static Streams 管理统一 program、共享 Reception、per-EU WQ 和事件同步 |
 | ExecutionBackend | payload handle、`IssueRequest` | 管理 EU instance、payload timing、busy/II，并返回 physical completion 或 partial-ready |
 
 `DeviceSimulator` 负责连接 loader、scheduler 和 backend。scheduler 读取
 `LoadedDeviceProgram`，ExecutionBackend 持有 execution graph 和 payload primitive。整体编译链和公共契约见
 [总体架构](architecture.md) 与 [TISA 论文语义对齐](tisa-alignment.md)。
 
-## 3. Static Streams 策略
+## 3. Static unified program 策略
 
 `static_streams` 对应论文 Static strategy。编译器根据最终 target TISA、payload、
-`MemoryPlan` 和 `MachineConfig` 生成每个逻辑 EU 的固定 command stream；运行期 descriptor
-先进入共享 Reception FIFO，再按编译分配路由到对应 EU 的 WQ。每个 EU 每周期从自己的 WQ
-取一条队首指令，set/wait table 管理跨 stream 依赖和 buffer reuse。
+`MemoryPlan` 和 `MachineConfig` 生成一个统一的静态 program。program entry 包含 TISA issue
+以及对应的 `set/wait/fence` command，并携带编译期确定的目标 EU。运行期 program entry 按顺序
+进入唯一的 Reception FIFO，再按 entry 的目标 EU 路由到对应 WQ。每个 EU 每周期检查自己的
+WQ 队首，`set_wait_table`、EU ready 和 ExecutionBackend 接收状态共同决定队首 command 是否推进。
+编译器内部的 per-EU stream 仅保存 command ownership 和局部顺序，它不构成独立的运行时输入。
 
 ### 3.1 流程
 
 ```mermaid
 flowchart TB
     INPUT["BackendArtifact + MachineConfig"] --> SCHEDULE["compile-time list scheduling"]
-    SCHEDULE --> PROGRAM["StaticControlProgram"]
-    RUNTIME["runtime envelopes"] --> RECEPTION["shared Reception FIFO"]
-    RECEPTION --> ROUTE["compiled stream route"]
+    SCHEDULE --> PROGRAM["Unified Static Program\nTISA issue + SET/WAIT/FENCE"]
+    PROGRAM --> RECEPTION["shared Reception FIFO\nprogram entries"]
+    RECEPTION --> ROUTE["FIFO-head route\ntarget EU"]
     ROUTE --> WQ["WQ[EU]\nper-EU queue"]
-    PROGRAM --> STREAM["stream\nper-EU fixed commands"]
-    WQ --> STREAM
-    STREAM --> ISSUE["issue\nqueue head / fixed order"]
-    STREAM --> TABLE["set/wait table\nwait / fence / set"]
+    WQ --> HEAD["WQ head decoder\nset_wait_table + EU ready"]
+    HEAD --> ISSUE["issue\nqueue head / fixed order"]
+    HEAD --> TABLE["set/wait table\nwait / fence / set"]
     ISSUE --> BACKEND["shared ExecutionBackend"]
     BACKEND --> FEEDBACK["execution_done / partial_ready"]
     FEEDBACK --> TABLE
     FEEDBACK --> COMPLETE["complete + trace"]
-    TABLE --> ADVANCE["advance stream"]
+    TABLE --> ADVANCE["pop WQ head"]
     ISSUE --> ADVANCE
-    ADVANCE --> STREAM
+    ADVANCE --> WQ
 ```
 
 流程顺序：
 
 1. 编译器为每条 target TISA 指令选择 `(resource, logical instance)`，估计开始和结束时间。
-2. `StaticControlProgram` 保存 per-EU stream；stream command 包含 `issue`、`wait`、
-   `fence` 和 `set`。
-3. Runtime envelope 以 Dynamic 相同的 receive width 进入共享 Reception FIFO。
-4. Static dispatch 按每个 stream 的下一条编译指令从 Reception 取数，每个 EU 每周期向
-   自己的 WQ 放入一条 descriptor。
-5. EU 只检查 WQ 队首和当前 stream command。`issue` 携带编译期选择的 EU instance 向共享
+2. `StaticControlProgram` 保存统一 program 的 entry 顺序和每个 entry 的目标 EU；entry
+   包含 `issue`、`wait`、`fence` 和 `set`。
+3. Runtime command chunk 按 program 顺序携带这些 entry，以 Dynamic 相同的 receive width
+   进入唯一的 Reception FIFO。
+4. Static dispatch 严格处理 Reception FIFO 队首，将 entry 路由到目标 EU 的 WQ；在全局
+   `dispatch_width` 约束下，每个 EU 每周期最多接收一个 entry。
+5. EU 只检查 WQ 队首。`issue` 携带编译期选择的 EU instance 向共享
    ExecutionBackend 请求执行，物理 payload 在该 instance 上运行；
    `wait` 等待依赖 event，`fence` 等待 allocation release，`set` 在 source feedback
    到达后按 consumer 数量发布 token。
-6. command 完成后 stream 前进。各 EU stream 独立推进，形成编译期安排的流水 overlap。
+6. issue 或 control 完成后从对应 WQ 弹出队首 entry。各 EU WQ 独立推进，形成编译期安排的
+   流水 overlap。
 
 ### 3.2 依赖与事件
 

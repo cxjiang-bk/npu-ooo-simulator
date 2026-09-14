@@ -3,9 +3,9 @@
 ## 定义与论文边界
 
 本项目将新的 `static_streams` 定义为：编译器对最终 target TISA 做资源约束 list
-scheduling，生成每个 EU 实例的固定指令流，并显式插入 `set/wait/fence`。运行期 descriptor
-先进入共享 Reception FIFO，再按 stream 路由进入每个 EU 的 WQ。固定的是流内顺序
-与同步关系，不是绝对执行周期。论文 Section III、VI 和 VIII-A 只公开 Static 使用编译期
+scheduling，生成一个包含 TISA issue 与 `set/wait/fence` 的统一静态 program。运行期 program
+entry 先进入唯一的 Reception FIFO，再按 entry 携带的目标 EU 路由进入对应 WQ。固定的是
+program 顺序、EU 归属与同步关系，不是绝对执行周期。论文 Section III、VI 和 VIII-A 只公开 Static 使用编译期
 重排、多阶段流水和 fence-based dependency management；事件编码、消费方式和控制成本没有
 公开，以下内容均是项目实现假设，不声称是 Epoch RTL。
 
@@ -23,7 +23,8 @@ npu-ooo simulate --compile-dir out/model-compile \
 ```text
 final target TISA + payload + MemoryPlan + correctness dependencies
   -> resource-constrained static list scheduling
-  -> shared Reception + per-EU streams/WQ + set/wait/fence
+  -> unified static program [TISA issue + SET/WAIT/FENCE]
+  -> one Reception FIFO + per-EU WQ + set_wait_table
   -> static_control_program.json
 ```
 
@@ -38,7 +39,8 @@ MemoryPlan 和正确性依赖只生成一次：
 
 `04_backend/static_control_program.json` 包含：
 
-- `StaticInstructionStream(resource, instance)`：每个逻辑 EU 流；
+- `StaticInstructionStream(resource, instance)`：编译期 command ownership 和 EU 局部顺序；
+- `StaticControlProgram.attributes.program_order`：统一 program 的全局 command 顺序；
 - `issue`：提交共享正文中的一条 target TISA；
 - `set`：等待 producer 的真实 feedback 后发布代次化事件；
 - `wait`：等待一个数据事件并消费对应 set_wait token；事件按消费者数量提供 token；
@@ -55,18 +57,19 @@ invocation_id :: compile_event_id :: generation
 
 ## 执行语义
 
-每个流只检查自己的 WQ 和 head command：
+运行期只使用一条统一 program 输入和一个 Reception FIFO。每个 EU 只检查自己的 WQ 和 head command：
 
-1. Runtime envelope 进入共享 Reception FIFO，Static dispatch 按每个 stream 的下一条编译
-   指令路由到对应 EU WQ，每个 EU 每周期放入一条；
-2. `issue` 检查 WQ 队首 descriptor 和 ExecutionBackend 接收；
-3. `set` 等匹配的 physical/partial feedback，producer 刚提交不会置位；
-4. `wait/fence` 未满足只阻塞当前流，其他流继续；
-5. invocation 在全部正文和尾部 set 完成后结束。
+1. Runtime command chunk 按 `program_order` 携带 TISA 与 control entry，进入共享 Reception FIFO；
+2. Static dispatch 严格处理 Reception FIFO 队首，将 entry 路由到目标 EU WQ；在全局
+   `dispatch_width` 约束下，每个 EU 每周期接收一条；
+3. `issue` 检查 WQ 队首 descriptor 和 ExecutionBackend 接收；
+4. `set` 等匹配的 physical/partial feedback，producer 刚提交不会置位；
+5. `wait/fence` 未满足时保留在 WQ 队首，其他 EU WQ 继续；
+6. invocation 在全部 program entry 完成后结束。
 
-静态执行器依据编译器生成的 set/wait/fence 控制推进。编译阶段用共享依赖图作独立 oracle，
+静态执行器依据统一 program 中的 set/wait/fence command 推进。编译阶段用共享依赖图作独立 oracle，
 每条依赖都对应 wait/fence 校验。Runtime 新增的物理 alias 需要出现在编译依赖的传递闭包
-中，`static_streams` 由该契约保持固定 stream 顺序。
+中，`static_streams` 由该契约保持固定 program 顺序和 EU 局部顺序。
 
 ExecutionBackend 仍唯一拥有 payload、EU busy、物理完成和内部 task trace；静态执行器不会
 维护第二套冲突的 EU busy 状态。

@@ -15,6 +15,7 @@ from npu_ooo.ir import (
     LoadedDeviceProgram,
     RuntimeSubmission,
     RuntimeOperandBinding,
+    StaticCommandEnvelope,
     StaticScheduleEntry,
     StaticSchedulePlan,
 )
@@ -52,6 +53,20 @@ def load_device_program(
     submission_order = {
         tisa_id: index for index, (_chunk, tisa_id) in enumerate(flattened)
     }
+    static_command_ids = tuple(
+        command_id for chunk in submission.commands for command_id in chunk.command_ids
+    )
+    if submission.policy == "static" and artifact.static_control is not None:
+        known_commands = {
+            command.command_id
+            for stream in artifact.static_control.streams
+            for command in stream.commands
+        }
+        if set(static_command_ids) != known_commands:
+            raise ValueError(
+                "runtime static program must submit every TISA/control command "
+                "exactly once; regenerate the submission from this compile artifact"
+            )
     operands = {
         tisa_id: tuple(
             item for item in submission.operands if item.tisa_id == tisa_id
@@ -113,6 +128,8 @@ def load_device_program(
                     "submission order with physical alias dependencies"
                 )
     cursor = 0.0
+    static_envelopes = []
+    static_command_position = 0
     envelope_by_tisa: dict[str, DescriptorEnvelope] = {}
     for chunk in submission.commands:
         start = max(cursor, chunk.availability_cycle)
@@ -128,6 +145,18 @@ def load_device_program(
                 chunk_order=chunk.submission_order,
                 descriptor_order=submission_order[tisa_id],
             )
+        for command_id in chunk.command_ids:
+            static_envelopes.append(
+                StaticCommandEnvelope(
+                    command_id=command_id,
+                    chunk_id=chunk.chunk_id,
+                    queue=chunk.queue,
+                    arrival_cycle=finish,
+                    chunk_order=chunk.submission_order,
+                    command_order=static_command_position,
+                )
+            )
+            static_command_position += 1
     loaded = LoadedDeviceProgram(
         program_id=artifact.program.program_id,
         artifact_id=artifact.artifact_id,
@@ -141,6 +170,7 @@ def load_device_program(
         synchronization_cycles=submission.synchronization_cycles,
         static_schedule=_static_schedule(artifact.program.program_id, descriptors),
         static_control=artifact.static_control,
+        static_command_envelopes=tuple(static_envelopes),
         attributes={
             "runtime_submission_id": submission.submission_id,
             "runtime_policy": submission.policy,
@@ -412,6 +442,32 @@ def load_implicit_device_program(
             )
         )
     descriptors = list(_add_runtime_alias_dependencies(tuple(descriptors)))
+    static_command_envelopes = ()
+    if artifact.static_control is not None:
+        commands_by_id = {
+            command.command_id: command
+            for stream in artifact.static_control.streams
+            for command in stream.commands
+        }
+        raw_program_order = artifact.static_control.attributes.get("program_order")
+        static_command_order = (
+            tuple(str(item) for item in raw_program_order)
+            if raw_program_order
+            else ()
+        )
+        if set(static_command_order) != set(commands_by_id):
+            static_command_order = tuple(commands_by_id)
+        static_command_envelopes = tuple(
+            StaticCommandEnvelope(
+                command_id=command_id,
+                chunk_id="implicit.chunk0000",
+                queue="device",
+                arrival_cycle=0.0,
+                chunk_order=0,
+                command_order=index,
+            )
+            for index, command_id in enumerate(static_command_order)
+        )
     loaded = LoadedDeviceProgram(
         program_id=artifact.program.program_id,
         artifact_id=artifact.artifact_id,
@@ -422,6 +478,7 @@ def load_implicit_device_program(
             artifact.program.program_id, tuple(descriptors)
         ),
         static_control=artifact.static_control,
+        static_command_envelopes=static_command_envelopes,
         attributes={"runtime_policy": "implicit_static", "command_chunk_count": 0},
     )
     loaded_issues = loaded.validate()

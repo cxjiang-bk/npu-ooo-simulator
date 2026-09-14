@@ -300,7 +300,7 @@ class RuntimeOperandBinding:
 
 @dataclass(frozen=True)
 class RuntimeCommandChunk:
-    """A software submission chunk; device issue may reorder its descriptors."""
+    """One ordered software-program chunk submitted to the device."""
 
     chunk_id: str
     queue: str
@@ -308,6 +308,10 @@ class RuntimeCommandChunk:
     tisa_ids: tuple[str, ...]
     availability_cycle: float = 0.0
     attributes: Mapping[str, Any] = field(default_factory=dict)
+    # Static submissions carry the complete TISA/control program in this
+    # order. Keep this field after the legacy fields so positional callers
+    # retain the original availability/attributes contract.
+    command_ids: tuple[str, ...] = ()
 
     def validate(self) -> tuple[str, ...]:
         issues: list[str] = []
@@ -317,10 +321,14 @@ class RuntimeCommandChunk:
             issues.append(f"runtime command chunk '{self.chunk_id}' order must be non-negative")
         if not math.isfinite(self.availability_cycle) or self.availability_cycle < 0:
             issues.append(f"runtime command chunk '{self.chunk_id}' availability must be non-negative")
-        if not self.tisa_ids:
-            issues.append(f"runtime command chunk '{self.chunk_id}' must contain TISA ids")
+        if not self.tisa_ids and not self.command_ids:
+            issues.append(f"runtime command chunk '{self.chunk_id}' must contain program entries")
         if len(set(self.tisa_ids)) != len(self.tisa_ids):
             issues.append(f"runtime command chunk '{self.chunk_id}' TISA ids must be unique")
+        if len(set(self.command_ids)) != len(self.command_ids):
+            issues.append(
+                f"runtime command chunk '{self.chunk_id}' command ids must be unique"
+            )
         return tuple(issues)
 
     def to_dict(self) -> dict[str, Any]:
@@ -329,6 +337,7 @@ class RuntimeCommandChunk:
             "queue": self.queue,
             "submission_order": self.submission_order,
             "tisa_ids": list(self.tisa_ids),
+            "command_ids": list(self.command_ids),
             "availability_cycle": self.availability_cycle,
             "attributes": dict(self.attributes),
         }
@@ -447,11 +456,17 @@ class RuntimeSubmission:
         if chunk_orders != list(range(len(self.commands))):
             issues.append("runtime command chunks must have contiguous submission_order")
         command_ids: list[str] = []
+        static_command_ids: list[str] = []
         for chunk in self.commands:
             issues.extend(chunk.validate())
             command_ids.extend(chunk.tisa_ids)
+            static_command_ids.extend(chunk.command_ids)
         if len(set(command_ids)) != len(command_ids):
             issues.append("runtime command chunks must not repeat TISA ids")
+        if len(set(static_command_ids)) != len(static_command_ids):
+            issues.append("runtime command chunks must not repeat static command ids")
+        if self.policy == "dynamic_ready_queue" and static_command_ids:
+            issues.append("dynamic runtime submission must contain only TISA commands")
         if program is not None:
             if self.program_id != program.program_id:
                 issues.append(
@@ -1557,25 +1572,102 @@ def create_runtime_submission(
         raise ValueError("chunk_size must be positive")
     available_cycles = dict(descriptor_available_cycles or {})
     submission_order = _submission_order(program, policy, available_cycles)
-    commands = tuple(
-        RuntimeCommandChunk(
-            chunk_id=f"{submission_id or program.program_id}.chunk{index:04d}",
-            queue=queue,
-            submission_order=index,
-            tisa_ids=tuple(
-                tisa_id
-                for tisa_id in submission_order[start : start + effective_chunk_size]
-            ),
-            availability_cycle=max(
-                (
-                    available_cycles.get(tisa_id, 0.0)
+    static_command_order: tuple[str, ...] = ()
+    if policy == "static" and artifact is not None and artifact.static_control is not None:
+        control = artifact.static_control
+        commands_by_id = {
+            command.command_id: command
+            for stream in control.streams
+            for command in stream.commands
+        }
+        raw_program_order = control.attributes.get("program_order")
+        candidate_order = (
+            tuple(str(command_id) for command_id in raw_program_order)
+            if raw_program_order
+            else ()
+        )
+        if not candidate_order:
+            candidate_order = tuple(
+                command.command_id
+                for stream in control.streams
+                for command in stream.commands
+            )
+        if (
+            len(candidate_order) != len(commands_by_id)
+            or len(set(candidate_order)) != len(candidate_order)
+            or set(candidate_order) != set(commands_by_id)
+        ):
+            raise ValueError(
+                "static control program_order must cover every control command"
+            )
+        static_command_order = candidate_order
+    if static_command_order:
+        commands_list: list[RuntimeCommandChunk] = []
+        command_by_id = {
+            command.command_id: command
+            for stream in artifact.static_control.streams
+            for command in stream.commands
+        }
+        current_tisa: list[str] = []
+        current_commands: list[str] = []
+        current_availability: list[float] = []
+        for command_id in static_command_order:
+            command = command_by_id[command_id]
+            current_commands.append(command_id)
+            if command.kind == "issue":
+                assert command.tisa_id is not None
+                current_tisa.append(command.tisa_id)
+                current_availability.append(
+                    available_cycles.get(command.tisa_id, 0.0)
+                )
+            if len(current_tisa) >= effective_chunk_size:
+                index = len(commands_list)
+                commands_list.append(
+                    RuntimeCommandChunk(
+                        chunk_id=f"{submission_id or program.program_id}.chunk{index:04d}",
+                        queue=queue,
+                        submission_order=index,
+                        tisa_ids=tuple(current_tisa),
+                        command_ids=tuple(current_commands),
+                        availability_cycle=max(current_availability, default=0.0),
+                    )
+                )
+                current_tisa, current_commands, current_availability = [], [], []
+        if current_commands:
+            index = len(commands_list)
+            commands_list.append(
+                RuntimeCommandChunk(
+                    chunk_id=f"{submission_id or program.program_id}.chunk{index:04d}",
+                    queue=queue,
+                    submission_order=index,
+                    tisa_ids=tuple(current_tisa),
+                    command_ids=tuple(current_commands),
+                    availability_cycle=max(current_availability, default=0.0),
+                )
+            )
+        commands = tuple(commands_list)
+    else:
+        commands = tuple(
+            RuntimeCommandChunk(
+                chunk_id=f"{submission_id or program.program_id}.chunk{index:04d}",
+                queue=queue,
+                submission_order=index,
+                tisa_ids=tuple(
+                    tisa_id
                     for tisa_id in submission_order[start : start + effective_chunk_size]
                 ),
-                default=0.0,
-            ),
+                availability_cycle=max(
+                    (
+                        available_cycles.get(tisa_id, 0.0)
+                        for tisa_id in submission_order[start : start + effective_chunk_size]
+                    ),
+                    default=0.0,
+                ),
+            )
+            for index, start in enumerate(
+                range(0, len(program.instructions), effective_chunk_size)
+            )
         )
-        for index, start in enumerate(range(0, len(program.instructions), effective_chunk_size))
-    )
     submission = RuntimeSubmission(
         submission_id=submission_id or f"submission.{program.program_id}",
         program_id=program.program_id,

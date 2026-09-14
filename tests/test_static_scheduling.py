@@ -25,7 +25,7 @@ from npu_ooo.ir import (
 )
 from npu_ooo.scheduler import SimulatorConfig, schedule_tisa_program, schedule_tisa_sequence
 from npu_ooo.scheduler.static import schedule_loaded_static_program
-from npu_ooo.runtime import load_implicit_device_program
+from npu_ooo.runtime import load_device_program, load_implicit_device_program
 from npu_ooo.simulator import TimingTableModel
 
 
@@ -252,6 +252,48 @@ class StaticControlCompilerTest(unittest.TestCase):
 
 
 class StaticStreamExecutionTest(unittest.TestCase):
+    def test_static_runtime_submission_contains_one_unified_program(self):
+        artifact = _artifact()
+        buffers = tuple(
+            BufferBinding(
+                item.tisa_id,
+                0x1000 + index * 0x100,
+                8,
+                "SRAM",
+                "SRAM",
+            )
+            for index, item in enumerate(artifact.program.instructions)
+        )
+        submission = create_runtime_submission(
+            artifact,
+            buffers,
+            chunk_size=2,
+        )
+        expected = tuple(artifact.static_control.attributes["program_order"])
+        submitted = tuple(
+            command_id for chunk in submission.commands for command_id in chunk.command_ids
+        )
+        self.assertEqual(submitted, expected)
+        self.assertTrue(
+            any(len(chunk.command_ids) > len(chunk.tisa_ids) for chunk in submission.commands)
+        )
+        self.assertEqual(
+            tuple(
+                tisa_id for chunk in submission.commands for tisa_id in chunk.tisa_ids
+            ),
+            tuple(
+                command.tisa_id
+                for command_id in expected
+                for stream in artifact.static_control.streams
+                for command in stream.commands
+                if command.command_id == command_id and command.kind == "issue"
+            ),
+        )
+        loaded = load_device_program(artifact, submission)
+        self.assertEqual(
+            tuple(item.command_id for item in loaded.static_command_envelopes), expected
+        )
+
     def test_legacy_package_requires_recompile_for_static_streams(self):
         artifact = _artifact()
         legacy = replace(artifact, static_control=None)
@@ -552,7 +594,9 @@ class StaticStreamExecutionTest(unittest.TestCase):
             event_backend=CycleEventBackend(),
         )
         self.assertEqual(result.instruction_timing("source").issue, 1)
-        self.assertEqual(result.instruction_timing("independent").issue, 5)
+        # Static issue and control entries share one Reception FIFO.  The
+        # independent EU receives its program entry before the source completes.
+        self.assertEqual(result.instruction_timing("independent").issue, 2)
         self.assertGreaterEqual(
             result.instruction_timing("consumer_mxu").issue,
             result.instruction_timing("source").finish,
