@@ -268,7 +268,8 @@ reduction / atomic / psum special semantics
 | 地址冲突 | 与 semantic compatibility 共同判断 | optional global address scoreboard | 不能替代论文机制 |
 | 资源检查 | unit/resource availability | issue 阶段检查 | 基本一致 |
 | 跨 EU address hazard | 依赖语义应全局可见 | global older-descriptor scan | 可作为项目保守扩展，但不是 Fu 检查 |
-| 全局 ROB | 论文公开路径之外 | active credit 在 dispatch 分配、complete 回收；ledger 按 submission order retire | 项目容量与观测扩展 |
+| Dynamic retire | completion feedback 驱动 | completion-ready 指令按完成顺序记录 retire | 与论文 completion path 对齐 |
+| Ordered retire ledger | 论文未规定 | `sequential/static_pipeline` 使用 `rob_entries` 维护顺序记录 | 兼容/reference 扩展 |
 | 全局 tile window | 论文未描述同名结构 | `max_inflight_tiles` | 非论文项目扩展 |
 
 ## 6. 应采用的对齐后架构
@@ -354,8 +355,8 @@ SemanticConflict:
 
 ### 7.1.1 广播的精确定义
 
-完整 TISA 在 `TISA_COMPLETE`（scheduler 接受 completion feedback）时广播，不等待全局
-ROB retire；partial condition 在对应 `TISA_PARTIAL_READY` 时广播。一条 consumer 有多个
+完整 TISA 在 `TISA_COMPLETE`（scheduler 接受 completion feedback）时广播，Dynamic retire
+在 completion-ready 阶段推进；partial condition 在对应 `TISA_PARTIAL_READY` 时广播。一条 consumer 有多个
 Deps 时，每次匹配只清除对应 bit，全部清零后才进入 wakeup latency。广播 tag 的 key 包含
 invocation、source TISA 和 condition，避免重复 invocation 使用旧完成状态。
 
@@ -519,11 +520,12 @@ ExecutionBackend / Exec[u]
 > 论文要求 typed dependency readiness、per-EU Fu semantic conflict 和 completion feedback，
 > 但未公开跨 EU notification 互连；本项目选择“让全部 WQ snoop completion tag，并已实现
 > pending mask 与本地 scope/allocation/range/access SemanticConflict。OpType compatibility 的
-> 安全放宽仍需建立明确规则”，全局 ROB/tile window 仍是非论文扩展。
+> 安全放宽仍需建立明确规则”；Dynamic 的 retire 路径沿用 completion feedback，Static 的
+> per-EU stream 使用 set/wait/fence 控制。tile window 仍是项目容量扩展。
 
 相关代码入口：
 
-- `src/npu_ooo/simulator/cycle.py:158`：WQ/IQ/Fu/ROB 状态初始化；
+- `src/npu_ooo/simulator/cycle.py:158`：WQ/IQ/Fu 和 retire 状态初始化；
 - `src/npu_ooo/simulator/cycle.py:368`：wakeup；
 - `src/npu_ooo/simulator/cycle.py:393`：address scoreboard；
 - `src/npu_ooo/simulator/cycle.py:414`：issue；

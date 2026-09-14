@@ -3,7 +3,8 @@
 ## 定义与论文边界
 
 本项目将新的 `static_streams` 定义为：编译器对最终 target TISA 做资源约束 list
-scheduling，生成每个 EU 实例的固定指令流，并显式插入 `set/wait/fence`。固定的是流内顺序
+scheduling，生成每个 EU 实例的固定指令流，并显式插入 `set/wait/fence`。运行期 descriptor
+先进入共享 Reception FIFO，再按 stream 路由进入每个 EU 的 WQ。固定的是流内顺序
 与同步关系，不是绝对执行周期。论文 Section III、VI 和 VIII-A 只公开 Static 使用编译期
 重排、多阶段流水和 fence-based dependency management；事件编码、消费方式和控制成本没有
 公开，以下内容均是项目实现假设，不声称是 Epoch RTL。
@@ -22,7 +23,7 @@ npu-ooo simulate --compile-dir out/model-compile \
 ```text
 final target TISA + payload + MemoryPlan + correctness dependencies
   -> resource-constrained static list scheduling
-  -> per-EU streams + set/wait/fence
+  -> shared Reception + per-EU streams/WQ + set/wait/fence
   -> static_control_program.json
 ```
 
@@ -40,7 +41,7 @@ MemoryPlan 和正确性依赖只生成一次：
 - `StaticInstructionStream(resource, instance)`：每个逻辑 EU 流；
 - `issue`：提交共享正文中的一条 target TISA；
 - `set`：等待 producer 的真实 feedback 后发布代次化事件；
-- `wait`：等待一个数据事件，非消费式，允许多消费者；
+- `wait`：等待一个数据事件并消费对应 set_wait token；事件按消费者数量提供 token；
 - `fence`：等待一个或多个 allocation/buffer reuse 事件，作用域不是全局 barrier；
 - iteration、stage、buffer slot/allocation、估计起止周期和来源 provenance。
 
@@ -54,17 +55,18 @@ invocation_id :: compile_event_id :: generation
 
 ## 执行语义
 
-每个流只检查自己的 head command：
+每个流只检查自己的 WQ 和 head command：
 
-1. `issue` 等 descriptor 到达和 ExecutionBackend 接收；
-2. `set` 等匹配的 physical/partial feedback，producer 刚提交不会置位；
-3. `wait/fence` 未满足只阻塞当前流，其他流继续；
-4. 事件不被 wait 消费；
+1. Runtime envelope 进入共享 Reception FIFO，Static dispatch 按每个 stream 的下一条编译
+   指令路由到对应 EU WQ，每个 EU 每周期放入一条；
+2. `issue` 检查 WQ 队首 descriptor 和 ExecutionBackend 接收；
+3. `set` 等匹配的 physical/partial feedback，producer 刚提交不会置位；
+4. `wait/fence` 未满足只阻塞当前流，其他流继续；
 5. invocation 在全部正文和尾部 set 完成后结束。
 
-静态执行器不调用 Dynamic 的 dependency-ready 判定。编译阶段用共享依赖图作独立 oracle，
-缺少 wait/fence 会让 artifact 校验失败。Runtime 新增的物理 alias 若不在编译依赖的传递闭包
-中，`static_streams` 拒绝该绑定，避免 runtime 偷偷重新排程。
+静态执行器依据编译器生成的 set/wait/fence 控制推进。编译阶段用共享依赖图作独立 oracle，
+每条依赖都对应 wait/fence 校验。Runtime 新增的物理 alias 需要出现在编译依赖的传递闭包
+中，`static_streams` 由该契约保持固定 stream 顺序。
 
 ExecutionBackend 仍唯一拥有 payload、EU busy、物理完成和内部 task trace；静态执行器不会
 维护第二套冲突的 EU busy 状态。

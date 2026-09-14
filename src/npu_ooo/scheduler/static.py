@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Any, Mapping
 
 from npu_ooo.execution import ExecutionBackend, IssueRequest
 from npu_ooo.ir import LoadedDeviceProgram, StaticControlCommand
 from npu_ooo.simulator.core import SimulationResult, SimulatorConfig, TaskTiming, TraceEvent
+from npu_ooo.scheduler.semantics import dependency_details
 
 
 @dataclass
@@ -49,17 +50,49 @@ class _StaticStreamExecutor:
         self.descriptors = {
             item.instruction.tisa_id: item for item in loaded.descriptors
         }
-        self.arrivals = {
-            loaded.descriptor(item.descriptor_id).instruction.tisa_id: item.arrival_cycle
-            for item in loaded.envelopes
-        }
         self.streams = {item.stream_id: item for item in self.control.streams}
+        self.stream_by_tisa = {
+            command.tisa_id: stream.stream_id
+            for stream in self.control.streams
+            for command in stream.commands
+            if command.kind == "issue" and command.tisa_id is not None
+        }
+        if set(self.stream_by_tisa) != set(self.descriptors):
+            raise ValueError("static control streams must cover every loaded descriptor")
         self.pointers = {stream_id: 0 for stream_id in self.streams}
+        self.stream_issue_order = {
+            stream_id: tuple(
+                command.tisa_id
+                for command in stream.commands
+                if command.kind == "issue" and command.tisa_id is not None
+            )
+            for stream_id, stream in self.streams.items()
+        }
+        self.next_stream_dispatch = {stream_id: 0 for stream_id in self.streams}
+        self.wq = {stream_id: deque() for stream_id in self.streams}
+        self.reception = deque()
+        self.next_receive = 0
+        self.received = set()
+        self.dispatched = set()
+        self.receive_cycles: dict[str, float] = {}
+        self.dispatch_cycles: dict[str, float] = {}
+        self.dispatch_counts = Counter()
+        self.stall_cycles = Counter()
+        self.snapshots: list[dict[str, Any]] = []
+        self.stream_input = [
+            (
+                envelope.arrival_cycle,
+                loaded.descriptor(envelope.descriptor_id).instruction.tisa_id,
+                envelope.chunk_id,
+            )
+            for envelope in sorted(loaded.envelopes, key=lambda item: item.descriptor_order)
+        ]
         self.pending_control: dict[str, tuple[StaticControlCommand, float]] = {}
         self.feedback: set[tuple[str, str]] = set()
         self.condition_ready: dict[tuple[str, str], float] = {}
-        self.signaled: set[str] = set()
+        self.set_wait_table: Counter[str] = Counter()
         self.issued: dict[str, float] = {}
+        self.instances: dict[str, int] = {}
         self.physical_done: dict[str, float] = {}
         self.completed: dict[str, float] = {}
         self.pending_done: dict[str, float] = {}
@@ -114,22 +147,6 @@ class _StaticStreamExecutor:
                     ),
                 )
             )
-        for tisa_id, arrival in self.arrivals.items():
-            descriptor = self.descriptors[tisa_id]
-            self.events.append(
-                TraceEvent(
-                    arrival,
-                    "TISA_RECEIVE",
-                    tisa_id,
-                    f"Static/{descriptor.instruction.unit_map.unit}",
-                    details={
-                        "operator_id": descriptor.instruction.operator_id,
-                        "tile_id": descriptor.instruction.tile_id,
-                        "static_streams": True,
-                    },
-                )
-            )
-
     def _validate_runtime_aliases(self) -> None:
         """Prove every runtime alias edge from typed static-control causality."""
 
@@ -225,7 +242,7 @@ class _StaticStreamExecutor:
         return f"{self.loaded.invocation_id}::{event_id}::g{event.generation}"
 
     def _event_ready(self, event_id: str) -> bool:
-        return event_id in self.signaled
+        return self.set_wait_table[event_id] > 0
 
     def _set_source_ready(self, command: StaticControlCommand) -> bool:
         event = next(item for item in self.control.events if item.event_id == command.event_ids[0])
@@ -331,10 +348,25 @@ class _StaticStreamExecutor:
 
     def _finish_control(self, stream_id: str, command: StaticControlCommand) -> None:
         if command.kind == "set":
-            self.signaled.add(command.event_ids[0])
+            event_id = command.event_ids[0]
+            event = next(item for item in self.control.events if item.event_id == event_id)
+            # The RTL table keeps one token for each destination wait.  The
+            # StaticEvent consumer list provides the equivalent fan-out count.
+            self.set_wait_table[event_id] += max(1, len(event.consumers))
             event_name = "STATIC_SET"
-        elif command.kind == "wait":
-            event_name = "STATIC_WAIT_SATISFIED"
+        elif command.kind in {"wait", "fence"}:
+            for event_id in command.event_ids:
+                if self.set_wait_table[event_id] <= 0:
+                    raise RuntimeError(
+                        f"static {command.kind} consumed an unavailable event token "
+                        f"'{event_id}'"
+                    )
+                self.set_wait_table[event_id] -= 1
+            event_name = (
+                "STATIC_WAIT_SATISFIED"
+                if command.kind == "wait"
+                else "STATIC_FENCE_SATISFIED"
+            )
         else:
             event_name = "STATIC_FENCE_SATISFIED"
         self.events.append(
@@ -351,7 +383,11 @@ class _StaticStreamExecutor:
                     ],
                     "scope": command.scope,
                     "source_kind": command.source_kind,
-                    "consuming": False,
+                    "consuming": command.kind in {"wait", "fence"},
+                    "set_wait_tokens": {
+                        event_id: self.set_wait_table[event_id]
+                        for event_id in command.event_ids
+                    },
                 },
             )
         )
@@ -420,7 +456,7 @@ class _StaticStreamExecutor:
             self.instruction_timings[tisa_id] = TaskTiming(
                 tisa_id,
                 f"TISA/{descriptor.instruction.unit_map.unit}",
-                0,
+                self.instances[tisa_id],
                 issue,
                 issue,
                 self.now,
@@ -459,17 +495,102 @@ class _StaticStreamExecutor:
             if finish <= self.now:
                 self._finish_control(stream_id, command)
 
+    def _receive(self) -> None:
+        """Admit runtime envelopes into the single shared Reception FIFO."""
+
+        received = 0
+        while self.next_receive < len(self.stream_input):
+            ready, tisa_id, chunk_id = self.stream_input[self.next_receive]
+            if ready > self.now:
+                break
+            if len(self.reception) >= self.config.instruction_queue_depth:
+                self.stall_cycles["reception_full"] += 1
+                break
+            if received >= self.pipe.receive_width:
+                self.stall_cycles["receive_bandwidth"] += 1
+                break
+            self.reception.append(tisa_id)
+            self.received.add(tisa_id)
+            self.receive_cycles[tisa_id] = self.now
+            self.next_receive += 1
+            received += 1
+            descriptor = self.descriptors[tisa_id]
+            self.events.append(
+                TraceEvent(
+                    self.now,
+                    "TISA_RECEIVE",
+                    tisa_id,
+                    f"Static/{descriptor.instruction.unit_map.unit}",
+                    details={
+                        "runtime_ready_cycle": ready,
+                        "runtime_chunk_id": chunk_id,
+                        "operator_id": descriptor.instruction.operator_id,
+                        "tile_id": descriptor.instruction.tile_id,
+                        "dependencies": dependency_details(descriptor),
+                        "runtime_operands": [
+                            item.to_dict() for item in descriptor.operands
+                        ],
+                        "static_streams": True,
+                    },
+                )
+            )
+
+    def _dispatch(self) -> None:
+        """Route the next fixed-stream instruction to each EU queue."""
+
+        dispatched_streams: set[str] = set()
+        for stream_id in sorted(self.streams):
+            if stream_id in dispatched_streams:
+                continue
+            index = self.next_stream_dispatch[stream_id]
+            issue_order = self.stream_issue_order[stream_id]
+            if index >= len(issue_order):
+                continue
+            tisa_id = issue_order[index]
+            try:
+                reception_index = self.reception.index(tisa_id)
+            except ValueError:
+                continue
+            stream = self.streams[stream_id]
+            capacity = self.machine.unit(stream.resource).queue_depth
+            if len(self.wq[stream_id]) >= capacity:
+                self.stall_cycles["wq_full"] += 1
+                continue
+            del self.reception[reception_index]
+            self.wq[stream_id].append(tisa_id)
+            dispatched_streams.add(stream_id)
+            self.dispatched.add(tisa_id)
+            self.dispatch_cycles[tisa_id] = self.now
+            self.dispatch_counts[stream_id] += 1
+            self.next_stream_dispatch[stream_id] += 1
+            descriptor = self.descriptors[tisa_id]
+            self.events.append(
+                TraceEvent(
+                    self.now,
+                    "TISA_DISPATCH",
+                    tisa_id,
+                    f"Static/{stream.resource}",
+                    stream.instance,
+                    {
+                        "static_stream_id": stream_id,
+                        "static_dispatch": "per_eu_one",
+                        "queue_depth": capacity,
+                        "reception_index": reception_index,
+                    },
+                )
+            )
+
     def _issue(self, stream_id: str, command: StaticControlCommand) -> bool:
         assert command.tisa_id is not None
         descriptor = self.descriptors[command.tisa_id]
-        arrival = self.arrivals.get(command.tisa_id, 0.0)
-        if arrival > self.now:
+        queue = self.wq[stream_id]
+        if not queue or queue[0] != command.tisa_id:
             self._open_wait(
                 stream_id,
                 command,
-                "STATIC_DESCRIPTOR_WAIT",
-                "descriptor_not_arrived",
-                {"arrival_cycle": arrival},
+                "STATIC_WQ_WAIT",
+                "descriptor_not_dispatched",
+                {"queue_depth": len(queue)},
             )
             return False
         accepted, reason = self.execution.can_accept(descriptor, self.now)
@@ -483,7 +604,13 @@ class _StaticStreamExecutor:
             )
             return False
         self._close_wait(stream_id, command)
-        receipt = self.execution.issue(IssueRequest(descriptor, self.now))
+        receipt = self.execution.issue(
+            IssueRequest(
+                descriptor,
+                self.now,
+                instance=self.streams[stream_id].instance,
+            )
+        )
         if not receipt.accepted:
             self._open_wait(
                 stream_id,
@@ -494,6 +621,9 @@ class _StaticStreamExecutor:
             )
             return False
         self.issued[command.tisa_id] = self.now
+        assert receipt.instance is not None
+        self.instances[command.tisa_id] = receipt.instance
+        queue.popleft()
         self.pointers[stream_id] += 1
         self.events.append(
             TraceEvent(
@@ -520,60 +650,68 @@ class _StaticStreamExecutor:
                 )
             self._accept_feedback()
             self._complete_controls()
+            self._dispatch()
+            self._receive()
             control_started = 0
             issue_started = 0
             resource_issued = Counter()
-            made_progress = True
-            while made_progress:
-                made_progress = False
-                for stream_id in sorted(self.streams):
-                    if stream_id in self.pending_control:
+            for stream_id in sorted(self.streams):
+                if stream_id in self.pending_control:
+                    continue
+                command = self._head(stream_id)
+                if command is None:
+                    continue
+                if command.kind == "issue":
+                    resource = self.streams[stream_id].resource
+                    if (
+                        issue_started >= self.pipe.issue_width
+                        or resource_issued[resource]
+                        >= self.machine.unit(resource).issue_width
+                    ):
+                        self.stall_cycles["issue_bandwidth"] += 1
                         continue
-                    command = self._head(stream_id)
-                    if command is None:
-                        continue
-                    if command.kind == "issue":
-                        resource = self.streams[stream_id].resource
-                        if (
-                            issue_started >= self.pipe.issue_width
-                            or resource_issued[resource]
-                            >= self.machine.unit(resource).issue_width
-                        ):
-                            continue
-                        if self._issue(stream_id, command):
-                            issue_started += 1
-                            resource_issued[resource] += 1
-                            made_progress = True
-                        continue
-                    if control_started >= self.pipe.control_width:
-                        continue
-                    if command.kind == "set" and not self._set_source_ready(command):
+                    if self._issue(stream_id, command):
+                        issue_started += 1
+                        resource_issued[resource] += 1
+                    continue
+                if control_started >= self.pipe.control_width:
+                    self.stall_cycles["dispatch_bandwidth"] += 1
+                    continue
+                if command.kind == "set" and not self._set_source_ready(command):
+                    self._open_wait(
+                        stream_id,
+                        command,
+                        "STATIC_SET_WAIT",
+                        "producer_feedback_pending",
+                        {"tisa_id": command.tisa_id},
+                    )
+                    continue
+                if command.kind in {"wait", "fence"}:
+                    blockers = self._blockers(command)
+                    if blockers:
                         self._open_wait(
                             stream_id,
                             command,
-                            "STATIC_SET_WAIT",
-                            "producer_feedback_pending",
-                            {"tisa_id": command.tisa_id},
+                            "STATIC_WAIT_INTERVAL",
+                            "event_pending",
+                            {
+                                "kind": command.kind,
+                                "blockers": blockers,
+                                "buffer_slots": list(command.buffer_slots),
+                            },
                         )
                         continue
-                    if command.kind in {"wait", "fence"}:
-                        blockers = self._blockers(command)
-                        if blockers:
-                            self._open_wait(
-                                stream_id,
-                                command,
-                                "STATIC_WAIT_INTERVAL",
-                                "event_pending",
-                                {
-                                    "kind": command.kind,
-                                    "blockers": blockers,
-                                    "buffer_slots": list(command.buffer_slots),
-                                },
-                            )
-                            continue
-                    self._start_control(stream_id, command)
-                    control_started += 1
-                    made_progress = True
+                self._start_control(stream_id, command)
+                control_started += 1
+            self.snapshots.append(
+                {
+                    "timestamp": self.now,
+                    "event": "CYCLE_END",
+                    "reception_queue": len(self.reception),
+                    "wq": {stream_id: len(queue) for stream_id, queue in self.wq.items()},
+                    "pending_control": len(self.pending_control),
+                }
+            )
             done_commands = all(
                 self.pointers[stream_id] == len(stream.commands)
                 for stream_id, stream in self.streams.items()
@@ -596,32 +734,63 @@ class _StaticStreamExecutor:
             busy[timing.resource] += timing.duration
         metrics = {
             "scheduler_target": "compiler_static_control",
-            "scheduler_model": "static-streams-v1",
+            "scheduler_model": "static-streams-v2",
             "event_backend": self.audit.get("event_backend", "cycle_event"),
             "policy": "static_streams",
-            "static_control_semantics": "fixed_per_eu_streams+set_wait_fence",
+            "static_control_semantics": "shared_reception+per_eu_wq+set_wait_fence",
             "static_control_assumption": "project_model_uncalibrated",
             "static_control_counts": dict(self.control_counts),
             "static_control_busy_cycles": self.control_busy_cycles,
             "static_control_records": self.control_records,
+            "set_wait_table_final": dict(self.set_wait_table),
             "static_wait_interval_count": sum(
                 event.event
                 in {"STATIC_WAIT_INTERVAL", "STATIC_SET_WAIT", "STATIC_RESOURCE_WAIT"}
                 for event in self.events
             ),
+            "stall_cycles": dict(self.stall_cycles),
+            "queue_occupancy_timeline": self.snapshots,
+            "reception_queue_peak": max(
+                (item["reception_queue"] for item in self.snapshots), default=0
+            ),
+            "wq_peak": {
+                stream_id: max(
+                    (item["wq"][stream_id] for item in self.snapshots), default=0
+                )
+                for stream_id in self.streams
+            },
+            "wq_peak_by_resource": {
+                resource: max(
+                    (
+                        sum(
+                            item["wq"][stream_id]
+                            for stream_id, stream in self.streams.items()
+                            if stream.resource == resource
+                        )
+                        for item in self.snapshots
+                    ),
+                    default=0,
+                )
+                for resource in {stream.resource for stream in self.streams.values()}
+            },
+            "static_dispatch_semantics": "one_head_per_eu_per_cycle",
+            "static_dispatch_counts": dict(self.dispatch_counts),
             "shared_workload_hash": self.control.workload_hash,
             "static_control_hash": self.control.control_hash,
             "dynamic_control_hash": self.control.attributes.get("dynamic_control_hash"),
             "static_controls_consumed": True,
             "tisa_instruction_count": len(self.descriptors),
             "issued_instruction_count": len(self.issued),
+            "retired_instruction_count": len(self.completed),
+            "retirement_order": "completion_ready_order",
             "dependency_timing_validated_count": dependency_timing_validated_count,
             "completed_instruction_count": len(self.completed),
             "payload_task_count": len(execution_timings),
             "resource_busy_cycles": dict(busy),
             "instruction_pipeline": {
                 tisa_id: {
-                    "received": self.arrivals.get(tisa_id, 0.0),
+                    "received": self.receive_cycles[tisa_id],
+                    "dispatched": self.dispatch_cycles[tisa_id],
                     "issued": self.issued[tisa_id],
                     "done": self.physical_done[tisa_id],
                     "completed": self.completed[tisa_id],
@@ -644,6 +813,7 @@ class _StaticStreamExecutor:
             "timing_calibration_status": self.audit.get(
                 "timing_calibration_status", "analytical"
             ),
+            "timing_provider_coverage": self.audit.get("timing_provider_coverage"),
             "scheduler_calibration_status": "uncalibrated",
             "calibration_status": "analytical",
         }

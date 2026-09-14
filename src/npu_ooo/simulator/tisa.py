@@ -675,14 +675,22 @@ def simulate_tisa_artifact(
     event_serial = 0
     next_receive = 0
     now = 0.0
-    rob_occupancy = 0
+    uses_ordered_retirement = policy != "dynamic_ready_queue"
+    ordered_inflight = 0
     inflight_tiles: set[str] = set()
     queue_depth = config.instruction_queue_depth or len(instructions) or 1
     dependency_window = config.dependency_window or queue_depth
     ready_queue_depth = config.ready_queue_depth or queue_depth
-    rob_limit = config.rob_entries or len(instructions) or 1
+    ordered_inflight_limit = (
+        config.rob_entries or len(instructions) or 1
+        if uses_ordered_retirement
+        else None
+    )
     tile_limit = config.max_inflight_tiles or len(tile_instruction_count) or 1
     wq_peak: dict[str, int] = {unit.name: 0 for unit in machine.execution_units}
+    simulator_config = config.to_dict()
+    if not uses_ordered_retirement:
+        simulator_config.pop("rob_entries", None)
     metrics: dict[str, Any] = {
         "backend": timing_model.name,
         "policy": policy,
@@ -708,7 +716,7 @@ def simulate_tisa_artifact(
         "address_hazard_count": 0,
         "address_hazards": [],
         "primitive_reordering_scope": "instruction_local",
-        "simulator_config": config.to_dict(),
+        "simulator_config": simulator_config,
         "tisa_instruction_count": len(instructions),
         "payload_task_count": len(artifact.execution_graph.tasks),
         "readiness_interpreter": "completion_boundary+payload_ready",
@@ -730,13 +738,11 @@ def simulate_tisa_artifact(
         "issued_task_count": 0,
         "completed_task_count": 0,
         "tisa_decision_count": 0,
-        "rob_peak": 0,
         "inflight_tile_peak": 0,
         "reception_queue_peak": 0,
         "wq_peak": wq_peak,
         "dependency_block_events": 0,
         "resource_block_events": 0,
-        "rob_block_events": 0,
         "tile_window_block_events": 0,
         "address_scoreboard_block_events": 0,
         "memory_bank_scoreboard": config.memory_bank_scoreboard,
@@ -751,6 +757,16 @@ def simulate_tisa_artifact(
             else machine_calibration_status
         ),
     }
+    if uses_ordered_retirement:
+        metrics.update(
+            {
+                "rob_credit_allocation": "issue",
+                "rob_credit_release": "completion",
+                "rob_occupancy_semantics": "issued_incomplete_instructions",
+                "rob_peak": 0,
+                "rob_block_events": 0,
+            }
+        )
     coverage = getattr(timing_model, "coverage", None)
     if callable(coverage):
         metrics["timing_provider_coverage"] = dict(
@@ -758,21 +774,21 @@ def simulate_tisa_artifact(
         )
 
     def record_occupancy(event: str) -> None:
-        metrics["queue_occupancy_timeline"].append(
-            {
-                "timestamp": now,
-                "event": event,
-                "reception_queue": len(waiting),
-                "rob": rob_occupancy,
-                "inflight_tiles": len(inflight_tiles),
-                "wq": {
-                    resource: sum(
-                        plans[tisa_id].resource == resource for tisa_id in waiting
-                    )
-                    for resource in resources
-                },
-            }
-        )
+        row = {
+            "timestamp": now,
+            "event": event,
+            "reception_queue": len(waiting),
+            "inflight_tiles": len(inflight_tiles),
+            "wq": {
+                resource: sum(
+                    plans[tisa_id].resource == resource for tisa_id in waiting
+                )
+                for resource in resources
+            },
+        }
+        if uses_ordered_retirement:
+            row["rob"] = ordered_inflight
+        metrics["queue_occupancy_timeline"].append(row)
 
     def receive_descriptors() -> None:
         nonlocal next_receive
@@ -899,7 +915,8 @@ def simulate_tisa_artifact(
             completion_time[tisa_id] = finish
             active.pop(tisa_id)
             active_memory_accesses.pop(tisa_id, None)
-            rob_occupancy -= 1
+            if uses_ordered_retirement:
+                ordered_inflight -= 1
             tile_completed_count[instruction.tile_id] += 1
             if (
                 tile_completed_count[instruction.tile_id]
@@ -954,9 +971,12 @@ def simulate_tisa_artifact(
 
         issued_at_now = 0
         while True:
-            if policy == "sequential" and rob_occupancy:
+            if policy == "sequential" and ordered_inflight:
                 break
-            if rob_occupancy >= rob_limit:
+            if (
+                uses_ordered_retirement
+                and ordered_inflight >= ordered_inflight_limit
+            ):
                 metrics["rob_block_events"] += 1
                 break
             visible = sorted(waiting, key=order.__getitem__)[:dependency_window]
@@ -1054,7 +1074,8 @@ def simulate_tisa_artifact(
             issued.add(tisa_id)
             active[tisa_id] = (plan.resource, resource_state.instance)
             active_memory_accesses[tisa_id] = memory_accesses_by_tisa[tisa_id]
-            rob_occupancy += 1
+            if uses_ordered_retirement:
+                ordered_inflight += 1
             inflight_tiles.add(instruction.tile_id)
             for dependency in readiness_dependencies.get(tisa_id, ()):
                 step = _payload_readiness_task(dependency.condition, plan)
@@ -1170,7 +1191,8 @@ def simulate_tisa_artifact(
             metrics["issued_instruction_count"] += 1
             metrics["issued_task_count"] += len(plan.steps)
             metrics["tisa_decision_count"] += 1
-            metrics["rob_peak"] = max(metrics["rob_peak"], rob_occupancy)
+            if uses_ordered_retirement:
+                metrics["rob_peak"] = max(metrics["rob_peak"], ordered_inflight)
             metrics["inflight_tile_peak"] = max(
                 metrics["inflight_tile_peak"], len(inflight_tiles)
             )
@@ -1505,14 +1527,17 @@ def simulate_tisa_sequence(
         for field in ("retired_instruction_count", "issued_instruction_count", "completed_instruction_count",
                       "tisa_decision_count", "issued_task_count", "completed_task_count", "partial_ready_event_count"):
             metrics[field] = sum(result.metrics[field] for result in invocation_results)
-        for field in (
-            "rob_peak",
-            "retirement_backlog_peak",
-            "completed_retirement_backlog_peak",
-            "reception_queue_peak",
-            "inflight_tile_peak",
-        ):
+        for field in ("reception_queue_peak", "inflight_tile_peak"):
             metrics[field] = max(result.metrics[field] for result in invocation_results)
+        if policy in {"sequential", "static_pipeline"}:
+            for field in (
+                "rob_peak",
+                "retirement_backlog_peak",
+                "completed_retirement_backlog_peak",
+            ):
+                metrics[field] = max(
+                    result.metrics[field] for result in invocation_results
+                )
         for field in ("wq_peak", "iq_peak", "fu_peak"):
             metrics[field] = {unit.name: max(result.metrics[field][unit.name] for result in invocation_results)
                               for unit in machine.execution_units}

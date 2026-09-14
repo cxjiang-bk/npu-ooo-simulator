@@ -237,7 +237,7 @@ CLI 默认是 **static + analytical_event**，不是 dynamic + cycle_event；需
 | CLI 参数 | 默认来源 | `cycle_event` 中的含义 |
 | --- | --- | --- |
 | `--instruction-queue-depth` | `machine.scheduler.instruction_queue_depth` | Reception FIFO 的 TISA 指令容量 |
-| `--rob-entries` | `machine.scheduler.rob_entries` | Active ROB credit 容量；dispatch 分配，complete 回收；retirement ledger 保持有序 retire |
+| `--rob-entries` | `machine.scheduler.rob_entries` | `sequential/static_pipeline` 的 ordered retire ledger 容量；Dynamic 使用 completion-ready retire |
 | `--max-inflight-tiles` | `machine.scheduler.max_inflight_tiles` | 同时活动的 tile 数，不是 TISA 条数；一个 tile 可以有多条 transfer/compute 指令 |
 | `--dependency-window` | `machine.scheduler.dependency_window` | 每个 WQ 的候选扫描窗口，不是整个程序长度 |
 | `--ready-queue-depth` | 最终生效的 `instruction_queue_depth` | 每类 EU 的 IQ 上限之一；实际容量为它与 `pipeline.iq_entries` 的较小值 |
@@ -251,7 +251,7 @@ CLI 默认是 **static + analytical_event**，不是 dynamic + cycle_event；需
 | JSON 字段 | 默认值 | 单位与含义 |
 | --- | ---: | --- |
 | `receive_width` | 1 | 每周期最多接收的指令数 |
-| `dispatch_width` | 1 | 每周期最多从 Reception 分派到 WQ 的指令数 |
+| `dispatch_width` | 1 | Dynamic 每周期最多从 Reception 分派到 WQ 的指令数；Static 每个 EU 每周期分派一条 |
 | `select_width` | 1 | 每周期最多从 WQ 选入 IQ 的指令数 |
 | `issue_width` | 1 | 全局每周期最多发射数，还受各 EU 的 `issue_width` 和接收能力限制 |
 | `completion_width` | 1 | 每周期最多接受的完整完成反馈数，不是物理 EU 数量 |
@@ -270,7 +270,7 @@ CLI 默认是 **static + analytical_event**，不是 dynamic + cycle_event；需
 Dynamic `cycle_event` 使用 condition-tag completion broadcast：所有 per-EU WQ snoop
 `(invocation, source TISA, condition)` 并更新 pending dependency mask；mask 清零后支付
 `wakeup_latency`。之后候选还要通过目标 EU 本地 Fu 的 scope/allocation/range/access
-SemanticConflict。广播互连及全局 ROB 均为论文未公开细节上的项目实现选择。
+SemanticConflict。广播互连、Fu 和 tile window 是项目的周期级实现选择。
 
 字段均为整数；除 `wakeup_latency`、`completion_latency` 可以为 0 外，其余至少为 1。
 示例：将下列内容保存为 `cycle-tuned.json`，然后传入 `--scheduler-config cycle-tuned.json`：
@@ -284,7 +284,8 @@ SemanticConflict。广播互连及全局 ROB 均为论文未公开细节上的�
 }
 ```
 
-需要比较队列、ROB、tile window、WQ window 和 IQ 容量时，使用 scheduler profile：
+需要比较 Reception、tile window、WQ window 和 IQ 容量时，使用 scheduler profile；ordered
+reference policy 可以额外配置 `rob_entries`：
 
 ~~~json
 {
@@ -344,6 +345,7 @@ SemanticConflict。广播互连及全局 ROB 均为论文未公开细节上的�
 | `analytical` | 不需要 | 使用任务携带的分析时长，缺失时回退到 EU 默认值 |
 | `timing_table` | 需要 | 按任务或 primitive 等键覆盖 duration/II；未命中回退 analytical |
 | `systolic_mxu_profile` | 需要 | 按 Matmul shape 匹配 MXU profile；未命中时按 profile 的策略报错或回退 |
+| `gm_latency_trace` | 需要 | 读取仿真专用 GM latency trace；GM task 叠加固定 extra latency，其他 task 保持 analytical timing |
 
 不指定 provider 时：无 timing 文件选择 `analytical`，有文件选择 `timing_table`。
 使用 MXU profile 时必须显式选择对应 provider；不要让它被当成普通 timing table 解析。
@@ -363,6 +365,36 @@ PYTHONPATH=src python3.12 -m npu_ooo.cli simulate \
 
 仓库中的 timing/profile 示例不是硬件实测数据。RTL JSON/CSV、VCS log 导入和测量区间定义见
 [RTL 校准指南](docs/analysis/rtl-calibration.md)。
+
+#### 仿真专用 GM 随机 latency trace
+
+GM trace 在 compile package 生成后单独创建，只服务于 simulation timing provider。编译阶段
+沿用预期 duration 和依赖生成 set/wait/fence；同一 trace 可以被
+static_streams 与 dynamic_ready_queue 共同回放。
+
+```bash
+PYTHONPATH=src python3.12 -m npu_ooo.cli generate-gm-latency \
+  --compile-dir out/attention-compile \
+  --output out/gm-latency-seed42.json \
+  --seed 42 --extra-latency-probability 0.1 \
+  --min-extra-latency-cycles 1 --max-extra-latency-cycles 40
+
+for policy in static_streams dynamic_ready_queue; do
+  PYTHONPATH=src python3.12 -m npu_ooo.cli simulate \
+    --compile-dir out/attention-compile --event-backend cycle_event \
+    --timing-provider gm_latency_trace \
+    --timing-config out/gm-latency-seed42.json \
+    --runtime-policy static --policy "$policy" \
+    --output-dir "out/attention-gm-$policy"
+done
+```
+
+trace 使用 seed 驱动的均匀整数采样。每个触及 GM 的 execution task 按
+extra_latency_probability 决定是否产生非理想事件，命中后将采样得到的
+extra_latency_cycles 叠加在 analytical task duration 上；其他 task 继续使用原 timing。
+trace 为每条 GM 请求保留 task ID，正常请求的 extra_latency_cycles 为 0，非理想请求保存采样值。
+trace 记录 task ID、基础 duration、GM 读写字节数、非理想请求数和采样分布，便于复现实验。该模型覆盖 task
+级随机延迟，DDR bank/channel/row-buffer/refresh 状态机属于后续模型范围。
 
 ### 5. Runtime：提交顺序、到达时间和动态绑定
 

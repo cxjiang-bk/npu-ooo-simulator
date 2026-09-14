@@ -700,6 +700,7 @@ def simulate_execution_graph(
         "calibration_status", "unspecified"
     )
     config = (config or SimulatorConfig()).resolved(machine)
+    uses_ordered_retirement = policy != "dynamic_ready_queue"
     if config.static_pipeline is not None and policy != "static_pipeline":
         raise ValueError("static_pipeline configuration is only valid with the static_pipeline policy")
     static_pipeline = config.static_pipeline if policy == "static_pipeline" else None
@@ -739,7 +740,7 @@ def simulate_execution_graph(
     event_queue: list[tuple[float, int, _EventKind, str, str, int]] = []
     event_serial = 0
     now = 0.0
-    rob_occupancy = 0
+    ordered_inflight = 0
     inflight_tiles: set[str] = set()
     stall_started: dict[tuple[str, str], float] = {}
     stall_cycles_by_reason: dict[str, float] = {}
@@ -748,24 +749,25 @@ def simulate_execution_graph(
     for task in graph.tasks:
         tile_task_count[task.tile_id] = tile_task_count.get(task.tile_id, 0) + 1
         tile_completed_count[task.tile_id] = 0
+    simulator_config = config.to_dict()
+    if not uses_ordered_retirement:
+        simulator_config.pop("rob_entries", None)
 
     metrics: dict[str, Any] = {
         "backend": timing_model.name,
         "policy": policy,
-        "simulator_config": config.to_dict(),
+        "simulator_config": simulator_config,
         "address_dependency_count": 0,
         "address_hazard_count": 0,
         "address_hazards": [],
         "resource_busy_cycles": {},
         "ready_set_peak": len(ready),
         "visible_ready_peak": 0,
-        "rob_peak": 0,
         "inflight_tile_peak": 0,
         "issued_task_count": 0,
         "completed_task_count": 0,
         "queue_wait_cycles": 0.0,
         "ready_wait_cycles": 0.0,
-        "rob_block_events": 0,
         "window_block_events": 0,
         "resource_block_events": 0,
         "tile_window_block_events": 0,
@@ -777,6 +779,16 @@ def simulate_execution_graph(
         "pipeline_drain_cycles": 0.0,
         "queue_occupancy_timeline": [],
     }
+    if uses_ordered_retirement:
+        metrics.update(
+            {
+                "rob_credit_allocation": "issue",
+                "rob_credit_release": "completion",
+                "rob_occupancy_semantics": "issued_incomplete_tasks",
+                "rob_peak": 0,
+                "rob_block_events": 0,
+            }
+        )
 
     def dependency_details(task: ExecutionTask) -> list[dict[str, Any]]:
         """Serialize predecessor provenance for trace consumers."""
@@ -813,19 +825,19 @@ def simulate_execution_graph(
         metrics["timing_provider_coverage"] = dict(coverage(graph.tasks))
 
     def record_occupancy(timestamp: float, event: str) -> None:
-        metrics["queue_occupancy_timeline"].append(
-            {
-                "timestamp": timestamp,
-                "event": event,
-                "rob": rob_occupancy,
-                "ready": len(ready),
-                "inflight_tiles": len(inflight_tiles),
-                "resources": {
-                    name: sum(resource.in_flight for resource in states)
-                    for name, states in resources.items()
-                },
-            }
-        )
+        row = {
+            "timestamp": timestamp,
+            "event": event,
+            "ready": len(ready),
+            "inflight_tiles": len(inflight_tiles),
+            "resources": {
+                name: sum(resource.in_flight for resource in states)
+                for name, states in resources.items()
+            },
+        }
+        if uses_ordered_retirement:
+            row["rob"] = ordered_inflight
+        metrics["queue_occupancy_timeline"].append(row)
 
     record_occupancy(0.0, "INIT")
 
@@ -894,7 +906,9 @@ def simulate_execution_graph(
                 key=lambda task: (program_order[task.task_id], order_index[task.task_id], task.task_id),
             )
         queue_limit = config.ready_queue_depth or len(ordered)
-        window_budget = max(0, (config.dependency_window or len(ordered)) - rob_occupancy)
+        window_budget = config.dependency_window or len(ordered)
+        if uses_ordered_retirement:
+            window_budget = max(0, window_budget - ordered_inflight)
         return ordered[: min(queue_limit, window_budget)]
 
     def candidate_resources(task: ExecutionTask) -> list[tuple[_ResourceState, float, float]]:
@@ -919,7 +933,8 @@ def simulate_execution_graph(
             resource.complete()
             completed.add(task_id)
             finish_by_task[task_id] = finish
-            rob_occupancy -= 1
+            if uses_ordered_retirement:
+                ordered_inflight -= 1
             task = tasks[task_id]
             if address_scoreboard is not None:
                 address_scoreboard.release(task_id)
@@ -955,20 +970,28 @@ def simulate_execution_graph(
             metrics["completed_task_count"] += 1
 
         metrics["ready_set_peak"] = max(metrics["ready_set_peak"], len(ready))
-        metrics["rob_peak"] = max(metrics["rob_peak"], rob_occupancy)
+        if uses_ordered_retirement:
+            metrics["rob_peak"] = max(metrics["rob_peak"], ordered_inflight)
         metrics["inflight_tile_peak"] = max(metrics["inflight_tile_peak"], len(inflight_tiles))
 
         issued_at_now = 0
         while True:
-            if policy == "sequential" and rob_occupancy:
+            if policy == "sequential" and ordered_inflight:
                 break
-            if rob_occupancy >= (config.rob_entries or math.inf):
+            if (
+                uses_ordered_retirement
+                and ordered_inflight >= (config.rob_entries or math.inf)
+            ):
                 metrics["rob_block_events"] += 1
                 break
             visible = visible_ready_tasks()
             metrics["visible_ready_peak"] = max(metrics["visible_ready_peak"], len(visible))
             if not visible:
-                if ready and rob_occupancy >= (config.dependency_window or math.inf):
+                if (
+                    uses_ordered_retirement
+                    and ready
+                    and ordered_inflight >= (config.dependency_window or math.inf)
+                ):
                     metrics["window_block_events"] += 1
                 break
             candidates: list[tuple[ExecutionTask, _ResourceState, float, float]] = []
@@ -1067,12 +1090,14 @@ def simulate_execution_graph(
             end_stalls(task, now)
             ready.remove(task.task_id)
             issued.add(task.task_id)
-            rob_occupancy += 1
+            if uses_ordered_retirement:
+                ordered_inflight += 1
             inflight_tiles.add(task.tile_id)
             if address_scoreboard is not None:
                 address_scoreboard.reserve(task)
             record_occupancy(now, "ISSUE")
-            metrics["rob_peak"] = max(metrics["rob_peak"], rob_occupancy)
+            if uses_ordered_retirement:
+                metrics["rob_peak"] = max(metrics["rob_peak"], ordered_inflight)
             metrics["inflight_tile_peak"] = max(metrics["inflight_tile_peak"], len(inflight_tiles))
             timings[task.task_id] = TaskTiming(
                 task_id=task.task_id,
@@ -1123,9 +1148,13 @@ def simulate_execution_graph(
                     if resource.in_flight < resource.unit.queue_depth and resource.next_issue > now + 1e-9:
                         next_times.append(resource.next_issue)
         if not next_times:
-            raise RuntimeError(
-                f"execution graph deadlocked at cycle {now}; ready={sorted(ready)}, rob={rob_occupancy}, inflight_tiles={sorted(inflight_tiles)}"
+            state = (
+                f"execution graph deadlocked at cycle {now}; "
+                f"ready={sorted(ready)}, inflight_tiles={sorted(inflight_tiles)}"
             )
+            if uses_ordered_retirement:
+                state += f", rob={ordered_inflight}"
+            raise RuntimeError(state)
         next_now = min(time for time in next_times if time > now + 1e-9) if any(time > now + 1e-9 for time in next_times) else None
         if next_now is None:
             raise RuntimeError("simulator made no time progress")
@@ -1167,11 +1196,12 @@ def simulate_execution_graph(
         for unit in machine.execution_units
     }
     metrics["queue_peak_occupancy"] = {
-        "rob": metrics["rob_peak"],
         "ready": metrics["ready_set_peak"],
         "visible_ready": metrics["visible_ready_peak"],
         "inflight_tiles": metrics["inflight_tile_peak"],
     }
+    if uses_ordered_retirement:
+        metrics["queue_peak_occupancy"]["rob"] = metrics["rob_peak"]
     metrics["completed_tile_count"] = len(tile_task_count)
     metrics["machine_calibration_status"] = machine_calibration_status
     metrics["timing_calibration_status"] = timing_calibration_status

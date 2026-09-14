@@ -282,17 +282,20 @@ def _task_parents(run_dir: Path) -> dict[str, str]:
     return result
 
 
-def _queue_transitions(run_dir: Path) -> list[dict[str, Any]]:
+def _queue_transitions(
+    run_dir: Path, *, ordered_retirement: bool
+) -> list[dict[str, Any]]:
     perfetto = _read_json(run_dir / "07_trace" / "perfetto.json", required=False)
     state = {
         "reception": 0,
         "wq": 0,
         "iq": 0,
-        "rob": 0,
         "completion_pending": 0,
         "wq_by_unit": {},
         "iq_by_unit": {},
     }
+    if ordered_retirement:
+        state["rob"] = 0
     transitions: list[dict[str, Any]] = []
     relevant = (
         "TISA_RECEIVE",
@@ -337,7 +340,8 @@ def _queue_transitions(run_dir: Path) -> list[dict[str, Any]]:
         elif event == "TISA_DISPATCH":
             state["reception"] = max(0, state["reception"] - 1)
             state["wq"] += 1
-            state["rob"] += 1
+            if ordered_retirement:
+                state["rob"] += 1
             if resource:
                 state["wq_by_unit"][resource] = state["wq_by_unit"].get(resource, 0) + 1
         elif event == "TISA_SELECT":
@@ -357,12 +361,13 @@ def _queue_transitions(run_dir: Path) -> list[dict[str, Any]]:
                     )
             else:
                 state["reception"] = max(0, state["reception"] - 1)
-                state["rob"] += 1
+                if ordered_retirement:
+                    state["rob"] += 1
         elif event == "TISA_EXECUTION_DONE":
             state["completion_pending"] += 1
         elif event == "TISA_COMPLETE":
             state["completion_pending"] = max(0, state["completion_pending"] - 1)
-        elif event == "TISA_RETIRE":
+        elif event == "TISA_RETIRE" and ordered_retirement:
             state["rob"] = max(0, state["rob"] - 1)
         snapshot = {
             "cycle": cycle,
@@ -491,7 +496,11 @@ def analyze_run(run_dir: str | Path) -> RunAnalysis:
             "instruction_pipeline": summary.get("metrics", {}).get(
                 "instruction_pipeline", {}
             ),
-            "queue_transitions": _queue_transitions(root),
+            "queue_transitions": _queue_transitions(
+                root,
+                ordered_retirement=summary.get("policy")
+                in {"sequential", "static_pipeline"},
+            ),
             "buffer_occupancy": {
                 memory: {
                     "protected": item.get("protected_occupancy", []),
@@ -653,10 +662,12 @@ def _joint_timeline_svg(analysis: RunAnalysis) -> str:
     ] + [
         ("iq_by_unit", unit, f"IQ[{unit}]", "#16a34a")
         for unit in queue_units
-    ] + [
-        ("rob", None, "ROB occupancy", "#7c3aed"),
-        ("completion_pending", None, "Completion pending", "#ea580c"),
     ]
+    if any("rob" in item for item in queue if isinstance(item, Mapping)):
+        queue_fields.append(("rob", None, "ROB occupancy", "#7c3aed"))
+    queue_fields.append(
+        ("completion_pending", None, "Completion pending", "#ea580c")
+    )
     queue_visible = bool(queue_units or queue)
     buffer_top = queue_top + (len(queue_fields) * queue_height if queue_visible else 0) + section_gap
     chart_bottom = buffer_top + len(buffers) * buffer_height
@@ -674,14 +685,16 @@ def _joint_timeline_svg(analysis: RunAnalysis) -> str:
     ]
 
     legend_x = label_width + 70
-    for label, color, dashed in (
+    legend_entries = [
         ("WQ", "#2563eb", False),
         ("IQ", "#16a34a", False),
-        ("ROB", "#7c3aed", False),
         ("Completion pending", "#ea580c", False),
         ("Protected bytes", "#dc2626", False),
         ("Retained bytes", "#16a34a", True),
-    ):
+    ]
+    if any(field == "rob" for field, _unit, _label, _color in queue_fields):
+        legend_entries.insert(2, ("ROB", "#7c3aed", False))
+    for label, color, dashed in legend_entries:
         dash = ' stroke-dasharray="5 3"' if dashed else ""
         parts.append(
             f'<line x1="{legend_x}" y1="14" x2="{legend_x + 22}" y2="14" '

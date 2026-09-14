@@ -171,15 +171,25 @@ class AnalyticalExecutionBackend:
             raise KeyError(f"unregistered payload '{payload_handle}'") from exc
 
     def _available_instance(
-        self, descriptor: BoundTISADescriptor, cycle: float
+        self,
+        descriptor: BoundTISADescriptor,
+        cycle: float,
+        requested_instance: int | None = None,
     ) -> int | None:
         plan = self.estimate(descriptor.payload_handle)
         if not self._unit_matches(descriptor.instruction.unit_map.unit, plan.resource):
             return None
+        candidates = (
+            range(len(self._instances[plan.resource]))
+            if requested_instance is None
+            else (requested_instance,)
+        )
         return next(
             (
                 index
-                for index, state in enumerate(self._instances[plan.resource])
+                for index in candidates
+                if index < len(self._instances[plan.resource])
+                for state in (self._instances[plan.resource][index],)
                 if state.busy_until <= cycle and state.next_issue <= cycle
             ),
             None,
@@ -224,7 +234,11 @@ class AnalyticalExecutionBackend:
                 rejection_reason=reason,
             )
         plan = self._plans[descriptor.payload_handle]
-        instance = self._available_instance(descriptor, request.cycle)
+        instance = self._available_instance(
+            descriptor,
+            request.cycle,
+            request.instance,
+        )
         assert instance is not None
         state = self._instances[plan.resource][instance]
         done = math.ceil(request.cycle + plan.duration_cycles)

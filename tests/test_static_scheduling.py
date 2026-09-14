@@ -220,7 +220,7 @@ class StaticControlCompilerTest(unittest.TestCase):
             if command.kind == "wait" and event.event_id in command.event_ids
         ]
         self.assertEqual(len(waits), 2)
-        self.assertTrue(all(not event.attributes["consuming_wait"] for _item in waits))
+        self.assertTrue(all(event.attributes["consuming_wait"] for _item in waits))
         self.assertTrue(
             any(
                 command.kind == "fence" and command.tisa_id == "reuse"
@@ -551,8 +551,8 @@ class StaticStreamExecutionTest(unittest.TestCase):
             ),
             event_backend=CycleEventBackend(),
         )
-        self.assertEqual(result.instruction_timing("source").issue, 0)
-        self.assertEqual(result.instruction_timing("independent").issue, 0)
+        self.assertEqual(result.instruction_timing("source").issue, 1)
+        self.assertEqual(result.instruction_timing("independent").issue, 5)
         self.assertGreaterEqual(
             result.instruction_timing("consumer_mxu").issue,
             result.instruction_timing("source").finish,
@@ -566,6 +566,35 @@ class StaticStreamExecutionTest(unittest.TestCase):
         self.assertEqual(len(wait_events), 3)
         event_ids = [item.details["event_ids"][0] for item in wait_events[:2]]
         self.assertEqual(len(set(event_ids)), 1)
+
+    def test_static_stream_issue_stays_on_compiler_assigned_eu(self):
+        artifact = _artifact()
+        base_machine = minimal_machine_config()
+        machine = replace(
+            base_machine,
+            execution_units=tuple(
+                replace(unit, count=2) if unit.name == "ARU" else unit
+                for unit in base_machine.execution_units
+            ),
+        )
+        artifact = attach_static_control(artifact, machine)
+        result = schedule_tisa_program(
+            artifact,
+            machine,
+            "static_streams",
+            simulator_config=SimulatorConfig(
+                pipeline=SchedulerPipelineConfig(issue_width=3)
+            ),
+            event_backend=CycleEventBackend(),
+        )
+        assigned = {
+            command.tisa_id: stream.instance
+            for stream in artifact.static_control.streams
+            for command in stream.commands
+            if command.kind == "issue" and command.tisa_id is not None
+        }
+        for tisa_id, instance in assigned.items():
+            self.assertEqual(result.instruction_timing(tisa_id).instance, instance)
 
     def test_actual_latency_not_compile_estimate_releases_set(self):
         artifact = _artifact()

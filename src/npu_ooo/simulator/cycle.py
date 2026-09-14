@@ -39,7 +39,6 @@ STALL_REASONS = (
     "reception_full",
     "wq_full",
     "iq_full",
-    "rob_full",
     "dependency_wait",
     "semantic_conflict",
     "fu_busy",
@@ -55,6 +54,7 @@ STALL_REASONS = (
     "issue_bandwidth",
     "static_order",
 )
+ORDERED_RETIREMENT_STALL_REASONS = ("rob_full",)
 
 
 @dataclass
@@ -142,8 +142,16 @@ class _CycleScheduler:
         )
         self.events, self.runtime_timings, self.snapshots = [], [], []
         self.timings, self.instruction_timings = {}, {}
-        self.stall_cycles = Counter({reason: 0 for reason in STALL_REASONS})
-        self.stall_instruction_cycles = Counter({reason: 0 for reason in STALL_REASONS})
+        self.uses_ordered_retirement = policy != "dynamic_ready_queue"
+        stall_reasons = STALL_REASONS + (
+            ORDERED_RETIREMENT_STALL_REASONS
+            if self.uses_ordered_retirement
+            else ()
+        )
+        self.stall_cycles = Counter({reason: 0 for reason in stall_reasons})
+        self.stall_instruction_cycles = Counter(
+            {reason: 0 for reason in stall_reasons}
+        )
         self.stall_seen, self.cycle_reasons = set(), set()
         self.active_stalls: dict[tuple[str, str, str], float] = {}
         self.hazards = {}
@@ -163,8 +171,9 @@ class _CycleScheduler:
         self.iq = {name: [] for name in self.units}
         self.fu = {name: set() for name in self.units}
         self.running = {}
-        self.rob = deque()
-        self.rob_active = set()
+        if self.uses_ordered_retirement:
+            self.rob = deque()
+            self.rob_active = set()
         self.completed, self.retired, self.issued = set(), set(), set()
         self.tile_remaining = Counter(
             item.tile_id for item in self.instructions.values()
@@ -447,6 +456,25 @@ class _CycleScheduler:
         return None
 
     def retire(self):
+        if not self.uses_ordered_retirement:
+            candidates = [
+                tid
+                for tid, entry in self.entries.items()
+                if entry.completed is not None
+                and entry.retired is None
+                and entry.completed + self.pipe.retire_latency <= self.now
+            ]
+            candidates.sort(
+                key=lambda tid: (self.entries[tid].completed, self.submission_order[tid])
+            )
+            for tid in candidates[: self.pipe.retire_width]:
+                entry = self.entries[tid]
+                entry.retired = self.now
+                self.retired.add(tid)
+                self.event("TISA_RETIRE", tid, retire_model="completion_ready")
+            for tid in candidates[self.pipe.retire_width :]:
+                self.stall(tid, "retire_backpressure", "retire")
+            return
         for _ in range(self.pipe.retire_width):
             if not self.rob:
                 break
@@ -489,7 +517,8 @@ class _CycleScheduler:
         for tid in due[: self.pipe.completion_width]:
             entry = self.entries[tid]
             entry.completed = self.now
-            self.rob_active.remove(tid)
+            if self.uses_ordered_retirement:
+                self.rob_active.remove(tid)
             self.completed.add(tid)
             self.fu[entry.resource].remove(tid)
             self.tile_remaining[self.instructions[tid].tile_id] -= 1
@@ -747,7 +776,7 @@ class _CycleScheduler:
         while self.reception and dispatched < self.pipe.dispatch_width:
             tid = self.reception[0]
             resource = self.entries[tid].resource
-            if len(self.rob_active) >= self.config.rob_entries:
+            if self.uses_ordered_retirement and len(self.rob_active) >= self.config.rob_entries:
                 self.stall(tid, "rob_full", "dispatch")
                 break
             if (
@@ -757,8 +786,9 @@ class _CycleScheduler:
                 self.stall(tid, "wq_full", "dispatch")
                 break
             self.reception.popleft()
-            self.rob.append(tid)
-            self.rob_active.add(tid)
+            if self.uses_ordered_retirement:
+                self.rob.append(tid)
+                self.rob_active.add(tid)
             self.wq[resource].append(tid)
             self.entries[tid].dispatched = self.now
             self._refresh_dependency_mask(tid)
@@ -801,12 +831,6 @@ class _CycleScheduler:
             "timestamp": self.now,
             "event": "CYCLE_END",
             "reception_queue": len(self.reception),
-            "rob": len(self.rob_active),
-            "retirement_backlog": len(self.rob),
-            "completed_retirement_backlog": sum(
-                self.entries[tid].completed is not None
-                for tid in self.rob
-            ),
             "inflight_tiles": len(self.active_tiles),
             "pending_dependencies": sum(
                 len(self.pending_dependencies[tid])
@@ -824,7 +848,18 @@ class _CycleScheduler:
                 for tid in self.issued - self.completed
             ),
         }
-        assert len(self.rob_active) <= self.config.rob_entries
+        if self.uses_ordered_retirement:
+            row.update(
+                {
+                    "rob": len(self.rob_active),
+                    "retirement_backlog": len(self.rob),
+                    "completed_retirement_backlog": sum(
+                        self.entries[tid].completed is not None
+                        for tid in self.rob
+                    ),
+                }
+            )
+            assert len(self.rob_active) <= self.config.rob_entries
         assert row["reception_queue"] <= self.config.instruction_queue_depth
         assert all(value <= self.pipe.inflight_entries for value in row["fu"].values())
         assert all(
@@ -843,18 +878,19 @@ class _CycleScheduler:
         assert len(queued) == len(set(queued)) and not set(queued).intersection(
             self.issued
         )
-        retirement_entries = {
-            tid
-            for tid, entry in self.entries.items()
-            if entry.dispatched is not None and entry.retired is None
-        }
-        active_entries = {
-            tid
-            for tid in retirement_entries
-            if self.entries[tid].completed is None
-        }
-        assert set(self.rob) == retirement_entries
-        assert self.rob_active == active_entries
+        if self.uses_ordered_retirement:
+            retirement_entries = {
+                tid
+                for tid, entry in self.entries.items()
+                if entry.dispatched is not None and entry.retired is None
+            }
+            active_entries = {
+                tid
+                for tid in retirement_entries
+                if self.entries[tid].completed is None
+            }
+            assert set(self.rob) == retirement_entries
+            assert self.rob_active == active_entries
         self.snapshots.append(row)
         for reason in self.cycle_reasons:
             self.stall_cycles[reason] += 1
@@ -892,7 +928,7 @@ class _CycleScheduler:
     def _future_transition(self):
         if self.issued - self.completed:
             return True
-        if self.rob:
+        if self.uses_ordered_retirement and self.rob:
             head = self.entries[self.rob[0]]
             if (
                 head.completed is not None
@@ -918,6 +954,11 @@ class _CycleScheduler:
         for entry in self.entries.values():
             if entry.retired is not None:
                 continue
+            if (
+                entry.completed is not None
+                and entry.completed + self.pipe.retire_latency > self.now
+            ):
+                return True
             if (
                 entry.dispatched is not None
                 and entry.dispatched + self.pipe.dispatch_latency > self.now
@@ -954,6 +995,9 @@ class _CycleScheduler:
             busy[timing.resource] += timing.duration
         timing_status = self.audit["timing_calibration_status"]
         payload_hash = self.audit["compile_package_sha256"]
+        simulator_config = self.config.to_dict()
+        if not self.uses_ordered_retirement:
+            simulator_config.pop("rob_entries", None)
         metrics = {
             "scheduler_target": "tisa",
             "scheduler_model": "cycle-stepped-v1",
@@ -966,7 +1010,7 @@ class _CycleScheduler:
             "machine_calibration_status": self.machine.attributes.get(
                 "calibration_status", "unspecified"
             ),
-            "simulator_config": self.config.to_dict(),
+            "simulator_config": simulator_config,
             "compile_package_sha256": payload_hash,
             "phase_order": [
                 "retire",
@@ -977,12 +1021,10 @@ class _CycleScheduler:
                 "dispatch",
                 "receive",
             ],
-            "retirement_order": "descriptor_submission_order",
-            "rob_credit_allocation": "dispatch",
-            "rob_credit_release": "completion",
-            "rob_occupancy_semantics": "dispatched_incomplete_instructions",
-            "retirement_ledger_semantics": (
-                "dispatched_instructions_pending_ordered_retirement"
+            "retirement_order": (
+                "descriptor_submission_order"
+                if self.uses_ordered_retirement
+                else "completion_ready_order"
             ),
             "payload_execution": "run_to_completion",
             "primitive_reordering_scope": "instruction_local",
@@ -1071,15 +1113,35 @@ class _CycleScheduler:
                 for dependency in descriptor.dependencies
             ),
         }
+        if self.uses_ordered_retirement:
+            metrics.update(
+                {
+                    "rob_credit_allocation": "dispatch",
+                    "rob_credit_release": "completion",
+                    "rob_occupancy_semantics": "dispatched_incomplete_instructions",
+                    "retirement_ledger_semantics": (
+                        "dispatched_instructions_pending_ordered_retirement"
+                    ),
+                }
+            )
         for name, field in (
-            ("rob_peak", "rob"),
-            ("retirement_backlog_peak", "retirement_backlog"),
-            ("completed_retirement_backlog_peak", "completed_retirement_backlog"),
             ("reception_queue_peak", "reception_queue"),
             ("inflight_tile_peak", "inflight_tiles"),
             ("pending_dependency_peak", "pending_dependencies"),
         ):
             metrics[name] = max((row[field] for row in self.snapshots), default=0)
+        if self.uses_ordered_retirement:
+            for name, field in (
+                ("rob_peak", "rob"),
+                ("retirement_backlog_peak", "retirement_backlog"),
+                (
+                    "completed_retirement_backlog_peak",
+                    "completed_retirement_backlog",
+                ),
+            ):
+                metrics[name] = max(
+                    (row[field] for row in self.snapshots), default=0
+                )
         for name in ("wq", "iq", "fu"):
             metrics[name + "_peak"] = {
                 unit: max((row[name][unit] for row in self.snapshots), default=0)

@@ -19,6 +19,7 @@ from .registry import (
 from .analytical import AnalyticalEventBackend
 from .cycle import CycleEventBackend
 from .codegen import AnalyticalCodegenBackend
+from .gm_latency import GMLatencyTraceTimingProvider, build_gm_latency_trace
 from .mxu_profile import SystolicMXUProfileEntry, SystolicMXUProfileTimingProvider
 from .rtl_trace import (
     AGGREGATIONS,
@@ -41,6 +42,7 @@ __all__ = [
     "CycleEventBackend",
     "EventBackend",
     "EventBackendRegistry",
+    "GMLatencyTraceTimingProvider",
     "SystemBackend",
     "SystolicMXUProfileEntry",
     "SystolicMXUProfileTimingProvider",
@@ -50,6 +52,7 @@ __all__ = [
     "TRACE_FORMAT",
     "RTLCompletionRecord",
     "build_systolic_mxu_profile",
+    "build_gm_latency_trace",
     "import_rtl_completion_trace",
     "load_rtl_completion_trace",
     "load_mxu_vcs_log",

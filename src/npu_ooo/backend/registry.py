@@ -183,6 +183,15 @@ def default_timing_provider_registry() -> TimingProviderRegistry:
         return SystolicMXUProfileTimingProvider.from_path(path)
 
     registry.register("systolic_mxu_profile", create_systolic_mxu_profile)
+
+    def create_gm_latency_trace(path: Path | None) -> TimingProvider:
+        if path is None:
+            raise ValueError("gm_latency_trace provider requires --timing-config")
+        from .gm_latency import GMLatencyTraceTimingProvider
+
+        return GMLatencyTraceTimingProvider.from_path(path)
+
+    registry.register("gm_latency_trace", create_gm_latency_trace)
     return registry
 
 

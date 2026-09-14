@@ -50,11 +50,14 @@ class PayloadEstimate:
 class IssueRequest:
     descriptor: BoundTISADescriptor
     cycle: float
+    instance: int | None = None
 
     def validate(self) -> tuple[str, ...]:
         issues = list(self.descriptor.validate())
         if self.cycle < 0:
             issues.append("execution issue cycle must be non-negative")
+        if self.instance is not None and self.instance < 0:
+            issues.append("execution issue instance must be non-negative")
         return tuple(issues)
 
 

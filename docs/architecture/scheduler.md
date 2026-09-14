@@ -4,10 +4,11 @@
 文档同时描述两条 scheduler 路径：
 
 - Dynamic 沿用论文 Figure 4 的 `Reception Buffer -> WQ -> IQ -> Exec` 语义路径；
-- Static Streams 使用编译器生成的 per-EU 固定流和 `set/wait/fence` 同步。
+- Static Streams 使用同一个 `Reception Buffer`、编译器生成的 per-EU 固定流和 `set/wait/fence` 同步。
 
 两条路径共享最终 target TISA、payload、MemoryPlan、依赖语义和 ExecutionBackend。
-Dynamic 路径补充项目中的 ROB、Fu、tile window 和 runtime 地址依赖容量模型。
+Dynamic 路径使用 Fu、tile window 和 runtime 地址依赖容量模型，完成反馈直接驱动
+completion-ready retire。
 
 论文 Semantic Conflict Detection、per-EU `Fu` 和跨 EU 依赖的对齐说明见
 [Scheduler 与论文对齐](scheduler-paper-alignment.md)。
@@ -24,8 +25,6 @@ queue 和 execution unit。队列按 UnitMap 分流，依赖完成通过 feedbac
 ```mermaid
 flowchart TB
     RB["Reception Buffer"]
-    ROB["ROB\nin-flight state"]
-
     subgraph TENSOR_LANE["Tensor path"]
         direction LR
         WQT["WQ[Tensor]\nwaiting queue"]
@@ -52,10 +51,9 @@ flowchart TB
 
     BROADCAST["completion / dependency feedback\nglobal broadcast"]
 
-    RB -->|"1a  allocate"| ROB
-    RB -->|"1b  UnitMap route"| TENSOR_LANE
-    RB -->|"1b  UnitMap route"| VECTOR_LANE
-    RB -->|"1b  UnitMap route"| DMA_LANE
+    RB -->|"1  UnitMap route"| TENSOR_LANE
+    RB -->|"1  UnitMap route"| VECTOR_LANE
+    RB -->|"1  UnitMap route"| DMA_LANE
 
     ET -.-> BROADCAST
     EV -.-> BROADCAST
@@ -68,7 +66,7 @@ flowchart TB
     classDef issue fill:#fefce8,stroke:#ca8a04,stroke-width:1.5px
     classDef exec fill:#fff7ed,stroke:#c2410c,stroke-width:1.5px
     classDef state fill:#f3f4f6,stroke:#6b7280,stroke-width:1.5px
-    class RB,ROB state
+    class RB state
     class WQT,WQV,WQD queue
     class IQT,IQV,IQD issue
     class ET,EV,ED exec
@@ -80,14 +78,14 @@ Exec 到另一组 WQ 的固定连接。
 
 图中编号对应论文的调度路径：
 
-1. Reception Buffer 为 descriptor 分配 ROB 状态，并按 `UnitMap` 分发到对应的 per-unit WQ。
+1. Reception Buffer 接收 descriptor，并按 `UnitMap` 分发到对应的 per-unit WQ。
 2. WQ 中依赖已经满足的候选进入对应 IQ。
 3. IQ 向可用的 Exec unit 发出 issue 请求。
 4. Exec 完成后将 completion 或 partial-ready feedback 广播到所有 WQ，由匹配的 dependency
    entry 接收。
 
 WQ、IQ 和 Exec 按 execution unit 类别独立维护；跨 EU 依赖通过 feedback 在队列之间传播。
-项目的 ROB、Fu、tile window 和 address scoreboard 属于周期级容量与安全检查，具体策略流程
+Fu、tile window 和 address scoreboard 属于 Dynamic 的周期级容量与安全检查，具体策略流程
 见后续 Static Streams 和 Dynamic ready queue 章节。
 
 ## 2. 模块边界
@@ -105,31 +103,30 @@ flowchart TB
         subgraph DS["3a. Dynamic scheduler / cycle.py"]
         direction TB
         RF["Reception FIFO\nself.reception"]
-        DISPATCH["dispatch\n分配 active credit / WQ / ledger"]
-        ROB_CREDIT["active ROB credit\ncomplete 回收"]
-        RETIRE_LEDGER["retirement ledger\ndescriptor 顺序"]
+        DISPATCH["dispatch\n分配 WQ entry"]
+        RETIRE_RECORD["completion-ready retire\nfeedback 顺序"]
         WQ["WQ[EU]\nMXU / ARU / DMA"]
         WAKE["wakeup\n依赖反馈检查"]
         SELECT["select\nfixed ready window + priority"]
         IQ["IQ[EU]\n等待 issue"]
         ISSUE["issue\n资源约束检查"]
         COMPLETE["complete\nfeedback 仲裁"]
-        RETIRE["retire\nledger head"]
+        RETIRE["retire\ncompletion-ready"]
 
         RF --> DISPATCH
-        DISPATCH --> ROB_CREDIT
-        DISPATCH --> RETIRE_LEDGER
+        DISPATCH --> RETIRE_RECORD
         DISPATCH --> WQ
         WQ --> WAKE --> SELECT --> IQ --> ISSUE
         COMPLETE --> RETIRE
-        RETIRE_LEDGER --> RETIRE
-        COMPLETE -. "回收 active credit" .-> ROB_CREDIT
+        RETIRE_RECORD --> RETIRE
         COMPLETE -. "唤醒后继指令" .-> WAKE
     end
 
     subgraph SS["3b. Static Streams / static.py"]
         direction TB
         STATIC_CONTROL["StaticControlProgram\nper-EU fixed streams"]
+        STATIC_RECEPTION["shared Reception FIFO\nruntime envelopes"]
+        STATIC_WQ["WQ[EU]\nper-EU fixed queue"]
         STATIC_STREAM["stream\nper-EU fixed commands"]
         STATIC_ISSUE["issue\nfixed stream order"]
         STATIC_SYNC["set/wait table\nevent state + fence"]
@@ -137,6 +134,8 @@ flowchart TB
         STATIC_COMPLETE["complete + trace"]
 
         STATIC_CONTROL --> STATIC_STREAM
+        STATIC_RECEPTION -->|"compiled stream route"| STATIC_WQ
+        STATIC_WQ --> STATIC_STREAM
         STATIC_STREAM -->|"issue"| STATIC_ISSUE
         STATIC_STREAM -->|"set / wait / fence"| STATIC_SYNC
         STATIC_ISSUE -->|"advance stream"| STATIC_STREAM
@@ -169,6 +168,7 @@ flowchart TB
     end
 
     LD --> RF
+    LD --> STATIC_RECEPTION
     LD --> STATIC_CONTROL
     ISSUE -->|"IssueRequest"| ACCEPT
     STATIC_ISSUE -->|"IssueRequest"| ACCEPT
@@ -190,7 +190,7 @@ flowchart TB
 | --- | --- | --- |
 | Runtime / loader | `RuntimeSubmission`、最终 TISA、`MemoryPlan` | 绑定地址、动态参数、descriptor arrival 和 completion token，生成 `LoadedDeviceProgram` |
 | Static-control compiler | `BackendArtifact`、`MachineConfig` | 生成资源约束的 per-EU 指令流和 `set/wait/fence` 控制 |
-| Device scheduler | `LoadedDeviceProgram`、policy、`MachineConfig`、backend feedback | Dynamic 管理 Reception/WQ/IQ/ROB，Static Streams 管理固定流 command 和事件同步 |
+| Device scheduler | `LoadedDeviceProgram`、policy、`MachineConfig`、backend feedback | Dynamic 管理 Reception/WQ/IQ，Static Streams 管理共享 Reception、per-EU WQ、固定流 command 和事件同步 |
 | ExecutionBackend | payload handle、`IssueRequest` | 管理 EU instance、payload timing、busy/II，并返回 physical completion 或 partial-ready |
 
 `DeviceSimulator` 负责连接 loader、scheduler 和 backend。scheduler 读取
@@ -200,8 +200,9 @@ flowchart TB
 ## 3. Static Streams 策略
 
 `static_streams` 对应论文 Static strategy。编译器根据最终 target TISA、payload、
-`MemoryPlan` 和 `MachineConfig` 生成每个逻辑 EU 的固定 command stream；运行期按 stream
-顺序执行，并通过 set/wait table 管理跨 stream 依赖和 buffer reuse。
+`MemoryPlan` 和 `MachineConfig` 生成每个逻辑 EU 的固定 command stream；运行期 descriptor
+先进入共享 Reception FIFO，再按编译分配路由到对应 EU 的 WQ。每个 EU 每周期从自己的 WQ
+取一条队首指令，set/wait table 管理跨 stream 依赖和 buffer reuse。
 
 ### 3.1 流程
 
@@ -209,8 +210,12 @@ flowchart TB
 flowchart TB
     INPUT["BackendArtifact + MachineConfig"] --> SCHEDULE["compile-time list scheduling"]
     SCHEDULE --> PROGRAM["StaticControlProgram"]
+    RUNTIME["runtime envelopes"] --> RECEPTION["shared Reception FIFO"]
+    RECEPTION --> ROUTE["compiled stream route"]
+    ROUTE --> WQ["WQ[EU]\nper-EU queue"]
     PROGRAM --> STREAM["stream\nper-EU fixed commands"]
-    STREAM --> ISSUE["issue\nfixed stream order"]
+    WQ --> STREAM
+    STREAM --> ISSUE["issue\nqueue head / fixed order"]
     STREAM --> TABLE["set/wait table\nwait / fence / set"]
     ISSUE --> BACKEND["shared ExecutionBackend"]
     BACKEND --> FEEDBACK["execution_done / partial_ready"]
@@ -226,9 +231,14 @@ flowchart TB
 1. 编译器为每条 target TISA 指令选择 `(resource, logical instance)`，估计开始和结束时间。
 2. `StaticControlProgram` 保存 per-EU stream；stream command 包含 `issue`、`wait`、
    `fence` 和 `set`。
-3. `issue` 向共享 ExecutionBackend 请求执行；`wait` 等待依赖 event，`fence` 等待
-   allocation release，`set` 在 source feedback 到达后发布 event。
-4. command 完成后 stream 前进。各 EU stream 独立推进，形成编译期安排的流水 overlap。
+3. Runtime envelope 以 Dynamic 相同的 receive width 进入共享 Reception FIFO。
+4. Static dispatch 按每个 stream 的下一条编译指令从 Reception 取数，每个 EU 每周期向
+   自己的 WQ 放入一条 descriptor。
+5. EU 只检查 WQ 队首和当前 stream command。`issue` 携带编译期选择的 EU instance 向共享
+   ExecutionBackend 请求执行，物理 payload 在该 instance 上运行；
+   `wait` 等待依赖 event，`fence` 等待 allocation release，`set` 在 source feedback
+   到达后按 consumer 数量发布 token。
+6. command 完成后 stream 前进。各 EU stream 独立推进，形成编译期安排的流水 overlap。
 
 ### 3.2 依赖与事件
 
@@ -237,9 +247,9 @@ flowchart TB
 
 | command | 作用 |
 | --- | --- |
-| `wait` | 等待 producer 的 ready condition |
-| `fence` | 等待 physical range 或 allocation release |
-| `set` | 在 producer 的 `execution_done` 或指定 `partial_ready` 后发布 event |
+| `wait` | 等待 producer 的 ready condition 并消费 set_wait token |
+| `fence` | 等待 physical range 或 allocation release，并消费对应 token |
+| `set` | 在 producer 的 `execution_done` 或指定 `partial_ready` 后按消费者数量发布 token |
 | `issue` | 在当前 stream 顺序和前置 event 满足后请求执行 |
 
 运行期以 ExecutionBackend 的实际 `can_accept()` 和 feedback 为准；control、wait、fence
@@ -265,7 +275,7 @@ Dynamic 在运行期处理已经到达的 descriptor。单一 Reception FIFO 保
 flowchart TB
     ARRIVAL["descriptor arrival"] --> RF["single Reception FIFO"]
     RF --> REGISTER["register pending dependency mask"]
-    REGISTER --> DISPATCH["dispatch\nWQ + active ROB credit + ledger"]
+    REGISTER --> DISPATCH["dispatch\nWQ entry"]
     DISPATCH --> WQ["WQ[EU]"]
     WQ --> WAKE["wakeup\nrefresh dependency state"]
     FEEDBACK["ExecutionBackend feedback\nexecution_done / partial_ready"] --> TAG["publish condition tag"]
@@ -281,8 +291,8 @@ flowchart TB
     CHECK -->|"阻塞"| IQ
     ISSUE --> BACKEND["ExecutionBackend"]
     BACKEND --> FEEDBACK
-    FEEDBACK --> COMPLETE["complete\ncredit / Fu / tile 回收"]
-    COMPLETE --> RETIRE["ordered ledger retire"]
+    FEEDBACK --> COMPLETE["complete\nFu / tile 回收"]
+    COMPLETE --> RETIRE["completion-ready retire"]
 ```
 
 Dynamic 每个 cycle 按以下顺序推进：
@@ -291,9 +301,9 @@ Dynamic 每个 cycle 按以下顺序推进：
 retire -> complete -> wakeup -> issue -> select -> dispatch -> receive
 ```
 
-`complete` 释放本周期可复用的容量，`wakeup` 消费完成反馈，`select` 将 ready 指令移入
-IQ，`issue` 向 ExecutionBackend 提交请求，`dispatch` 将 Reception FIFO head 放入 WQ、
-active ROB credit 和 retirement ledger。
+`complete` 释放本周期可复用的 Fu 和 tile 容量，`wakeup` 消费完成反馈，`select` 将 ready
+指令移入 IQ，`issue` 向 ExecutionBackend 提交请求，`dispatch` 将 Reception FIFO head 放入
+WQ。完成反馈按照 completion-ready 顺序推进 retire。
 
 ### 4.2 依赖检查
 
@@ -356,24 +366,23 @@ WQ[resource] -> IQ[resource]
 `execution.advance(now)` 返回 physical done 或 partial-ready。完整完成经过
 `completion_latency` 和 `completion_width` 仲裁后成为 TISA complete；complete 执行：
 
-- 释放 Fu entry 和 active ROB credit；
+- 释放 Fu entry；
 - 更新 tile remaining，必要时释放 tile window；
 - 广播 source TISA 的 completion conditions；
 - 清除 WQ 中匹配的 pending dependency bit。
 
-Retirement ledger 保留 descriptor submission order。年轻指令可以先 complete 并释放 active
-credit，ledger 仍按队首顺序 retire。
+Retire 记录 completion-ready 指令的实际完成顺序，Dynamic 允许年轻指令先完成并先 retire。
 
 ## 5. Static 与 Dynamic 对照
 
 | 维度 | Static Streams（论文 Static） | Dynamic ready queue |
 | --- | --- | --- |
 | 决策位置 | 编译期资源约束 list scheduling | 运行期 scheduler cycle |
-| 控制表示 | per-EU fixed stream + `set/wait/fence` | 单一 Reception FIFO + per-EU WQ/IQ |
+| 控制表示 | 共享 Reception FIFO + per-EU WQ + fixed stream + `set/wait/fence` | 单一 Reception FIFO + per-EU WQ/IQ |
 | 候选选择 | stream command 固定顺序 | 固定 `queue[:dependency_window]` 内按 priority 选择 |
 | 依赖同步 | StaticEvent、wait、fence、set | condition tag 与 pending dependency mask |
 | 地址与资源 | 编译期 instance 排程，运行期 `can_accept()` 校验 | runtime scope/range/access、Fu、bank/port 和 `can_accept()` |
-| 完成管理 | stream/event state | completion broadcast、ROB credit、ordered ledger |
+| 完成管理 | stream/event state | completion broadcast、Fu/tile 回收、completion-ready retire |
 | 执行后端 | 共享 ExecutionBackend | 共享 ExecutionBackend |
 
 两条策略使用同一 target TISA、operand region、payload timing、EU instance 和 completion
@@ -405,14 +414,14 @@ completion 和 partial-ready。
 
 | 论文概念 | 当前实现 | 作用 |
 | --- | --- | --- |
-| Reception Buffer | `self.reception` | 接收 descriptor 的 FIFO |
-| `WQTensor` / `WQVector` / `WQDMA` | `self.wq[resource]` | 按 EU 类型保存等待指令 |
+| Reception Buffer | `self.reception` | Dynamic 与 Static 共用的 descriptor FIFO |
+| `WQTensor` / `WQVector` / `WQDMA` | `self.wq[resource]` 或 Static `self.wq[stream]` | 按 EU 类型或逻辑 EU 保存等待指令 |
 | `IQTensor` / `IQVector` / `IQDMA` | `self.iq[resource]` | 保存 ready、等待 issue 的指令 |
 | `Exec[unit]` | ExecutionBackend EU instance | 执行 payload 并返回反馈 |
 | 反馈 4 | completion-tag broadcast | 唤醒跨 EU 后继指令 |
 
-项目在论文公开路径上增加 active ROB credit、ordered retirement ledger、tile window、Fu
-和 address/memory scoreboard，用于建模容量、别名和周期级资源约束。
+项目在 Dynamic 论文路径上增加 tile window、Fu 和 address/memory scoreboard，用于建模容量、
+别名和周期级资源约束。Static 使用编译 stream 和 set/wait/fence 的确定性控制。
 
 ## 7. 当前建模边界
 
@@ -439,6 +448,6 @@ completion width、memory bank/port 和 ExecutionBackend timing。`static_pipeli
 | `ir/static.py` | 定义 StaticControlProgram、stream、command 和 validation contract |
 | `scheduler/static.py` | 执行 Static Streams、验证 condition-aware happens-before |
 | `simulator/cycle.py` | Dynamic receive/dispatch/select/issue/complete/retire 主循环 |
-| `scheduler/event.py` | Dynamic event-reference backend 和 completion-time ROB credit 回收 |
+| `scheduler/event.py` | Dynamic event-reference backend 和 completion-time feedback 处理 |
 | `scheduler/semantics.py` | TileMem alias/range/access conflict rules |
 | `execution/analytical.py` | payload timing、EU instance 和 completion feedback |

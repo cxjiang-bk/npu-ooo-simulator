@@ -106,7 +106,12 @@ def schedule_loaded_event_program(
     queue_depth = config.instruction_queue_depth or len(descriptors) or 1
     dependency_window = config.dependency_window or queue_depth
     ready_queue_depth = config.ready_queue_depth or queue_depth
-    rob_limit = config.rob_entries or len(descriptors) or 1
+    uses_ordered_retirement = policy != "dynamic_ready_queue"
+    ordered_inflight_limit = (
+        config.rob_entries or len(descriptors) or 1
+        if uses_ordered_retirement
+        else None
+    )
     tile_limit = config.max_inflight_tiles or len(descriptors) or 1
     tile_instruction_count = Counter(
         item.instruction.tile_id for item in loaded.descriptors
@@ -124,12 +129,15 @@ def schedule_loaded_event_program(
     active_accesses: dict[str, tuple] = {}
     inflight_tiles: set[str] = set()
     next_receive = 0
-    rob_occupancy = 0
+    ordered_inflight = 0
     now = 0.0
     events: list[TraceEvent] = []
     runtime_timings: list[TaskTiming] = []
     hazards: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
     wq_peak = {unit.name: 0 for unit in machine.execution_units}
+    simulator_config = config.to_dict()
+    if not uses_ordered_retirement:
+        simulator_config.pop("rob_entries", None)
 
     chunks: dict[str, list] = {}
     for envelope in loaded.envelopes:
@@ -160,9 +168,6 @@ def schedule_loaded_event_program(
         "scheduler_target": "bound_tisa_descriptor",
         "scheduler_model": "event-reference-v2",
         "payload_execution": "run_to_completion",
-        "rob_credit_allocation": "issue",
-        "rob_credit_release": "completion",
-        "rob_occupancy_semantics": "issued_incomplete_instructions",
         "runtime_policy": loaded.attributes.get("runtime_policy", "implicit_static"),
         "runtime_launch_count": int(loaded.attributes.get("command_chunk_count", 0)),
         "runtime_submit_cycles": float(loaded.attributes.get("runtime_submit_cycles", 0.0)),
@@ -179,7 +184,7 @@ def schedule_loaded_event_program(
         "address_hazard_count": 0,
         "address_hazards": [],
         "primitive_reordering_scope": "instruction_local",
-        "simulator_config": config.to_dict(),
+        "simulator_config": simulator_config,
         "tisa_instruction_count": len(descriptors),
         "payload_task_count": sum(len(item.steps) for item in plans.values()),
         "readiness_interpreter": "completion_token+partial_ready",
@@ -197,13 +202,11 @@ def schedule_loaded_event_program(
         "issued_task_count": 0,
         "completed_task_count": 0,
         "tisa_decision_count": 0,
-        "rob_peak": 0,
         "inflight_tile_peak": 0,
         "reception_queue_peak": 0,
         "wq_peak": wq_peak,
         "dependency_block_events": 0,
         "resource_block_events": 0,
-        "rob_block_events": 0,
         "tile_window_block_events": 0,
         "address_scoreboard_block_events": 0,
         "memory_bank_scoreboard": config.memory_bank_scoreboard,
@@ -232,23 +235,33 @@ def schedule_loaded_event_program(
             for dependency in descriptor.dependencies
         ),
     }
+    if uses_ordered_retirement:
+        metrics.update(
+            {
+                "rob_credit_allocation": "issue",
+                "rob_credit_release": "completion",
+                "rob_occupancy_semantics": "issued_incomplete_instructions",
+                "rob_peak": 0,
+                "rob_block_events": 0,
+            }
+        )
     if audit.get("timing_provider_coverage") is not None:
         metrics["timing_provider_coverage"] = audit["timing_provider_coverage"]
 
     def record_occupancy(event: str) -> None:
-        metrics["queue_occupancy_timeline"].append(
-            {
-                "timestamp": now,
-                "event": event,
-                "reception_queue": len(waiting),
-                "rob": rob_occupancy,
-                "inflight_tiles": len(inflight_tiles),
-                "wq": {
-                    resource: sum(plans[item].resource == resource for item in waiting)
-                    for resource in wq_peak
-                },
-            }
-        )
+        row = {
+            "timestamp": now,
+            "event": event,
+            "reception_queue": len(waiting),
+            "inflight_tiles": len(inflight_tiles),
+            "wq": {
+                resource: sum(plans[item].resource == resource for item in waiting)
+                for resource in wq_peak
+            },
+        }
+        if uses_ordered_retirement:
+            row["rob"] = ordered_inflight
+        metrics["queue_occupancy_timeline"].append(row)
 
     def receive() -> None:
         nonlocal next_receive
@@ -351,7 +364,8 @@ def schedule_loaded_event_program(
             completion_time[tisa_id] = feedback.cycle
             active.pop(tisa_id, None)
             active_accesses.pop(tisa_id, None)
-            rob_occupancy -= 1
+            if uses_ordered_retirement:
+                ordered_inflight -= 1
             tile = descriptor.instruction.tile_id
             tile_completed_count[tile] += 1
             if tile_completed_count[tile] == tile_instruction_count[tile]:
@@ -383,7 +397,10 @@ def schedule_loaded_event_program(
         while True:
             if policy == "sequential" and active:
                 break
-            if rob_occupancy >= rob_limit:
+            if (
+                uses_ordered_retirement
+                and ordered_inflight >= ordered_inflight_limit
+            ):
                 metrics["rob_block_events"] += 1
                 break
             visible = sorted(waiting, key=order.__getitem__)[:dependency_window]
@@ -463,7 +480,8 @@ def schedule_loaded_event_program(
             issued.add(selected)
             active[selected] = (str(receipt.resource), int(receipt.instance))
             active_accesses[selected] = accesses[selected]
-            rob_occupancy += 1
+            if uses_ordered_retirement:
+                ordered_inflight += 1
             inflight_tiles.add(descriptor.instruction.tile_id)
             instruction_timings[selected] = TaskTiming(
                 selected,
@@ -496,7 +514,8 @@ def schedule_loaded_event_program(
             metrics["issued_instruction_count"] += 1
             metrics["issued_task_count"] += len(plans[selected].steps)
             metrics["tisa_decision_count"] += 1
-            metrics["rob_peak"] = max(metrics["rob_peak"], rob_occupancy)
+            if uses_ordered_retirement:
+                metrics["rob_peak"] = max(metrics["rob_peak"], ordered_inflight)
             metrics["inflight_tile_peak"] = max(
                 metrics["inflight_tile_peak"], len(inflight_tiles)
             )
@@ -538,12 +557,15 @@ def schedule_loaded_event_program(
                 ]
                 for item in unresolved
             }
-            raise RuntimeError(
+            state = (
                 f"event scheduler deadlocked at cycle {now}; waiting={unresolved}, "
-                f"received={len(received)}, issued={len(issued)}, completed={len(completed)}, "
-                f"next_static={next_static}, next_stream={next_stream}, rob={rob_occupancy}, "
-                f"unmet={unmet}"
+                f"received={len(received)}, issued={len(issued)}, "
+                f"completed={len(completed)}, next_static={next_static}, "
+                f"next_stream={next_stream}"
             )
+            if uses_ordered_retirement:
+                state += f", rob={ordered_inflight}"
+            raise RuntimeError(f"{state}, unmet={unmet}")
         now = min(future)
 
     execution_timings = tuple(execution.task_timings())

@@ -6,14 +6,17 @@ from npu_ooo.arch import minimal_machine_config
 from npu_ooo.backend import (
     AnalyticalCodegenBackend,
     AnalyticalEventBackend,
+    GMLatencyTraceTimingProvider,
     CodegenBackendRegistry,
     EventBackendRegistry,
+    build_gm_latency_trace,
     default_codegen_backend_registry,
     default_event_backend_registry,
     default_timing_provider_registry,
 )
-from npu_ooo.ir import ExecutionTask
+from npu_ooo.ir import BufferRegion, ExecutionGraph, ExecutionTask
 from npu_ooo.simulator import TimingTableModel
+from types import SimpleNamespace
 
 
 class BackendContractTest(unittest.TestCase):
@@ -51,7 +54,7 @@ class BackendContractTest(unittest.TestCase):
         registry = default_timing_provider_registry()
         self.assertEqual(
             registry.names(),
-            ("analytical", "systolic_mxu_profile", "timing_table"),
+            ("analytical", "gm_latency_trace", "systolic_mxu_profile", "timing_table"),
         )
         analytical = registry.create("analytical")
         self.assertEqual(analytical.capabilities.calibration_status, "analytical")
@@ -64,6 +67,109 @@ class BackendContractTest(unittest.TestCase):
     def test_systolic_mxu_profile_requires_a_path(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires --timing-config"):
             default_timing_provider_registry().create("systolic_mxu_profile")
+
+    def test_gm_latency_trace_provider_requires_a_path(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires --timing-config"):
+            default_timing_provider_registry().create("gm_latency_trace")
+
+    def test_gm_latency_trace_adds_only_to_tasks_touching_gm(self) -> None:
+        gm_region = BufferRegion(
+            "gm_tensor", "GM", (4,), (0,), size_bytes=16, valid_bytes=16
+        )
+        gm_task = ExecutionTask(
+            "gm.load", "tile.0", "op", "load", "DMA", reads=(gm_region,), duration_cycles=5
+        )
+        sram_task = ExecutionTask(
+            "sram.compute", "tile.0", "op", "elementwise", "ARU", duration_cycles=7
+        )
+        provider = GMLatencyTraceTimingProvider.from_dict(
+            {
+                "format": "npu_ooo.gm_latency_trace.v1",
+                "name": "probe",
+                "requests": {"gm.load": {"extra_latency_cycles": 11}},
+            }
+        )
+        self.assertEqual(provider.timing(gm_task, minimal_machine_config()).duration_cycles, 16)
+        self.assertEqual(provider.timing(sram_task, minimal_machine_config()).duration_cycles, 7)
+        coverage = provider.coverage((gm_task, sram_task))
+        self.assertEqual(coverage["gm_request_count"], 1)
+        self.assertEqual(coverage["gm_trace_hit_count"], 1)
+        self.assertEqual(coverage["gm_nonideal_hit_count"], 1)
+        self.assertEqual(coverage["gm_trace_missing_count"], 0)
+        self.assertEqual(coverage["gm_extra_latency_cycles"], 11)
+        self.assertEqual(coverage["gm_read_bytes"], 16)
+
+    def test_gm_latency_trace_reports_missing_request(self) -> None:
+        gm_region = BufferRegion("gm_tensor", "GM", (4,), (0,), size_bytes=16)
+        task = ExecutionTask(
+            "gm.load", "tile.0", "op", "load", "DMA", reads=(gm_region,), duration_cycles=5
+        )
+        provider = GMLatencyTraceTimingProvider.from_dict(
+            {"format": "npu_ooo.gm_latency_trace.v1", "requests": {}}
+        )
+        with self.assertRaisesRegex(ValueError, "missing request 'gm.load'"):
+            provider.timing(task, minimal_machine_config())
+
+    def test_gm_latency_trace_generation_is_replayable(self) -> None:
+        gm_region = BufferRegion("gm_tensor", "GM", (4,), (0,), size_bytes=16)
+        tasks = (
+            ExecutionTask(
+                "gm.0", "tile.0", "op", "load", "DMA", reads=(gm_region,), duration_cycles=5
+            ),
+            ExecutionTask("sram.0", "tile.0", "op", "elementwise", "ARU", duration_cycles=7),
+            ExecutionTask(
+                "gm.1", "tile.1", "op", "store", "DMA", writes=(gm_region,), duration_cycles=9
+            ),
+        )
+        artifact = SimpleNamespace(
+            artifact_id="artifact.probe",
+            program=SimpleNamespace(program_id="program.probe"),
+            execution_graph=ExecutionGraph("graph.probe", tasks),
+            memory_plan=None,
+        )
+        first = build_gm_latency_trace(
+            artifact,
+            minimal_machine_config(),
+            seed=42,
+            min_extra_latency_cycles=3,
+            max_extra_latency_cycles=3,
+            extra_latency_probability=1.0,
+        )
+        second = build_gm_latency_trace(
+            artifact,
+            minimal_machine_config(),
+            seed=42,
+            min_extra_latency_cycles=3,
+            max_extra_latency_cycles=3,
+            extra_latency_probability=1.0,
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(first["request_count"], 2)
+        self.assertEqual(first["nonideal_request_count"], 2)
+        self.assertEqual(set(first["requests"]), {"gm.0", "gm.1"})
+        self.assertEqual(first["requests"]["gm.0"]["extra_latency_cycles"], 3)
+
+    def test_gm_latency_trace_can_model_sparse_nonideal_requests(self) -> None:
+        gm_region = BufferRegion("gm_tensor", "GM", (4,), (0,), size_bytes=16)
+        task = ExecutionTask(
+            "gm.0", "tile.0", "op", "load", "DMA", reads=(gm_region,), duration_cycles=5
+        )
+        artifact = SimpleNamespace(
+            artifact_id="artifact.probe",
+            program=SimpleNamespace(program_id="program.probe"),
+            execution_graph=ExecutionGraph("graph.probe", (task,)),
+            memory_plan=None,
+        )
+        trace = build_gm_latency_trace(
+            artifact,
+            minimal_machine_config(),
+            seed=42,
+            min_extra_latency_cycles=10,
+            max_extra_latency_cycles=10,
+            extra_latency_probability=0.0,
+        )
+        self.assertEqual(trace["nonideal_request_count"], 0)
+        self.assertEqual(trace["requests"]["gm.0"]["extra_latency_cycles"], 0)
 
     def test_systolic_mxu_profile_matches_exact_tile_shape(self) -> None:
         path = Path("configs/timing/systolic_mxu_matmul_example.json")

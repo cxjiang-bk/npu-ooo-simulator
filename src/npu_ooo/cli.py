@@ -28,6 +28,7 @@ from npu_ooo.analysis import (
 from npu_ooo.backend import (
     AGGREGATIONS,
     INTERVALS,
+    build_gm_latency_trace,
     default_codegen_backend_registry,
     default_event_backend_registry,
     default_timing_provider_registry,
@@ -732,6 +733,19 @@ def build_parser() -> argparse.ArgumentParser:
     rtl_log.add_argument("--input", type=Path, required=True)
     rtl_log.add_argument("--output", type=Path, required=True)
     rtl_log.add_argument("--k-per-tile", type=int, default=8)
+
+    gm_latency = commands.add_parser(
+        "generate-gm-latency",
+        help="generate a replayable simulation-only GM latency trace from a compile package",
+    )
+    gm_latency.add_argument("--compile-dir", type=Path, required=True)
+    gm_latency.add_argument("--output", type=Path, required=True)
+    gm_latency.add_argument("--seed", type=int, default=0)
+    gm_latency.add_argument("--min-extra-latency-cycles", type=int, default=1)
+    gm_latency.add_argument("--max-extra-latency-cycles", type=int, default=40)
+    gm_latency.add_argument("--extra-latency-probability", type=float, default=0.1)
+    gm_latency.add_argument("--memory", default="GM")
+    gm_latency.add_argument("--name")
     return parser
 
 
@@ -816,6 +830,40 @@ def run_import_rtl_log(args: argparse.Namespace) -> int:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(trace, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps({"output": str(args.output), "record_count": len(trace["records"])}, sort_keys=True))
+    return 0
+
+
+def run_generate_gm_latency(args: argparse.Namespace) -> int:
+    """Create simulation input without changing the compiler-owned package."""
+
+    _compile_root, artifact, _graph, machine, _manifest = _load_compile_package(
+        args.compile_dir
+    )
+    trace = build_gm_latency_trace(
+        artifact,
+        machine,
+        seed=args.seed,
+        min_extra_latency_cycles=args.min_extra_latency_cycles,
+        max_extra_latency_cycles=args.max_extra_latency_cycles,
+        extra_latency_probability=args.extra_latency_probability,
+        memory=args.memory,
+        name=args.name,
+    )
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(
+        json.dumps(trace, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    print(
+        json.dumps(
+            {
+                "output": str(args.output),
+                "request_count": trace["request_count"],
+                "seed": trace["seed"],
+            },
+            sort_keys=True,
+        )
+    )
     return 0
 
 
@@ -2459,6 +2507,7 @@ def main(argv: list[str] | None = None) -> int:
         "analyze": run_analyze,
         "import-rtl-trace": run_import_rtl_trace,
         "import-rtl-log": run_import_rtl_log,
+        "generate-gm-latency": run_generate_gm_latency,
     }
     return runners[args.command](args)
 

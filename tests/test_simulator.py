@@ -343,7 +343,14 @@ class EventSimulatorTest(unittest.TestCase):
             ),
         )
         self.assertGreaterEqual(constrained_result.total_cycles, open_result.total_cycles)
-        self.assertEqual(constrained_result.metrics["rob_peak"], 1)
+        self.assertNotIn("rob_peak", constrained_result.metrics)
+        self.assertNotIn("rob_credit_release", constrained_result.metrics)
+        self.assertNotIn(
+            "rob_entries", constrained_result.metrics["simulator_config"]
+        )
+        self.assertNotIn(
+            "rob", constrained_result.metrics["queue_peak_occupancy"]
+        )
         self.assertLessEqual(constrained_result.metrics["visible_ready_peak"], 1)
 
     def test_instruction_queue_override_controls_visible_ready_depth(self) -> None:

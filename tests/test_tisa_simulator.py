@@ -371,7 +371,11 @@ class TISADeviceSimulatorTest(unittest.TestCase):
 
         self.assertEqual(result.instruction_timing("short").issue, 0)
         self.assertEqual(result.instruction_timing("critical").issue, 10)
-        self.assertEqual(result.metrics["rob_peak"], 1)
+        self.assertNotIn("rob_peak", result.metrics)
+        self.assertNotIn("rob_entries", result.metrics["simulator_config"])
+        self.assertTrue(
+            all("rob" not in row for row in result.metrics["queue_occupancy_timeline"])
+        )
 
     def test_runtime_submission_controls_reception_and_reports_overhead(self) -> None:
         artifact = self._critical_path_artifact()

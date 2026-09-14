@@ -156,6 +156,7 @@ class CliSurfaceTest(unittest.TestCase):
                 "analyze",
                 "import-rtl-trace",
                 "import-rtl-log",
+                "generate-gm-latency",
             },
         )
 
@@ -209,6 +210,28 @@ class CliSurfaceTest(unittest.TestCase):
         self.assertEqual(args.compile_dir, Path("out/attention-compile"))
         self.assertEqual(args.runtime_config, Path("runtime.json"))
         self.assertEqual(args.policy, "dynamic_ready_queue")
+
+    def test_generate_gm_latency_accepts_compile_package_and_trace_options(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "generate-gm-latency",
+                "--compile-dir",
+                "out/attention-compile",
+                "--output",
+                "out/gm-latency.json",
+                "--seed",
+                "42",
+                "--max-extra-latency-cycles",
+                "80",
+                "--extra-latency-probability",
+                "0.1",
+            ]
+        )
+        self.assertEqual(args.compile_dir, Path("out/attention-compile"))
+        self.assertEqual(args.output, Path("out/gm-latency.json"))
+        self.assertEqual(args.seed, 42)
+        self.assertEqual(args.max_extra_latency_cycles, 80)
+        self.assertEqual(args.extra_latency_probability, 0.1)
 
     def test_swimlane_window_options_are_available_to_simulation_and_matrix(self) -> None:
         simulate_args = build_parser().parse_args(

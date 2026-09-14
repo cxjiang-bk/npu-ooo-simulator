@@ -199,7 +199,7 @@ def build_static_control_program(
                     if condition.startswith("payload_ready:")
                     else "execution_done"
                 ),
-                "consuming_wait": False,
+                "consuming_wait": True,
             },
         )
 
@@ -329,7 +329,7 @@ def build_static_control_program(
             "timing_estimate_is_oracle": False,
             "control_cost_assumption": "configured_at_simulation",
             "initial_slot_state": "allocated_but_no_dynamic_value",
-            "wait_consumes_event": False,
+            "wait_consumes_event": True,
             "finalization": "invocation completes after all shared workload instructions",
             "dynamic_control_hash": dynamic_control_hash(workload_hash),
         },

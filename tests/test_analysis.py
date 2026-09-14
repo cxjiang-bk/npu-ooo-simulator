@@ -102,7 +102,8 @@ class OfflineAnalysisTest(unittest.TestCase):
             for resource in resource_names:
                 self.assertIn(f"WQ[{resource}]", report_html)
                 self.assertIn(f"IQ[{resource}]", report_html)
-            self.assertIn("ROB occupancy", report_html)
+            self.assertNotIn("ROB occupancy", report_html)
+            self.assertNotIn(">ROB<", report_html)
             self.assertIn("Completion pending", report_html)
             self.assertIn("Protected bytes", report_html)
             self.assertIn("Retained bytes", report_html)
